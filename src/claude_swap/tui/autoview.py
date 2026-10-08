@@ -255,7 +255,8 @@ class AutoScreen(Screen):
                 ConfirmModal(
                     "Go live? claude-swap will switch your active account "
                     "automatically when the threshold is reached.\n\n"
-                    "(Same behavior as running `cswap auto` in a terminal.)",
+                    f"(Same behavior as running `{self.app.cli_prefix} auto` in a "
+                    "terminal.)",
                     title="Go live",
                     yes_label="Go live",
                 ),
@@ -310,7 +311,8 @@ class AutoScreen(Screen):
             entry.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
-                    f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
+                    f"  {data.sentinel_label(acc.usage.sentinel, self.app.sentinel_notes)}",
+                    style=palette.muted,
                 )
                 ranked.append((998.0, acc.number))
             elif pct is None:

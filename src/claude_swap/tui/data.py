@@ -87,9 +87,10 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
 # Display helpers
 # ---------------------------------------------------------------------------
 
-def sentinel_label(sentinel: str) -> str:
-    """The same wording ``cswap list`` prints for this sentinel state."""
-    return SENTINEL_NOTES.get(sentinel, sentinel)
+def sentinel_label(sentinel: str, notes: dict[str, str] = SENTINEL_NOTES) -> str:
+    """The same wording ``cswap list`` prints for this sentinel state
+    (``notes``: the provider's, see ``CswapApp.sentinel_notes``)."""
+    return notes.get(sentinel, sentinel)
 
 
 def window_pct(last_good: dict | None, key: str) -> float | None:

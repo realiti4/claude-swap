@@ -30,6 +30,15 @@ from claude_swap.models import Platform
 
 LEGACY_BACKUP_DIRNAME = ".claude-swap-backup"
 
+# Codex's store is this subdir of the backup root, and how cswap names it.
+# Here rather than on CodexAccountSwitcher alone because the Claude purge
+# must leave that store in place: the base switcher reads these, never its
+# subclass.
+CODEX_SUBDIR = "codex"
+CODEX_DISPLAY_NAME = "Codex"
+CODEX_CLI_PREFIX = "cswap codex"
+CODEX_TOKEN_KIND = "OpenAI API key"
+
 
 def get_claude_config_home() -> Path:
     """Return the Claude config home directory (CLAUDE_CONFIG_DIR or ~/.claude)."""

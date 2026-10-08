@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from claude_swap import codex_auth
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -26,17 +27,27 @@ def extract_access_token(credentials: str) -> str | None:
     """Extract the OAuth access token from a credentials JSON string."""
     try:
         data = json.loads(credentials)
+        if codex_auth.is_codex_blob(data):
+            return (codex_auth.oauth_view(credentials) or {}).get("accessToken")
         return data.get("claudeAiOauth", {}).get("accessToken")
     except (json.JSONDecodeError, AttributeError):
         return None
 
 
 def extract_oauth_data(credentials: str) -> dict | None:
-    """Extract the Claude AI OAuth payload from a credentials JSON string."""
+    """Extract the Claude AI OAuth payload from a credentials JSON string.
+
+    Codex blobs get ``codex_auth.oauth_view`` — the same ``accessToken`` /
+    ``refreshToken`` / ``expiresAt`` (ms) keys — so every helper below that
+    reads through here (fingerprints, expiry, token status) and every caller
+    of it handles both providers unchanged.
+    """
     try:
         data = json.loads(credentials)
     except json.JSONDecodeError:
         return None
+    if codex_auth.is_codex_blob(data):
+        return codex_auth.oauth_view(credentials)
     oauth = data.get("claudeAiOauth")
     return oauth if isinstance(oauth, dict) else None
 
@@ -162,6 +173,8 @@ def try_refresh_oauth_credentials(
         return RefreshOutcome(None, "transient")
     if not isinstance(data, dict):
         return RefreshOutcome(None, "transient")
+    if codex_auth.is_codex_blob(data):
+        return codex_auth.try_refresh(credentials, timeout_s)
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
@@ -392,6 +405,21 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     if "clock" in window:
         return window.get("countdown", "?"), window["clock"]
     return None
+
+
+def _request_usage_result(credentials: str, access_token: str) -> dict | None:
+    """One usage round trip for whichever provider issued ``credentials``,
+    normalized. Codex errors raise the same exception types as
+    ``request_usage_data``, so the caller's classification (401 refresh,
+    Retry-After, error kinds) applies to both."""
+    if codex_auth.parse_blob(credentials) is not None:
+        # Lazy: codex_store -> credentials -> models -> usage_store -> oauth.
+        from claude_swap.codex_store import chatgpt_base_url
+
+        return codex_auth.build_usage_result(
+            codex_auth.request_usage(credentials, base_url=chatgpt_base_url())
+        )
+    return build_usage_result(request_usage_data(access_token))
 
 
 def request_usage_data(access_token: str) -> dict:
@@ -703,8 +731,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
-        return UsageOutcome(build_usage_result(data))
+        return UsageOutcome(_request_usage_result(working_credentials, access_token))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
         if (
@@ -752,8 +779,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
-            data = request_usage_data(new_token)
-            return UsageOutcome(build_usage_result(data))
+            return UsageOutcome(_request_usage_result(working_credentials, new_token))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)

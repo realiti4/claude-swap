@@ -21,7 +21,7 @@ from claude_swap import printer
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ERROR_NOTES, SENTINEL_NOTES, ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
@@ -62,6 +62,20 @@ class CswapApp(App):
         self._start = start  # "dashboard" | "watch" (`cswap watch`)
         self._detected = detected  # terminal background sensed pre-driver, or None
         self.source = SnapshotSource(switcher)
+        # The provider's wording (`cswap codex tui` names Codex). The tests'
+        # FakeSwitcher carries none of these attributes: Claude's wording.
+        self.sentinel_notes = getattr(switcher, "sentinel_notes", SENTINEL_NOTES)
+        self.error_notes = getattr(switcher, "error_notes", ERROR_NOTES)
+        self.login_name = getattr(switcher, "display_name", "Claude Code")
+        self.cli_prefix = getattr(switcher, "cli_prefix", "cswap")
+        # What `add-token` takes (None: Claude's setup-token / API key).
+        self.token_name = getattr(switcher, "token_kind", None)
+        self.token_source = (
+            f"your {self.token_name}" if self.token_name else "a setup-token / API key"
+        )
+        # The theme is one setting for every provider, in the backup root
+        # (a Codex store is a child of it).
+        self._theme_root = getattr(switcher, "root_dir", switcher.backup_dir)
         self._store_only = False
         self._full_next = False
         self._normal_refreshing = False
@@ -79,7 +93,7 @@ class CswapApp(App):
         except Exception:
             self.threshold_pct = None
         try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+            self._theme_name = load_ui_settings(self._theme_root).theme
         except Exception:
             self._theme_name = "auto"
 
@@ -332,7 +346,7 @@ class CswapApp(App):
     def action_add_current(self) -> None:
         self.push_screen(
             ConfirmModal(
-                "Back up the current Claude Code login as a managed account?\n\n"
+                f"Back up the current {self.login_name} login as a managed account?\n\n"
                 "If this account is already managed, its stored credentials "
                 "are refreshed in place.",
                 title="Add account",
@@ -350,7 +364,7 @@ class CswapApp(App):
             )
 
     def action_add_token(self) -> None:
-        self.push_screen(AddTokenModal(), self._on_token_form)
+        self.push_screen(AddTokenModal(self.token_name), self._on_token_form)
 
     def _on_token_form(self, form: TokenForm | None) -> None:
         if form is None:
@@ -422,7 +436,7 @@ class CswapApp(App):
         self.theme = f"cswap-{resolved}"
         printer.set_theme(resolved)
         try:
-            set_setting(self.switcher.backup_dir, "ui.theme", name)
+            set_setting(self._theme_root, "ui.theme", name)
         except Exception as exc:  # persistence is best-effort; never crash the UI
             self.notify(f"Could not save theme: {exc}", severity="warning")
 

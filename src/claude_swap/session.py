@@ -46,7 +46,7 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
@@ -458,7 +458,12 @@ def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     return email, oauth_account.get("organizationUuid") or ""
 
 
-def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bool:
+def session_identity_drifted(
+    session_dir: Path,
+    email: str,
+    org_uuid: str,
+    read_identity: Callable[[Path], tuple[str, str] | None] | None = None,
+) -> bool:
     """Whether the profile is logged in as a *different* account than its slot.
 
     An in-session ``/login`` (e.g. after the slot's account hit its rate limit
@@ -468,8 +473,12 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     have a value. An unreadable identity is NOT drift — missing metadata
     degrades to trusting the profile (its token family is normally the slot's
     freshest) rather than abandoning it over a broken ``.claude.json``.
+
+    ``read_identity`` swaps the profile identity reader (a provider whose
+    profile records identity elsewhere); None = ``read_session_identity``,
+    resolved at call time.
     """
-    identity = read_session_identity(session_dir)
+    identity = (read_identity or read_session_identity)(session_dir)
     if identity is None:
         return False
     profile_email, profile_org = identity
@@ -529,6 +538,17 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
+    # What `_sync_sharing` mirrors from `_share_source()`. Class attributes so
+    # a provider subclass (codex_session) can name its own home's items; the
+    # profile-state reads it also needs (liveness, credentials, keychain
+    # cleanup) go through the switcher's session hooks.
+    shared_items = SHARED_ITEMS
+    history_items = HISTORY_ITEMS
+    # The client launched, and the env vars that would make it bypass the
+    # profile's login (scrubbed from the session launch, with a warning).
+    binary = "claude"
+    auth_override_env_vars = AUTH_OVERRIDE_ENV_VARS
+
     def __init__(self, switcher: ClaudeAccountSwitcher):
         self.switcher = switcher
         self.sessions_dir = switcher.backup_dir / "sessions"
@@ -551,12 +571,13 @@ class SessionManager:
         terminal to one account per session needs the isolation guaranteed,
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
+
+        Provider seams (codex_session overrides them): ``binary``,
+        ``auth_override_env_vars``, ``_normalize_nested_env``,
+        ``_fast_path_allowed``, ``_current_login`` and ``_exec_session``.
         """
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+        self._normalize_nested_env()
+        claude_bin = self._find_binary()
         if share_history and self.switcher.platform == Platform.WINDOWS:
             raise SessionError(
                 "--share-history is not supported on Windows yet: sharing uses "
@@ -569,44 +590,35 @@ class SessionManager:
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
 
-        config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir_preset:
-            # With CLAUDE_CONFIG_DIR set, "current default account" is
-            # meaningless (we may already be inside a session terminal), so
-            # the same-account fast path below must not trigger.
-            warning(
-                f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
-                "overriding it for this launch."
-            )
-        else:
+        if self._fast_path_allowed():
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
             # refresh token.
-            current = self.switcher._get_current_account()
+            current = self._current_login()
             if current is not None and current == (email, org_uuid):
                 if require_session:
                     raise SessionError(
                         f"Account-{account_num} ({email}) is the active default "
-                        "login, so this launch would run plain claude on the "
-                        "default login rather than in a session profile (a "
+                        f"login, so this launch would run plain {self.binary} on "
+                        "the default login rather than in a session profile (a "
                         "second copy of the active credential would drift). "
                         "Switch the default login to another account first, "
-                        "or run `claude` directly."
+                        f"or run `{self.binary}` directly."
                     )
                 print(
                     dimmed(
                         f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
+                        f"default login — launching {self.binary} directly."
                     )
                 )
                 self._exec(claude_bin, claude_args, env=dict(os.environ))
 
-        scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
+        scrubbed = [v for v in self.auth_override_env_vars if os.environ.get(v)]
         if scrubbed:
             warning(
                 f"Ignoring {', '.join(scrubbed)} for this session — it would "
-                f"override the selected account inside Claude Code."
+                f"override the selected account inside {self.switcher.display_name}."
             )
 
         session_dir, account_num, email = self.setup_session(
@@ -617,8 +629,52 @@ class SessionManager:
             f"{accent('Launching')} Account-{account_num} ({email}) "
             f"{muted('[session mode]')}"
         )
+        self._exec_session(claude_bin, session_dir, claude_args, share_history)
+
+    def _find_binary(self) -> str:
+        """``binary`` on PATH, or a SessionError naming the product."""
+        claude_bin = shutil.which(self.binary)
+        if not claude_bin:
+            raise SessionError(
+                f"'{self.binary}' was not found on PATH. "
+                f"Install {self.switcher.display_name} first."
+            )
+        return claude_bin
+
+    def _normalize_nested_env(self) -> None:
+        """Repair ``os.environ`` before a launch reads it. Nothing to do for
+        Claude: a preset CLAUDE_CONFIG_DIR disables the fast path instead."""
+
+    def _fast_path_allowed(self) -> bool:
+        """Whether "the current default account" means anything here."""
+        config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
+        if config_dir_preset:
+            # With CLAUDE_CONFIG_DIR set, "current default account" is
+            # meaningless (we may already be inside a session terminal), so
+            # the same-account fast path must not trigger.
+            warning(
+                f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
+                "overriding it for this launch."
+            )
+            return False
+        return True
+
+    def _current_login(self) -> tuple[str, str] | None:
+        """The default login's ``(email, org_uuid)``, for the fast path."""
+        return self.switcher._get_current_account()
+
+    def _exec_session(
+        self,
+        claude_bin: str,
+        session_dir: Path,
+        claude_args: list[str],
+        share_history: bool,
+    ) -> NoReturn:
+        """Exec into the bootstrapped profile, auth overrides scrubbed."""
         env = {
-            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
+            k: v
+            for k, v in os.environ.items()
+            if k not in self.auth_override_env_vars
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
@@ -632,12 +688,7 @@ class SessionManager:
         profile, no auth-override scrubbing), so whatever the default login
         resolves to is what runs.
         """
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
-        self._exec(claude_bin, claude_args, env=dict(os.environ))
+        self._exec(self._find_binary(), claude_args, env=dict(os.environ))
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
@@ -667,8 +718,9 @@ class SessionManager:
         if self.switcher._account_kind(account_num) == "api_key":
             raise SessionError(
                 f"Account-{account_num} ({email}) is an API-key account; "
-                "'cswap run' (session mode) does not support API-key accounts yet. "
-                "Use 'cswap --switch-to' to make it your default login instead."
+                f"'{self.switcher.cli_prefix} run' (session mode) does not support "
+                f"API-key accounts yet. Use '{self.switcher.cli_prefix} --switch-to' "
+                "to make it your default login instead."
             )
 
     # -- bootstrap -------------------------------------------------------
@@ -687,7 +739,7 @@ class SessionManager:
         # pass the local reuse check. Honored only when no session is live —
         # a second `cswap run` joining a live session must not invalidate
         # under the running claude (the marker survives for later).
-        stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
+        stale = is_session_stale(session_dir) and self._is_quiescent(session_dir)
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
@@ -753,8 +805,12 @@ class SessionManager:
                     f"neither be stored nor stashed, so the backup holds a "
                     f"spent grant and the successor is gone. Fix the storage "
                     f"failure first; retrying before that spends nothing but "
-                    f"earns a strike. If the slot strikes, log in again and "
-                    f"re-add it: cswap --add-account --slot {account_num}"
+                    f"earns a strike. If the slot strikes, "
+                    + self.switcher.relogin_hint(
+                        "log in again and re-add it: "
+                        f"cswap --add-account --slot {account_num}",
+                        account_num, "re-add it: {cmd}",
+                    )
                 )
             if outcome.error is not None:
                 warning(
@@ -765,7 +821,7 @@ class SessionManager:
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
-            if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
+            if is_session_stale(session_dir) and self._is_quiescent(session_dir):
                 self.switcher._invalidate_session_credentials(account_num, email)
                 clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid):
@@ -791,7 +847,7 @@ class SessionManager:
                 # session.
                 if not self._profile_matches_backup(
                     session_dir, account_num, email
-                ) and profile_is_quiescent(session_dir):
+                ) and self._is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
@@ -827,12 +883,20 @@ class SessionManager:
                 self._cleanup_failed_session(session_dir)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
-                    f"validation. Log in with that account and re-add it: "
-                    f"cswap --add-account --slot {account_num}"
+                    f"validation. "
+                    + self.switcher.relogin_hint(
+                        "Log in with that account and re-add it: "
+                        f"cswap --add-account --slot {account_num}",
+                        account_num, "Re-add it: {cmd}",
+                    )
                 )
         # Lock released here, before any exec.
 
         return session_dir, account_num, email
+
+    def _is_quiescent(self, session_dir: Path) -> bool:
+        """The switcher's liveness hook (Claude: ``profile_is_quiescent``)."""
+        return self.switcher._profile_is_quiescent(session_dir)
 
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str
@@ -849,7 +913,7 @@ class SessionManager:
         """
         from claude_swap import oauth as _oauth
 
-        profile = read_session_credentials(session_dir)
+        profile = self.switcher._read_session_credentials(session_dir)
         backup = self.switcher.read_account_credentials(account_num, email)
         if not profile or not backup:
             return True
@@ -941,7 +1005,7 @@ class SessionManager:
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone. The
         # stale marker is a sibling, so rmtree does not take it.
-        delete_macos_keychain_entry(session_dir)
+        self.switcher._delete_session_keychain_entry(session_dir)
         shutil.rmtree(session_dir, ignore_errors=True)
         clear_session_stale(session_dir)
 
@@ -1050,6 +1114,11 @@ class SessionManager:
 
     # -- sharing ---------------------------------------------------------
 
+    def _share_source(self) -> Path:
+        """The home shared items are mirrored from: always the default
+        ``~/.claude`` (see ``_sync_sharing``)."""
+        return Path.home() / ".claude"
+
     def _sync_sharing(
         self, session_dir: Path, share: bool, share_history: bool = False
     ) -> None:
@@ -1075,10 +1144,10 @@ class SessionManager:
         # this also drops any links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
             share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
+        active_items = (self.shared_items if share else ()) + (
+            self.history_items if share_history else ()
         )
-        source_root = Path.home() / ".claude"
+        source_root = self._share_source()
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
 
@@ -1090,7 +1159,8 @@ class SessionManager:
         for name in managed:
             if name not in active_items:
                 dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                history = name in self.history_items
+                if history and dest.exists() and not dest.is_symlink():
                     continue
                 self._remove_managed(dest)
         if not active_items:
@@ -1104,7 +1174,7 @@ class SessionManager:
             src = source_root / name
             dest = session_dir / name
 
-            if name in HISTORY_ITEMS and not self._prepare_history_share(
+            if name in self.history_items and not self._prepare_history_share(
                 src, dest, session_dir
             ):
                 continue
@@ -1376,7 +1446,7 @@ class SessionManager:
             # Real per-account history accumulated before the flag existed.
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
-            if not profile_is_quiescent(session_dir):
+            if not self._is_quiescent(session_dir):
                 print(
                     dimmed(
                         f"Not sharing {dest.name} yet: another session is "
@@ -1461,13 +1531,12 @@ class SessionManager:
                     f.write("\n".join(lines) + "\n")
             dest.unlink()
 
-    @staticmethod
-    def _read_manifest(manifest_path: Path) -> list[str]:
+    def _read_manifest(self, manifest_path: Path) -> list[str]:
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             items = data.get("items", [])
             # Only ever act on names we could have created.
-            return [i for i in items if i in SHARED_ITEMS + HISTORY_ITEMS]
+            return [i for i in items if i in self.shared_items + self.history_items]
         except (OSError, json.JSONDecodeError, AttributeError):
             return []
 

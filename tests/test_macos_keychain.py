@@ -120,6 +120,25 @@ def test_set_password_raises_on_nonzero():
             macos_keychain.set_password("svc", "acct", "secret")
 
 
+def test_get_password_decodes_hex_printed_for_unprintable_values():
+    # `security find-generic-password -w` prints a value holding any
+    # unprintable byte (a pretty-printed Codex auth.json's newlines, or
+    # non-ASCII text) as bare hex instead of the text itself.
+    value = '{\n  "auth_mode": "chatgpt",\n  "name": "é"\n}'
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout=value.encode("utf-8").hex() + "\n")
+        assert macos_keychain.get_password("svc", "acct") == value
+
+
+@pytest.mark.parametrize("printed", ["deadbeef", "0a0a", "7b7d", "abc"])
+def test_get_password_keeps_values_that_are_not_hex_printed_json(printed):
+    # Printable values come back verbatim even when they happen to be hex
+    # digits; only hex that decodes to a JSON value is treated as encoded.
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout=printed + "\n")
+        assert macos_keychain.get_password("svc", "acct") == printed
+
+
 def test_set_get_roundtrip_hex_is_decodable():
     # The hex written on set must decode back to the original UTF-8 secret.
     secret = 'token-with "quotes" and \\ backslash and é'

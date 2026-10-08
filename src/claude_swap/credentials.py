@@ -287,6 +287,9 @@ class _StoreHost(Protocol):
 
     platform: Platform
     credentials_dir: Path
+    # macOS Keychain service for per-account BACKUP items (per provider, so
+    # two providers' `account-{num}-{email}` items never collide).
+    backup_keychain_service: str
     _logger: logging.Logger
 
 
@@ -1052,7 +1055,8 @@ class CredentialStore:
     # -- backup credential backends ---------------------------------------
     #
     # Two backends for per-account backups: base64 ``.enc`` files under
-    # ``credentials_dir`` and the macOS Keychain (``SECURITY_SERVICE``). On macOS
+    # ``credentials_dir`` and the macOS Keychain (the host's
+    # ``backup_keychain_service``; ``SECURITY_SERVICE`` for Claude). On macOS
     # reads are ``.enc``-wins: a fallback ``.enc`` (written while the Keychain was
     # unusable) is authoritative over a possibly-stale Keychain copy, so a Keychain
     # that recovers can't shadow a newer file. A successful Keychain write
@@ -1073,7 +1077,7 @@ class CredentialStore:
         """
         creds = self._kc_call(
             macos_keychain.get_password,
-            SECURITY_SERVICE,
+            self._host.backup_keychain_service,
             self._backup_username(account_num, email),
         )
         return creds or ""
@@ -1082,7 +1086,7 @@ class CredentialStore:
         """Write a per-account backup to the Keychain only. Raises on failure."""
         self._kc_call(
             macos_keychain.set_password,
-            SECURITY_SERVICE,
+            self._host.backup_keychain_service,
             self._backup_username(account_num, email),
             credentials,
         )
@@ -1091,7 +1095,7 @@ class CredentialStore:
         """Delete a per-account backup Keychain item only. Raises on failure."""
         self._kc_call(
             macos_keychain.delete_password,
-            SECURITY_SERVICE,
+            self._host.backup_keychain_service,
             self._backup_username(account_num, email),
         )
 
@@ -1099,7 +1103,7 @@ class CredentialStore:
         """Delete a slot's retained ``.prev`` Keychain item. Raises on failure."""
         self._kc_call(
             macos_keychain.delete_password,
-            SECURITY_SERVICE,
+            self._host.backup_keychain_service,
             self._prev_backup_username(account_num, email),
         )
 
@@ -1511,7 +1515,7 @@ class CredentialStore:
             if self._use_keychain():
                 self._kc_call(
                     macos_keychain.set_password,
-                    SECURITY_SERVICE,
+                    self._host.backup_keychain_service,
                     self._prev_backup_username(account_num, email),
                     current,
                 )
@@ -1544,7 +1548,7 @@ class CredentialStore:
             try:
                 return self._kc_call(
                     macos_keychain.get_password,
-                    SECURITY_SERVICE,
+                    self._host.backup_keychain_service,
                     self._prev_backup_username(account_num, email),
                 ) or ""
             except macos_keychain.KEYCHAIN_ERRORS as e:

@@ -86,8 +86,8 @@ class DashboardScreen(Screen):
 
     def _add_entries(self) -> MenuEntries:
         return [
-            ("From current Claude Code login", "add-login"),
-            ("From a setup-token / API key…", "add-token"),
+            (f"From current {self.app.login_name} login", "add-login"),
+            (f"From {self.app.token_source}…", "add-token"),
             _BACK,
         ]
 

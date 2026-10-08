@@ -9,7 +9,6 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from claude_swap.usage_store import UsageEntry
@@ -169,7 +168,6 @@ class SwitchTransaction:
     original_config: str
     original_account_num: str
     original_email: str
-    config_path: Path
     completed_steps: list[str] = field(default_factory=list)
 
     def record_step(self, step: str) -> None:
@@ -188,11 +186,7 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
-                    )
-                    if sys.platform != "win32":
-                        os.chmod(self.config_path, 0o600)
+                    switcher._restore_live_config(self.original_config)
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()
                     if data:

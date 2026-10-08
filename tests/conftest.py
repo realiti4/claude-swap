@@ -50,6 +50,29 @@ class RealStoreWriteBlocked(Exception):
     """
 
 
+_CONFTEST_PATH = Path(__file__).resolve()
+
+
+def _codex_home_specs() -> tuple[tuple[Path, bool], ...]:
+    """``~/.codex`` and an exported ``$CODEX_HOME``, recursively protected.
+
+    Except when this very checkout lives under one: Codex keeps its own git
+    worktrees in ``$CODEX_HOME/worktrees/``, and a recursive root there
+    would refuse the suite's own ``__pycache__``/``.pytest_cache`` writes —
+    the reason ``~/.claude`` is non-recursive. Such a root keeps its direct
+    children (``auth.json``, ``config.toml``) protected.
+    """
+    roots = [Path.home() / ".codex"]
+    if raw := os.environ.get("CODEX_HOME"):
+        # Absolute as spelled (what cswap joins paths onto) AND resolved
+        # (what Codex canonicalizes it to): the hook compares spellings, and
+        # a relative value would match no absolute candidate at all.
+        roots += [Path(os.path.abspath(raw)), Path(raw).resolve()]
+    return tuple(
+        (root, not _CONFTEST_PATH.is_relative_to(root.resolve())) for root in roots
+    )
+
+
 def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
     """Snapshot the REAL (non-test) account-store roots EXACTLY ONCE, here,
     at conftest import time — before any fixture has ever touched
@@ -144,6 +167,9 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             # directory exists, so not one mkdir is attempted above them.
             (_paths.get_default_claude_config_home() / "projects", True),
             (_paths.get_claude_config_home() / "projects", True),
+            # Codex's live login (`auth.json`, `config.toml`) and everything
+            # else under its home is the user's, never cswap's to touch.
+            *_codex_home_specs(),
         )
 
     ambient_specs = _resolve()
@@ -515,6 +541,8 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    # Same bypass for Codex: CODEX_HOME points straight at a live login.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
     if "tmp_keychain" in request.fixturenames:
@@ -573,6 +601,95 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_codex_network(request, monkeypatch):
+    """Safety net: no test may reach chatgpt.com / auth.openai.com.
+
+    The workspace-name lookup is advisory, so it answers None (its documented
+    failure value). Usage and refresh have no such neutral answer — a silent
+    stub would let a test pass on fake data it never asked for — so they
+    raise ``AssertionError("real Codex network call in test")``. Called
+    directly, or through ``oauth.try_refresh_oauth_credentials``, that
+    propagates. Through ``oauth.try_fetch_usage_for_account`` it does NOT:
+    that function's catch-all turns it into ``UsageOutcome(usage=None,
+    error="AssertionError")``, so a test there must assert on that error
+    kind to notice. Tests that patch these explicitly override this;
+    ``@pytest.mark.no_codex_network_fake`` opts out for tests that exercise
+    the functions themselves against a mocked ``urlopen``.
+    """
+    if request.node.get_closest_marker("no_codex_network_fake"):
+        yield
+        return
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("real Codex network call in test")
+
+    monkeypatch.setattr("claude_swap.codex_auth.fetch_workspace_name", lambda *a, **k: None)
+    monkeypatch.setattr("claude_swap.codex_auth.request_usage", refuse)
+    monkeypatch.setattr("claude_swap.codex_auth.try_refresh", refuse)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def block_real_codex_process_scan(monkeypatch):
+    """No test may read the machine's process table: the Codex switcher's
+    running-process scan (``cswap codex list``, the switch follow-up) is a
+    ``ps`` listing, so it answers "none running". Tests of the scan itself
+    keep a reference to the real ``list_codex_processes`` taken at import
+    and fake ``subprocess.run`` beneath it."""
+    monkeypatch.setattr("claude_swap.process_detection.list_codex_processes", lambda: [])
+    yield
+
+
+@pytest.fixture(autouse=True)
+def block_real_codex_binary(monkeypatch):
+    """No test may run the real ``codex``: a real ``codex login``/``logout``
+    revokes, and a real TUI hangs the run. Every launch resolves the binary
+    with ``shutil.which`` first (``add --login``, ``cswap codex run``), so
+    looking ``codex`` up fails the test unless the test fakes ``shutil.which``
+    and the launch itself (``fake_codex``, ``execs``); spawning anything named
+    ``codex`` fails too."""
+    import subprocess
+
+    def is_codex(cmd) -> bool:
+        if isinstance(cmd, (list, tuple)):
+            cmd = cmd[0] if cmd else ""
+        if isinstance(cmd, bytes):
+            cmd = os.fsdecode(cmd)
+        parts = str(cmd).split()
+        return bool(parts) and Path(parts[0]).stem == "codex"
+
+    def refuse(cmd) -> None:
+        if is_codex(cmd):
+            raise AssertionError(f"real codex launched in test: {cmd!r}")
+
+    real_which = shutil.which
+
+    def which(cmd, *args, **kwargs):
+        if is_codex(cmd):
+            raise AssertionError("real codex looked up in test; fake shutil.which and the launch")
+        return real_which(cmd, *args, **kwargs)
+
+    class GuardedPopen(subprocess.Popen):
+        def __init__(self, args, *a, **kw):
+            refuse(args)
+            super().__init__(args, *a, **kw)
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(subprocess, "Popen", GuardedPopen)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def close_codex_http_errors():
+    """Close the HTTPErrors ``codex_fixtures.http_error`` made (see there)."""
+    yield
+    from tests import codex_fixtures
+
+    while codex_fixtures.OPEN_HTTP_ERRORS:
+        codex_fixtures.OPEN_HTTP_ERRORS.pop().close()
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
@@ -589,6 +706,45 @@ def temp_home(tmp_path: Path):
         # Also patch Path.home() directly for cross-platform compatibility
         with patch("pathlib.Path.home", return_value=home):
             yield home
+
+
+@pytest.fixture
+def codex_home(temp_home: Path, monkeypatch: pytest.MonkeyPatch):
+    """``~/.codex`` under ``temp_home`` holding a live personal ChatGPT login.
+
+    ``auth.json`` is ``codex_fixtures.auth_json()`` (user@example.com,
+    account ``acct-personal``, plan ``plus``); rewrite it to vary the live
+    login. ``CODEX_HOME`` stays unset, so Codex's default home is used.
+
+    Every switcher built re-points the shared ``claude-swap`` logger, and
+    ``setup_logging`` drops the previous file handler without closing it;
+    close each one as it is replaced and at teardown, so these tests leave no
+    unclosed-log ResourceWarnings behind (as ``test_logging_config`` does).
+    """
+    import logging
+
+    from claude_swap import switcher as switcher_module
+    from tests import codex_fixtures
+
+    logger = logging.getLogger("claude-swap")
+
+    def close_handlers() -> None:
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+
+    real_setup_logging = switcher_module.setup_logging
+
+    def setup_logging(*args, **kwargs):
+        close_handlers()
+        return real_setup_logging(*args, **kwargs)
+
+    monkeypatch.setattr(switcher_module, "setup_logging", setup_logging)
+    home = temp_home / ".codex"
+    home.mkdir()
+    (home / "auth.json").write_text(codex_fixtures.auth_json(), encoding="utf-8")
+    yield home
+    close_handlers()
 
 
 @pytest.fixture

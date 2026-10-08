@@ -37,6 +37,8 @@ from pathlib import Path
 from claude_swap.exceptions import ClaudeSwitchError
 
 LABEL = "com.cswap.menubar"
+# `cswap codex menubar` runs as its own service, beside Claude's.
+CODEX_LABEL = f"{LABEL}.codex"
 
 # launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which covers
 # `security` (Keychain reads) but not a Homebrew or ~/.local/bin `claude`. The
@@ -123,18 +125,21 @@ def build_plist(
     program: list[str] | None = None,
     label: str = LABEL,
     home: Path | None = None,
+    args: tuple[str, ...] = ("menubar",),
 ) -> bytes:
     """Serialize the LaunchAgent plist.
 
     Built with :mod:`plistlib` rather than a formatted XML string so paths
     containing ``&`` or ``<`` cannot produce a plist launchd refuses to parse.
+    ``args`` is the subcommand launchd runs (``("codex", "menubar")`` for the
+    Codex menu bar, which is its own service under its own label).
     """
     program = program or resolve_program()
     out_log, err_log = log_paths(label, home)
     return plistlib.dumps(
         {
             "Label": label,
-            "ProgramArguments": [*program, "menubar"],
+            "ProgramArguments": [*program, *args],
             "RunAtLoad": True,
             # Restart a crash, but respect a deliberate Quit. The menu bar's
             # quit handler calls rumps.quit_application(), a clean exit(0);
@@ -219,6 +224,7 @@ def install(
     home: Path | None = None,
     program: list[str] | None = None,
     uid: int | None = None,
+    args: tuple[str, ...] = ("menubar",),
 ) -> dict:
     """Write the plist and hand the service to launchd.
 
@@ -233,7 +239,7 @@ def install(
 
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
-    target_plist.write_bytes(build_plist(program, label, home))
+    target_plist.write_bytes(build_plist(program, label, home, args))
 
     settled = True
     if is_loaded(label, uid):
@@ -253,7 +259,7 @@ def install(
     return {
         "label": label,
         "plist": str(target_plist),
-        "program": [*program, "menubar"],
+        "program": [*program, *args],
         "stdout_log": str(out_log),
         "stderr_log": str(err_log),
     }

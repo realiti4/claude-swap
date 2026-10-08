@@ -17,7 +17,7 @@ from textual.widgets import ListItem, Static
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
-from claude_swap.switcher import ERROR_NOTES
+from claude_swap.switcher import ERROR_NOTES, SENTINEL_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -167,6 +167,8 @@ def account_card_text(
     threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    sentinel_notes: dict[str, str] = SENTINEL_NOTES,
+    error_notes: dict[str, str] = ERROR_NOTES,
 ) -> Text:
     """The full account card: header line + per-window bar rows."""
     now = now if now is not None else time.time()
@@ -192,7 +194,7 @@ def account_card_text(
         text.append("\n    ")
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         marker = "·" if sentinel == USAGE_API_KEY else "⚠"
-        text.append(f"{marker} {data.sentinel_label(sentinel)}", style=style)
+        text.append(f"{marker} {data.sentinel_label(sentinel, sentinel_notes)}", style=style)
         # Same supplementary line `cswap list` prints: the last good
         # measurement behind the sentinel (API-key accounts have no quota to
         # have "seen").
@@ -211,7 +213,7 @@ def account_card_text(
             # Same wording as the CLI detail line: error KINDS with a
             # friendly note render it, so both surfaces describe the state
             # identically.
-            note = ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)
+            note = error_notes.get(acc.usage.last_error, acc.usage.last_error)
             text.append(f" · {note}", style=palette.muted)
         return text
 
@@ -241,7 +243,11 @@ def account_card_text(
 
 
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
+    sentinel_notes: dict[str, str] = SENTINEL_NOTES,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -265,7 +271,7 @@ def mini_account_text(
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        text.append(data.sentinel_label(sentinel), style=style)
+        text.append(data.sentinel_label(sentinel, sentinel_notes), style=style)
         return text
 
     last_good = acc.usage.last_good
@@ -329,7 +335,7 @@ class AccountsPanel(Static):
             return Text(
                 "No managed accounts yet.\n"
                 "Use the menu below: Add account — from your current "
-                "Claude Code login, or from a setup-token / API key.",
+                f"{app.login_name} login, or from {app.token_source}.",
                 style=palette.muted,
             )
         now = time.time()
@@ -340,11 +346,14 @@ class AccountsPanel(Static):
                 blocks.append(
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
-                        palette=palette,
+                        palette=palette, sentinel_notes=app.sentinel_notes,
+                        error_notes=app.error_notes,
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(mini_account_text(
+                    acc, now, palette=palette, sentinel_notes=app.sentinel_notes,
+                ))
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
@@ -372,9 +381,11 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
+        app: "CswapApp" = self.app  # type: ignore[assignment]
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
-            palette=Palette.from_theme(self.app.current_theme),
+            palette=Palette.from_theme(app.current_theme),
+            sentinel_notes=app.sentinel_notes, error_notes=app.error_notes,
         )
 
 

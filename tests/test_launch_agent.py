@@ -164,6 +164,33 @@ def test_resolve_program_ignores_an_argv0_that_is_not_cswap(tmp_path):
             assert launch_agent.resolve_program() == [str(found)]
 
 
+def test_build_plist_default_is_the_pre_provider_claude_plist(tmp_path):
+    # The whole document, key order included, as it was before `args`
+    # existed: Claude's installed service must not change.
+    expected = plistlib.dumps({
+        "Label": "com.cswap.menubar",
+        "ProgramArguments": [*PROGRAM, "menubar"],
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ProcessType": "Interactive",
+        "EnvironmentVariables": {"PATH": launch_agent._path_env(PROGRAM)},
+        "StandardOutPath": str(tmp_path / "Library/Logs/com.cswap.menubar.log"),
+        "StandardErrorPath": str(tmp_path / "Library/Logs/com.cswap.menubar.err"),
+    })
+    assert launch_agent.build_plist(PROGRAM, home=tmp_path) == expected
+
+
+def test_build_plist_runs_the_given_subcommand_under_its_own_label(tmp_path):
+    label = launch_agent.CODEX_LABEL
+    assert label == "com.cswap.menubar.codex"
+    parsed = plistlib.loads(launch_agent.build_plist(
+        PROGRAM, label=label, home=tmp_path, args=("codex", "menubar")
+    ))
+    assert parsed["Label"] == label
+    assert parsed["ProgramArguments"] == [*PROGRAM, "codex", "menubar"]
+    assert parsed["StandardErrorPath"] == str(tmp_path / "Library/Logs" / f"{label}.err")
+
+
 # --- install ---------------------------------------------------------------
 
 
@@ -176,6 +203,20 @@ def test_install_writes_the_plist_and_bootstraps_it(tmp_path):
     assert written.exists()
     calls = [c.args[0] for c in run.call_args_list]
     assert ["launchctl", "bootstrap", f"gui/{UID}", str(written)] in calls
+
+
+def test_install_writes_a_plist_for_the_given_label_and_subcommand(tmp_path):
+    label = "com.cswap.menubar.codex"
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.install(
+            label=label, home=tmp_path, program=PROGRAM, uid=UID,
+            args=("codex", "menubar"),
+        )
+    assert result["program"] == [*PROGRAM, "codex", "menubar"]
+    parsed = plistlib.loads(Path(result["plist"]).read_bytes())
+    assert parsed["ProgramArguments"] == [*PROGRAM, "codex", "menubar"]
+    assert Path(result["plist"]).name == f"{label}.plist"
 
 
 def test_install_creates_the_log_directory(tmp_path):

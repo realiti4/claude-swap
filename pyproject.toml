@@ -1,7 +1,7 @@
 [project]
 name = "claude-swap"
 version = "0.27.0b1"
-description = "Multi-account switcher for Claude Code"
+description = "Multi-account switcher for Claude Code and OpenAI Codex CLI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,7 +15,7 @@ dependencies = [
 ]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
 license = {text = "MIT"}
-keywords = ["claude", "claude-code", "account-switcher", "cli"]
+keywords = ["claude", "claude-code", "codex", "codex-cli", "openai", "account-switcher", "cli"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -69,4 +69,5 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
     "no_oauth_profile_fake: opt out of the autouse fetch_oauth_profile stub (test exercises fetch_oauth_profile itself against a mocked urlopen)",
+    "no_codex_network_fake: opt out of the autouse Codex network stub (test exercises codex_auth's request_usage/try_refresh/fetch_workspace_name against a mocked urlopen)",
 ]

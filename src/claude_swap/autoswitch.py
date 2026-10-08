@@ -77,12 +77,25 @@ _SYSTEMIC_MESSAGES = {
                       "account",
     "stash-unreadable": "a stashed successor is unreadable — unlock the "
                         "keychain or fix the file, then retry; "
-                        "`cswap unclaimed` inspects it",
+                        "`{prefix} unclaimed` inspects it",
     "consume-busy": "another cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
 # drift apart.
 _SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
+
+
+def _systemic_message(status: str, switcher) -> str:
+    """The remedy for ``status``, naming the provider's own command prefix
+    (``getattr``: the engine takes any duck-typed switcher)."""
+    return _SYSTEMIC_MESSAGES[status].format(
+        prefix=getattr(switcher, "cli_prefix", "cswap")
+    )
+
+
+def _claude_relogin(number: str) -> str:
+    return f"Log in with it and run 'cswap --add-account --slot {number}'"
+
 
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
@@ -409,6 +422,8 @@ class QuarantineEvent(AutoSwitchEvent):
     number: str
     email: str
     reason: str
+    # The provider's re-login step, for the human line only (empty: Claude's).
+    recovery: str = ""
 
     def _fields(self) -> dict:
         return {"number": self.number, "email": self.email, "reason": self.reason}
@@ -416,8 +431,7 @@ class QuarantineEvent(AutoSwitchEvent):
     def human(self) -> str:
         return (
             f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
-            f"Log in with it and run 'cswap --add-account --slot {self.number}' "
-            "to recover."
+            f"{self.recovery or _claude_relogin(self.number)} to recover."
         )
 
 
@@ -650,6 +664,10 @@ class AutoSwitchEngine:
     ):
         self.switcher = switcher
         self.settings = settings
+        # The provider's words in event text (duck-typed switchers may lack
+        # them: Claude's).
+        self._prefix = getattr(switcher, "cli_prefix", "cswap")
+        self._product = getattr(switcher, "display_name", "Claude Code")
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -726,7 +744,12 @@ class AutoSwitchEngine:
             }
 
         self._mutate_state(add)
-        self._emit(QuarantineEvent(number=number, email=email, reason=reason))
+        relogin = getattr(self.switcher, "relogin_hint", None)
+        self._emit(QuarantineEvent(
+            number=number, email=email, reason=reason,
+            recovery=relogin(_claude_relogin(number), number, "Run '{cmd}'")
+            if relogin else "",
+        ))
 
     def _release_recovered_quarantines(self, state: dict) -> dict:
         """Drop quarantine entries whose credential was replaced since.
@@ -916,14 +939,15 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="unmanaged-active-account",
-                        detail="run 'cswap --add-account' to include it in rotation",
+                        detail=f"run '{self._prefix} --add-account' to include "
+                        "it in rotation",
                     )
                 )
             else:
                 self._emit(
                     NoSwitchEvent(
                         reason="no-active-account",
-                        detail="log in and run 'cswap --add-account' first",
+                        detail=f"log in and run '{self._prefix} --add-account' first",
                     )
                 )
             return TickOutcome.NO_ACTION
@@ -1016,7 +1040,7 @@ class AutoSwitchEngine:
                         NoSwitchEvent(
                             reason="active-idle",
                             detail=(
-                                "token expired while Claude Code is idle; "
+                                f"token expired while {self._product} is idle; "
                                 "resumes on next use"
                             ),
                         )
@@ -1371,7 +1395,8 @@ class AutoSwitchEngine:
         if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
-                    message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
+                    message="could not freshen: "
+                    + _systemic_message(systemic, self.switcher)
                     if systemic
                     else "could not freshen any candidate (network?)",
                     transient=True,

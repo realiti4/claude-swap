@@ -2,6 +2,8 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
+Manages OpenAI Codex CLI accounts too: put `codex` after `cswap` in any command (see [Codex CLI](#codex-cli)).
+
 ## Installation
 
 ### Using uv (recommended)
@@ -260,6 +262,50 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 
 </details>
 
+## Codex CLI
+
+claude-swap also manages [OpenAI Codex CLI](https://github.com/openai/codex) accounts. Put `codex` after `cswap` and every command above works the same way, on a separate set of Codex accounts:
+
+```bash
+cswap codex add                       # store the account Codex is logged in with now
+cswap codex add --login               # sign in another account (browser)
+cswap codex add --login --device-auth # same, with a device code (headless machines)
+cswap codex add-token sk-proj-...     # an OpenAI API key account (or '-' for stdin)
+cswap codex list                      # 5h/7d usage for every Codex account
+cswap codex switch 2                  # make account 2 Codex's login
+cswap codex run 2                     # run Codex as account 2, this terminal only
+cswap codex auto                      # auto-switch before a limit hits
+cswap codex                           # dashboard (also: cswap codex tui / watch)
+```
+
+**Adding accounts.** `cswap codex add` stores the login Codex is using now. For every other account use `cswap codex add --login`: it runs `codex login` in a throwaway Codex home inside cswap's store, keeps the result, and deletes that home without logging out, so your current login is not touched. Re-run it for an account whose login has died (`re-login needed` in `cswap codex list`); it refreshes that account's slot. A personal plan and a workspace under the same email are separate accounts.
+
+**Never run `codex login` or `codex logout` in your Codex home once its account is stored.** Both revoke the login there on OpenAI's side, and the stored copy dies with it. The same goes for `/logout`, `codex login` and `codex logout` inside a `cswap codex run` session (cswap refuses `login` and `logout` there) or in a Codex app still running on the previous account after a switch, where signing out also deletes the new account's login. Use `cswap codex add --login` to add or re-login accounts, and `cswap codex remove N` to drop one.
+
+**Restart Codex after switching.** Codex reads its login once at startup, so processes that are already running keep the previous account until restarted. The Codex TUI uses a shared background server; restart it with `codex app-server daemon restart`, and restart the Codex desktop app or IDE extension if you use them. cswap prints this reminder after each switch, with how many Codex processes it found running.
+
+<details>
+<summary>Details — tokens, sessions, settings, menu bar, JSON & supported setups</summary>
+
+- **Tokens.** Codex refreshes (and rotates) the active login itself, so cswap never refreshes it: its usage is read with the current access token, and an expired one shows as `token expired` until Codex renews it. When you switch away, the login Codex last wrote is what gets stored. Only inactive accounts are refreshed by cswap.
+- **Forced login settings.** If Codex's `config.toml` sets `forced_login_method` or `forced_chatgpt_workspace_id`, a switch to an account that doesn't match is refused, since Codex would delete that login at startup.
+- **Usage.** Codex's two rate-limit windows are shown as 5h and 7d (a window of a day or less as 5h, a longer one as 7d). Codex reports no per-model limits, so `--model` has no effect.
+- **Session mode.** `cswap codex run N` launches `codex` with `CODEX_HOME` pointing at the account's own profile. It shares `config.toml`, `AGENTS.md`, `AGENTS.override.md`, `skills/`, `rules/`, `hooks.json`, `agents/` and `themes/` from your Codex home; history stays per account unless you pass `--share-history`, which also shares the threads database so `codex resume` lists every account's conversations (not on Windows). Arguments after `--` go to codex (`cswap codex run 2 -- resume`). If account N is already Codex's default login, plain `codex` runs on your Codex home instead (a second copy of that login would fight over its rotating refresh token); `--require-session` refuses in that case instead. `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` are ignored inside a session, and API-key accounts can't run in one.
+- **Settings and storage.** Codex accounts live in `codex/` inside the backup directory, with their own `settings.json` (`cswap codex config`), auto-switch state, session profiles and log; on macOS their credentials are in the Keychain under `claude-swap-codex`. Only `ui.theme` is shared with Claude. `cswap codex purge` removes only the Codex accounts and leaves your current Codex login in place; `cswap purge` leaves Codex accounts alone.
+- **Menu bar.** `cswap codex menubar` is its own menu bar item. `cswap codex menubar --install-service` installs it as `com.cswap.menubar.codex` (plist and logs named after that label), next to Claude's.
+- **JSON.** Codex output from `list`, `status`, `switch`, `config`, `auto --json` and error envelopes carries `"provider": "codex"`; Claude output is unchanged. Exports and `import-usage` input are tagged the same way, and each provider refuses the other's.
+- **Supported setups.** cswap follows `CODEX_HOME` (default `~/.codex`) and the `cli_auth_credentials_store` setting in its `config.toml`:
+
+  | `cli_auth_credentials_store` | macOS | Linux / Windows |
+  |------------------------------|-------|-----------------|
+  | `file` (default) | Supported | Supported |
+  | `keyring`, `auto` | Supported (Keychain) | Not supported |
+  | `ephemeral` | Not supported | Not supported |
+
+  `keyring`/`auto` with `[features] secret_auth_storage` enabled is not supported either. For an unsupported setup cswap refuses with an error; set `cli_auth_credentials_store = "file"` in that `config.toml`.
+
+</details>
+
 ## Advanced
 
 ### Configuration
@@ -383,6 +429,7 @@ Remove all data:
 
 ```bash
 cswap purge
+cswap codex purge    # if you stored Codex accounts too
 ```
 
 Then uninstall the tool:
@@ -397,6 +444,7 @@ pipx uninstall claude-swap
 
 - Python 3.12+
 - Claude Code installed and logged in
+- For Codex accounts: the Codex CLI (`codex`) installed
 
 ## License
 

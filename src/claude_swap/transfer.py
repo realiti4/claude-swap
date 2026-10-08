@@ -10,13 +10,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
 import sys
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
-from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
@@ -27,6 +27,7 @@ from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
+from claude_swap.paths import CODEX_CLI_PREFIX, CODEX_DISPLAY_NAME
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -46,6 +47,48 @@ _PLATFORM_TAG = {
 def _eprint(msg: str) -> None:
     """Print to stderr so stdout stays pure JSON in pipe mode."""
     print(msg, file=sys.stderr)
+
+
+def _refuse_other_provider(
+    switcher: ClaudeAccountSwitcher, document: dict, source: str, command: str
+) -> None:
+    """Refuse a document another provider's switcher wrote.
+
+    Documents name their provider: a Codex export or ``cswap codex list
+    --json`` carries ``"provider": "codex"``; a Claude one has no such field
+    (it predates providers, and its bytes stay as they were). A Claude slot
+    holding a Codex login (or the reverse) is unusable and its switch would
+    write it into the wrong live store, so each side takes only its own
+    documents and names the command that takes the other's.
+    """
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    provider = document.get("provider", "claude")
+    if provider is not None and not isinstance(provider, str):
+        raise TransferError(
+            f"provider must be a string, got {type(provider).__name__}"
+        )
+    if provider == switcher.provider_name:
+        return
+    kind = "usage document lists" if command == "import-usage" else "export holds"
+    # Constants, not the Codex switcher class: Claude's import path stays
+    # free of the Codex modules (as purge's is).
+    other = {
+        ClaudeAccountSwitcher.provider_name: (
+            ClaudeAccountSwitcher.display_name, ClaudeAccountSwitcher.cli_prefix
+        ),
+        "codex": (CODEX_DISPLAY_NAME, CODEX_CLI_PREFIX),
+    }.get(provider)
+    if other is None:
+        raise TransferError(
+            f"This {kind} accounts of provider {provider!r}, which this version "
+            "of cswap does not support."
+        )
+    raise TransferError(
+        f"This {kind} {other[0]} accounts; '{switcher.cli_prefix} "
+        f"{command}' takes {switcher.display_name} ones. Import it with: "
+        f"{other[1]} {command} {shlex.quote(source)}"
+    )
 
 
 def _parse_payload(text: str, label: str) -> dict:
@@ -187,7 +230,9 @@ def export_accounts(
     """
     sequence_data = switcher._get_sequence_data_migrated()
     if not sequence_data or not sequence_data.get("accounts"):
-        raise TransferError("no accounts to export — run cswap --add-account first")
+        raise TransferError(
+            f"no accounts to export — run {switcher.cli_prefix} --add-account first"
+        )
 
     accounts_map = sequence_data["accounts"]
 
@@ -225,10 +270,9 @@ def export_accounts(
                 raise CredentialReadError(
                     f"failed to read live credentials for active account {email}"
                 )
-            config_path = switcher._get_claude_config_path()
-            if not config_path.exists():
-                raise ConfigError("Claude config file not found")
-            config_text = config_path.read_text(encoding="utf-8")
+            config_text = switcher._snapshot_live_config()
+            if config_text is None:
+                raise ConfigError(switcher.live_config_missing)
         else:
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
@@ -244,7 +288,7 @@ def export_accounts(
                 _eprint(
                     f"Skipping Account-{num} ({email}): no stored "
                     f"credentials/config — re-add with: "
-                    f"cswap --add-account --slot {num}"
+                    + switcher.relogin_hint(f"cswap --add-account --slot {num}", num)
                 )
                 continue
 
@@ -255,7 +299,7 @@ def export_accounts(
         # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
-        is_api_key = looks_like_api_key(creds_text)
+        is_api_key = switcher._looks_like_api_key(creds_text)
         if is_api_key:
             creds_payload: Any = creds_text.strip()
         else:
@@ -281,7 +325,8 @@ def export_accounts(
     if not accounts_payload:
         raise TransferError(
             "no exportable accounts — all managed slots are missing stored "
-            "credentials/config. Re-add with: cswap --add-account --slot <number>"
+            "credentials/config. Re-add with: "
+            + switcher.relogin_hint("cswap --add-account --slot <number>", "<number>")
         )
 
     # Only carry activeAccountNumber if that slot is actually present in the
@@ -302,6 +347,8 @@ def export_accounts(
         "activeAccountNumber": active_in_payload,
         "accounts": accounts_payload,
     }
+    if switcher.provider_name != "claude":
+        envelope["provider"] = switcher.provider_name
 
     serialized = json.dumps(envelope, indent=2)
 
@@ -359,8 +406,10 @@ def import_accounts(
     if envelope.get("encrypted") is True:
         raise TransferError(
             "encrypted exports are not supported in this version — "
-            "decrypt before piping (e.g. gpg -d backup.gpg | cswap --import -)"
+            f"decrypt before piping (e.g. gpg -d backup.gpg | "
+            f"{switcher.cli_prefix} --import -)"
         )
+    _refuse_other_provider(switcher, envelope, source, "import")
 
     accounts = envelope.get("accounts")
     if not isinstance(accounts, list) or not accounts:
@@ -390,9 +439,10 @@ def import_accounts(
         # carry a JSON object.
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
         if is_api_key:
-            if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
+            if not (isinstance(creds_obj, str) and switcher._looks_like_api_key(creds_obj)):
                 raise TransferError(
-                    f"API-key credentials for {email} must be a raw sk-ant-api… string"
+                    f"API-key credentials for {email} must be a "
+                    f"{switcher.api_key_format}"
                 )
             creds_text = creds_obj.strip()
         else:
@@ -528,7 +578,7 @@ def import_accounts(
                     f"Warning: {entry['email']} (slot {target_num}) has a live "
                     f"session-mode instance (PID {', '.join(map(str, live_pids))}); "
                     "its session profile keeps the pre-import credentials until "
-                    "it is restarted via 'cswap run'."
+                    f"it is restarted via '{switcher.cli_prefix} run'."
                 )
         else:
             if entry["exported_num"] not in data.get("accounts", {}):
@@ -644,7 +694,8 @@ def import_accounts(
         if live_slot is not None and live_slot in written_slots:
             _eprint(
                 f"Note: {identity[0]} is your current live login — activate the "
-                f"imported credentials with: cswap --switch-to {live_slot} --force"
+                f"imported credentials with: "
+                f"{switcher.cli_prefix} --switch-to {live_slot} --force"
             )
 
 
@@ -690,8 +741,10 @@ def import_usage(
     if version != JSON_SCHEMA_VERSION:
         raise TransferError(
             f"unsupported usage document schemaVersion: {version!r} "
-            f"(expected {JSON_SCHEMA_VERSION}, as printed by 'cswap list --json')"
+            f"(expected {JSON_SCHEMA_VERSION}, as printed by "
+            f"'{switcher.cli_prefix} list --json')"
         )
+    _refuse_other_provider(switcher, document, source, "import-usage")
     rows = document.get("accounts")
     if not isinstance(rows, list):
         raise TransferError("usage document has no accounts list")

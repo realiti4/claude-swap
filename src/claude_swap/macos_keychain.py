@@ -35,7 +35,9 @@ its functions are only meaningful on macOS.
 
 from __future__ import annotations
 
+import json
 import os
+import string
 import subprocess
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
@@ -125,13 +127,39 @@ def get_password(service: str, account: str) -> str | None:
     if result.returncode == 0:
         # `-w` prints the value followed by one newline; strip exactly that so
         # values with meaningful leading/trailing whitespace survive intact.
-        return result.stdout.removesuffix("\n")
+        return _decode_hex_printed(result.stdout.removesuffix("\n"))
     if result.returncode == _NOT_FOUND_RC:
         return None
     raise KeychainError(
         f"security find-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
     )
+
+
+def _decode_hex_printed(value: str) -> str:
+    """Undo ``security -w``'s hex printing of unprintable values.
+
+    ``-w`` prints a value holding any byte outside printable ASCII — the
+    newlines of a pretty-printed Codex ``auth.json``, or non-ASCII text — as
+    bare hex instead of the text, so such a value would come back unparseable.
+    Only hex that decodes to UTF-8 text with an unprintable character (the
+    reason ``security`` encoded it) that is also JSON is decoded: every
+    multi-line value this tool stores is JSON, and a printable value is always
+    printed verbatim, so one that merely looks like hex is returned unchanged.
+    """
+    if not value or len(value) % 2 or any(c not in string.hexdigits for c in value):
+        return value
+    try:
+        text = bytes.fromhex(value).decode("utf-8")
+    except ValueError:  # includes UnicodeDecodeError
+        return value
+    if all(" " <= ch <= "~" for ch in text):
+        return value
+    try:
+        json.loads(text)
+    except ValueError:
+        return value
+    return text
 
 
 def item_exists(service: str, account: str) -> bool:

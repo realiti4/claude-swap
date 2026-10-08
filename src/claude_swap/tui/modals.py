@@ -79,15 +79,26 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
         Binding("right", "app.focus_next", show=False),
     ]
 
+    def __init__(self, token_kind: str | None = None) -> None:
+        super().__init__()
+        # What the provider's add-token takes (None: Claude's tokens).
+        self._kind = token_kind
+
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box"):
             yield Label("Add account from token", classes="modal-title")
             yield Static(
-                "OAuth setup-token (sk-ant-oat…) or managed API key "
+                f"Paste your {self._kind}."
+                if self._kind
+                else "OAuth setup-token (sk-ant-oat…) or managed API key "
                 "(sk-ant-api…); the type is auto-detected.",
                 classes="modal-body",
             )
-            yield Input(password=True, placeholder="token (required)", id="token")
+            yield Input(
+                password=True,
+                placeholder=f"{self._kind} (required)" if self._kind else "token (required)",
+                id="token",
+            )
             yield Input(placeholder="email label (optional)", id="email")
             yield Input(placeholder="slot number (optional)", id="slot", type="integer")
             yield Static("", id="form-error", classes="form-error")

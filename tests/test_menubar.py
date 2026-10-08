@@ -617,3 +617,180 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- Codex provider (`cswap codex menubar`) -------------------------------------
+
+def test_display_usage_and_snapshot_use_the_providers_notes():
+    from claude_swap.codex_switcher import CODEX_SENTINEL_NOTES
+    from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+
+    entry = _FakeEntry(sentinel=USAGE_RELOGIN_REQUIRED)
+    note = menubar._account_display_usage(entry, CODEX_SENTINEL_NOTES)
+    assert note == CODEX_SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    assert "cswap codex add --login" in note
+    snap = menubar._adapt_snapshot(
+        _FakeSnap([_FakeAcct("1", "a@x.com", True, entry)]), CODEX_SENTINEL_NOTES
+    )
+    assert snap["active_usage"] == note
+
+
+def _fake_rumps(monkeypatch):
+    """A stand-in ``rumps``/``AppKit`` just wide enough to build the app;
+    returns (rumps, launched apps)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    apps: list = []
+
+    class App:
+        def __init__(self, title, quit_button=None):
+            self.title = title
+            self.items: list = []
+            self._menu = SimpleNamespace(clear=lambda: None)
+
+        @property
+        def menu(self):
+            return self._menu
+
+        @menu.setter
+        def menu(self, items):
+            self.items = items
+
+        def run(self):
+            apps.append(self)
+
+    class MenuItem:
+        def __init__(self, title, callback=None):
+            self.title, self.callback, self.children, self.state = title, callback, [], 0
+
+        def add(self, item):
+            self.children.append(item)
+
+    rumps = SimpleNamespace(
+        App=App, MenuItem=MenuItem, Timer=MagicMock(), Window=MagicMock(),
+        notification=MagicMock(), alert=MagicMock(), quit_application=MagicMock(),
+        rumps=SimpleNamespace(NSApp=SimpleNamespace()),
+    )
+    monkeypatch.setitem(sys.modules, "rumps", rumps)
+    monkeypatch.setitem(sys.modules, "AppKit", MagicMock())
+    monkeypatch.setattr(menubar, "ensure_notification_identity", lambda: None)
+    monkeypatch.setattr(menubar, "framework_build_warning", lambda: None)
+
+    class Source:
+        def __init__(self, switcher):
+            pass
+
+        def take(self, full=False, store_only=False):
+            return _FakeSnap([])
+
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", Source)
+    return rumps, apps
+
+
+class _CodexSwitcher:
+    """The public surface the menu bar uses, as the Codex provider."""
+
+    display_name = "Codex"
+    cli_prefix = "cswap codex"
+    token_kind = "OpenAI API key"
+    switch_notice = "Restart Codex processes to apply it."
+
+    def __init__(self, tmp_path: Path):
+        import logging
+        from unittest.mock import MagicMock
+
+        from claude_swap.codex_switcher import CODEX_SENTINEL_NOTES
+
+        self.sentinel_notes = CODEX_SENTINEL_NOTES
+        self.backup_dir = tmp_path
+        self.login = tmp_path / "auth.json"
+        self.login.write_text("{}")
+        self.identity: tuple | None = ("a@x.com", "acct")
+        self.identity_reads = 0
+        self._logger = logging.getLogger("claude-swap")
+        self.add_account_from_token = MagicMock()
+
+    def live_login_path(self) -> Path:
+        return self.login
+
+    def current_identity(self):
+        self.identity_reads += 1
+        return self.identity
+
+
+def _launch(monkeypatch, tmp_path):
+    import time
+
+    rumps, apps = _fake_rumps(monkeypatch)
+    switcher = _CodexSwitcher(tmp_path)
+    assert menubar.run(switcher) == 0
+    app = apps[-1]
+    deadline = time.monotonic() + 2
+    while app._refreshing and time.monotonic() < deadline:
+        time.sleep(0.01)  # the first display refresh runs on a thread
+    return rumps, switcher, app
+
+
+def test_codex_menu_bar_watches_the_live_login_through_the_public_api(
+    monkeypatch, tmp_path
+):
+    _rumps, switcher, app = _launch(monkeypatch, tmp_path)
+    assert app._config_path == switcher.login
+    app._config_mtime = 0.0  # as if the login file just changed
+    app._detect_active_change()
+    assert switcher.identity_reads == 1
+
+
+def test_codex_menu_bar_asks_for_an_openai_api_key(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    rumps, switcher, app = _launch(monkeypatch, tmp_path)
+    add_menu = next(i for i in app.items if getattr(i, "title", None) == "Add account")
+    assert [c.title for c in add_menu.children] == ["From current login", "From OpenAI API key…"]
+    assert "provider_name" not in vars(_CodexSwitcher)  # wording comes from token_kind
+
+    rumps.Window.return_value.run.return_value = SimpleNamespace(clicked=1, text="sk-proj-x")
+    app.on_add_token(None)
+    prompts = [c.kwargs["message"] for c in rumps.Window.call_args_list]
+    assert prompts == ["Email for this OpenAI API key:", "OpenAI API key:"]
+    assert all("sk-ant" not in p for p in prompts)
+    switcher.add_account_from_token.assert_called_once_with(
+        token="sk-proj-x", email="sk-proj-x", slot=None
+    )
+
+
+def test_codex_menu_bar_messages_name_codex(monkeypatch, tmp_path):
+    rumps, switcher, app = _launch(monkeypatch, tmp_path)
+    app._notify_switched()
+    assert rumps.notification.call_args.args[2] == switcher.switch_notice
+    switcher.identity = None
+    app.on_refresh_creds(None)
+    assert rumps.alert.call_args.kwargs["message"] == (
+        "No active Codex login detected. Log in first."
+    )
+
+
+def test_the_codex_menu_bar_title_names_codex(monkeypatch, tmp_path):
+    import time
+
+    from claude_swap.codex_switcher import CodexAccountSwitcher
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    icon = CodexAccountSwitcher.menubar_icon
+    assert icon.startswith(menubar.ICON) and icon != menubar.ICON
+    assert getattr(ClaudeAccountSwitcher, "menubar_icon", menubar.ICON) == menubar.ICON
+
+    class Codex(_CodexSwitcher):
+        menubar_icon = icon
+
+    _rumps, apps = _fake_rumps(monkeypatch)
+    assert menubar.run(Codex(tmp_path)) == 0
+    app = apps[-1]
+    deadline = time.monotonic() + 2
+    while app._refreshing and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert app.title == icon
+    settings = menubar.MenuBarSettings()
+    assert menubar.format_title("a@x.com", None, settings, icon=icon) == f"{icon} a"
+    assert menubar.format_title("a@x.com", None, settings) == f"{menubar.ICON} a"

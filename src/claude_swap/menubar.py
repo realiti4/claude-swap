@@ -31,7 +31,7 @@ from pathlib import Path
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
-from claude_swap.switcher import SENTINEL_NOTES
+from claude_swap.switcher import SENTINEL_NOTES, ClaudeAccountSwitcher
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -304,10 +304,11 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    icon: str = ICON,
 ) -> str:
     """Build the menu-bar title from the active account and settings."""
     if active_email is None:
-        return ICON
+        return icon
     if now is None:
         now = time.time()
     segments: list[str] = []
@@ -331,8 +332,8 @@ def format_title(
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
     if not segments:
-        return ICON
-    return f"{ICON} " + " · ".join(segments)
+        return icon
+    return f"{icon} " + " · ".join(segments)
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -388,15 +389,17 @@ def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> li
     return out[-limit:][::-1]
 
 
-def _account_display_usage(entry) -> dict | str | None:
+def _account_display_usage(
+    entry, notes: dict[str, str] = SENTINEL_NOTES
+) -> dict | str | None:
     """Menu-display usage for a ``UsageEntry``.
 
     A human-readable note for a sentinel state (token expired / API key /
-    keychain unavailable), otherwise the last-good measurement dict, otherwise
-    ``None``.
+    keychain unavailable; ``notes`` is the provider's wording), otherwise the
+    last-good measurement dict, otherwise ``None``.
     """
     if entry.sentinel:
-        return SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+        return notes.get(entry.sentinel, entry.sentinel)
     return entry.last_good
 
 
@@ -408,7 +411,7 @@ EMPTY_SNAPSHOT: dict = {
 }
 
 
-def _adapt_snapshot(snap) -> dict:
+def _adapt_snapshot(snap, notes: dict[str, str] = SENTINEL_NOTES) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
@@ -423,7 +426,7 @@ def _adapt_snapshot(snap) -> dict:
     active_usage = None
     active_alias = None
     for acc in snap.accounts:
-        display = _account_display_usage(acc.usage)
+        display = _account_display_usage(acc.usage, notes)
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
@@ -554,9 +557,31 @@ def run(switcher) -> int:
     settings_path = switcher.backup_dir / "menubar_settings.json"
     log_path = switcher.backup_dir / "claude-swap.log"
 
+    # Provider wording: `cswap codex menubar` is the same app over the Codex
+    # switcher, a process (and launchd service) of its own.
+    notes = getattr(switcher, "sentinel_notes", SENTINEL_NOTES)
+    product = getattr(switcher, "display_name", "Claude Code")
+    prefix = getattr(switcher, "cli_prefix", "cswap")
+    switched_note = getattr(
+        switcher, "switch_notice", ClaudeAccountSwitcher.switch_notice
+    )
+    # Codex's title is tagged, so its item and Claude's stay told apart.
+    icon = getattr(switcher, "menubar_icon", ICON)
+    kind = getattr(switcher, "token_kind", None)  # None: Claude's setup-token
+    if kind:
+        token_item, token_title, email_prompt, token_prompt = (
+            f"From {kind}…", f"Add account from {kind}",
+            f"Email for this {kind}:", f"{kind}:",
+        )
+    else:
+        token_item, token_title, email_prompt, token_prompt = (
+            "From setup-token…", "Add account from setup-token",
+            "Email for this token:", "Setup token (sk-ant-oat01-…):",
+        )
+
     class MenuBarApp(rumps.App):
         def __init__(self):
-            super().__init__(ICON, quit_button=None)
+            super().__init__(icon, quit_button=None)
             self.switcher = switcher
             self.settings = MenuBarSettings.load(settings_path)
             # The supported paced read path: per refresh it fetches only the
@@ -569,7 +594,7 @@ def run(switcher) -> int:
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
-            self._config_path = switcher._get_claude_config_path()
+            self._config_path = switcher.live_login_path()
             self._config_mtime = 0.0
             self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
@@ -609,7 +634,7 @@ def run(switcher) -> int:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
                     return
-                snap = _adapt_snapshot(raw)
+                snap = _adapt_snapshot(raw, notes)
                 self._log_usage(snap)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
@@ -646,11 +671,13 @@ def run(switcher) -> int:
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
             # within ~1s. Detecting *which* account is active is a cheap local
-            # read of ~/.claude.json -- no Keychain or usage API -- so we can do
-            # it on every tick. We gate the read on the file's mtime (a cheap
-            # stat) so a large config isn't parsed each second, and only kick a
-            # refresh when the active email actually changed (Claude Code rewrites
-            # this file often for unrelated reasons).
+            # read of the live login file (~/.claude.json; Codex: auth.json)
+            # -- no Keychain or usage API -- so we can do it on every tick. We
+            # gate the read on the file's mtime (a cheap stat) so a large
+            # config isn't parsed each second, and only kick a refresh when
+            # the active email actually changed (Claude Code rewrites this file
+            # often for unrelated reasons). A login kept in the Keychain has no
+            # file to stat; the refresh timer still picks the change up.
             if self._refreshing:
                 return  # a worker is already in-flight; it refreshes the marker
             try:
@@ -660,7 +687,7 @@ def run(switcher) -> int:
             if mtime == self._config_mtime:
                 return
             self._config_mtime = mtime
-            current = self.switcher._get_current_account()
+            current = self.switcher.current_identity()
             email = current[0] if current else None
             if email and email != self.snapshot.get("active_email"):
                 self.refresh_async()
@@ -738,6 +765,7 @@ def run(switcher) -> int:
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                icon=icon,
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -794,7 +822,7 @@ def run(switcher) -> int:
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
             if hasattr(self.switcher, "add_account_from_token"):
-                menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
+                menu.add(rumps.MenuItem(token_item, callback=self.on_add_token))
             return menu
 
         def _remove_menu(self, rumps):
@@ -897,11 +925,7 @@ def run(switcher) -> int:
                 return False
 
         def _notify_switched(self):
-            rumps.notification(
-                "claude-swap",
-                "Account switched",
-                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
-            )
+            rumps.notification("claude-swap", "Account switched", switched_note)
 
         def _make_switch_to(self, num):
             def cb(_sender):
@@ -950,16 +974,16 @@ def run(switcher) -> int:
             import AppKit
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             email_win = rumps.Window(
-                title="Add account from setup-token",
-                message="Email for this token:",
+                title=token_title,
+                message=email_prompt,
                 ok="Next", cancel="Cancel", dimensions=(320, 24),
             )
             email_resp = email_win.run()
             if email_resp.clicked != 1 or not email_resp.text.strip():
                 return
             token_win = rumps.Window(
-                title="Add account from setup-token",
-                message="Setup token (sk-ant-oat01-…):",
+                title=token_title,
+                message=token_prompt,
                 ok="Add", cancel="Cancel", dimensions=(320, 24),
             )
             token_resp = token_win.run()
@@ -977,9 +1001,9 @@ def run(switcher) -> int:
             subprocess.run(["open", "-R", str(target)], check=False)
 
         def on_refresh_creds(self, _sender):
-            if self.switcher._get_current_account() is None:
+            if self.switcher.current_identity() is None:
                 rumps.alert(title="claude-swap",
-                            message="No active Claude Code login detected. Log in first.")
+                            message=f"No active {product} login detected. Log in first.")
                 return
             try:
                 self.switcher.add_account(slot=None)
@@ -991,7 +1015,7 @@ def run(switcher) -> int:
                     title="claude-swap",
                     message="Couldn't read the active credential. If the menu bar is running "
                             "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: cswap --menubar",
+                            f"quit and relaunch it from a Terminal with: {prefix} --menubar",
                 )
                 return
             except ClaudeSwitchError as e:

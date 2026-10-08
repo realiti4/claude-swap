@@ -3,6 +3,8 @@
 Reads session PID files (~/.claude/sessions/{pid}.json) and IDE lockfiles
 (~/.claude/ide/{port}.lock) to determine which Claude Code instances are
 currently running. Uses the same mechanism Claude Code itself uses internally.
+Codex keeps no such records, so its processes come from one ``ps`` listing
+(:func:`list_codex_processes`).
 """
 
 from __future__ import annotations
@@ -225,6 +227,13 @@ def pid_matches_record(pid: int, proc_start: str | None) -> bool:
     return process_is_claude(pid) is not False
 
 
+def proc_start_stamp(pid: int) -> str | None:
+    """``pid``'s start, stamped the way claude stamps ``procStart`` (and so
+    the way :func:`pid_matches_record` reads it): ``/proc`` clock ticks where
+    that exists (Linux), else ``ps -o lstart``. None when unknowable."""
+    return process_start_ticks(pid) or _ps(pid, "lstart")
+
+
 def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], int]:
     """Live sessions, and how many records could NOT be read.
 
@@ -348,3 +357,61 @@ def get_running_instances(
     """Return all running Claude Code sessions and IDE instances."""
     resolved = claude_dir or get_claude_dir()
     return list_sessions(resolved), list_ide_instances(resolved)
+
+
+@dataclass
+class CodexProcess:
+    """A running ``codex`` executable, from :func:`list_codex_processes`.
+
+    Shaped like :class:`ClaudeSession` where ``cswap list`` reads one:
+    ``entrypoint`` is the group label and ``cwd`` is unknown (``ps`` does
+    not show it), so every Codex process groups by label alone.
+    """
+
+    pid: int
+    args: str
+    cwd: str = ""
+
+    @property
+    def entrypoint(self) -> str:
+        # App-servers (the shared daemon, the desktop app's, an IDE
+        # extension's) hold a login for their clients; anything else is a
+        # CLI process (TUI, exec, resume).
+        return "codex app-server" if "app-server" in self.args.split() else "codex"
+
+
+def list_codex_processes() -> list[CodexProcess]:
+    """Running Codex processes: those whose executable is named ``codex``.
+
+    Codex keeps no session records to read, so this is one ``ps`` listing.
+    Matching the executable name (``ucomm``, never argv) counts the native
+    binary and skips the npm wrapper (``node …/bin/codex``, which only spawns
+    it) and the ``codex-code-mode-host`` helper, whose name is longer than
+    ``codex`` even as truncated by ``ps`` (codex-spec §10). POSIX only, under
+    ``LC_ALL=C`` like :func:`_ps`; Windows and every failure answer an empty
+    list, since this only feeds displays.
+
+    ponytail: a process whose name merely starts with ``codex `` (a space,
+    then more) would also match; nothing ships such a name.
+    """
+    if sys.platform == "win32":
+        return []
+    try:
+        proc = subprocess.run(
+            ["ps", "-A", "-ww", "-o", "pid=,ucomm=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    found = []
+    for line in proc.stdout.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        name, _, args = rest.strip().partition(" ")
+        if name == "codex" and pid.isdigit():
+            found.append(CodexProcess(pid=int(pid), args=args.strip()))
+    return found

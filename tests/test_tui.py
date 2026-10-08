@@ -1710,3 +1710,130 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+# ---------------------------------------------------------------------------
+# Codex provider (`cswap codex tui`)
+# ---------------------------------------------------------------------------
+
+
+class CodexFakeSwitcher(FakeSwitcher):
+    """The fake dressed as the Codex provider: its store is ``<root>/codex``
+    and it carries Codex's labels and note wording (no ``provider_name``: the
+    TUI words itself from these attributes alone)."""
+
+    display_name = "Codex"
+    cli_prefix = "cswap codex"
+    token_kind = "OpenAI API key"
+
+    def __init__(self, accounts: list[AccountSnapshot], root: Path):
+        from claude_swap.codex_switcher import CODEX_ERROR_NOTES, CODEX_SENTINEL_NOTES
+
+        (root / "codex").mkdir(parents=True, exist_ok=True)
+        super().__init__(accounts, root / "codex")
+        self.root_dir = root
+        self.sentinel_notes = CODEX_SENTINEL_NOTES
+        self.error_notes = CODEX_ERROR_NOTES
+
+
+def _menu_labels(app) -> list[str]:
+    from textual.widgets import ListView, Static
+
+    from claude_swap.tui.widgets import MenuItem
+
+    menu = app.screen.query_one("#menu", ListView)
+    return [it.query_one(Static).render().plain for it in menu.query(MenuItem)]
+
+
+@pytest.mark.asyncio
+class TestCodexProvider:
+    async def test_add_menu_and_confirm_name_codex(self, tmp_path):
+        from claude_swap.tui.modals import ConfirmModal
+
+        app = make_app(CodexFakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "add-menu")
+            labels = _menu_labels(app)
+            assert "From current Codex login" in labels
+            assert "From your OpenAI API key…" in labels
+            await menu_select(pilot, "add-login")
+            assert isinstance(app.screen, ConfirmModal)
+            assert "current Codex login" in app.screen._message
+
+    async def test_token_modal_asks_for_an_openai_api_key(self, tmp_path):
+        from textual.widgets import Input, Static
+
+        app = make_app(CodexFakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "add-menu")
+            await menu_select(pilot, "add-token")
+            body = " ".join(
+                s.render().plain for s in app.screen.query(Static).filter(".modal-body")
+            )
+            assert "OpenAI API key" in body and "sk-ant" not in body
+            assert app.screen.query_one("#token", Input).placeholder == (
+                "OpenAI API key (required)"
+            )
+
+    async def test_empty_state_names_codex(self, tmp_path):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        app = make_app(CodexFakeSwitcher([], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert "current Codex login, or from your OpenAI API key" in panel
+            assert "Claude" not in panel
+
+    async def test_usage_notes_use_codex_wording(self, tmp_path):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        from claude_swap.tui.widgets import AccountsPanel
+
+        accounts = [
+            make_account(1, active=True, entry=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED)),
+            make_account(2, entry=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED)),
+        ]
+        app = make_app(CodexFakeSwitcher(accounts, tmp_path))
+        async with app.run_test(size=(120, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert panel.count("cswap codex add --login") == 2  # card + mini line
+            assert "Claude" not in panel
+
+    async def test_error_note_uses_codex_wording(self, tmp_path):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        entry = UsageEntry(last_error="stash-unreadable")
+        app = make_app(CodexFakeSwitcher([make_account(1, active=True, entry=entry)], tmp_path))
+        async with app.run_test(size=(140, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert "`cswap codex unclaimed` inspects it" in panel
+
+    async def test_go_live_names_cswap_codex_auto(self, tmp_path, fake_engine):
+        from claude_swap.tui.modals import ConfirmModal
+
+        app = make_app(CodexFakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        ))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
+            await pilot.press("l")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            assert "`cswap codex auto`" in app.screen._message
+
+    async def test_theme_is_read_from_and_written_to_the_root(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"theme": "light"}}))
+        fake = CodexFakeSwitcher([make_account("1", active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.theme == "cswap-light"
+            app.apply_theme("dark")
+            await pilot.pause()
+        assert json.loads((tmp_path / "settings.json").read_text())["ui"]["theme"] == "dark"
+        assert not (tmp_path / "codex" / "settings.json").exists()
