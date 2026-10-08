@@ -1365,3 +1365,21 @@ class TestPinnedFileModeEndsWhenTheFileIsGone:
         store._read_active_credentials()
         assert store._use_keychain() is False
 
+    def test_any_later_pin_disarms_the_lift(self, macos_switcher, monkeypatch):
+        """A pin that is not the OAuth fallback's own is never liftable.
+
+        Drives `_pin_file_mode` directly after an OAuth pin, with nothing else
+        clearing the flag, so this fails if `_pin_file_mode` stops resetting it.
+        """
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.paths import get_credentials_path
+
+        store = macos_switcher._store
+        self._pin_through_a_failed_write(store, monkeypatch, delete_ok=True)
+        store._pin_file_mode(residual_cleared=False)  # e.g. the managed-key pin
+        get_credentials_path().unlink()
+        monkeypatch.setattr(_kc, "get_password", lambda *_a, **_kw: "residual")
+
+        store._read_active_credentials()
+        assert store._use_keychain() is False
+

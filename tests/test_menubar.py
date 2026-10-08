@@ -657,3 +657,22 @@ def test_two_alternating_engine_errors_are_each_limited():
         for i, ev in enumerate([a, b, a, b, a, b])
     ]
     assert surfaced == [True, True, False, False, False, False]
+
+
+def test_engine_errors_differing_only_in_numbers_are_one_error():
+    seen: dict = {}
+    first = ErrorEvent(message="LockError: lock held by pid 4242 for 31s")
+    later = ErrorEvent(message="LockError: lock held by pid 4243 for 92s")
+    assert should_surface_engine_error(first, seen, now=1000.0) is True
+    assert should_surface_engine_error(later, seen, now=1060.0) is False
+
+
+def test_engine_error_table_is_pruned():
+    seen: dict = {}
+    for i in range(50):
+        should_surface_engine_error(
+            ErrorEvent(message=f"error kind {chr(65 + i % 26)}{i}"), seen, now=0.0
+        )
+    should_surface_engine_error(ErrorEvent(message="x"), seen, now=ENGINE_ERROR_REPEAT_S)
+    assert list(seen) == ["x"]
+

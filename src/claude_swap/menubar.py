@@ -386,10 +386,14 @@ def should_surface_engine_error(event, surfaced: dict, now: float) -> bool:
     message = getattr(event, "message", None)
     if not message:
         return False
-    last = surfaced.get(message)
-    if last is not None and now - last < ENGINE_ERROR_REPEAT_S:
+    # Digits stripped so a message carrying a changing id, count or time is
+    # still one error, and stale entries pruned so the table stays bounded.
+    key = re.sub(r"\d+", "#", message)
+    for k in [k for k, t in surfaced.items() if now - t >= ENGINE_ERROR_REPEAT_S]:
+        del surfaced[k]
+    if key in surfaced:
         return False
-    surfaced[message] = now
+    surfaced[key] = now
     return True
 
 
