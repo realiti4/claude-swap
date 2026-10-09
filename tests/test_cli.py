@@ -749,6 +749,9 @@ class TestRunCommand:
                     require_session,
                 ))
 
+            def own_login(self, identifier):
+                calls.append(("own_login", identifier))
+
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher"), \
              patch("os.geteuid", return_value=1000, create=True), \
@@ -779,6 +782,18 @@ class TestRunCommand:
     def test_require_session_flag(self):
         calls = self._dispatch(["run", "2", "--require-session"])
         assert ("run", "2", [], True, False, True) in calls
+
+    def test_own_login_logs_the_profile_in_without_launching(self, capsys):
+        calls = self._dispatch(["run", "2", "--own-login"])
+        assert ("own_login", "2") in calls
+        assert not any(c[0] == "run" for c in calls)
+        assert "own login" in capsys.readouterr().out
+
+    def test_own_login_needs_an_account(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "run", "--own-login"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])

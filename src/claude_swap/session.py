@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
-from claude_swap.claude_locks import proper_lockfile
+from claude_swap.claude_locks import claude_credentials_lock, proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -110,6 +110,20 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # One-time migration stash: session-local MCP definitions displaced by the
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
+
+
+OWN_LOGIN_MARKER = ".cswap-own-login"
+
+
+def has_own_login(session_dir: Path) -> bool:
+    """Whether the profile holds a login of its own (``cswap run N --own-login``).
+
+    Its token family is independent of the slot's backup, so the two never
+    share a refresh token: cswap never seeds it from the backup, adopts it
+    into the backup or invalidates it when the backup moves, and the default
+    login may be the same account while it runs.
+    """
+    return (session_dir / OWN_LOGIN_MARKER).exists()
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -429,6 +443,15 @@ def read_config_dir_credentials(
         return None
 
 
+def read_profile_config(session_dir: Path) -> dict | None:
+    """A profile's ``.claude.json`` as a dict, or ``None`` when unreadable."""
+    try:
+        config = json.loads((session_dir / ".claude.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return config if isinstance(config, dict) else None
+
+
 def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     """Best-effort read of the account identity a session profile is logged in as.
 
@@ -476,6 +499,18 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     if profile_email != email:
         return True
     return bool(profile_org and org_uuid and profile_org != org_uuid)
+
+
+def profile_holds_slot_family(session_dir: Path, email: str, org_uuid: str) -> bool:
+    """Whether the profile's credential is the slot's own token family.
+
+    Not when an in-session ``/login`` re-pointed it at another account, and
+    not when it has its own login (``has_own_login``): either way it is an
+    independent family, which nothing may sync with the slot's backup.
+    """
+    return not has_own_login(session_dir) and not session_identity_drifted(
+        session_dir, email, org_uuid
+    )
 
 
 def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
@@ -571,36 +606,44 @@ class SessionManager:
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir_preset:
-            # With CLAUDE_CONFIG_DIR set, "current default account" is
-            # meaningless (we may already be inside a session terminal), so
-            # the same-account fast path below must not trigger.
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-        else:
-            # Same-account fast path: never create a second credential copy
-            # for the account that is already the active default login —
-            # two copies of one account can drift if the server rotates the
-            # refresh token.
-            current = self.switcher._get_current_account()
-            if current is not None and current == (email, org_uuid):
-                if require_session:
-                    raise SessionError(
-                        f"Account-{account_num} ({email}) is the active default "
-                        "login, so this launch would run plain claude on the "
-                        "default login rather than in a session profile (a "
-                        "second copy of the active credential would drift). "
-                        "Switch the default login to another account first, "
-                        "or run `claude` directly."
-                    )
-                print(
-                    dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
-                    )
+        # Same-account fast path: never create a second credential copy
+        # for the account that is already the active default login — two
+        # copies hold one single-use refresh token, so whichever refreshes
+        # second is logged out. A preset CLAUDE_CONFIG_DIR (we may be inside
+        # a session terminal) doesn't change which account the default login
+        # is, so read the default profile's identity, not the env's.
+        current = (
+            self.switcher._get_default_login_account()
+            if config_dir_preset
+            else self.switcher._get_current_account()
+        )
+        own = has_own_login(
+            session_dir_for(self.switcher.backup_dir, account_num, email)
+        )
+        if not own and current is not None and current == (email, org_uuid):
+            if require_session:
+                raise SessionError(
+                    f"Account-{account_num} ({email}) is the active default "
+                    "login, so this launch would run plain claude on the "
+                    "default login rather than in a session profile (a "
+                    "second copy of its single-use refresh token would log one "
+                    "copy out). "
+                    "Switch the default login to another account first, "
+                    "or run `claude` directly."
                 )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+            print(
+                dimmed(
+                    f"Account-{account_num} ({email}) is already the active "
+                    "default login — launching claude directly."
+                )
+            )
+            env = dict(os.environ)
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            self._exec(claude_bin, claude_args, env=env)
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -681,6 +724,18 @@ class SessionManager:
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+
+        if has_own_login(session_dir):
+            # Its own login, not the slot's: never seeded from the backup, so
+            # neither the stale marker nor the consume gate applies.
+            if not self._is_session_valid(session_dir, email, org_uuid):
+                raise SessionError(
+                    f"Account-{account_num}'s session profile has its own "
+                    f"login, and it is no longer valid. Log it in again: "
+                    f"cswap run {account_num} --own-login"
+                )
+            self._sync_sharing(session_dir, share, share_history)
+            return session_dir, account_num, email
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -857,14 +912,113 @@ class SessionManager:
             profile
         ) == _oauth.credential_fingerprint(backup)
 
+    def own_login(self, identifier: str) -> Path:
+        """Give the account's session profile a login of its own.
+
+        Runs ``claude auth login`` for the account in a scratch config dir,
+        checks it logged in as that account, then installs the credential
+        into the profile and marks it (``has_own_login``). The scratch dir
+        keeps a login as the wrong account away from the profile and from any
+        agent running in it. The install holds the profile's own Claude Code
+        credential locks, so a running agent re-reads the new login on its
+        next refresh instead of writing its old token family back over it.
+        """
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise SessionError(
+                "'claude' was not found on PATH. Install Claude Code first."
+            )
+        account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        self._ensure_not_api_key(account_num, email)
+        session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        _mkdir_private(self.sessions_dir)
+        scratch = Path(
+            tempfile.mkdtemp(prefix=f".login-{account_num}-", dir=self.sessions_dir)
+        )
+        try:
+            result = subprocess.run(
+                [claude_bin, "auth", "login", "--claudeai", "--email", email],
+                env=_probe_env(scratch),
+            )
+            if result.returncode != 0:
+                raise SessionError(
+                    f"`claude auth login` for Account-{account_num} ({email}) "
+                    "did not complete; the profile was left unchanged."
+                )
+            if self._session_validity(scratch, email, org_uuid) != "valid":
+                identity = read_session_identity(scratch)
+                who = identity[0] if identity else "no readable account"
+                raise SessionError(
+                    f"The login is {who}, not Account-{account_num} ({email}); "
+                    "the profile was left unchanged. Retry and sign in as "
+                    f"{email}."
+                )
+            creds = read_session_credentials(scratch)
+            oauth_account = (read_profile_config(scratch) or {}).get("oauthAccount")
+            if not creds or not oauth_account:
+                raise SessionError(
+                    f"`claude auth login` for Account-{account_num} left no "
+                    "readable credential; the profile was left unchanged."
+                )
+            with FileLock(
+                self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT
+            ), claude_credentials_lock(config_home=session_dir):
+                # A session that refreshed holds the slot's newest token
+                # generation, the backup a consumed one: save it before the
+                # profile's copy is replaced, or the slot is left dead.
+                ahead = self.switcher._session_profile_ahead(
+                    account_num, email, org_uuid
+                )
+                if ahead:
+                    self.switcher._store._write_account_credentials(
+                        account_num, email, ahead
+                    )
+                self._write_profile(session_dir, creds, oauth_account, "dark")
+                (session_dir / OWN_LOGIN_MARKER).touch()
+                clear_session_stale(session_dir)
+        finally:
+            delete_macos_keychain_entry(scratch)
+            shutil.rmtree(scratch, ignore_errors=True)
+        self._logger.info(
+            f"Session profile for account {account_num} has its own login"
+        )
+        return session_dir
+
+    def _write_profile(
+        self, session_dir: Path, creds: str, oauth_account: dict, theme: str
+    ) -> None:
+        """Install a credential and identity into a profile. Caller holds the lock.
+
+        Claude reads the keychain before the plaintext file, so a hashed
+        entry from an earlier credential at this path would shadow the seed.
+        The identity is merged into any existing .claude.json, so the
+        profile's own projects/history survive. The ``theme`` key is
+        load-bearing: claude shows onboarding when
+        ``!config.theme || !config.hasCompletedOnboarding``.
+        """
+        delete_macos_keychain_entry(session_dir)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(session_dir, 0o700)
+
+        creds_path = session_dir / ".credentials.json"
+        creds_path.write_text(creds, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(creds_path, 0o600)
+
+        config_path = session_dir / ".claude.json"
+        existing = read_profile_config(session_dir) or {}
+        existing["oauthAccount"] = oauth_account
+        existing["hasCompletedOnboarding"] = True
+        existing.setdefault("theme", theme)
+        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(config_path, 0o600)
+
     def _bootstrap(
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
-        # Claude reads the keychain before the plaintext file — a stale hashed
-        # entry from an earlier profile at this path would shadow the seed.
-        delete_macos_keychain_entry(session_dir)
-
         creds, unreadable = self.switcher._read_account_credentials_ex(
             account_num, email
         )
@@ -899,32 +1053,9 @@ class SessionManager:
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
 
-        session_dir.mkdir(parents=True, exist_ok=True)
-        if sys.platform != "win32":
-            os.chmod(session_dir, 0o700)
-
-        creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
-
-        # Merge the identity seed into any existing .claude.json so a
-        # re-bootstrap preserves the profile's own projects/history. The
-        # `theme` key is load-bearing: claude shows onboarding when
-        # `!config.theme || !config.hasCompletedOnboarding`.
-        config_path = session_dir / ".claude.json"
-        existing: dict = {}
-        if config_path.exists():
-            try:
-                existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-        existing["oauthAccount"] = oauth_account
-        existing["hasCompletedOnboarding"] = True
-        existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        self._write_profile(
+            session_dir, creds, oauth_account, config_data.get("theme") or "dark"
+        )
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"

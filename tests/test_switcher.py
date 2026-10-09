@@ -29,6 +29,7 @@ from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
 from claude_swap.credentials import ActiveCredentials
+from tests.conftest import make_live
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
@@ -8988,6 +8989,48 @@ class TestDisableEnableAccount:
         assert rows[2].get("disabled") is True
         # Additive: absent (not False) on enabled rows.
         assert "disabled" not in rows[1]
+
+
+class TestLiveSessionSlotIsNoRotationTarget:
+    """A slot with a live `cswap run` session cannot become the default login
+    (its refresh token would live in two places), so automatic selection
+    passes over it instead of failing on it."""
+
+    _setup = TestDisableEnableAccount._setup
+    _seed = TestDisableEnableAccount._seed
+    _make_live = TestDisableEnableAccount._make_live
+
+    def test_rotation_skips_slot_with_live_session(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        make_live(s._session_dir("2", "b@example.com"))
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        assert "Skipping Account-2 (live cswap run session)" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_best_strategy_ignores_slot_with_live_session(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        make_live(s._session_dir("2", "b@example.com"))
+
+        target, note = s._select_best_switchable("1")
+
+        assert (target, note) == (None, "none")
+
+    def test_slot_with_live_session_is_not_auto_switchable(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        make_live(s._session_dir("2", "b@example.com"))
+
+        assert s.switchable_account_numbers() == ["1"]
 
 
 class TestDegradedReadProvenance:
