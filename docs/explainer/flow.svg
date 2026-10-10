@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 633 836.5" width="633" height="836.5" role="img" aria-labelledby="d-title d-desc">
+  <title id="d-title">claude-swap — Process / Data Flow</title>
+  <desc id="d-desc">the runtime loop: poll usage, compare to threshold, pick the fullest account, refresh its token, then swap credentials atomically</desc>
+  <metadata><![CDATA[
+Poll active account's usage (every 60s) -> Compare against threshold -> Pick account with most quota left -> Refresh that account's token -> Swap credentials, holding the lock
+]]></metadata>
+  <style>
+    .flow-line { stroke-dasharray: 8 10; stroke-width: 3; animation: flow-dash 1.1s linear infinite; }
+    @keyframes flow-dash { to { stroke-dashoffset: -36; } }
+    .node-pulse { transform-box: fill-box; transform-origin: center; animation: node-pulse 2.1s cubic-bezier(0.4,0,0.2,1) infinite; }
+    @keyframes node-pulse { 0%, 100% { opacity: 0.35; transform: scale(1); } 50% { opacity: 1; transform: scale(1.6); } }
+    @media (prefers-reduced-motion: reduce) { .flow-line, .node-pulse { animation: none; } }
+  </style>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#0b1018"/><stop offset="0.55" stop-color="#0a0e15"/><stop offset="1" stop-color="#070a10"/>
+    </linearGradient>
+    <radialGradient id="spot" cx="0.5" cy="0.02" r="0.8">
+      <stop offset="0" stop-color="rgba(255,176,32,0.1)"/><stop offset="0.5" stop-color="rgba(255,176,32,0.025)"/><stop offset="1" stop-color="rgba(0,0,0,0)"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="rgba(255,255,255,0.09)"/><stop offset="0.5" stop-color="rgba(255,255,255,0.015)"/><stop offset="1" stop-color="rgba(255,255,255,0)"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="rgba(255,255,255,0.014)"/>
+    </pattern>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="11"/></filter>
+    <filter id="glowS" x="-150%" y="-150%" width="400%" height="400%"><feGaussianBlur stdDeviation="4"/></filter>
+    <filter id="cardSh" x="-40%" y="-50%" width="180%" height="210%">
+      <feDropShadow dx="0" dy="6" stdDeviation="11" flood-color="#000000" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+  <!-- concept archetype: column -->
+  <rect x="0" y="0" width="633" height="836.5" fill="url(#bg)"/>
+  <rect x="0" y="0" width="633" height="836.5" fill="url(#spot)"/>
+  <rect x="0" y="0" width="633" height="836.5" fill="url(#grid)"/>
+  <g transform="translate(0.0,0)">
+<text x="316.5" y="44" font-family="ui-monospace,SFMono-Regular,&quot;SF Mono&quot;,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="600" fill="#ffb020" text-anchor="middle" letter-spacing="3">CLAUDE-SWAP · DATA FLOW</text>
+  <text x="316.5" y="80" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="30" font-weight="800" fill="#ffb020" text-anchor="middle" opacity="0.45" filter="url(#glowS)">What happens to your data</text>
+<text x="316.5" y="80" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="30" font-weight="800" fill="#f1f5f9" text-anchor="middle">What happens to your data</text>
+  <line x1="282.5" y1="98" x2="350.5" y2="98" stroke="#ffb020" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+  <line x1="316.5" y1="216" x2="316.5" y2="254" stroke="#9ac050" stroke-width="9" opacity="0.3" filter="url(#glow)" stroke-linecap="round"/>
+  <line class="flow-line" x1="316.5" y1="216" x2="316.5" y2="254" stroke="#b3d07c" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M 312.2 246.1 L 316.5 254.0 L 320.8 246.1" fill="none" stroke="#b3d07c" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="316.5" y1="344" x2="316.5" y2="382" stroke="#38b8bf" stroke-width="9" opacity="0.3" filter="url(#glow)" stroke-linecap="round"/>
+  <line class="flow-line" x1="316.5" y1="344" x2="316.5" y2="382" stroke="#6acacf" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M 312.2 374.1 L 316.5 382.0 L 320.8 374.1" fill="none" stroke="#6acacf" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="316.5" y1="472" x2="316.5" y2="510" stroke="#5b7eff" stroke-width="9" opacity="0.3" filter="url(#glow)" stroke-linecap="round"/>
+  <line class="flow-line" x1="316.5" y1="472" x2="316.5" y2="510" stroke="#849eff" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M 312.2 502.1 L 316.5 510.0 L 320.8 502.1" fill="none" stroke="#849eff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="316.5" y1="600" x2="316.5" y2="638" stroke="#4f98f7" stroke-width="9" opacity="0.3" filter="url(#glow)" stroke-linecap="round"/>
+  <line class="flow-line" x1="316.5" y1="600" x2="316.5" y2="638" stroke="#7bb2f9" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M 312.2 630.1 L 316.5 638.0 L 320.8 630.1" fill="none" stroke="#7bb2f9" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="65" y="129" width="503" height="88" rx="22" fill="#ffb020" opacity="0.250" filter="url(#glow)"/>
+  <rect x="70" y="140" width="493" height="78" rx="18" fill="rgba(102,70,13,0.85)"/>
+  <rect x="70" y="132" width="493" height="78" rx="18" fill="rgba(255,176,32,0.18)" stroke="rgba(255,176,32,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
+  <rect x="70" y="132" width="493" height="78" rx="18" fill="url(#sheen)"/>
+  <path d="M 88 133.25 H 545" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
+<text x="316.5" y="171" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="18.5" font-weight="700" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Poll active account's usage (every 60s)</text>
+  <rect x="142.5" y="257" width="348" height="88" rx="22" fill="#35d07f" opacity="0.250" filter="url(#glow)"/>
+  <rect x="147.5" y="268" width="338" height="78" rx="18" fill="rgba(21,83,51,0.85)"/>
+  <rect x="147.5" y="260" width="338" height="78" rx="18" fill="rgba(53,208,127,0.18)" stroke="rgba(53,208,127,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
+  <rect x="147.5" y="260" width="338" height="78" rx="18" fill="url(#sheen)"/>
+  <path d="M 165.5 261.25 H 467.5" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
+<text x="316.5" y="299" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="18.5" font-weight="700" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Compare against threshold</text>
+  <rect x="98" y="385" width="437" height="88" rx="22" fill="#3aa0ff" opacity="0.250" filter="url(#glow)"/>
+  <rect x="103" y="396" width="427" height="78" rx="18" fill="rgba(23,64,102,0.85)"/>
+  <rect x="103" y="388" width="427" height="78" rx="18" fill="rgba(58,160,255,0.18)" stroke="rgba(58,160,255,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
+  <rect x="103" y="388" width="427" height="78" rx="18" fill="url(#sheen)"/>
+  <path d="M 121 389.25 H 512" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
+<text x="316.5" y="427" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="18.5" font-weight="700" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Pick account with most quota left</text>
+  <rect x="126" y="513" width="381" height="88" rx="22" fill="#ffb020,#35d07f,#3aa0ff,#ff5d5d" opacity="0.250" filter="url(#glow)"/>
+  <rect x="131" y="524" width="371" height="78" rx="18" fill="rgba(50,37,102,0.85)"/>
+  <rect x="131" y="516" width="371" height="78" rx="18" fill="rgba(124,92,255,0.18)" stroke="rgba(124,92,255,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
+  <rect x="131" y="516" width="371" height="78" rx="18" fill="url(#sheen)"/>
+  <path d="M 149 517.25 H 484" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
+<text x="316.5" y="555" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="18.5" font-weight="700" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Refresh that account's token</text>
+  <rect x="92.5" y="641" width="448" height="88" rx="22" fill="#22d3ee" opacity="0.250" filter="url(#glow)"/>
+  <rect x="97.5" y="652" width="438" height="78" rx="18" fill="rgba(14,84,95,0.85)"/>
+  <rect x="97.5" y="644" width="438" height="78" rx="18" fill="rgba(34,211,238,0.18)" stroke="rgba(34,211,238,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
+  <rect x="97.5" y="644" width="438" height="78" rx="18" fill="url(#sheen)"/>
+  <path d="M 115.5 645.25 H 517.5" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
+<text x="316.5" y="683" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="18.5" font-weight="700" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Swap credentials, holding the lock</text>
+<text x="316.5" y="769" font-family="ui-monospace,SFMono-Regular,&quot;SF Mono&quot;,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="400" fill="#7c8aa0" text-anchor="middle">the runtime loop: poll usage, compare to threshold, pick the</text>
+<text x="316.5" y="788.5" font-family="ui-monospace,SFMono-Regular,&quot;SF Mono&quot;,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="400" fill="#7c8aa0" text-anchor="middle">fullest account, refresh its token, then swap credentials</text>
+<text x="316.5" y="808" font-family="ui-monospace,SFMono-Regular,&quot;SF Mono&quot;,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="400" fill="#7c8aa0" text-anchor="middle">atomically</text>
+  </g>
+</svg>

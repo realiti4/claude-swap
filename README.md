@@ -1,5 +1,12 @@
 # claude-swap
 
+<!-- explainmyrepo:link:start -->
+[![Explainer — live](https://img.shields.io/badge/Explainer-live-7c3aed?style=flat-square)](https://claude-swap-explainer.netlify.app)
+
+A visual, newcomer-friendly explainer for **claude-swap**: https://claude-swap-explainer.netlify.app
+<!-- explainmyrepo:link:end -->
+
+
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
 ## Installation
@@ -401,3 +408,20 @@ pipx uninstall claude-swap
 ## License
 
 MIT
+
+<!-- explainmyrepo:start -->
+## Explainer
+
+### Architecture
+
+How claude-swap fits together: saved account slots, a usage poller (5h/7d windows) and a switch engine (manual + auto), driven from the CLI, TUI and menu bar.
+
+![How claude-swap fits together: saved account slots, a usage poller (5h/7d windows) and a switch engine (manual + auto), driven from the CLI, TUI and menu bar.](docs/explainer/architecture.svg)
+
+### How it works
+
+What happens on an auto-switch: poll the active account every 60s, compare to the threshold, pick the account with the most quota left, refresh its token, then swap credentials while holding the lock.
+
+![What happens on an auto-switch: poll the active account every 60s, compare to the threshold, pick the account with the most quota left, refresh its token, then swap credentials while holding the lock.](docs/explainer/flow.svg)
+
+<!-- explainmyrepo:end -->
