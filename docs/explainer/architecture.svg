@@ -1,81 +1,103 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 766 583" width="766" height="583" role="img" aria-labelledby="d-title d-desc">
-  <title id="d-title">claude-swap — Architecture</title>
-  <desc id="d-desc">the conceptual parts a reader must hold in their head: account slots, token store, usage poller, switch engine, and the interfaces that drive it</desc>
-  <metadata><![CDATA[
-Account slots (stored tokens) -> Usage poller (5h/7d windows) -> Switch engine (manual + auto) -> CLI, TUI, and menu bar surfaces
-]]></metadata>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1110 590" width="1110" height="590" role="img" aria-labelledby="t d">
+  <title id="t">What claude-swap plugs into</title>
+  <desc id="d">Your saved Claude accounts, kept in the macOS Keychain or in credential files on Windows and Linux, feed one auto-switch engine that polls usage, decides, and swaps. The engine sends one stream of events to three front ends: the command line, a terminal dashboard, and an optional macOS menu bar. claude-swap works with the Claude Code CLI and the VS Code extension on macOS, Windows and Linux or WSL. Nothing in the README or source mentions Codex.</desc>
   <style>
-    .flow-line { stroke-dasharray: 8 10; stroke-width: 3; animation: flow-dash 1.1s linear infinite; }
-    @keyframes flow-dash { to { stroke-dashoffset: -36; } }
-    .node-pulse { transform-box: fill-box; transform-origin: center; animation: node-pulse 2.1s cubic-bezier(0.4,0,0.2,1) infinite; }
-    @keyframes node-pulse { 0%, 100% { opacity: 0.35; transform: scale(1); } 50% { opacity: 1; transform: scale(1.6); } }
-    @media (prefers-reduced-motion: reduce) { .flow-line, .node-pulse { animation: none; } }
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .ttl { font-size: 24px; font-weight: 700; fill: #f0f6fc; }
+    .sub { font-size: 13px; fill: #8b949e; }
+    .h { font-size: 16px; font-weight: 700; fill: #f0f6fc; }
+    .s { font-size: 12.5px; fill: #8b949e; }
+    .head { font-size: 11px; letter-spacing: 1.6px; fill: #8b949e; font-weight: 700; }
+    .pill { font-size: 14px; font-weight: 700; }
+    .code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #79c0ff; }
+    .num { font-size: 12px; font-weight: 700; fill: #0d1117; }
+    .flow { fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-dasharray: 6 9; }
+    @media (prefers-reduced-motion: no-preference) {
+      .flow { animation: dash 1.3s linear infinite; }
+    }
+    @keyframes dash { to { stroke-dashoffset: -30; } }
   </style>
 
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0.3" y2="1">
-      <stop offset="0" stop-color="#0b1018"/><stop offset="0.55" stop-color="#0a0e15"/><stop offset="1" stop-color="#070a10"/>
-    </linearGradient>
-    <radialGradient id="spot" cx="0.5" cy="0.02" r="0.8">
-      <stop offset="0" stop-color="rgba(255,176,32,0.1)"/><stop offset="0.5" stop-color="rgba(255,176,32,0.025)"/><stop offset="1" stop-color="rgba(0,0,0,0)"/>
-    </radialGradient>
-    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="rgba(255,255,255,0.09)"/><stop offset="0.5" stop-color="rgba(255,255,255,0.015)"/><stop offset="1" stop-color="rgba(255,255,255,0)"/>
-    </linearGradient>
-    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-      <circle cx="1" cy="1" r="1" fill="rgba(255,255,255,0.014)"/>
-    </pattern>
-    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="11"/></filter>
-    <filter id="glowS" x="-150%" y="-150%" width="400%" height="400%"><feGaussianBlur stdDeviation="4"/></filter>
-    <filter id="cardSh" x="-40%" y="-50%" width="180%" height="210%">
-      <feDropShadow dx="0" dy="6" stdDeviation="11" flood-color="#000000" flood-opacity="0.34"/>
-    </filter>
-  </defs>
-  <!-- concept archetype: orbit -->
-  <rect x="0" y="0" width="766" height="583" fill="url(#bg)"/>
-  <rect x="0" y="0" width="766" height="583" fill="url(#spot)"/>
-  <rect x="0" y="0" width="766" height="583" fill="url(#grid)"/>
-<text x="383" y="44" font-family="ui-monospace,SFMono-Regular,&quot;SF Mono&quot;,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="600" fill="#ffb020" text-anchor="middle" letter-spacing="3">CLAUDE-SWAP · ARCHITECTURE</text>
-  <text x="383" y="80" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="30" font-weight="800" fill="#ffb020" text-anchor="middle" opacity="0.45" filter="url(#glowS)">How it is built</text>
-<text x="383" y="80" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="30" font-weight="800" fill="#f1f5f9" text-anchor="middle">How it is built</text>
-  <line x1="349" y1="98" x2="417" y2="98" stroke="#ffb020" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
-  <line x1="383" y1="218" x2="205.1782387532265" y2="279.002064817804" stroke="#9ac050" stroke-width="9" opacity="0.3" filter="url(#glow)" stroke-linecap="round"/>
-  <line class="flow-line" x1="383" y1="218" x2="205.1782387532265" y2="279.002064817804" stroke="#b3d07c" stroke-width="2.4" stroke-linecap="round"/>
-  <path d="M 211.2 272.4 L 205.2 279.0 L 214.0 280.5" fill="none" stroke="#b3d07c" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-  <line x1="383" y1="218" x2="383" y2="382" stroke="#9da890" stroke-width="9" opacity="0.3" filter="url(#glow)" stroke-linecap="round"/>
-  <line class="flow-line" x1="383" y1="218" x2="383" y2="382" stroke="#b6beac" stroke-width="2.4" stroke-linecap="round"/>
-  <path d="M 378.7 374.1 L 383.0 382.0 L 387.3 374.1" fill="none" stroke="#b6beac" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-  <line x1="383" y1="218" x2="560.8217612467735" y2="279.002064817804" stroke="#be8690" stroke-width="9" opacity="0.3" filter="url(#glow)" stroke-linecap="round"/>
-  <line class="flow-line" x1="383" y1="218" x2="560.8217612467735" y2="279.002064817804" stroke="#cea4ac" stroke-width="2.4" stroke-linecap="round"/>
-  <path d="M 552.0 280.5 L 560.8 279.0 L 554.8 272.4" fill="none" stroke="#cea4ac" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="51.14419360149577" y="257.39276197293174" width="230" height="92" rx="19" fill="#35d07f" opacity="0.200" filter="url(#glow)"/>
-  <rect x="56.14419360149577" y="266.39276197293174" width="220" height="82" rx="15" fill="rgba(21,83,51,0.85)"/>
-  <rect x="56.14419360149577" y="260.39276197293174" width="220" height="82" rx="15" fill="rgba(53,208,127,0.15)" stroke="rgba(53,208,127,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
-  <rect x="56.14419360149577" y="260.39276197293174" width="220" height="82" rx="15" fill="url(#sheen)"/>
-  <path d="M 71.14419360149577 261.64276197293174 H 261.1441936014958" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
-<text x="166.14419360149577" y="291.39276197293174" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="13.5" font-weight="600" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Usage poller (5h/7d</text>
-<text x="166.14419360149577" y="311.39276197293174" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="13.5" font-weight="600" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">windows)</text>
-  <rect x="268" y="383" width="230" height="92" rx="19" fill="#3aa0ff" opacity="0.200" filter="url(#glow)"/>
-  <rect x="273" y="392" width="220" height="82" rx="15" fill="rgba(23,64,102,0.85)"/>
-  <rect x="273" y="386" width="220" height="82" rx="15" fill="rgba(58,160,255,0.15)" stroke="rgba(58,160,255,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
-  <rect x="273" y="386" width="220" height="82" rx="15" fill="url(#sheen)"/>
-  <path d="M 288 387.25 H 478" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
-<text x="383" y="417" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="13.5" font-weight="600" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Switch engine (manual +</text>
-<text x="383" y="437" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="13.5" font-weight="600" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">auto)</text>
-  <rect x="484.8558063985042" y="257.39276197293174" width="230" height="92" rx="19" fill="#ffb020,#35d07f,#3aa0ff,#ff5d5d" opacity="0.200" filter="url(#glow)"/>
-  <rect x="489.8558063985042" y="266.39276197293174" width="220" height="82" rx="15" fill="rgba(50,37,102,0.85)"/>
-  <rect x="489.8558063985042" y="260.39276197293174" width="220" height="82" rx="15" fill="rgba(124,92,255,0.15)" stroke="rgba(124,92,255,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
-  <rect x="489.8558063985042" y="260.39276197293174" width="220" height="82" rx="15" fill="url(#sheen)"/>
-  <path d="M 504.8558063985042 261.64276197293174 H 694.8558063985042" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
-<text x="599.8558063985042" y="291.39276197293174" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="13.5" font-weight="600" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">CLI, TUI, and menu bar</text>
-<text x="599.8558063985042" y="311.39276197293174" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="13.5" font-weight="600" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">surfaces</text>
-  <rect x="228" y="125" width="310" height="108" rx="24" fill="#ffb020" opacity="0.310" filter="url(#glow)"/>
-  <rect x="233" y="137" width="300" height="98" rx="20" fill="rgba(102,70,13,0.85)"/>
-  <rect x="233" y="128" width="300" height="98" rx="20" fill="rgba(255,176,32,0.22)" stroke="rgba(255,176,32,0.42)" stroke-width="1.25" filter="url(#cardSh)"/>
-  <rect x="233" y="128" width="300" height="98" rx="20" fill="url(#sheen)"/>
-  <path d="M 253 129.25 H 513" stroke="rgba(255,255,255,0.14)" stroke-width="1" fill="none" stroke-linecap="round"/>
-<text x="383" y="165" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="17" font-weight="800" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">Account slots (stored</text>
-<text x="383" y="189" font-family="ui-sans-serif,system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,sans-serif" font-size="17" font-weight="800" fill="#f1f5f9" text-anchor="middle" dominant-baseline="central">tokens)</text>
-<text x="383" y="535" font-family="ui-monospace,SFMono-Regular,&quot;SF Mono&quot;,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="400" fill="#7c8aa0" text-anchor="middle">the conceptual parts a reader must hold in their head: account slots, token store,</text>
-<text x="383" y="554.5" font-family="ui-monospace,SFMono-Regular,&quot;SF Mono&quot;,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="400" fill="#7c8aa0" text-anchor="middle">usage poller, switch engine, and the interfaces that drive it</text>
+  <rect x="1" y="1" width="1108" height="588" rx="16" fill="#0d1117" stroke="#30363d"/>
+  <text class="ttl" x="40" y="48">What claude-swap plugs into</text>
+  <text class="sub" x="40" y="72">Built from the README and source: one engine, three ways to drive it, and what it works with.</text>
+
+  <!-- accounts -->
+  <text class="head" x="40" y="104">YOUR ACCOUNTS</text>
+  <g fill="#161b22" stroke="#30363d">
+    <rect x="40" y="116" width="210" height="62" rx="10"/>
+    <rect x="40" y="192" width="210" height="62" rx="10"/>
+    <rect x="40" y="268" width="210" height="62" rx="10"/>
+  </g>
+  <circle cx="64" cy="147" r="7" fill="#f85149"/><circle cx="64" cy="223" r="7" fill="#d29922"/><circle cx="64" cy="299" r="7" fill="#3fb950"/>
+  <text class="h" x="82" y="143">Account 1</text><text class="s" x="82" y="163">saved login, with its usage</text>
+  <text class="h" x="82" y="219">Account 2</text><text class="s" x="82" y="239">saved login, with its usage</text>
+  <text class="h" x="82" y="295">Account 3</text><text class="s" x="82" y="315">saved login, with its usage</text>
+  <rect x="40" y="346" width="210" height="64" rx="10" fill="none" stroke="#30363d" stroke-dasharray="4 4"/>
+  <text class="s" x="56" y="368">macOS: the Keychain</text>
+  <text class="s" x="56" y="388">Windows, Linux/WSL: files</text>
+
+  <!-- accounts -> engine -->
+  <path class="flow" stroke="#8b949e" d="M 250 147 C 290 147, 290 250, 330 250"/>
+  <path class="flow" stroke="#8b949e" d="M 250 223 C 290 223, 290 262, 330 262"/>
+  <path class="flow" stroke="#8b949e" d="M 250 299 C 290 299, 290 274, 330 274"/>
+
+  <!-- engine -->
+  <rect x="330" y="104" width="330" height="306" rx="14" fill="#161b22" stroke="#3fb950" stroke-width="1.6"/>
+  <text class="h" x="352" y="136">Auto-switch engine</text>
+  <text class="s" x="352" y="156">one engine, no screen of its own</text>
+  <g fill="#0d1117" stroke="#30363d">
+    <rect x="352" y="172" width="286" height="62" rx="10"/>
+    <rect x="352" y="256" width="286" height="62" rx="10"/>
+    <rect x="352" y="340" width="286" height="62" rx="10"/>
+  </g>
+  <circle cx="376" cy="203" r="11" fill="#58a6ff"/><text class="num" x="376" y="207" text-anchor="middle">1</text>
+  <text class="h" x="398" y="199">Poll usage</text><text class="s" x="398" y="219">each account's 5h and 7d windows, every 60s</text>
+  <circle cx="376" cy="287" r="11" fill="#d29922"/><text class="num" x="376" y="291" text-anchor="middle">2</text>
+  <text class="h" x="398" y="283">Decide</text><text class="s" x="398" y="303">90% threshold, 10-pt margin, 5-min cooldown</text>
+  <circle cx="376" cy="371" r="11" fill="#3fb950"/><text class="num" x="376" y="375" text-anchor="middle">3</text>
+  <text class="h" x="398" y="367">Swap</text><text class="s" x="398" y="387">refresh the token, hold a lock, switch</text>
+  <path d="M 495 236 L 495 254 M 489 248 L 495 255 L 501 248" stroke="#8b949e" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <path d="M 495 320 L 495 338 M 489 332 L 495 339 L 501 332" stroke="#8b949e" stroke-width="2" fill="none" stroke-linecap="round"/>
+
+  <!-- engine -> surfaces -->
+  <text class="s" x="668" y="132">one event stream</text>
+  <path class="flow" stroke="#3fb950" d="M 660 257 C 720 257, 720 156, 770 156"/>
+  <path class="flow" stroke="#3fb950" d="M 660 257 C 710 257, 730 257, 770 257"/>
+  <path class="flow" stroke="#3fb950" d="M 660 257 C 720 257, 720 358, 770 358"/>
+
+  <!-- surfaces -->
+  <text class="head" x="770" y="104">THREE WAYS TO DRIVE IT</text>
+  <g fill="#161b22" stroke="#30363d">
+    <rect x="770" y="116" width="300" height="80" rx="10"/>
+    <rect x="770" y="217" width="300" height="80" rx="10"/>
+    <rect x="770" y="318" width="300" height="80" rx="10"/>
+  </g>
+  <text class="h" x="790" y="146">Command line</text>
+  <text class="code" x="790" y="166">cswap auto</text><text class="s" x="790" y="184">readable lines, or JSON for scripts</text>
+  <text class="h" x="790" y="247">Terminal dashboard</text>
+  <text class="code" x="790" y="267">cswap</text><text class="s" x="790" y="285">live usage bars for every account</text>
+  <text class="h" x="790" y="348">Menu bar</text>
+  <text class="code" x="790" y="368">cswap menubar</text><text class="s" x="790" y="386">macOS only, optional, click to switch</text>
+
+  <!-- works with -->
+  <rect x="40" y="432" width="1030" height="130" rx="14" fill="#161b22" stroke="#30363d"/>
+  <text class="head" x="64" y="462">WORKS WITH</text>
+  <rect x="64" y="474" width="190" height="36" rx="18" fill="#12261a" stroke="#3fb950"/>
+  <text class="pill" x="159" y="497" text-anchor="middle" fill="#3fb950">✓ Claude Code CLI</text>
+  <rect x="270" y="474" width="220" height="36" rx="18" fill="#12261a" stroke="#3fb950"/>
+  <text class="pill" x="380" y="497" text-anchor="middle" fill="#3fb950">✓ VS Code extension</text>
+  <rect x="506" y="474" width="130" height="36" rx="18" fill="#2a1a12" stroke="#d29922"/>
+  <text class="pill" x="571" y="497" text-anchor="middle" fill="#d29922">✕ Codex</text>
+  <text class="s" x="652" y="497">not mentioned anywhere in the README or source</text>
+
+  <text class="head" x="64" y="538">RUNS ON</text>
+  <g fill="none" stroke="#8b949e">
+    <rect x="140" y="523" width="84" height="26" rx="13"/>
+    <rect x="236" y="523" width="96" height="26" rx="13"/>
+    <rect x="344" y="523" width="116" height="26" rx="13"/>
+  </g>
+  <text class="s" x="182" y="540" text-anchor="middle" fill="#f0f6fc">macOS</text>
+  <text class="s" x="284" y="540" text-anchor="middle" fill="#f0f6fc">Windows</text>
+  <text class="s" x="402" y="540" text-anchor="middle" fill="#f0f6fc">Linux / WSL</text>
 </svg>

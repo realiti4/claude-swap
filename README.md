@@ -14,15 +14,15 @@ Multi-account switcher for Claude Code. Easily switch between multiple Claude ac
 
 ### Architecture
 
-How claude-swap fits together: saved account slots, a usage poller (5h/7d windows) and a switch engine (manual + auto), driven from the CLI, TUI and menu bar.
+What claude-swap plugs into: your saved accounts feed one auto-switch engine (poll, decide, swap) that drives the command line, a terminal dashboard and a macOS menu bar. It works with the Claude Code CLI and the VS Code extension on macOS, Windows and Linux/WSL.
 
-![How claude-swap fits together: saved account slots, a usage poller (5h/7d windows) and a switch engine (manual + auto), driven from the CLI, TUI and menu bar.](docs/explainer/architecture.svg)
+![What claude-swap plugs into: your saved accounts feed one auto-switch engine (poll, decide, swap) that drives the command line, a terminal dashboard and a macOS menu bar. It works with the Claude Code CLI and the VS Code extension on macOS, Windows and Linux/WSL.](docs/explainer/architecture.svg)
 
 ### How it works
 
-What happens on an auto-switch: poll the active account every 60s, compare to the threshold, pick the account with the most quota left, refresh its token, then swap credentials while holding the lock.
+The moment it switches: when the account you are using crosses the threshold, claude-swap skips accounts that are not at least 10 points better, picks the one with the most headroom, and swaps to it before the old one runs dry.
 
-![What happens on an auto-switch: poll the active account every 60s, compare to the threshold, pick the account with the most quota left, refresh its token, then swap credentials while holding the lock.](docs/explainer/flow.svg)
+![The moment it switches: when the account you are using crosses the threshold, claude-swap skips accounts that are not at least 10 points better, picks the one with the most headroom, and swaps to it before the old one runs dry.](docs/explainer/flow.svg)
 
 <!-- explainmyrepo:end -->
 
