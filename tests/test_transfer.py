@@ -254,6 +254,57 @@ class TestAliasTransfer:
                 with pytest.raises(TransferError):
                     import_accounts(dst, str(out_file))
 
+    def test_import_alias_collision_across_case_drops_and_warns(self, temp_home: Path, capsys):
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="work")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 9, "existing@example.com", alias="Work")
+                import_accounts(dst, str(out_file))
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["9"]["alias"] == "Work"
+                alice = next(a for a in seq["accounts"].values() if a["email"] == "alice@example.com")
+                assert "alias" not in alice
+        assert "already used by an existing account" in capsys.readouterr().err
+
+    def test_import_keeps_the_exported_case(self, temp_home: Path):
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="Personal")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                import_accounts(dst, str(out_file))
+                (alice,) = dst._get_sequence_data()["accounts"].values()
+                assert alice["alias"] == "Personal"
+
+    def test_import_duplicate_alias_across_case_within_export_rejected(self, temp_home: Path):
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com")
+        _seed_account(src, 2, "bob@example.com")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+        envelope = json.loads(out_file.read_text())
+        envelope["accounts"][0]["alias"] = "Dev"
+        envelope["accounts"][1]["alias"] = "dev"
+        out_file.write_text(json.dumps(envelope))
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                with pytest.raises(TransferError, match="duplicate alias"):
+                    import_accounts(dst, str(out_file))
+
     def test_import_invalid_alias_format_rejected(self, temp_home: Path):
         src = _linux_switcher(temp_home)
         _seed_account(src, 1, "alice@example.com")
