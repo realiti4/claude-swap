@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -18,6 +19,20 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+# What ``claude setup-token`` grants (and what ``cswap add-token`` stores).
+# Such a token can run inference but cannot read the usage endpoint.
+SETUP_TOKEN_SCOPES = ("user:inference",)
+
+# The header probe: a 1-output-token Haiku request whose response headers
+# carry the account's unified 5h/7d utilization. Pinned to a model snapshot,
+# so it needs updating when that snapshot retires (the probe then fails with
+# http-404 and the account shows its usage as unavailable, as before).
+USAGE_PROBE_URL = "https://api.anthropic.com/v1/messages"
+USAGE_PROBE_MODEL = "claude-haiku-4-5-20251001"
+USAGE_PROBE_API_VERSION = "2023-06-01"
+# OAuth inference requests are only accepted with Claude Code's system prompt.
+USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
 _logger = logging.getLogger("claude-swap")
 
@@ -407,6 +422,111 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+def is_setup_token(oauth: dict | None) -> bool:
+    """Whether an OAuth payload is an inference-only setup-token.
+
+    ``claude setup-token`` issues a long-lived access token with no refresh
+    token and only the ``user:inference`` scope. The usage endpoint never
+    answers such a token, so its usage is read from response headers instead
+    (see :func:`request_usage_via_probe`).
+    """
+    if not isinstance(oauth, dict) or oauth.get("refreshToken"):
+        return False
+    scopes = oauth.get("scopes")
+    return isinstance(scopes, list) and set(scopes) == set(SETUP_TOKEN_SCOPES)
+
+
+# Unified rate-limit header prefix → usage API window key.
+_UNIFIED_WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
+
+
+def parse_unified_ratelimit_headers(headers) -> dict:
+    """Map ``anthropic-ratelimit-unified-*`` response headers to the raw usage
+    API shape, so :func:`build_usage_result` normalizes them unchanged.
+
+    ``-utilization`` is a 0-1 fraction (the API's ``utilization`` is a
+    percentage) and ``-reset`` is epoch seconds (the API's ``resets_at`` is
+    ISO 8601). A window with a missing or unusable utilization is left out;
+    a missing reset only drops ``resets_at``. The headers carry no per-model
+    (``limits``) windows and no ``extra_usage``.
+    """
+    data: dict = {}
+    for prefix, key in _UNIFIED_WINDOWS:
+        base = f"anthropic-ratelimit-unified-{prefix}"
+        try:
+            fraction = float(headers.get(f"{base}-utilization"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(fraction) or fraction < 0:
+            continue
+        window: dict = {"utilization": round(fraction * 100, 2)}
+        try:
+            reset_ts = float(headers.get(f"{base}-reset"))
+            if math.isfinite(reset_ts) and reset_ts > 0:
+                window["resets_at"] = datetime.fromtimestamp(
+                    reset_ts, tz=timezone.utc
+                ).isoformat()
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+        data[key] = window
+    return data
+
+
+def request_usage_via_probe(access_token: str) -> dict:
+    """Read utilization from the rate-limit headers of a minimal model request.
+
+    Every ``/v1/messages`` response carries the account's unified 5h/7d
+    utilization, and inference is the one thing a setup-token may do. The
+    request asks for a single Haiku output token. An exhausted account
+    answers 429 with the same headers, so that is read too; any response
+    without them re-raises. Returns the raw usage API shape (possibly empty).
+    """
+    body = json.dumps({
+        "model": USAGE_PROBE_MODEL,
+        "max_tokens": 1,
+        "system": USAGE_PROBE_SYSTEM,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "anthropic-version": USAGE_PROBE_API_VERSION,
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(
+        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return parse_unified_ratelimit_headers(resp.headers)
+    except urllib.error.HTTPError as e:
+        data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}
+        if e.code == 429 and data:
+            return data
+        raise
+
+
+def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
+    """Usage from the header probe, classified like an endpoint fetch."""
+    try:
+        data = request_usage_via_probe(access_token)
+    except Exception as e:
+        kind, retry_after = _classify_usage_error(e)
+        cause = kind if retry_after is None else f"{kind}, retry-after {retry_after:.0f}s"
+        _logger.warning("Usage header probe failed %s: %s", context, cause)
+        _logger.debug("Usage header probe failure detail %s: %r", context, e)
+        return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+    usage = build_usage_result(data)
+    if usage is None:
+        _logger.warning(
+            "Usage header probe %s: response carried no rate-limit headers",
+            context,
+        )
+        return UsageOutcome(None, error="bad-response")
+    return UsageOutcome(usage)
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
@@ -635,6 +755,10 @@ _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
 )
 
+# Usage-endpoint refusals after which a setup-token falls back to the header
+# probe. Anything else (timeouts, 5xx) is not specific to the token kind.
+_PROBE_FALLBACK_CODES = frozenset({401, 403, 429})
+
 
 def try_fetch_usage_for_account(
     account_num: str,
@@ -643,6 +767,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
+    header_probe: bool = False,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -652,6 +777,11 @@ def try_fetch_usage_for_account(
     freshest copy under the slot lock, persists via fingerprint CAS, and
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
+
+    ``header_probe`` lets a setup-token credential (see
+    :func:`is_setup_token`) whose usage request is refused fall back to
+    :func:`request_usage_via_probe`. It replaces the failed request, so the
+    caller's poll plan and backoff pace it exactly like an endpoint fetch.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -707,6 +837,20 @@ def try_fetch_usage_for_account(
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
+        if (
+            header_probe
+            and e.code in _PROBE_FALLBACK_CODES
+            and is_setup_token(oauth)
+        ):
+            # Measured: the usage endpoint answers setup-tokens 429 even on a
+            # first request (others have reported 401/403). Not a budget
+            # signal for these tokens, so no warning and no 429 stamp — the
+            # probe's own outcome is what gets recorded.
+            _logger.debug(
+                "Usage endpoint answered %s %s; reading usage from a header "
+                "probe instead", kind, context,
+            )
+            return _usage_from_probe(access_token, context)
         if (
             e.code != 401
             or is_active
