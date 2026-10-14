@@ -163,18 +163,24 @@ class ActiveCredentials(NamedTuple):
     degraded: bool = False
 
 
+# Console API keys. User-scoped ``sk-ant-usr`` keys authenticate as ``x-api-key``
+# exactly like ``sk-ant-api`` ones and, like them, have no subscription usage.
+API_KEY_PREFIXES = ("sk-ant-api", "sk-ant-usr")
+
+
 def looks_like_api_key(credentials: str | None) -> bool:
     """Whether a stored active credential is a raw managed API key vs OAuth JSON.
 
-    Strict on purpose: a managed key is a bare ``sk-ant-api…`` string, while every
-    OAuth/setup-token credential is a JSON object (``{"claudeAiOauth": …}``). Requiring
-    the ``sk-ant-api`` prefix (and that it isn't JSON) keeps a raw/garbled
-    ``sk-ant-oat…`` setup token from ever being misclassified as an API key.
+    Strict on purpose: a managed key is a bare ``sk-ant-api…`` (or user-scoped
+    ``sk-ant-usr…``) string, while every OAuth/setup-token credential is a JSON
+    object (``{"claudeAiOauth": …}``). Requiring an API-key prefix (and that it
+    isn't JSON) keeps a raw/garbled ``sk-ant-oat…`` setup token from ever being
+    misclassified as an API key.
     """
     if not credentials:
         return False
     text = credentials.strip()
-    return text.startswith("sk-ant-api") and not text.startswith("{")
+    return text.startswith(API_KEY_PREFIXES) and not text.startswith("{")
 
 
 def _credential_object(credentials: str | None) -> dict | None:

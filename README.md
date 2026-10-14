@@ -356,7 +356,7 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
-or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+or a managed API key (`sk-ant-api...` / `sk-ant-usr...`) and you don't want to log in via the browser
 flow first — useful on headless servers or when receiving a token from another
 machine — register it directly. The token type is auto-detected:
 
@@ -371,7 +371,7 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
-**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
+**API-key accounts.** An `sk-ant-api...` (or user-scoped `sk-ant-usr...`) value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth
 setup-token. It switches like any other account; since API keys have no subscription
 quota, they show no usage and the usage-aware `switch` strategies never skip them as

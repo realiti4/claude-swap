@@ -75,6 +75,10 @@ class TestKindDetection:
     def test_api_key_detected(self):
         assert looks_like_api_key(API_KEY) is True
 
+    def test_user_scoped_api_key_detected(self):
+        # Console user-scoped keys authenticate as x-api-key just like sk-ant-api.
+        assert looks_like_api_key("sk-ant-usr01-" + "x" * 80) is True
+
     @pytest.mark.parametrize(
         "value",
         [
