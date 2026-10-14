@@ -21,7 +21,11 @@ import os
 import platform
 import plistlib
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
@@ -99,6 +103,7 @@ class MenuBarSettings:
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
+    show_usage_bars: bool = True  # draw each account as a panel of usage bars
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -285,9 +290,13 @@ def format_account_label(
     fetched_at: float | None = None,
 ) -> str:
     """Build one account row's menu label."""
-    label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    return f"{num}  {account_identity(email, alias)}{marker}  {usage_summary(usage, now, fetched_at)}"
+
+
+def account_identity(email: str, alias: str | None = None) -> str:
+    """How an account names itself in a menu row: ``alias  (email)`` or the email."""
+    return f"{alias}  ({email})" if alias else email
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -386,6 +395,21 @@ def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> li
         stamp = line.split(" - ", 1)[0].strip()[:16]  # "YYYY-MM-DD HH:MM"
         out.append(f"{m.group(1)} → {m.group(2)}   {stamp}")
     return out[-limit:][::-1]
+
+
+def purge_menu_callbacks(registry: dict, nsmenu) -> None:
+    """Drop every native item of ``nsmenu`` (and its submenus) from ``registry``.
+
+    ``registry`` is rumps' process-global ``NSApp._ns_to_py_and_callback``,
+    which ``Menu.clear()`` never prunes; see ``rebuild_menu``. Items whose
+    content is a custom view (the usage-bar panels) are ordinary entries of
+    ``itemArray()``, so they are covered the same way.
+    """
+    for item in nsmenu.itemArray():
+        registry.pop(item, None)
+        sub = item.submenu()
+        if sub is not None:
+            purge_menu_callbacks(registry, sub)
 
 
 def _account_display_usage(entry) -> dict | str | None:
@@ -516,6 +540,393 @@ def framework_build_warning(
     )
 
 
+# ---- open dashboard -------------------------------------------------------------
+#
+# A menu can only show rows of text; the Textual dashboard (``cswap watch``)
+# already draws the usage bars, so the menu bar opens it in a Terminal window
+# rather than re-implementing it. It writes a small launcher script under the
+# backup directory and asks Terminal to open that file: no command line passes
+# through the login shell's quoting, and ``open`` needs no Automation
+# permission.
+
+DASHBOARD_NAMES: tuple[str, ...] = ("cswap", "claude-swap")
+# One launcher file per click, named by mkstemp: two menu bars sharing a
+# backup directory can never overwrite each other's script. The name is
+# "open-dashboard.<pid>.<random>.command", where <pid> is the menu bar that
+# created it, so a later sweep can tell whose file it is without a clock.
+DASHBOARD_SCRIPT_PREFIX = "open-dashboard."
+DASHBOARD_SCRIPT_SUFFIX = ".command"
+TERMINAL_BUNDLE_ID = "com.apple.Terminal"  # by id, so a renamed Terminal.app resolves
+OPEN_TIMEOUT = 30  # seconds
+
+
+def _is_package_main(path: str) -> bool:
+    """True when ``path`` is this package's ``__main__.py`` (a ``-m`` launch)."""
+    return (
+        os.path.basename(path) == "__main__.py"
+        and os.path.basename(os.path.dirname(path)) == "claude_swap"
+    )
+
+
+def dashboard_executable(
+    argv0: str | None = None,
+    which=shutil.which,
+    python: str = sys.executable,
+) -> list[str]:
+    """Argv for the watch dashboard, using the cswap that launched this process.
+
+    Reusing the launching executable keeps pipx, uv tool, and venv installs on
+    their own build instead of whatever ``cswap`` happens to be first on PATH.
+    Order: the launching console script; a ``python -m claude_swap`` launch
+    (the same interpreter, before PATH can pick another install); PATH; and
+    finally the current interpreter. Every result is absolute, because
+    Terminal starts the command in the user's home directory, not our cwd.
+    """
+    arg = sys.argv[0] if argv0 is None else argv0
+    if arg and os.path.basename(arg) in DASHBOARD_NAMES:
+        if os.path.dirname(arg):
+            return [os.path.abspath(arg), "watch"]
+        found = which(arg)  # bare name: abspath would anchor it to the cwd
+        if found:
+            return [os.path.abspath(found), "watch"]
+    if arg and _is_package_main(arg):
+        return [python, "-m", "claude_swap", "watch"]
+    for name in DASHBOARD_NAMES:
+        found = which(name)
+        if found:
+            return [os.path.abspath(found), "watch"]
+    return [python, "-m", "claude_swap", "watch"]
+
+
+# Environment variables that decide which profile, data directory, and copy of
+# the package the dashboard runs with. The dashboard starts in a fresh Terminal
+# shell whose rc files may export their own values, so each key is pinned to
+# the menu bar's state: set to its value when the menu bar has it (even when
+# empty), removed when it does not. Nothing else from the environment is
+# touched. PYTHONPATH keeps a checkout-run ``python -m`` install importable.
+# HOME is here because the account store (~/.claude-swap-backup) and, with
+# CLAUDE_CONFIG_DIR unset, the default profile both resolve through it; a
+# menu bar started with another HOME than Terminal's login shell would
+# otherwise open a different store. The launcher's own ``cd`` uses the
+# absolute working directory, so nothing in the script depends on HOME.
+DASHBOARD_ENV_KEYS: tuple[str, ...] = (
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "XDG_DATA_HOME",
+    "PYTHONPATH",
+    "HOME",
+)
+
+# macOS's BSD env supports ``-u`` (checked: ``env -u HOME env`` prints no
+# HOME=).
+ENV_PROGRAM = "/usr/bin/env"
+
+DASHBOARD_CWD_GONE = (
+    "The menu bar's working directory no longer exists; restart the menu bar."
+)
+
+
+def dashboard_env(environ=None) -> dict[str, str | None]:
+    """Each of DASHBOARD_ENV_KEYS mapped to its value, or None when unset.
+
+    Values are never rewritten: the keychain service name is derived from the
+    exact CLAUDE_CONFIG_DIR string, so absolutizing a relative value would
+    make the dashboard read a different credential. A relative value keeps its
+    meaning because the dashboard starts in the menu bar's working directory.
+    """
+    source = os.environ if environ is None else environ
+    return {key: source.get(key) for key in DASHBOARD_ENV_KEYS}
+
+
+def dashboard_cwd(getcwd=os.getcwd) -> str | None:
+    """The menu bar's working directory, or None if it no longer exists.
+
+    None means the dashboard must not be opened: without the cd, relative
+    profile and PYTHONPATH values would resolve somewhere else.
+    """
+    try:
+        return getcwd()
+    except OSError:
+        return None
+
+
+_PAUSE = (
+    "printf '%s\\n' 'Press Return to close this window.' >&2\n"
+    "read -r _ || :\n"
+)
+
+
+def _indent(text: str, prefix: str) -> str:
+    return "".join(prefix + line + "\n" for line in text.splitlines())
+
+
+def dashboard_script(
+    cmd: list[str],
+    env: dict[str, str | None] | None,
+    cwd: str,
+) -> str:
+    """The launcher script Terminal runs to open the dashboard.
+
+    It deletes itself first (the shell keeps reading its open copy), enters
+    the menu bar's working directory, and runs ``env -u ... K=v ... <cmd>``
+    in the foreground. It does not ``exec``: it stays behind so that when
+    the dashboard cannot start or exits with an error, it can say so. Both
+    that case and a directory Terminal cannot enter (a privacy-protected
+    folder, say) print a message and wait for Return, because Terminal runs
+    the file as ``<file> ; exit;`` and a profile set to close the window when
+    the shell exits would otherwise hide it. The script never calls ``exit``.
+
+    The status variable is not named ``status``: that is read-only in zsh.
+
+    env takes its first ``NAME=value`` operand as an assignment, so a program
+    path containing ``=`` is run through ``/bin/sh -c 'exec "$0" "$@"'``
+    rather than being env's utility operand.
+    """
+    argv = list(cmd)
+    if env:
+        unset = [key for key, value in env.items() if value is None]
+        assigned = [f"{key}={value}" for key, value in env.items() if value is not None]
+        if "=" in argv[0]:
+            argv = ["/bin/sh", "-c", 'exec "$0" "$@"', *argv]
+        argv = [ENV_PROGRAM, *(arg for key in unset for arg in ("-u", key)), *assigned, *argv]
+    cd_message = (
+        f"cswap: cannot open the dashboard from {cwd} "
+        "(Terminal may not have access to it). Run: cswap watch"
+    )
+    return (
+        "#!/bin/sh\n"
+        'rm -f -- "$0"\n'
+        f"if cd {shlex.quote(cwd)}; then\n"
+        f"    {' '.join(shlex.quote(part) for part in argv)}\n"
+        "    dashboard_status=$?\n"
+        '    if [ "$dashboard_status" -ne 0 ]; then\n'
+        "        printf '%s\\n' \"cswap: the dashboard exited with status"
+        " $dashboard_status. Run: cswap watch\" >&2\n"
+        + _indent(_PAUSE, "        ")
+        + "    fi\n"
+        "else\n"
+        f"    printf '%s\\n' {shlex.quote(cd_message)} >&2\n"
+        + _indent(_PAUSE, "    ")
+        + "fi\n"
+    )
+
+
+def create_dashboard_script(directory: Path, text: str) -> Path:
+    """Write ``text`` to a new, uniquely named owner-only executable.
+
+    mkstemp picks a name no other creation collides with, so the name is
+    never reused across launches: one menu bar's click cannot overwrite the
+    script another click (or another menu bar sharing the backup directory)
+    is about to run. On any failure the file is removed.
+    """
+    fd, name = tempfile.mkstemp(
+        dir=directory,
+        prefix=f"{DASHBOARD_SCRIPT_PREFIX}{os.getpid()}.",
+        suffix=DASHBOARD_SCRIPT_SUFFIX,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(name, 0o700)
+    except BaseException:
+        _remove_quietly(name)
+        raise
+    return Path(name)
+
+
+PID_MAX = 2**31 - 1  # pid_t is a signed 32-bit int
+
+
+def _launcher_pid(name: str) -> int | None:
+    """The creating pid from a launcher script name, or None if it has none.
+
+    Only plain ASCII digits up to PID_MAX count; anything else is not a pid
+    this sweep can reason about.
+    """
+    if not (name.startswith(DASHBOARD_SCRIPT_PREFIX) and name.endswith(DASHBOARD_SCRIPT_SUFFIX)):
+        return None
+    segment = name[len(DASHBOARD_SCRIPT_PREFIX):].split(".", 1)[0]
+    if not (segment.isascii() and segment.isdigit()):
+        return None
+    pid = int(segment)
+    return pid if pid <= PID_MAX else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this pid exists. Unknown counts as alive."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: it exists but belongs to someone else
+        return True
+    except (OverflowError, ValueError):  # not representable as a pid_t
+        return True
+    return True
+
+
+def sweep_stale_dashboard_scripts(directory: Path) -> int:
+    """Delete launcher scripts left by menu bars that are no longer running.
+
+    A script normally deletes itself when Terminal runs it, but ``open`` can
+    succeed while Terminal never runs the file (quit mid-launch, a cancelled
+    dialog), and the menu bar that made it may then quit. Each name carries
+    the creating pid; a file is removed only when that process is gone, so a
+    running instance's pending launch is never touched, whatever the clock
+    does. Names without a parsable pid, and anything that is not a regular
+    file, are left alone. Returns how many were removed. Never raises: an
+    unexpected error on one entry is logged at debug and the sweep goes on.
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except Exception:  # OSError for a missing directory; anything else too
+        return 0
+    removed = 0
+    for entry in entries:
+        try:
+            pid = _launcher_pid(entry.name)
+            if pid is None or not entry.is_file(follow_symlinks=False):
+                continue
+            if not _pid_alive(pid):
+                os.unlink(entry.path)
+                removed += 1
+        except OSError:
+            continue
+        except Exception:
+            # One odd entry must never block the launch that is sweeping.
+            logging.getLogger("claude-swap").debug(
+                "Skipped launcher %s during sweep", entry.name, exc_info=True
+            )
+            continue
+    return removed
+
+
+def _remove_quietly(path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def open_dashboard_terminal(
+    cmd: list[str],
+    script_dir: Path,
+    cwd: str,
+    env: dict[str, str | None] | None = None,
+    run=None,
+    create=create_dashboard_script,
+) -> tuple[bool, str]:
+    """Write a launcher script and open it in Terminal. Returns (ok, message).
+
+    Never raises. When ``open`` fails, nothing will run the script, so it is
+    removed here; otherwise the script removes itself. ``run`` defaults to
+    ``subprocess.run``, looked up at call time.
+    """
+    try:
+        script_path = create(script_dir, dashboard_script(cmd, env=env, cwd=cwd))
+    except OSError as exc:
+        return False, f"Could not write the dashboard launcher script: {exc}"
+    run = run or subprocess.run
+    try:
+        proc = run(
+            ["open", "-b", TERMINAL_BUNDLE_ID, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=OPEN_TIMEOUT,
+        )
+    except FileNotFoundError:
+        _remove_quietly(script_path)
+        return False, "the open command was not found"
+    except subprocess.TimeoutExpired:
+        _remove_quietly(script_path)
+        return False, f"open did not finish within {OPEN_TIMEOUT}s"
+    except OSError as exc:
+        _remove_quietly(script_path)
+        return False, f"open failed to start: {exc}"
+    if proc.returncode != 0:
+        _remove_quietly(script_path)
+        reason = (proc.stderr or "").strip().splitlines()
+        return False, (reason[-1][:200] if reason else f"open exited with status {proc.returncode}")
+    return True, "Opened dashboard in Terminal"
+
+
+def _open_dashboard_from_here(script_dir: Path) -> tuple[bool, str]:
+    """Open the dashboard with this process's install, profile, and cwd.
+
+    Runs on the launcher's worker thread. Stale scripts from launches
+    Terminal never ran are swept first, before this launch creates its own.
+    """
+    sweep_stale_dashboard_scripts(script_dir)
+    cwd = dashboard_cwd()
+    if cwd is None:
+        return False, DASHBOARD_CWD_GONE  # fail closed rather than drop the cd
+    return open_dashboard_terminal(
+        dashboard_executable(), script_dir, cwd, env=dashboard_env()
+    )
+
+
+class DashboardLauncher:
+    """Opens the dashboard on a worker thread so the menu never freezes.
+
+    rumps runs click handlers on the main thread, so writing the launcher
+    script and waiting on ``open`` (up to OPEN_TIMEOUT) inline would stall
+    every menu action and timer. Mirrors the refresh
+    worker: an in-flight flag drops repeat clicks, the worker only rebinds a
+    plain attribute, and the main-thread sync tick collects any failure with
+    :meth:`take_error` to show it.
+    """
+
+    def __init__(self, logger, script_dir=None, open_fn=None, start_thread=None):
+        self._logger = logger
+        if open_fn is None:
+            if script_dir is None:
+                raise ValueError("DashboardLauncher needs script_dir or open_fn")
+            script_dir = Path(script_dir)
+            open_fn = lambda: _open_dashboard_from_here(script_dir)  # noqa: E731
+        self._open = open_fn
+        self._start_thread = start_thread or (
+            lambda target: threading.Thread(target=target, daemon=True).start()
+        )
+        self._lock = threading.Lock()
+        self._error: str | None = None
+        self.in_flight = False
+
+    def start(self) -> bool:
+        """Begin opening the dashboard; False if an open is already running."""
+        if self.in_flight:
+            return False
+        self.in_flight = True
+        try:
+            self._start_thread(self._run)
+        except Exception as exc:
+            self.in_flight = False
+            self._fail(str(exc) or type(exc).__name__)
+        return True
+
+    def _run(self) -> None:
+        try:
+            try:
+                ok, message = self._open()
+            except Exception as exc:  # the helper returns errors; this is a backstop
+                ok, message = False, str(exc) or type(exc).__name__
+            if not ok:
+                self._fail(message)
+        finally:
+            self.in_flight = False
+
+    def _fail(self, message: str) -> None:
+        self._logger.warning("Could not open dashboard: %s", message)
+        with self._lock:
+            self._error = message
+
+    def take_error(self) -> str | None:
+        """Return and clear the pending failure message (main thread)."""
+        with self._lock:
+            error, self._error = self._error, None
+        return error
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -547,6 +958,18 @@ def run(switcher) -> int:
         AppKit.NSApplicationActivationPolicyAccessory
     )
 
+    create_app(switcher).run()
+    return 0
+
+
+def create_app(switcher):
+    """Build the menu bar app for ``switcher`` without starting its event loop.
+
+    ``run`` starts it; tests drive the returned app directly (rebuilds, the
+    sync tick, panel activation) with a fake switcher.
+    """
+    import rumps
+
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
@@ -577,6 +1000,15 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            self._dashboard = DashboardLauncher(switcher._logger, switcher.backup_dir)
+            # Native menu support (usage panels, deferred rebuilds). The
+            # target and the delegate live as long as the app; rebuilds
+            # never replace them.
+            self._menu_open = False
+            self._rebuild_pending = False  # a rebuild waiting for the menu to close
+            self._bars_broken = False  # a panel failed to draw: text rows this session
+            self._account_target = None
+            self._setup_native_menu()
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -624,7 +1056,7 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at, *_extra in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -637,11 +1069,14 @@ def run(switcher) -> int:
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
-            if self._dirty:
+            if self._dirty or (self._rebuild_pending and not self._menu_open):
                 self._dirty = False
-                self.rebuild_menu()
+                self.rebuild_menu()  # defers again by itself while the menu is open
             self._detect_active_change()
             self._drain_engine_events()
+            dashboard_error = self._dashboard.take_error()
+            if dashboard_error:
+                rumps.notification("claude-swap", "Could not open dashboard", dashboard_error)
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -733,11 +1168,20 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
+            if self._menu_open:
+                # Rebuilding purges the rumps callbacks of the items on
+                # screen and swaps rows under the pointer; wait for close.
+                self._rebuild_pending = True
+                return
+            self._rebuild_pending = False
+            # Read once: a worker refresh can replace self.snapshot at any
+            # moment, and every part of this menu must describe one snapshot.
+            snap = self.snapshot
             self.title = format_title(
-                self.snapshot["active_email"],
-                self.snapshot["active_usage"],
+                snap["active_email"],
+                snap["active_usage"],
                 self.settings,
-                alias=self.snapshot.get("active_alias"),
+                alias=snap.get("active_alias"),
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -751,37 +1195,22 @@ def run(switcher) -> int:
             # it, degrade to "leaks again" rather than crashing on every rebuild.
             _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
             if _reg is not None:
-                def _purge(nsmenu):
-                    for _it in nsmenu.itemArray():
-                        _reg.pop(_it, None)
-                        _sub = _it.submenu()
-                        if _sub is not None:
-                            _purge(_sub)
-                _purge(self.menu._menu)
+                purge_menu_callbacks(_reg, self.menu._menu)
             self.menu.clear()
-            account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
-                item = rumps.MenuItem(
-                    format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
-                    ),
-                    callback=self._make_switch_to(num),
-                )
-                item.state = 1 if is_active else 0
-                account_items.append(item)
-            if not account_items:
-                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+            account_items = self._account_items(snap)
 
             self.menu = [
                 *account_items,
+                None,
+                rumps.MenuItem("Open dashboard…", callback=self.on_open_dashboard),
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._switch(None)),
                 rumps.MenuItem("Switch to best", callback=self._switch("best")),
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
-                self._disable_menu(rumps),
-                self._remove_menu(rumps),
+                self._disable_menu(rumps, snap),
+                self._remove_menu(rumps, snap),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
@@ -790,6 +1219,98 @@ def run(switcher) -> int:
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
 
+        def _account_items(self, snap):
+            """One row per account: a text row, drawn as a usage panel when enabled."""
+            rows = []  # (account number, item)
+            for num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra in snap["accounts"]:
+                item = rumps.MenuItem(
+                    format_account_label(
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                    ),
+                    callback=self._make_switch_to(num),
+                )
+                item.state = 1 if is_active else 0
+                rows.append((num, item))
+            if not rows:
+                return [rumps.MenuItem("No managed accounts", callback=None)]
+            if (
+                self.settings.show_usage_bars
+                and not self._bars_broken
+                and self._account_target is not None
+            ):
+                self._attach_usage_bars(rows, snap["accounts"])
+            return [item for _num, item in rows]
+
+        def _attach_usage_bars(self, rows, accounts):
+            """Draw every account row as a usage panel, or leave them all as text.
+
+            Panels are paired with rows by account number. Any failure here
+            (building, attaching, installing the delegate) is rolled back by
+            ``attach_usage_panels`` to the exact text rows.
+            """
+            try:
+                from claude_swap import menubar_panel_view as pv
+                from claude_swap.menubar_panel import build_account_panel
+
+                now = time.time()
+                panels = {entry[0]: build_account_panel(entry, now) for entry in accounts}
+                pv.attach_usage_panels(
+                    [(item, panels[num]) for num, item in rows],
+                    target=self._account_target,
+                    on_draw_failure=self._panel_draw_failed,
+                    after_attach=self._install_menu_delegate,
+                )
+            except Exception:
+                self.switcher._logger.debug("usage bars unavailable; showing text rows", exc_info=True)
+
+        def _setup_native_menu(self):
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                self._account_target = pv.make_account_target(
+                    self._activate_account,
+                    is_open=lambda: self._menu_open,
+                    menu=self.menu._menu,
+                )
+                self._install_menu_delegate()
+            except Exception:
+                self.switcher._logger.debug("native menu support unavailable", exc_info=True)
+
+        def _install_menu_delegate(self):
+            from claude_swap import menubar_panel_view as pv
+
+            pv.install_menu_delegate(
+                self.menu._menu, on_open=self._menu_will_open, on_close=self._menu_did_close
+            )
+
+        def _menu_will_open(self):
+            self._menu_open = True
+
+        def _menu_did_close(self):
+            self._menu_open = False  # a pending rebuild runs on the next sync tick
+
+        def _activate_account(self, num):
+            """Switch for a usage panel, checked against the snapshot current now.
+
+            The panel was drawn from an earlier snapshot; the account may have
+            been removed since, in which case nothing is switched.
+            """
+            if not any(str(entry[0]) == num for entry in self.snapshot["accounts"]):
+                self.switcher._logger.info(
+                    "Menu bar: account %s is no longer listed; not switching", num
+                )
+                return
+            self._make_switch_to(num)(None)
+
+        def _panel_draw_failed(self):
+            # Called from inside a panel's drawRect_ error handler.
+            if not self._bars_broken:
+                self._bars_broken = True
+                self.switcher._logger.warning(
+                    "Menu bar usage bars failed to draw; showing text rows", exc_info=True
+                )
+            self._rebuild_pending = True
+
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
@@ -797,22 +1318,22 @@ def run(switcher) -> int:
                 menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
             return menu
 
-        def _remove_menu(self, rumps):
+        def _remove_menu(self, rumps, snap):
             menu = rumps.MenuItem("Remove account")
-            accounts = self.snapshot["accounts"]
+            accounts = snap["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, *_extra in accounts:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
 
-        def _disable_menu(self, rumps):
+        def _disable_menu(self, rumps, snap):
             menu = rumps.MenuItem("Disable / enable account")
-            accounts = self.snapshot["accounts"]
+            accounts = snap["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at, *_extra in accounts:
                 name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
@@ -859,6 +1380,10 @@ def run(switcher) -> int:
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
+
+            bars_item = rumps.MenuItem("Show usage bars", callback=self.on_toggle_usage_bars)
+            bars_item.state = 1 if self.settings.show_usage_bars else 0
+            menu.add(bars_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -976,6 +1501,10 @@ def run(switcher) -> int:
             target = log_path if log_path.exists() else log_path.parent
             subprocess.run(["open", "-R", str(target)], check=False)
 
+        def on_open_dashboard(self, _sender):
+            # Opens on a worker thread; a failure surfaces via on_sync_tick.
+            self._dashboard.start()
+
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:
                 rumps.alert(title="claude-swap",
@@ -1012,6 +1541,12 @@ def run(switcher) -> int:
 
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
+            self._save_and_rebuild()
+
+        def on_toggle_usage_bars(self, _sender):
+            self.settings.show_usage_bars = not self.settings.show_usage_bars
+            if self.settings.show_usage_bars:
+                self._bars_broken = False  # asked for again: try drawing them again
             self._save_and_rebuild()
 
         def _make_title_pct(self, mode):
@@ -1052,5 +1587,4 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             return cb
 
-    MenuBarApp().run()
-    return 0
+    return MenuBarApp()
