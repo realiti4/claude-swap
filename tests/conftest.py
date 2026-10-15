@@ -488,6 +488,26 @@ def _make_fake_keyring() -> types.ModuleType:
     return mod
 
 
+# Every variable that can hand a child an outbound hop. The suite forwards
+# `os.environ` into its doubles and pytest prints whatever a failing assertion
+# touched, so an operator behind an authenticated proxy publishes that
+# credential on the first unrelated red case. cswap reads none of these names,
+# so the removal costs nothing.
+def outbound_hop_names(env):
+    """Every name in ``env`` that urllib would read as an outbound hop.
+
+    BY SHAPE, NOT BY A LIST. ``urllib.request.getproxies()`` treats any
+    ``<scheme>_proxy`` as a hop and the default opener builds its
+    ``ProxyHandler`` from that, so the set is open-ended. A hand-written tuple
+    of the eight common names goes stale the first time an operator's network
+    needs SOCKS or FTP -- and what it misses is not a flag, it is a URL that can
+    carry ``user:secret@host``.
+
+    The suffix is exact rather than a substring: ``PROXY_MODE`` is not a hop.
+    """
+    return sorted(k for k in env if k.lower().endswith("_proxy"))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     """Safety net: no test may read or write the developer's real ``$HOME``.
@@ -515,6 +535,8 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    for _hop in outbound_hop_names(os.environ):
+        monkeypatch.delenv(_hop, raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
     if "tmp_keychain" in request.fixturenames:

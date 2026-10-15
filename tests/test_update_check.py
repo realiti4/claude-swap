@@ -11,9 +11,17 @@ import pytest
 from claude_swap.update_check import (
     CACHE_TTL,
     _detect_install_method,
+    _is_editable_install,
     check_for_update,
     run_self_upgrade,
 )
+
+
+@pytest.fixture(autouse=True)
+def _not_editable_by_default(monkeypatch):
+    """The dev/test environment installs claude-swap as an editable checkout;
+    default every test to a non-editable stub unless it overrides this."""
+    monkeypatch.setattr("claude_swap.update_check._is_editable_install", lambda: False)
 
 
 def _make_pypi_response(version: str) -> MagicMock:
@@ -349,3 +357,73 @@ class TestRunSelfUpgradeWindows:
         assert "uv tool upgrade claude-swap" in err
         assert "pipx upgrade claude-swap" in err
         assert "pip install --upgrade claude-swap" in err
+
+
+class TestIsEditableInstall:
+    def test_editable_direct_url_returns_true(self, monkeypatch):
+        mock_dist = MagicMock()
+        mock_dist.read_text.return_value = json.dumps(
+            {"url": "file:///repo", "dir_info": {"editable": True}}
+        )
+        monkeypatch.setattr(
+            "claude_swap.update_check.distribution", lambda name: mock_dist
+        )
+        assert _is_editable_install() is True
+
+    def test_non_editable_direct_url_returns_false(self, monkeypatch):
+        mock_dist = MagicMock()
+        mock_dist.read_text.return_value = json.dumps({"url": "file:///repo"})
+        monkeypatch.setattr(
+            "claude_swap.update_check.distribution", lambda name: mock_dist
+        )
+        assert _is_editable_install() is False
+
+    def test_missing_direct_url_returns_false(self, monkeypatch):
+        mock_dist = MagicMock()
+        mock_dist.read_text.return_value = None
+        monkeypatch.setattr(
+            "claude_swap.update_check.distribution", lambda name: mock_dist
+        )
+        assert _is_editable_install() is False
+
+    def test_garbled_direct_url_returns_false(self, monkeypatch):
+        mock_dist = MagicMock()
+        mock_dist.read_text.return_value = "{not json"
+        monkeypatch.setattr(
+            "claude_swap.update_check.distribution", lambda name: mock_dist
+        )
+        assert _is_editable_install() is False
+
+    def test_distribution_not_found_returns_false(self, monkeypatch):
+        from importlib.metadata import PackageNotFoundError
+
+        def raise_not_found(name):
+            raise PackageNotFoundError(name)
+
+        monkeypatch.setattr("claude_swap.update_check.distribution", raise_not_found)
+        assert _is_editable_install() is False
+
+
+class TestCheckForUpdateEditable:
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_editable_install_suppresses_nag(self, mock_urlopen, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr("claude_swap.update_check._is_editable_install", lambda: True)
+        mock_urlopen.return_value = _make_pypi_response("99.0.0")
+
+        result = check_for_update("0.3.2")
+
+        assert result is None
+        mock_urlopen.assert_not_called()
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_non_editable_install_still_nags(self, mock_urlopen, tmp_path, monkeypatch):
+        # CONTROL: same setup, editable off, nag still fires.
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr("claude_swap.update_check._is_editable_install", lambda: False)
+        mock_urlopen.return_value = _make_pypi_response("99.0.0")
+
+        result = check_for_update("0.3.2")
+
+        assert result is not None
+        assert "99.0.0" in result
