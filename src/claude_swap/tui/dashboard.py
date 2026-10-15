@@ -96,7 +96,7 @@ class DashboardScreen(Screen):
         entries: MenuEntries = [
             (
                 f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
-                f"  [{acc.display_tag}]",
+                + (f"  [{acc.display_tag}]" if self.app.tag_shown(acc) else ""),
                 f"remove:{acc.number}",
             )
             for acc in (snap.accounts if snap else ())

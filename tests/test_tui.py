@@ -662,6 +662,16 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "pace" not in mini_account_text(acc, now).plain
 
+    @pytest.mark.parametrize("show", [True, False])
+    def test_org_tag_follows_show_tag(self, show):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        acc = dataclasses.replace(make_account(1, active=True), org_name="acme")
+        card = account_card_text(acc, 80, show_tag=show).plain
+        mini = mini_account_text(acc, time.time(), show_tag=show).plain
+        assert ("[acme]" in card) is show
+        assert ("[acme]" in mini) is show
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
@@ -866,6 +876,49 @@ class TestDashboard:
                 item.query_one(Static).render().plain for item in menu.query(MenuItem)
             ]
             assert any("[red]" in label for label in labels)
+
+    @pytest.mark.parametrize("show", [True, False])
+    async def test_org_tag_setting_keeps_tag_only_on_shared_email_in_menus(
+        self, tmp_path, show
+    ):
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import AccountCard, AccountsPanel, MenuItem
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"ui": {"showOrgTag": show}})
+        )
+        accounts = [
+            dataclasses.replace(
+                make_account(n, active=n == 1, email=email), org_name=org
+            )
+            for n, email, org in (
+                (1, "dup@example.com", "orgA"),
+                (2, "dup@example.com", "orgB"),
+                (3, "solo@example.com", "solo"),
+            )
+        ]
+        app = make_app(FakeSwitcher(accounts, tmp_path))
+
+        def tags(text: str) -> set[str]:
+            return {o for o in ("orgA", "orgB", "solo") if f"[{o}]" in text}
+
+        everywhere = {"orgA", "orgB", "solo"}
+        menus = everywhere if show else {"orgA", "orgB"}
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert tags(panel) == (everywhere if show else set())
+            await menu_select(pilot, "remove-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            labels = " ".join(
+                item.query_one(Static).render().plain for item in menu.query(MenuItem)
+            )
+            assert tags(labels) == menus
+            await pilot.press("escape", "s")
+            await pilot.pause()
+            cards = " ".join(c.render().plain for c in app.screen.query(AccountCard))
+            assert tags(cards) == menus
 
     async def test_back_menu_entry_pops_submenu(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
