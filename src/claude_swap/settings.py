@@ -44,6 +44,13 @@ class AutoSwitchSettings:
     """
 
     threshold: float = 90.0
+    # Per-window overrides; ``None`` = fall back to ``threshold``, so a config
+    # that sets neither behaves exactly as it did before. The two windows want
+    # opposite values: quota not spent before a WEEKLY reset is gone for good,
+    # so that window wants an aggressive line, while overshooting the 5h window
+    # costs one interrupted turn and the window recycles in hours.
+    threshold_five_hour: float | None = None
+    threshold_weekly: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -104,7 +111,15 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Switch when a window reaches this pct (per-window keys below)",
+        ),
+        SettingSpec(
+            "autoswitch", "thresholdFiveHour", "threshold_five_hour", "float", 50.0, 99.9,
+            help="Switch line for the 5h window only (unset: autoswitch.threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "thresholdWeekly", "threshold_weekly", "float", 50.0, 99.9,
+            help="Switch line for weekly windows only (unset: autoswitch.threshold)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
