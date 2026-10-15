@@ -101,6 +101,26 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
+def _refresh_request_body(oauth_data: dict) -> dict[str, str]:
+    """Build a refresh request from stored OAuth metadata when available."""
+    client_id = oauth_data.get("clientId")
+    if not isinstance(client_id, str) or not client_id:
+        client_id = OAUTH_CLIENT_ID
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": oauth_data["refreshToken"],
+        "client_id": client_id,
+    }
+    scopes = oauth_data.get("scopes")
+    if (
+        isinstance(scopes, list)
+        and scopes
+        and all(isinstance(scope, str) and scope for scope in scopes)
+    ):
+        body["scope"] = " ".join(scopes)
+    return body
+
+
 @dataclass(frozen=True)
 class RefreshOutcome:
     """Result of a refresh-token grant attempt.
@@ -167,11 +187,7 @@ def try_refresh_oauth_credentials(
         return RefreshOutcome(None, "no_refresh_token")
 
     try:
-        body = json.dumps({
-            "grant_type": "refresh_token",
-            "refresh_token": oauth["refreshToken"],
-            "client_id": OAUTH_CLIENT_ID,
-        }).encode()
+        body = json.dumps(_refresh_request_body(oauth)).encode()
 
         req = urllib.request.Request(
             OAUTH_TOKEN_URL,
