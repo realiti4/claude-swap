@@ -6959,3 +6959,82 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+def _seat_usage(five_h: float, fable: float, reset: str | None = None) -> dict:
+    """Team/Enterprise-seat shape: no account-wide ``seven_day`` window at
+    all — just ``five_hour`` plus the per-model weekly ``scoped`` window."""
+    scoped: dict = {"name": "Fable", "pct": fable}
+    if reset:
+        scoped["resets_at"] = reset
+    return {"five_hour": {"pct": five_h}, "scoped": [scoped]}
+
+
+class TestConsumeFirstScopedReset:
+    """consume-first on seats that report no 7-day window: with
+    ``autoswitch.model`` set, the model's weekly reset is the perishable
+    quota to rank by. Without it, or when a 7-day window is reported, the
+    strategy behaves exactly as before."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_seat_ranks_by_model_weekly_reset(self, temp_home):
+        # Active seat's Fable window resets last; seat 2's resets soonest and
+        # has room -> proactive consume-first switch, even though every 5h
+        # window is far below the threshold.
+        h = self._harness(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _seat_usage(20, 50, _R_LATEST),
+            "2": _seat_usage(10, 40, _R_SOON),
+            "3": _seat_usage(10, 30, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switches = [e for e in h.events if isinstance(e, SwitchEvent)]
+        assert switches and switches[-1].trigger == "consume-first"
+
+    def test_seat_already_on_soonest_model_reset_holds(self, temp_home):
+        h = self._harness(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _seat_usage(20, 50, _R_SOON),
+            "2": _seat_usage(10, 40, _R_LATER),
+            "3": _seat_usage(10, 30, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_seat_without_model_setting_is_still_reset_unknown(self, temp_home):
+        # No autoswitch.model: the scoped window is not a gating window, so
+        # there is nothing to rank by — the honest reset-unknown hold stays.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _seat_usage(20, 50, _R_LATEST),
+            "2": _seat_usage(10, 40, _R_SOON),
+            "3": _seat_usage(10, 30, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["reset-unknown"]
+
+    def test_reported_seven_day_window_still_wins(self, temp_home):
+        # Max/Pro shape: a 7-day window is reported, so it ranks even when the
+        # Fable window on another account would reset sooner.
+        h = self._harness(temp_home, model="Fable")
+        active = _usage7(20, 20, _R_SOON)
+        active["scoped"] = [{"name": "Fable", "pct": 50, "resets_at": _R_LATEST}]
+        other = _usage7(10, 10, _R_LATER)
+        other["scoped"] = [{"name": "Fable", "pct": 10, "resets_at": _R_PAST}]
+        outcome = h.tick_with_usage({"1": active, "2": other})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]

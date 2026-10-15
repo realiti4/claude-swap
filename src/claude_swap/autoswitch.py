@@ -535,9 +535,11 @@ _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
 
 
-def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
-    """Epoch of an account's 7-day (weekly) window reset, or None if unknown
-    or already past.
+def _seven_day_reset_ts(
+    usage: dict | str | None, now: float, models: Sequence[str] = ()
+) -> float | None:
+    """Epoch of an account's weekly window reset, or None if unknown or
+    already past.
 
     The consume-first strategy ranks by this — the weekly window is the
     perishable quota (the 5-hour one recycles too fast to be worth planning
@@ -547,13 +549,32 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     unknown. Plain ``ts <= now``: RESET_SLACK_S is poll-scheduling lag
     tolerance, not ranking input — padding here would turn a genuinely
     imminent reset into a false reset-unknown hold.
+
+    Team/Enterprise seats report no account-wide ``seven_day`` window at
+    all — only ``five_hour`` plus the per-model weekly ``scoped`` windows —
+    so for them the perishable quota *is* the configured model's weekly
+    window (``autoswitch.model``). When the 7-day reset is unknown and
+    ``models`` is set, fall back to the soonest future reset among those
+    scoped windows; the 7-day window still wins whenever it is reported, so
+    Max/Pro accounts rank exactly as before.
     """
-    if isinstance(usage, dict):
-        window = usage.get("seven_day")
-        if isinstance(window, dict):
-            ts = _parse_reset_ts(window.get("resets_at"))
-            if ts is not None and ts > now:
-                return ts
+    if not isinstance(usage, dict):
+        return None
+    window = usage.get("seven_day")
+    if isinstance(window, dict):
+        ts = _parse_reset_ts(window.get("resets_at"))
+        if ts is not None and ts > now:
+            return ts
+    if models:
+        scoped = [
+            ts
+            for label, _pct, resets_at in oauth.relevant_windows(usage, models)
+            if label not in ("5h", "7d")
+            and (ts := _parse_reset_ts(resets_at)) is not None
+            and ts > now
+        ]
+        if scoped:
+            return min(scoped)
     return None
 
 
@@ -1776,7 +1797,9 @@ class AutoSwitchEngine:
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
+            _seven_day_reset_ts(usage.get(current), now, self._models)
+            if consume_first
+            else None
         )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
@@ -1836,7 +1859,9 @@ class AutoSwitchEngine:
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(usage.get(num), now, self._models)
+                if consume_first
+                else None
             )
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
