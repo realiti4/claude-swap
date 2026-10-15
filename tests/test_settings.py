@@ -33,6 +33,7 @@ def _args(**kwargs) -> argparse.Namespace:
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
+        "start_timer_on_reset": None,
         "strategy": None,
     }
     defaults.update(kwargs)
@@ -97,6 +98,11 @@ class TestLoadSettings:
     def test_set_strategy_consume_first(self, tmp_path: Path):
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
+
+    def test_timer_start_is_opt_in_and_round_trips(self, tmp_path: Path):
+        assert load_settings(tmp_path).start_timer_on_reset is False
+        set_setting(tmp_path, "autoswitch.startTimerOnReset", "true")
+        assert load_settings(tmp_path).start_timer_on_reset is True
 
 
 class TestSaveSettings:

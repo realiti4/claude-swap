@@ -22,9 +22,10 @@ whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
 
-Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
-(so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
-read-modify-write under a dedicated file lock.
+Cooldown, quarantine, and opt-in five-hour timer observations persist in
+``<backup_root>/autoswitch_state.json`` (so cron-driven ``cswap auto --once``
+ticks behave across processes), mutated read-modify-write under a dedicated
+file lock.
 """
 
 from __future__ import annotations
@@ -36,13 +37,14 @@ import math
 import random
 import threading
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, timer_start
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -102,6 +104,16 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# Reset-triggered timer-start requests are fenced across the CLI, TUI, menu
+# bar, and cron-driven ``--once`` processes through the shared state file.
+# The lease comfortably covers session bootstrap plus the bounded Claude
+# request; a crashed owner becomes retryable. Failures back off so a missing
+# CLI or temporary provider outage does not launch a process every poll tick.
+TIMER_CLAIM_TTL_S = 5 * 60.0
+TIMER_RETRY_S = 5 * 60.0
+TIMER_PCT_EPSILON = 0.01
+TIMER_UNSTARTED_RESET = "unstarted-window"
 
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
@@ -491,6 +503,37 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class FiveHourTimerEvent(AutoSwitchEvent):
+    """Outcome of the opt-in message that starts a newly reset 5h window."""
+
+    kind: ClassVar[str] = "five-hour-timer"
+    account: dict
+    reset_at: str
+    status: str  # "started" | "failed" | "would-start"
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        fields = {
+            "account": self.account,
+            "resetAt": self.reset_at,
+            "status": self.status,
+        }
+        if self.detail:
+            fields["detail"] = self.detail
+        return fields
+
+    def human(self) -> str:
+        number = self.account.get("number")
+        email = self.account.get("email")
+        if self.status == "started":
+            return f"Started new 5h timer for Account-{number} ({email})"
+        if self.status == "would-start":
+            return f"[dry-run] would start new 5h timer for Account-{number} ({email})"
+        suffix = f": {self.detail}" if self.detail else ""
+        return f"Could not start new 5h timer for Account-{number} ({email}){suffix}"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -630,6 +673,87 @@ def _headroom_by_account(
     }
 
 
+@dataclass(frozen=True)
+class _FiveHourResetClaim:
+    number: str
+    email: str
+    reset_at: str
+    claim_id: str
+
+
+def _five_hour_observation(entry) -> dict | None:
+    """Persistable view of one successful five-hour usage observation.
+
+    A successful response can legitimately omit ``five_hour`` between
+    windows, so absence is itself an observation. A row with no successful
+    fetch timestamp is not.
+    """
+    if entry is None or entry.fetched_at is None:
+        return None
+    usage = entry.last_good
+    if not isinstance(usage, dict):
+        return None
+    window = usage.get("five_hour")
+    present = isinstance(window, dict) and isinstance(
+        window.get("pct"), (int, float)
+    )
+    return {
+        "lastFetchedAt": float(entry.fetched_at),
+        "windowPresent": present,
+        "pct": float(window["pct"]) if present else None,
+        "resetsAt": window.get("resets_at") if present else None,
+    }
+
+
+def _detected_five_hour_reset(previous: dict, current: dict) -> str | None:
+    """Return the reset boundary just crossed, or ``None``.
+
+    Five-hour utilization is monotone within a window. A reset is therefore
+    proven when a fresh observation at/after the advertised boundary either
+    drops utilization, loses the window/reset timestamp, or when the provider
+    advances the reset timestamp to the next cycle. Merely passing a cached
+    ``resets_at`` is not enough: the usage endpoint can keep returning the
+    exhausted window briefly, and sending during that lag would just hit the
+    old limit.
+    """
+    if previous.get("windowPresent") is not True:
+        return None
+    reset_at = previous.get("resetsAt")
+    if not isinstance(reset_at, str) or not reset_at:
+        return None
+    reset_ts = _parse_reset_ts(reset_at)
+    if reset_ts is None:
+        return None
+
+    current_reset_ts = _parse_reset_ts(current.get("resetsAt"))
+    if current.get("lastFetchedAt", 0.0) < reset_ts:
+        return None
+    advanced = (
+        current_reset_ts is not None
+        and current_reset_ts > reset_ts + 1.0
+    )
+    if advanced:
+        return reset_at
+    if current.get("windowPresent") is not True:
+        return reset_at
+    # Once an idle five-hour window has ended, the API keeps the window object
+    # (at 0%) but removes ``resets_at`` until the next message starts a clock.
+    # This is also the only reliable rollover signal when the tiny timer-start
+    # prompt rounded to 0%, so there is no numeric drop to observe.
+    if current.get("resetsAt") is None:
+        return reset_at
+
+    old_pct = previous.get("pct")
+    new_pct = current.get("pct")
+    if (
+        isinstance(old_pct, (int, float))
+        and isinstance(new_pct, (int, float))
+        and new_pct + TIMER_PCT_EPSILON < old_pct
+    ):
+        return reset_at
+    return None
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -684,6 +808,11 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Dry-run promises no state-file writes. Keep reset observations in
+        # memory so a foreground dry-run can still demonstrate the timer
+        # trigger after it observes a rollover.
+        self._dry_timer_state: dict = {"accounts": {}}
+        self._pending_five_hour_timer_claims: list[_FiveHourResetClaim] = []
 
     # -- state file ---------------------------------------------------------
 
@@ -710,6 +839,282 @@ class AutoSwitchEngine:
             mutator(state)
             atomic_write_json(self.state_path, state)
             return state
+
+    # -- five-hour timer priming ---------------------------------------------
+
+    def _timer_eligible_accounts(self, quarantined: set[str]) -> dict[str, str]:
+        """Enabled OAuth slots whose resets may receive an automatic prompt."""
+        eligible: dict[str, str] = {}
+        for number in self.switcher.switchable_account_numbers():
+            if number in quarantined:
+                continue
+            if self.switcher.account_kind_for(number) == "api_key":
+                continue
+            email = self.switcher.account_email(number)
+            if email:
+                eligible[number] = email
+        return eligible
+
+    def _scan_five_hour_timer_state(
+        self,
+        timer_state: dict,
+        entries: dict,
+        eligible: dict[str, str],
+        now: float,
+        *,
+        dry_run: bool,
+    ) -> tuple[list[_FiveHourResetClaim], bool]:
+        """Advance observations and fence each newly detected reset once."""
+        accounts = timer_state.get("accounts")
+        changed = False
+        if not isinstance(accounts, dict):
+            accounts = {}
+            timer_state["accounts"] = accounts
+            changed = True
+
+        # Disabled/quarantined/removed accounts lose their baseline. If later
+        # re-enabled they start with a fresh observation rather than sending a
+        # prompt for a reset that happened while the user explicitly rested
+        # them.
+        for number in tuple(accounts):
+            if number not in eligible:
+                del accounts[number]
+                changed = True
+
+        claims: list[_FiveHourResetClaim] = []
+
+        def claim_pending(
+            number: str, email: str, row: dict, reset_at: str
+        ) -> None:
+            nonlocal changed
+            if dry_run:
+                row["handledReset"] = reset_at
+                claims.append(
+                    _FiveHourResetClaim(number, email, reset_at, "dry-run")
+                )
+                changed = True
+                return
+
+            claim_until = row.get("claimUntil")
+            next_retry = row.get("nextRetryAt")
+            if (
+                isinstance(claim_until, (int, float))
+                and now < float(claim_until)
+            ) or (
+                isinstance(next_retry, (int, float))
+                and now < float(next_retry)
+            ):
+                return
+
+            claim_id = str(uuid.uuid4())
+            row["claimId"] = claim_id
+            row["claimUntil"] = now + TIMER_CLAIM_TTL_S
+            claims.append(_FiveHourResetClaim(number, email, reset_at, claim_id))
+            changed = True
+
+        for number, email in eligible.items():
+            observation = _five_hour_observation(entries.get(number))
+            row = accounts.get(number)
+            if observation is None:
+                if isinstance(row, dict) and row.get("email") == email:
+                    pending = row.get("pendingReset")
+                    if (
+                        isinstance(pending, str)
+                        and pending
+                        and row.get("handledReset") != pending
+                    ):
+                        claim_pending(number, email, row, pending)
+                continue
+            if not isinstance(row, dict) or row.get("email") != email:
+                row = {"email": email, **observation}
+                accounts[number] = row
+                changed = True
+
+            # A present 0% window with no reset timestamp is not merely a low
+            # first sample: it is the provider's representation of a clock
+            # waiting for its first message. Prime it immediately. Requiring
+            # no prior pending/handled reset preserves the normal first-sample
+            # baseline for active windows and lets state written by the first
+            # feature version self-heal on upgrade.
+            if (
+                row.get("resetsAt") is None
+                and row.get("pendingReset") is None
+                and row.get("handledReset") is None
+                and observation.get("windowPresent") is True
+                and observation.get("resetsAt") is None
+                and isinstance(observation.get("pct"), (int, float))
+                and float(observation["pct"]) <= TIMER_PCT_EPSILON
+            ):
+                last_fetched = row.get("lastFetchedAt")
+                if not isinstance(last_fetched, (int, float)) or (
+                    observation["lastFetchedAt"] > float(last_fetched)
+                ):
+                    row.update(observation)
+                row["pendingReset"] = TIMER_UNSTARTED_RESET
+                claim_pending(
+                    number, email, row, TIMER_UNSTARTED_RESET
+                )
+                changed = True
+                continue
+
+            last_fetched = row.get("lastFetchedAt")
+            if (
+                isinstance(last_fetched, (int, float))
+                and observation["lastFetchedAt"] <= float(last_fetched)
+            ):
+                pending = row.get("pendingReset")
+                if (
+                    isinstance(pending, str)
+                    and pending
+                    and row.get("handledReset") != pending
+                ):
+                    claim_pending(number, email, row, pending)
+                continue
+
+            reset_at = _detected_five_hour_reset(row, observation)
+            row.update(observation)
+            changed = True
+            if reset_at is None:
+                pending = row.get("pendingReset")
+                if (
+                    isinstance(pending, str)
+                    and pending
+                    and row.get("handledReset") != pending
+                ):
+                    claim_pending(number, email, row, pending)
+                continue
+            if row.get("handledReset") == reset_at:
+                continue
+
+            if row.get("pendingReset") != reset_at:
+                row["pendingReset"] = reset_at
+                for key in (
+                    "claimId",
+                    "claimUntil",
+                    "nextRetryAt",
+                    "lastError",
+                ):
+                    row.pop(key, None)
+            claim_pending(number, email, row, reset_at)
+        return claims, changed
+
+    def _claim_five_hour_resets(
+        self, entries: dict, quarantined: set[str]
+    ) -> list[_FiveHourResetClaim]:
+        eligible = self._timer_eligible_accounts(quarantined)
+        now = self.clock()
+        if self.dry_run:
+            claims, _ = self._scan_five_hour_timer_state(
+                self._dry_timer_state,
+                entries,
+                eligible,
+                now,
+                dry_run=True,
+            )
+            return claims
+
+        with self._state_lock():
+            state = self._read_state()
+            timer_state = state.get("fiveHourTimer")
+            changed = False
+            if not isinstance(timer_state, dict):
+                timer_state = {"accounts": {}}
+                state["fiveHourTimer"] = timer_state
+                changed = True
+            claims, scanned = self._scan_five_hour_timer_state(
+                timer_state,
+                entries,
+                eligible,
+                now,
+                dry_run=False,
+            )
+            if changed or scanned:
+                state["schemaVersion"] = STATE_SCHEMA_VERSION
+                atomic_write_json(self.state_path, state)
+            return claims
+
+    def _finish_five_hour_timer_claim(
+        self,
+        claim: _FiveHourResetClaim,
+        result: timer_start.TimerStartResult,
+    ) -> None:
+        """Commit an attempt only if this process still owns its fence."""
+        with self._state_lock():
+            state = self._read_state()
+            timer_state = state.get("fiveHourTimer")
+            accounts = (
+                timer_state.get("accounts")
+                if isinstance(timer_state, dict)
+                else None
+            )
+            row = accounts.get(claim.number) if isinstance(accounts, dict) else None
+            if not isinstance(row, dict) or (
+                row.get("email") != claim.email
+                or row.get("pendingReset") != claim.reset_at
+                or row.get("claimId") != claim.claim_id
+            ):
+                return
+
+            row.pop("claimId", None)
+            row.pop("claimUntil", None)
+            if result.success:
+                row["handledReset"] = claim.reset_at
+                row["lastStartedAt"] = self.clock()
+                row.pop("nextRetryAt", None)
+                row.pop("lastError", None)
+            else:
+                row["nextRetryAt"] = self.clock() + TIMER_RETRY_S
+                row["lastError"] = result.error or "unknown error"
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
+            atomic_write_json(self.state_path, state)
+
+    def _run_five_hour_timer_claims(
+        self, claims: Sequence[_FiveHourResetClaim]
+    ) -> None:
+        for claim in claims:
+            if self.dry_run:
+                self._emit(
+                    FiveHourTimerEvent(
+                        account=_ref(claim.number, claim.email),
+                        reset_at=claim.reset_at,
+                        status="would-start",
+                    )
+                )
+                continue
+            try:
+                result = timer_start.start_five_hour_timer(
+                    self.switcher, claim.number, claim.email
+                )
+            except Exception as exc:  # defensive: retain retry semantics
+                result = timer_start.TimerStartResult(
+                    False, f"{type(exc).__name__}: {exc}"
+                )
+            self._finish_five_hour_timer_claim(claim, result)
+            if result.success:
+                try:
+                    # The message creates a reset timestamp, but every view
+                    # would otherwise keep serving the pre-message 0% row
+                    # until its normal poll plan comes due. Refresh just this
+                    # account so the shared store — and therefore the TUI —
+                    # reflects the new countdown immediately.
+                    self.switcher.refresh_usage_accounts({claim.number})
+                except Exception as exc:
+                    # Priming already succeeded. A display refresh failure is
+                    # best-effort and must not turn that success into a retry,
+                    # which would send a duplicate message five minutes later.
+                    _logger.warning(
+                        "Post-timer usage refresh failed for account %s: %s",
+                        claim.number,
+                        exc,
+                    )
+            self._emit(
+                FiveHourTimerEvent(
+                    account=_ref(claim.number, claim.email),
+                    reset_at=claim.reset_at,
+                    status="started" if result.success else "failed",
+                    detail=result.error or "",
+                )
+            )
 
     # -- quarantine -----------------------------------------------------------
 
@@ -878,16 +1283,22 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        self._pending_five_hour_timer_claims = []
         try:
-            return self._tick_inner()
+            outcome = self._tick_inner()
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
             self._emit(
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
+        # A timer prompt may take tens of seconds. Run it only after the
+        # switch decision has committed, so priming an inactive account can
+        # never delay an urgent escape from the active account's limit.
+        self._run_five_hour_timer_claims(self._pending_five_hour_timer_claims)
+        return outcome
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
@@ -956,6 +1367,11 @@ class AutoSwitchEngine:
                 },
             )
         )
+
+        if settings.start_timer_on_reset:
+            self._pending_five_hour_timer_claims = self._claim_five_hour_resets(
+                entries, quarantined
+            )
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
