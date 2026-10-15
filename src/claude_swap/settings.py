@@ -47,7 +47,20 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best": most headroom. "consume-first": soonest weekly reset, and it
+    # moves below the threshold too. "weekly-first": soonest weekly reset,
+    # but only once the active account reaches the threshold.
+    strategy: str = "best"
+    # Per-window thresholds. Each overrides ``threshold`` for that one window;
+    # None means "use ``threshold``". The 5h window recycles in hours and can
+    # burn a point a minute, so it wants margin; the 7d window is the one
+    # that expires unused, so it wants to run closer to the wall.
+    threshold_5h: float | None = None
+    threshold_7d: float | None = None
+    # Landing caps. A switch target must sit at or under these on its OWN 5h
+    # and 7d windows, on every trigger and every strategy. 100 = no cap.
+    landing_max_5h_pct: float = 100.0
+    landing_max_7d_pct: float = 100.0
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -120,8 +133,24 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "weekly-first"),
             help="How auto-switch picks the target account",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold5h", "threshold_5h", "float", 50.0, 99.9,
+            help="Switch when the 5h window reaches this pct (unset: use threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold7d", "threshold_7d", "float", 50.0, 99.9,
+            help="Switch when the 7d window reaches this pct (unset: use threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "landingMax5hPct", "landing_max_5h_pct", "float", 0.0, 100.0,
+            help="Never switch onto an account with its 5h window above this pct (100 = off)",
+        ),
+        SettingSpec(
+            "autoswitch", "landingMax7dPct", "landing_max_7d_pct", "float", 0.0, 100.0,
+            help="Never switch onto an account with its 7d window above this pct (100 = off)",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
@@ -141,6 +170,33 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
     )
 }
+
+def window_threshold(label: str, settings: AutoSwitchSettings) -> float:
+    """The threshold that applies to one window.
+
+    ``threshold_5h`` / ``threshold_7d`` override ``threshold`` for the two
+    account-wide windows when set. Every other window (a per-model scoped
+    window named by ``autoswitch.model``) uses ``threshold``.
+    """
+    if label == "5h" and settings.threshold_5h is not None:
+        return settings.threshold_5h
+    if label == "7d" and settings.threshold_7d is not None:
+        return settings.threshold_7d
+    return settings.threshold
+
+
+def poll_threshold(settings: AutoSwitchSettings) -> float:
+    """The lowest threshold any window can trip — what the poll planner
+    should tighten cadence toward, so an early 5h line is watched as closely
+    as the account-wide one. Shared by the engine's pin and the switcher's
+    settings-file fallback so every surface plans the same cadence."""
+    lines = [settings.threshold]
+    if settings.threshold_5h is not None:
+        lines.append(settings.threshold_5h)
+    if settings.threshold_7d is not None:
+        lines.append(settings.threshold_7d)
+    return min(lines)
+
 
 _AUTOSWITCH_KEYS: dict[str, str] = {
     spec.field: spec.json_key
