@@ -402,6 +402,74 @@ def _unclaimed_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _hook_command(argv: list[str]) -> None:
+    """Handle `cswap hook attachments|install|uninstall|status`.
+
+    `attachments` is the UserPromptSubmit hook handler itself: it reads the
+    hook's JSON on stdin, prints its JSON answer (or nothing) and always exits
+    0, because a hook failure must never block the user's prompt. The others
+    manage the hook entry in Claude Code's settings.json.
+    """
+    action = argv[0] if argv else ""
+    if action == "attachments":
+        from claude_swap.attachment_recovery import run_hook
+
+        out = run_hook(sys.stdin.read(), ClaudeAccountSwitcher)
+        if out:
+            print(out)
+        sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} hook",
+        description=(
+            "Claude Code hook that recovers Remote Control attachments which "
+            "failed to download because cswap switched the account. See the "
+            "README section 'Remote Control attachments'."
+        ),
+    )
+    parser.add_argument(
+        "action",
+        choices=("install", "uninstall", "status", "attachments"),
+        help="install/uninstall/status manage the hook in settings.json; "
+        "attachments is the handler Claude Code runs",
+    )
+    args = parser.parse_args(argv)
+
+    from claude_swap.attachment_recovery import (
+        SettingsError,
+        hook_installed,
+        install_hook,
+        settings_path,
+        uninstall_hook,
+    )
+
+    path = settings_path()
+    try:
+        if args.action == "install":
+            result, backup = install_hook(path)
+            if result == "unchanged":
+                print(dimmed(f"Attachment hook already installed in {path}"))
+            else:
+                print(f"{accent(result.capitalize())} attachment hook in {path}")
+                if backup:
+                    print(dimmed(f"  Previous settings saved to {backup}"))
+                print(dimmed("  Applies to Claude Code sessions started from now on."))
+        elif args.action == "uninstall":
+            removed, backup = uninstall_hook(path)
+            if removed:
+                print(f"{accent('Removed')} attachment hook from {path}")
+                if backup:
+                    print(dimmed(f"  Previous settings saved to {backup}"))
+            else:
+                print(dimmed(f"No attachment hook in {path}"))
+        else:
+            state = "installed" if hook_installed(path) else "not installed"
+            print(f"Attachment hook: {state} ({path})")
+    except (SettingsError, OSError) as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -1016,6 +1084,9 @@ def main() -> None:
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
+    if argv and argv[0] == "hook":
+        _hook_command(argv[1:])
+        return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
@@ -1058,6 +1129,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s hook install               recover Remote Control attachments after a switch
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
