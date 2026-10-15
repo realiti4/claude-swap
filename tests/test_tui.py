@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import re
 import sys
 import threading
 import time
@@ -20,7 +21,8 @@ from pathlib import Path
 import pytest
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
-from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_API_KEY, USAGE_RELOGIN_REQUIRED, USAGE_TOKEN_EXPIRED)
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
@@ -662,6 +664,16 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "pace" not in mini_account_text(acc, now).plain
 
+    def test_lapsed_plan_row_draws_no_window_chips(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        entry = dataclasses.replace(
+            make_entry(30.0, 85.0), last_error="oauth_not_allowed_for_organization"
+        )
+        row = mini_account_text(make_account(2, entry=entry), time.time()).plain
+        assert "no plan" in row
+        assert "5h" not in row and "7d" not in row
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
@@ -784,8 +796,109 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            assert "5h 92%" in mini_part
+            assert "5h  92%" in mini_part
             assert "7d" not in mini_part
+
+    async def test_compact_rows_share_fixed_columns(self, tmp_path):
+        # No field may shift between compact rows: long org tags are capped,
+        # a missing window leaves a blank cell, and the pace / reset / disabled
+        # markers never move a later column.
+        def row(n, org, entry, **kw):
+            acc = make_account(n, entry=entry, **kw)
+            return dataclasses.replace(acc, org_name=org)
+
+        fable = [("Fable", 100.0)]
+        spend = {"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "USD"}
+        accs = [
+            make_account(1, active=True),
+            row(2, "someone@example.com's Organization",
+                make_entry(47.0, 90.0, scoped=fable)),  # 7d ahead of pace
+            row(3, "NA - Example Electronics Co. Ltd", make_entry(92.0, 40.0)),
+            row(4, "", make_entry(5.0, None, scoped=fable)),  # no 7d window
+            row(5, "work", make_entry(100.0, 100.0, scoped=fable),
+                alias="wk", email="u5@acme.io", disabled=True),  # reset suffixes
+            row(6, "work", make_entry(sentinel=USAGE_API_KEY), disabled=True),
+            # the longest note, and the "usage unknown" note
+            row(7, "work", make_entry(sentinel=USAGE_RELOGIN_REQUIRED), disabled=True),
+            row(8, "work", make_entry(None, None, spend=spend), disabled=True),
+            row(9, "work", make_entry(30.0, 85.0), disabled=True),  # ahead and disabled
+        ]
+        app = make_app(FakeSwitcher(accs, tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import (
+                AccountsPanel, mini_account_text, mini_widths)
+
+            widget = app.screen.query_one(AccountsPanel)
+            panel = widget.render().plain
+            # a row wider than the panel is ellipsized, never wrapped onto a second line
+            assert widget.size.height == len(panel.splitlines())
+            width = widget.size.width
+            await pilot.resize_terminal(70, 40)
+            await settle(pilot)
+            narrow = widget.render().plain
+            assert widget.size.height == len(narrow.splitlines())
+            narrow_width = widget.size.width
+
+        def compact(text):
+            lines = text.splitlines()
+            return [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 10)]
+
+        rows = compact(panel)
+        assert narrow_width < width
+        cut = compact(narrow)
+        assert all(len(ln) <= narrow_width for ln in cut)
+        assert all(len(ln) <= width for ln in rows)  # every marker fully visible
+        # the one trailing marker field is whole and starts at one column, cut or not
+        fields = {2: "(ahead)", 5: "(disabled)", 6: "(disabled)", 7: "(disabled)",
+                  8: "(disabled)", 9: "(ahead) (disabled)"}
+        for lines in (rows, cut):
+            marked = {n: ln for n, ln in zip(range(2, 10), lines)
+                      if "(ahead)" in ln or "(disabled)" in ln}
+            assert list(marked) == list(fields)
+            assert all(ln.endswith(fields[n]) for n, ln in marked.items())
+            assert len({len(ln) - len(fields[n]) for n, ln in marked.items()}) == 1
+
+        def starts(token, lines=rows):
+            return {ln.index(token) for ln in lines if token in ln}
+
+        assert "(ahead)" in panel and "(resets" in panel
+        for token in ("[", "5h ", "7d ", "Fable (!)"):
+            assert len(starts(token)) == 1, (token, rows)
+            assert len(starts(token, cut)) <= 1, (token, cut)  # a cut row may lose it
+        # the pace marker is no part of the 7d cell: ahead or not, only the pct
+        assert "Fable (!)" in rows[0] and "Fable (!)" in rows[3]  # wide rows are whole
+        s7, sf = starts("7d ").pop(), starts("Fable (!)").pop()
+        for n in (2, 3, 9):
+            assert re.fullmatch(r"7d +\d+%\s*", rows[n - 2][s7:sf]), rows[n - 2]
+        tags = [re.search(r"\[[^\]]*\]", ln).group() for ln in rows]
+        assert [len(t) for t in tags[:2]] == [24, 24]  # capped, ellipsis inside
+        assert all(t.endswith("…]") for t in tags[:2]) and "[work]" in tags
+        assert "[personal]" in tags
+        # under the cap the tag column is the widest tag shown, not the cap
+        now = time.time()
+        assert mini_widths(accs[3:5], now).tag == len("[personal]") < 24
+        # only note rows shown: no window grid, the notes alone set the column
+        notes = accs[5:7]
+        widths = mini_widths(notes, now)
+        assert len({mini_account_text(a, now, widths=widths).plain.index("(disabled)")
+                    for a in notes}) == 1
+        # a cut that falls in a row's blank padding hides nothing, so it shows no
+        # ellipsis, yet the marker still starts where it does on every cut row
+        lacking = row(10, "work", make_entry(5.0, None), disabled=True)  # no 7d, no Fable
+        shown = accs[1:] + [lacking]
+        widths = mini_widths(shown, now)
+        edge = max(len(mini_account_text(a, now, widths=widths).plain) for a in shown) - 1
+        out = {a.number: mini_account_text(a, now, widths=widths, width=edge).plain
+               for a in shown}
+        assert "…" not in out["10"] and "…" in out["2"]  # real content cut: ellipsis kept
+        marked = {"2": "(ahead)", "5": "(disabled)", "9": "(ahead) (disabled)", "10": "(disabled)"}
+        assert all(out[n].endswith(f) for n, f in marked.items())
+        assert len({len(out[n]) - len(f) for n, f in marked.items()}) == 1
+        for ln in rows:  # nothing between the tag and the first window cell
+            if "5h " in ln:
+                assert not ln[ln.index("]") + 1 : ln.index("5h ")].strip()
+        assert [ln for ln in rows if ln.endswith("(disabled)")] == rows[3:]
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
