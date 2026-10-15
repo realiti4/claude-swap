@@ -183,7 +183,8 @@ class TestScopedContextDoesNotLeakTheAutouseScrub:
     """
 
     @pytest.fixture(autouse=True, scope="class")
-    def _exported(self):
+    @classmethod
+    def _exported(cls):
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("FORCE_COLOR", "3")
             yield
