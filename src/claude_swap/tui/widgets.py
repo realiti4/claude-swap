@@ -132,6 +132,13 @@ def usage_rows(
         reset, reset_full = _reset_parts(spend, now)
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
+        if "enabled" in spend:
+            status = "available" if spend["enabled"] else {
+                "out_of_credits": "out of credits",
+                "spend_limit_reached": "spending cap reached",
+            }.get(spend.get("disabled_reason"), "disabled")
+            suffix += f"  paid overflow · {status}"
+            suffix_full += f"  paid overflow · {status}"
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)

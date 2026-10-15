@@ -49,6 +49,8 @@ class AutoSwitchSettings:
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
+    paid_overflow_account: str | None = None
+    paid_overflow_max_monthly_usd: float = 0.0
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
@@ -126,6 +128,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
+        ),
+        SettingSpec(
+            "autoswitch", "paidOverflowAccount", "paid_overflow_account", "string",
+            help="Email of the optional paid overflow account; unset disables fallback",
+        ),
+        SettingSpec(
+            "autoswitch", "paidOverflowMaxMonthlyUsd", "paid_overflow_max_monthly_usd", "float", 0.0, 1000000.0,
+            help="Maximum acceptable provider monthly USD cap for paid fallback; 0 disables it",
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
