@@ -4091,7 +4091,11 @@ class ClaudeAccountSwitcher:
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
+                # A transient Keychain miss returns ""; retry once so the
+                # usage tuple carries the recovered credential.
                 creds = self._read_account_credentials(str(num), email)
+                if not creds:
+                    creds = self._read_account_credentials(str(num), email)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
