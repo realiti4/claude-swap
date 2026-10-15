@@ -1531,6 +1531,33 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_demote_and_mark_disabled_accounts(
+        self, tmp_path, fake_engine
+    ):
+        """A disabled slot is held out of automatic rotation, so the engine
+        will never pick it: the panel must rank it below every real candidate
+        and say why, however much headroom it has."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 5.0), disabled=True),
+                make_account(3, entry=make_entry(50.0, 10.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            # On headroom alone #2 (5% used) would head the list.
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert "(disabled)" in plain
+
 
 class TestEventText:
     def test_switch_event_styling_and_content(self):
