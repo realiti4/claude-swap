@@ -11,6 +11,7 @@ import sys
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
+from claude_swap.logging_config import setup_logging
 from claude_swap.printer import (
     accent,
     bolded,
@@ -47,7 +48,7 @@ def _prog_name() -> str:
 # users type `cswap list`, `cswap status`, `cswap add`, etc. instead of `--list`
 # / `--status` / `--add-account`, which all still work. `switch` is special-cased
 # below (a bare `switch` rotates; `switch <target>` jumps to one account) and
-# `run`/`auto` keep their own pre-dispatch parsers, so none of those are listed here.
+# `run`/`auto`/`rc` keep their own pre-dispatch parsers, so none of those are listed here.
 _SUBCOMMAND_FLAGS = {
     "help": "--help",
     "list": "--list",
@@ -229,6 +230,50 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _rc_command(argv: list[str]) -> None:
+    """Handle `cswap rc [-- <claude args>]`.
+
+    Pre-dispatched like `run`. Launches plain claude on the default login
+    behind a pty relay that re-runs /remote-control after a swap drops Remote
+    Control (see remote_control.py). Exits with claude's return code.
+    """
+    if "--" in argv:
+        split = argv.index("--")
+        head, tail = argv[:split], argv[split + 1 :]
+    else:
+        head, tail = argv, []
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} rc",
+        usage="%(prog)s [-h] [-- <claude args>]",
+        description=(
+            "Launch Claude Code on the default login and turn Remote Control "
+            "back on after a switch. Claude Code stops Remote Control whenever "
+            "the signed-in account changes; about 30s later, once the session "
+            "is idle, this runs /remote-control for you, keeping any unsent "
+            "draft via Claude Code's stash (Ctrl+S). macOS/Linux/WSL only."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap rc
+  cswap rc -- --remote-control
+  cswap rc -- --resume
+  alias claude='cswap rc --'     # every claude you start
+        """,
+    )
+    parser.parse_args(head)
+
+    try:
+        setup_logging(paths.get_backup_root())
+        from claude_swap import remote_control
+
+        remote_control.launch(tail)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -991,13 +1036,16 @@ def main() -> None:
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
 
-    # `run` and `auto` keep their dedicated pre-dispatch parsers.
+    # `run`, `auto` and `rc` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "rc":
+        _rc_command(argv[1:])
+        return  # only reachable in tests where exec/exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1049,6 +1097,7 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s rc [-- ...]                run claude, reconnecting Remote Control after a switch
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

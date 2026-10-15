@@ -293,6 +293,10 @@ class TestCliShouldProbe:
         # `run` execs a child that takes over the terminal.
         assert appearance.cli_should_probe(["run", "2"], colors_enabled=True) is False
 
+    def test_rc_subcommand_never_probes(self):
+        # `rc` also hands the terminal to a claude child.
+        assert appearance.cli_should_probe(["rc"], colors_enabled=True) is False
+
     def test_json_flag_never_probes(self):
         # --json must stay machine-readable; the OSC query can't precede it.
         assert appearance.cli_should_probe(["list", "--json"], colors_enabled=True) is False
