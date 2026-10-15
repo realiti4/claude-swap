@@ -2,8 +2,9 @@
 
 ``bar_cells``/``usage_bar`` are custom renderers rather than Textual's
 ``ProgressBar`` because the design needs three things the stock widget
-doesn't do: a severity color ramp, an optional threshold tick mark (the
-auto-switch trigger line), and stale-measurement dimming.
+doesn't do: a severity color ramp, optional tick marks (the auto-switch
+trigger line and, on weekly windows, the expected-pace position), and
+stale-measurement dimming.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ _BAR_FILLED = "━"
 _BAR_HALF = "╸"
 _BAR_EMPTY = "─"
 _BAR_TICK = "┃"
+_BAR_PACE_TICK = "╎"
 
 
 def bar_cells(
@@ -37,9 +39,16 @@ def bar_cells(
     *,
     stale: bool = False,
     threshold: float | None = None,
+    expected: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
-    """Just the bar glyphs: severity-colored fill, track, optional tick."""
+    """Just the bar glyphs: severity-colored fill, track, optional ticks.
+
+    ``threshold`` draws the warn-colored auto-switch tick; ``expected`` draws
+    a dimmer tick where on-schedule usage would sit (issue #228). The gap
+    between the fill's edge and that tick is the pace delta, in either
+    direction. The threshold tick wins when both land on one cell.
+    """
     text = Text()
     if pct is None:
         text.append(_BAR_EMPTY * width, style=palette.track)
@@ -48,14 +57,15 @@ def bar_cells(
     cells = frac * width
     full = int(cells)
     half = (cells - full) >= 0.5 and full < width
-    tick_at: int | None = None
-    if threshold is not None:
-        tick_at = min(width - 1, max(0, round(threshold / 100.0 * width)))
+    tick_at = _tick_cell(threshold, width)
+    pace_at = _tick_cell(expected, width)
     color = palette.severity(pct)
     fill_style = f"{color} dim" if stale else color
     for i in range(width):
         if tick_at is not None and i == tick_at:
             text.append(_BAR_TICK, style=palette.sev_warn)
+        elif pace_at is not None and i == pace_at:
+            text.append(_BAR_PACE_TICK, style=palette.muted)
         elif i < full:
             text.append(_BAR_FILLED, style=fill_style)
         elif i == full and half:
@@ -63,6 +73,13 @@ def bar_cells(
         else:
             text.append(_BAR_EMPTY, style=palette.track)
     return text
+
+
+def _tick_cell(pct: float | None, width: int) -> int | None:
+    """Bar cell index for a percentage mark, clamped into the bar."""
+    if pct is None:
+        return None
+    return min(width - 1, max(0, round(pct / 100.0 * width)))
 
 
 def usage_bar(
@@ -73,12 +90,15 @@ def usage_bar(
     *,
     stale: bool = False,
     threshold: float | None = None,
+    expected: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
-    """One full bar line: ``5h ━━━━╸────┃──  47%  resets 2h 13m · 20:39``."""
+    """One full bar line: ``7d ━━━━╸─╎──┃──  47%  resets 3d 2h · 20:39``."""
     text = Text()
     text.append(f"{label} ", style=palette.muted)
-    text.append(bar_cells(pct, width, stale=stale, threshold=threshold, palette=palette))
+    text.append(
+        bar_cells(pct, width, stale=stale, threshold=threshold, expected=expected, palette=palette)
+    )
     if pct is None:
         text.append("  usage unknown", style=palette.muted)
     else:
@@ -102,17 +122,29 @@ def _reset_parts(window: dict, now: float) -> tuple[str | None, str | None]:
     return reset, f"{reset} · {clock}" if clock else reset
 
 
-def _pace_suffix(window: dict, fetched_at: float | None) -> str:
-    """"(ahead of pace)" when a weekly window is meaningfully ahead, else ""."""
-    result = pace.compute_pace(window, fetched_at=fetched_at)
-    return "(ahead of pace)" if result and result.ahead else ""
+def _pace_parts(window: dict, fetched_at: float | None) -> tuple[str, float | None]:
+    """``("(ahead of pace)" or "", expected_pct or None)`` for a weekly window.
+
+    The suffix keeps its gates: meaningfully ahead, and not within
+    ``pace.SUPPRESS_AFTER_RESET_S`` of a reset. The expected percentage skips
+    that suppression — it exists because "ahead" is a false positive while
+    expected is near zero, but the tick is a position, not a verdict, and a
+    bar with no tick reads as "pace unknown" rather than "early". Both are
+    None together only when pace is not computable at all (no ``fetched_at``
+    or ``resets_at``).
+    """
+    marker = pace.compute_pace(window, fetched_at=fetched_at)
+    position = pace.compute_pace(window, fetched_at=fetched_at, suppress_after_reset_s=0.0)
+    if position is None:
+        return "", None
+    return ("(ahead of pace)" if marker and marker.ahead else ""), position.expected_pct
 
 
 def usage_rows(
     last_good: dict | None, now: float, fetched_at: float | None = None
-) -> list[tuple[str, float, str, str]]:
-    """(label, pct, suffix, suffix_full) rows mirroring the CLI's
-    ``_format_usage_lines``.
+) -> list[tuple[str, float, str, str, float | None]]:
+    """(label, pct, suffix, suffix_full, expected_pct) rows mirroring the
+    CLI's ``_format_usage_lines``.
 
     ``suffix_full`` extends the reset countdown with the absolute clock time
     (``resets 2h 13m · 20:39``) for rows that have room; otherwise it equals
@@ -121,42 +153,44 @@ def usage_rows(
     the CLI: spend, 5h, 7d, then per-model scoped windows (e.g. "Fable"),
     the latter marked ``(!)`` at/over their limit. The weekly (7d) and scoped
     rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
-    week's expected usage (issue #125) — never the 5h row.
+    week's expected usage (issue #125) — never the 5h row. ``expected_pct``
+    is where on-schedule usage would sit for those same rows (the bar's pace
+    tick, issue #228) and None for spend and 5h.
     """
     if not isinstance(last_good, dict):
         return []
-    rows: list[tuple[str, float, str, str]] = []
+    rows: list[tuple[str, float, str, str, float | None]] = []
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
         reset, reset_full = _reset_parts(spend, now)
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
-        rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
+        rows.append(("$$", float(spend["pct"]), suffix, suffix_full, None))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
             reset, reset_full = _reset_parts(window, now)
             suffix, suffix_full = reset or "", reset_full or ""
+            expected: float | None = None
             if key == "seven_day":
-                marker = _pace_suffix(window, fetched_at)
+                marker, expected = _pace_parts(window, fetched_at)
                 if marker:
                     suffix = f"{suffix}  {marker}" if suffix else marker
                     suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
-            rows.append((label, float(window["pct"]), suffix, suffix_full))
+            rows.append((label, float(window["pct"]), suffix, suffix_full, expected))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
         suffix, suffix_full = _reset_parts(window, now)
         suffix, suffix_full = suffix or "", suffix_full or ""
+        marker, expected = _pace_parts(window, fetched_at)
         if pct >= 100:
             suffix = f"{suffix}  (!)" if suffix else "(!)"
             suffix_full = f"{suffix_full}  (!)" if suffix_full else "(!)"
-        else:
-            marker = _pace_suffix(window, fetched_at)
-            if marker:
-                suffix = f"{suffix}  {marker}" if suffix else marker
-                suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
-        rows.append((window["name"], pct, suffix, suffix_full))
+        elif marker:
+            suffix = f"{suffix}  {marker}" if suffix else marker
+            suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
+        rows.append((window["name"], pct, suffix, suffix_full, expected))
     return rows
 
 
@@ -216,11 +250,11 @@ def account_card_text(
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
-    label_width = max(len(label) for label, _pct, _suffix, _full in rows)
+    label_width = max(len(label) for label, *_ in rows)
     bar_width = max(12, min(30, width - 42 - label_width))
     # everything on a row except the suffix: indent, label, bar, " NNN%", gap
     row_overhead = 4 + label_width + 1 + bar_width + 5 + 2
-    for label, pct, suffix, suffix_full in rows:
+    for label, pct, suffix, suffix_full, expected in rows:
         # per-row: show the absolute clock only where it fits, so a long
         # spend row degrading doesn't cost the 5h/7d rows their clocks
         if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
@@ -234,6 +268,7 @@ def account_card_text(
                 bar_width,
                 stale=stale,
                 threshold=threshold,
+                expected=expected,
                 palette=palette,
             )
         )

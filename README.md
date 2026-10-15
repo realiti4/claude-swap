@@ -166,6 +166,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+Each usage bar carries two marks: a `┃` at the `autoswitch.threshold`, and on weekly rows (7d and per-model) a dim `╎` where on-schedule usage would sit — fill past it means ahead of pace, fill short of it means behind. The `╎` shows from the start of the week; the `(ahead of pace)` suffix and the `--json` pace fields keep waiting out the first day (see below).
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
