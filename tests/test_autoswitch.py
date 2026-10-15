@@ -1822,6 +1822,40 @@ class TestApiKeyAccounts:
             "active-api-key"
         ]
 
+    def test_included_active_api_key_rests_instead_of_failing_over(self, temp_home):
+        """An active key reads no quota by design. It must not count as an
+        unhealthy poll: after unhealthyTicks that forced a failover onto a
+        nearly spent subscription, and the fallback then went back to the key."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        for _ in range(6):  # twice the default unhealthy_ticks
+            outcome = h.tick_with_usage({"1": "api key", "2": _usage(95)})
+            assert outcome is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        assert h.active_number() == 1
+        assert h.engine._unhealthy_ticks == 0
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+
+    def test_included_active_api_key_leaves_for_a_recovered_subscription(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage(
+            {"1": "api key", "2": _usage(95), "3": _usage(40)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
