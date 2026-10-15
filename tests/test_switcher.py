@@ -3478,6 +3478,56 @@ class TestActiveAccountRefresh:
         mock_fetch.assert_not_called()
 
 
+class TestListRunningInstancesRemoteControl:
+    """`cswap list` marks Running-instances lines that are on Remote Control."""
+
+    @staticmethod
+    def _session(pid: int, bridge: str | None, cwd: str = "/work/app"):
+        from claude_swap.process_detection import ClaudeSession
+
+        return ClaudeSession(
+            pid=pid, session_id=f"s{pid}", cwd=cwd, started_at=0,
+            kind="interactive", entrypoint="claude-desktop",
+            bridge_session_id=bridge,
+        )
+
+    def _running_block(self, temp_home, sample_sequence_data, capsys, sessions):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch("claude_swap.switcher.get_running_instances",
+                   return_value=(sessions, [])):
+            switcher.list_accounts()
+        out = capsys.readouterr().out
+        assert "Running instances:" in out
+        return out[out.index("Running instances:"):]
+
+    def test_single_rc_session(self, temp_home, sample_sequence_data, capsys):
+        out = self._running_block(
+            temp_home, sample_sequence_data, capsys, [self._session(1, "b1")],
+        )
+        assert "(1 session, Remote Control)" in out
+
+    def test_mixed_group(self, temp_home, sample_sequence_data, capsys):
+        sessions = [
+            self._session(1, "b1"), self._session(2, "b2"),
+            self._session(3, None),
+        ]
+        out = self._running_block(
+            temp_home, sample_sequence_data, capsys, sessions,
+        )
+        assert "(3 sessions, 2 on Remote Control)" in out
+
+    def test_no_rc_output_unchanged(self, temp_home, sample_sequence_data, capsys):
+        out = self._running_block(
+            temp_home, sample_sequence_data, capsys,
+            [self._session(1, None), self._session(2, None)],
+        )
+        assert "(2 sessions)" in out
+        assert "Remote Control" not in out
+
+
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
 
@@ -3765,6 +3815,132 @@ class TestPerformSwitchPostDisplay:
         assert "Switched to" in output
         assert "usage display unavailable" in output
         assert "no restart needed" in output
+
+    # --- Remote Control report ---
+
+    @staticmethod
+    def _rc_session(pid: int, cwd: str, entrypoint: str = "claude-desktop"):
+        from claude_swap.process_detection import ClaudeSession
+
+        return ClaudeSession(
+            pid=pid, session_id=f"s{pid}", cwd=cwd, started_at=0,
+            kind="interactive", entrypoint=entrypoint,
+            bridge_session_id=f"bridge-{pid}",
+        )
+
+    def _switch_with_rc(
+        self, temp_home, sample_sequence_data, target="2", emit_output=True,
+        rc=None,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live-1", "refreshToken": "rt-live-1"},
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        switcher.platform = Platform.LINUX
+        seen: dict = {}
+
+        def fake_rc(*a, **k):
+            seen["creds_at_snapshot"] = live_state["creds"]
+            if isinstance(rc, Exception):
+                raise rc
+            return rc or []
+
+        try:
+            with patch("claude_swap.switcher.remote_control_sessions",
+                       side_effect=fake_rc), \
+                 patch.object(switcher, "list_accounts"):
+                switcher._perform_switch(target, emit_output=emit_output)
+        finally:
+            for p in patches:
+                p.stop()
+        seen["creds_after"] = live_state["creds"]
+        return seen
+
+    def test_rc_report_after_switch_to_different_account(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        home = str(Path.home())
+        rc = [
+            self._rc_session(1, f"{home}/Projects/claude-swap"),
+            self._rc_session(2, f"{home}/Projects/tyria-plugin-family"),
+        ]
+        seen = self._switch_with_rc(temp_home, sample_sequence_data, rc=rc)
+        out = capsys.readouterr().out
+        assert (
+            "Remote Control: 2 running sessions were connected and will "
+            "disconnect when they pick up the new account"
+        ) in out
+        assert "  \u2022 ~/Projects/claude-swap (Desktop)" in out
+        assert "  \u2022 ~/Projects/tyria-plugin-family (Desktop)" in out
+        # Desktop re-enables RC on the session's next message (unless the user
+        # toggled RC by hand there), so the hint says so for Desktop sessions.
+        assert (
+            "Reconnect: Desktop sessions usually come back on your next "
+            "message; otherwise run /remote-control in each session"
+        ) in out
+        # Reported after the follow-up note, and snapshotted before the swap.
+        assert out.index("no restart needed") < out.index("Remote Control:")
+        assert seen["creds_at_snapshot"] != seen["creds_after"]
+
+    def test_rc_report_singular(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        rc = [self._rc_session(1, str(Path.home() / "app"), "cli")]
+        self._switch_with_rc(temp_home, sample_sequence_data, rc=rc)
+        out = capsys.readouterr().out
+        assert (
+            "Remote Control: 1 running session was connected and will "
+            "disconnect when it picks up the new account"
+        ) in out
+        assert "~/app (CLI)" in out
+        # Terminal-only: no Desktop wording.
+        assert "Reconnect: run /remote-control in the session" in out
+        assert "Desktop sessions" not in out
+
+    def test_rc_report_silent_without_rc_sessions(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        self._switch_with_rc(temp_home, sample_sequence_data, rc=[])
+        assert "Remote Control" not in capsys.readouterr().out
+
+    def test_rc_report_silent_when_switching_to_active_account(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        rc = [self._rc_session(1, "/x")]
+        self._switch_with_rc(
+            temp_home, sample_sequence_data, target="1", rc=rc,
+        )
+        assert "Remote Control" not in capsys.readouterr().out
+
+    def test_rc_report_silent_in_json_mode(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        rc = [self._rc_session(1, "/x")]
+        self._switch_with_rc(
+            temp_home, sample_sequence_data, emit_output=False, rc=rc,
+        )
+        assert "Remote Control" not in capsys.readouterr().out
+
+    def test_rc_scan_failure_does_not_break_switch(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        self._switch_with_rc(
+            temp_home, sample_sequence_data, rc=RuntimeError("scan boom"),
+        )
+        out = capsys.readouterr().out
+        assert "Switched to" in out
+        assert "Remote Control" not in out
 
     def test_switch_followup_macos(self, temp_home: Path, capsys):
         """macOS shows the ~30s cache note; a restart applies it instantly."""
