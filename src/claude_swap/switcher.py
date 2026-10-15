@@ -79,6 +79,7 @@ from claude_swap.paths import (
     get_backup_root,
     get_credentials_path,
     get_default_claude_config_home,
+    get_default_global_config_path,
     get_global_config_path,
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
@@ -620,6 +621,9 @@ class ClaudeAccountSwitcher:
 
     def _use_keychain(self) -> bool:
         return self._store._use_keychain()
+
+    def _active_write_misses_read_store(self) -> bool:
+        return self._store._active_write_misses_read_store()
 
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
@@ -3021,6 +3025,26 @@ class ClaudeAccountSwitcher:
         identity = self._get_current_account()
         return identity is not None and identity == (email, org_uuid or "")
 
+    def _is_default_login_from_another_profile(
+        self, email: str, org_uuid: str
+    ) -> bool:
+        """Whether this slot is the default profile's login while this process
+        reads another profile (``CLAUDE_CONFIG_DIR``, a session shell).
+
+        Read from the default profile's config on purpose: the identity this
+        process resolves as current is the other profile's.
+        """
+        default_config = get_default_global_config_path()
+        if self._get_claude_config_path() == default_config:
+            return False
+        if not default_config.exists():
+            return False
+        account = (self._read_json(default_config) or {}).get("oauthAccount") or {}
+        return (
+            account.get("emailAddress", ""),
+            account.get("organizationUuid", "") or "",
+        ) == (email, org_uuid or "")
+
     def _resolved_matches_slot_identity(
         self, account_num: str, resolved: dict
     ) -> bool | None:
@@ -4254,6 +4278,25 @@ class ClaudeAccountSwitcher:
             )
             return FetchRecord(error="store-unmirrored")
 
+        # The CLAUDE_CONFIG_DIR half of the same parity (#206). On macOS the
+        # credential above was read from that profile's hashed Keychain item,
+        # and _write_credentials reaches only the default profile's. A
+        # refresh from here consumes the profile's grant and persists the
+        # successor into the default login: every claude running on the
+        # profile keeps the consumed generation and is logged out at its
+        # next refresh, and the default login now holds another account's
+        # token. A `cswap run` session shell is the common way in, since
+        # `list` there resolves the session's account as the active one.
+        # The profile's own claude renews on its next call, so the slot is
+        # expired and nothing more.
+        if self._active_write_misses_read_store():
+            self._logger.debug(
+                "CLAUDE_CONFIG_DIR names a profile whose Keychain item cswap "
+                "cannot write; leaving account %s's active credential to "
+                "that profile's own claude.", account_num,
+            )
+            return _defer(force_refresh)
+
         # Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up
         # outright: attributable live → refresh it; unattributable live but
@@ -4922,11 +4965,20 @@ class ClaudeAccountSwitcher:
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 return self._read_only_fetch(str(num), email, session_creds, rejected_fp)
 
-        if has_live_session:
+        if has_live_session or self._is_default_login_from_another_profile(
+            email, org_uuid
+        ):
             # No profile credential to read (wiped under the session, or
             # unreadable): the backup copy serves read-only, and once the
             # live claude has rotated past it the server refuses it for
             # good. An expired copy is known refused without asking.
+            #
+            # The default login polled from another profile's shell is owned
+            # the same way. _build_accounts_info resolves the active slot
+            # through CLAUDE_CONFIG_DIR, so this slot arrives here as idle
+            # while the default profile's claude still rotates its family in
+            # the default store. Refreshing the backup would consume the
+            # generation that store holds and log that claude out.
             backup_oauth = oauth.extract_oauth_data(creds) or {}
             if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
