@@ -223,6 +223,13 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
+def _five_hour_window_running(entry: UsageEntry | None) -> bool:
+    """Whether the last good reading shows a 5-hour window not yet reset."""
+    five_hour = ((entry.last_good if entry else None) or {}).get("five_hour") or {}
+    reset = poll_policy.parse_reset_ts(five_hour.get("resets_at"))
+    return reset is not None and reset > time.time()
+
+
 def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
@@ -5571,6 +5578,50 @@ class ClaudeAccountSwitcher:
         if unclaimed:
             payload["unclaimedCredentials"] = sorted(unclaimed)
         return payload
+
+    def warm_up_accounts(
+        self, model: str | None = None
+    ) -> tuple[str | None, list[tuple[str, str, str]]]:
+        """Start the 5-hour usage window on every account where it is idle.
+
+        Sends a short message per enabled account whose window has not
+        started (or has already reset), using ``model`` or else the newest
+        Haiku the Models API lists. Returns the model used and
+        ``(num, email, outcome)`` rows.
+        """
+        # A usage pass first: it refreshes expired tokens under the same locks
+        # as `cswap list`, and reports which windows are already running.
+        entries = self._collect_usage_entries(self._build_accounts_info())
+        data = self._get_sequence_data() or {}
+        results: list[tuple[str, str, str]] = []
+        for num, email, _org, _uuid, _active, creds, _alias in self._build_accounts_info():
+            key = str(num)
+            entry = entries.get(key)
+            if self._disabled_from_data(data, key):
+                results.append((key, email, "skipped: disabled"))
+                continue
+            if entry is not None and entry.sentinel:
+                results.append((key, email, f"skipped: {entry.sentinel}"))
+                continue
+            if _five_hour_window_running(entry):
+                results.append((key, email, "already running"))
+                continue
+            token = oauth.extract_access_token(creds)
+            if not token:
+                results.append((key, email, f"skipped: {USAGE_NO_CREDENTIALS}"))
+                continue
+            try:
+                model = model or oauth.find_warmup_model(token)
+                if not model:
+                    results.append((key, email, "failed: no Haiku model listed"))
+                    continue
+                oauth.send_warmup_message(token, model)
+                results.append((key, email, "sent"))
+            except Exception as e:
+                kind, _ = oauth._classify_usage_error(e)
+                self._logger.warning(f"Warm-up failed for account {key}: {e!r}")
+                results.append((key, email, f"failed: {kind}"))
+        return model, results
 
     def list_accounts(
         self,

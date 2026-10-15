@@ -447,6 +447,61 @@ Examples:
         sys.exit(130)
 
 
+def _warmup_command(argv: list[str]) -> None:
+    """Handle `cswap warmup [--model MODEL]`.
+
+    Starts the 5-hour usage window on every idle account with a short
+    message. Pre-dispatched for the same reason as `swap`.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} warmup",
+        description=(
+            "Start the 5-hour usage window on every account where it is idle, "
+            "by sending each a short message on the cheapest model. "
+            "Accounts whose window is already running, disabled accounts, and "
+            "API keys are skipped."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap warmup
+  cswap warmup --model MODEL_ID
+        """,
+    )
+    parser.add_argument(
+        "--model",
+        help="Model to send with (default: the newest Haiku the API lists)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if not switcher.sequence_file.exists():
+            print(dimmed("No accounts are managed yet."))
+            return
+        model, results = switcher.warm_up_accounts(args.model)
+        if model:
+            print(muted(f"Model: {model}"))
+        for num, email, outcome in results:
+            mark = accent(outcome) if outcome == "sent" else muted(outcome)
+            print(f"  {num}: {email}  {mark}")
+        if any(outcome == "sent" for _, _, outcome in results):
+            print(dimmed(
+                "New windows can take a few minutes to show a reset time in "
+                f"`{_prog_name()} list`."
+            ))
+        if any(outcome.startswith("failed") for _, _, outcome in results):
+            sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _move_command(argv: list[str]) -> None:
     """Handle `cswap move NUM|EMAIL|ALIAS SLOT`.
 
@@ -1019,6 +1074,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "warmup":
+        _warmup_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1058,6 +1116,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s warmup                     start the 5h window on every idle account
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
