@@ -402,6 +402,29 @@ def _unclaimed_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+ROTATOR_INSTALL_HINT = (
+    "cswap rotator needs the cswap-rotator package. Install it into cswap's environment:\n"
+    "  uv tool install 'claude-swap[rotator]'"
+)
+
+
+def _rotator_command(argv: list[str]) -> None:
+    """Handle `cswap rotator ...` by handing off to the cswap-rotator companion.
+
+    cswap-rotator is a local proxy that moves Claude Code sessions between
+    subscriptions and an API key per request, without restarting them (which a
+    credential switch cannot do across the two auth modes). It ships as a
+    separate package behind the `rotator` extra, so cswap itself never carries
+    a proxy; this command only delegates to it.
+    """
+    try:
+        from cswap_rotator.cli import main as rotator_main
+    except ImportError:
+        printer.error(ROTATOR_INSTALL_HINT)
+        sys.exit(1)
+    sys.exit(rotator_main(argv) or 0)
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -1016,6 +1039,9 @@ def main() -> None:
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
+    if argv and argv[0] == "rotator":
+        _rotator_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
@@ -1058,6 +1084,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s rotator ...                per-request subscription/API-key rotation (rotator extra)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
