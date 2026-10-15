@@ -46,6 +46,16 @@ class AutoSwitchSettings:
     threshold: float = 90.0
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
+    # Standby handback ("failback") on its own timer, the way keepalived keeps
+    # `preempt_delay` separate from its other timers. None (default) = failback
+    # keeps following `cooldown_seconds`, exactly as before this field existed.
+    # A number is the seconds a recovered primary must stay eligible before the
+    # reserve hands back, measured from when the handback first became
+    # actionable -- not from the last switch, which for a reserve promoted
+    # BECAUSE every primary was exhausted has almost always already elapsed.
+    # 0 = hand back on the first fresh eligible poll. `0.0` and None are
+    # different policies: never conflate them with a falsiness test.
+    failback_delay_seconds: float | None = None
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
@@ -113,6 +123,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
             help="Minimum seconds between proactive switches",
+        ),
+        SettingSpec(
+            "autoswitch", "failbackDelaySeconds", "failback_delay_seconds", "float",
+            0.0, 86400.0,
+            help="Seconds a recovered primary must hold before a standby hands "
+                 "back; unset follows cooldownSeconds",
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
@@ -428,6 +444,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("threshold", "threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
+        ("failback_delay", "failback_delay_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
