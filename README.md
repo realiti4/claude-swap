@@ -189,7 +189,7 @@ cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
-cswap remove 2                  # Remove an account
+cswap remove 2                  # Remove an account (the rest renumber 1…n)
 cswap disable 2                 # Hold an account out of auto-rotation (keeps its login)
 cswap enable 2                  # Return a disabled account to rotation
 cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
