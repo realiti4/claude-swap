@@ -15,13 +15,13 @@ import dataclasses
 import json
 import logging
 import os
+import secrets
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import replace_with_retry, write_all
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -462,27 +462,46 @@ def atomic_write_json(path: Path, data: dict) -> None:
     - The 0700 hardening stays on the directory cswap owns. Applying it to
       the resolved parent would narrow a directory belonging to something
       else, and raise ``PermissionError`` outright when that parent is not
-      ours to chmod. The written file still gets 0600, and ``mkstemp``
-      creates it 0600 to begin with, so the secret is never exposed.
+      ours to chmod. The written file still gets 0600, set on the fd before
+      the publish, so the secret is never exposed at any point.
     """
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+    # THE NAME BEFORE THE FILE. `mkstemp` picks the name internally and opens
+    # the file before it returns, so an interrupt in that window strands a temp
+    # nothing can name. `O_EXCL` keeps the collision safety mkstemp gave.
+    tmp_path = str(target.parent
+                   / f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    fd = -1
     try:
-        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+        try:
+            fd = os.open(
+                tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+            # the name, so the cleanup below must not unlink their file.
+            tmp_path = None
+            raise
+        write_all(fd, json.dumps(data, indent=2).encode("utf-8"))
+        if sys.platform != "win32":
+            # On the fd, BEFORE the publish. Not for secrecy: `mkstemp`
+            # opens at 0600 and a umask only clears bits, so its temp is
+            # never wider. It is so the try block ends AT the publish — a
+            # chmod on the target after it can fail once the rename has
+            # handed the temp name to whoever draws it next.
+            os.fchmod(fd, 0o600)
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(target))
-        if sys.platform != "win32":
-            os.chmod(str(target), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise
