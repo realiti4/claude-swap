@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -411,10 +412,10 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
-    exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
-    HTTP-date form is rare enough to ignore).
+    (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
+    ``"bad-response"``, or the exception type name as a fallback).
+    ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
+    one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
@@ -430,6 +431,16 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
+        # A TLS handshake the SERVER answered and we refused is not a
+        # transport failure, and calling it one sends you to DNS while the
+        # repair is a CA bundle. Measured: a TLS-terminating proxy
+        # presented a CA urllib does not trust, every poll raised
+        # URLError(SSLCertVerificationError), all of it stored as "network",
+        # and one account sat unpolled for ten days with that one word as the
+        # whole record. The remedy is platform-dependent and lives in
+        # ERROR_NOTES["tls-cert"], where the operator actually reads it.
+        if isinstance(e.reason, ssl.SSLCertVerificationError):
+            return "tls-cert", None
         return "network", None
     if isinstance(e, json.JSONDecodeError):
         return "bad-response", None

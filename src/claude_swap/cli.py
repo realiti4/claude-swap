@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import sys
@@ -892,6 +893,9 @@ Examples:
         sys.exit(130)
 
 
+_logger = logging.getLogger("claude-swap")
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -907,14 +911,26 @@ def _use_native_tls() -> None:
     with its own bundled roots) is unaffected. ``truststore`` delegates to them.
 
     Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
-    the CLI over a TLS-trust nicety.
+    the CLI over a TLS-trust nicety -- but SAY SO, because the fallback is not
+    trust-neutral. Measured on macOS, the OS keychains carry 173 unique roots
+    against stdlib's 128, and 67 are trusted by the OS and not by stdlib, four
+    of them in the system keychain where an administrator installs a corporate
+    MITM CA. A swallowed failure can withdraw the exact root the machine was
+    configured with, and ``ERROR_NOTES["tls-cert"]`` then sends the user to a
+    store nothing is reading.
     """
     try:
         import truststore
 
         truststore.inject_into_ssl()
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning(
+            "native TLS trust unavailable (%s: %s); falling back to stdlib "
+            "ssl, which does not read the OS certificate store; a CA trusted "
+            "only there will not verify",
+            type(e).__name__,
+            e,
+        )
 
 
 def _menubar_service(args) -> int:
