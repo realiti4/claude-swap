@@ -26,6 +26,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
 from claude_swap.models import AccountsSnapshot
+from claude_swap.settings import load_settings
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -243,7 +244,9 @@ class AccountListScreen(Screen):
             first_build = not self._numbers
             previous = listview.index
             await listview.clear()
-            await listview.extend(AccountItem(acc) for acc in snap.accounts)
+            await listview.extend(
+                AccountItem(acc, pinging=snap.pinging) for acc in snap.accounts
+            )
             self._numbers = numbers
             listview.index = (
                 self._index_after_build(snap, first_build, previous)
@@ -252,7 +255,7 @@ class AccountListScreen(Screen):
             )
         else:
             for item, acc in zip(listview.query(AccountItem), snap.accounts):
-                item.set_account(acc)
+                item.set_account(acc, snap.pinging)
         self._flash_updated(snap, listview)
 
     def _index_after_build(
@@ -352,8 +355,15 @@ class WatchScreen(AccountListScreen):
     def __init__(self) -> None:
         super().__init__()
         self._selecting = False
+        # Read once at mount, like the auto-switch view's own settings load:
+        # this screen runs no engine of its own, so this is the file's
+        # *configured* preference, honored whenever some `cswap auto` (this
+        # TUI's own auto view, the CLI, a cron `--once`, or the menu bar)
+        # is actually running — never a claim that priming is happening now.
+        self._warm_on_reset = False
 
     def on_mount(self) -> None:
+        self._warm_on_reset = load_settings(self.app.switcher.backup_dir).warm_on_reset
         self.watch(self.app, "refresh_status", self._on_refresh_status)
         self.query_one("#list-title", Static).update(self._title_text())
         super().on_mount()
@@ -361,8 +371,13 @@ class WatchScreen(AccountListScreen):
     def _title_text(self) -> str:
         if self._selecting:
             return self._SELECT_TITLE
+        base = (
+            f"{self._WATCH_TITLE} · warm-on-reset"
+            if self._warm_on_reset
+            else self._WATCH_TITLE
+        )
         status = self.app.refresh_status
-        return f"{self._WATCH_TITLE} · {status}" if status else self._WATCH_TITLE
+        return f"{base} · {status}" if status else base
 
     def _on_refresh_status(self, status: str) -> None:
         if not self._selecting:
