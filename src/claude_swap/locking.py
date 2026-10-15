@@ -41,6 +41,7 @@ class FileLock:
         self._lock_file = open(self.lock_path, "w")
 
         start = time.monotonic()
+        deadline = start + timeout
         while True:
             try:
                 if sys.platform == "win32":
@@ -56,7 +57,10 @@ class FileLock:
                     self._lock_file.close()
                     self._lock_file = None
                     return False
-                time.sleep(0.1)
+                # Clamped to the remaining budget, so `timeout` bounds the
+                # call: the deadline check above cannot fire while a full
+                # sleep is still running past it.
+                time.sleep(max(0.0, min(0.1, deadline - time.monotonic())))
 
     def release(self) -> None:
         """Release the lock."""
