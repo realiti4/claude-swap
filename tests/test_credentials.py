@@ -271,3 +271,73 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestActiveWriteStaysOnOneProfile:
+    """The write must land on the item the read consults.
+
+    The read was redirected to the profile's hashed item; the write kept the
+    hardcoded default-profile name. Under a custom ``CLAUDE_CONFIG_DIR`` that
+    splits the two: the switch writes an item claude never reads, so the live
+    credential never changes while the config identity does — and the next read
+    reports the departing account's token under the arriving account's slot.
+    """
+
+    @staticmethod
+    def _fake_keychain(
+        mapping: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> list[tuple[str, str]]:
+        """Record every write, serve reads from ``mapping``, swallow deletes."""
+        writes: list[tuple[str, str]] = []
+
+        def set_password(service: str, account: str, password: str) -> None:
+            writes.append((service, password))
+            mapping[service] = password
+
+        monkeypatch.setattr("claude_swap.macos_keychain.set_password", set_password)
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            _keychain(mapping, []),
+        )
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.delete_password",
+            lambda service, account: mapping.pop(service, None),
+        )
+        return writes
+
+    def test_custom_config_dir_writes_its_own_hashed_keychain_item(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        mapping = {CLAUDE_CODE_KEYCHAIN_SERVICE: DEFAULT_PROFILE_CREDS}
+        writes = self._fake_keychain(mapping, monkeypatch)
+
+        CredentialStore(_Host(tmp_path / "backups"))._write_credentials(
+            CUSTOM_PROFILE_CREDS
+        )
+
+        assert writes == [(keychain_service_name(str(custom)), CUSTOM_PROFILE_CREDS)]
+        assert mapping[CLAUDE_CODE_KEYCHAIN_SERVICE] == DEFAULT_PROFILE_CREDS, (
+            "wrote the default profile's item under a custom CLAUDE_CONFIG_DIR"
+        )
+
+    def test_write_then_read_round_trips_under_a_custom_config_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The invariant a split read/write breaks: a switch is observable."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        mapping = {keychain_service_name(str(custom)): DEFAULT_PROFILE_CREDS}
+        self._fake_keychain(mapping, monkeypatch)
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(CUSTOM_PROFILE_CREDS)
+
+        assert store._read_active_credentials().value == CUSTOM_PROFILE_CREDS
