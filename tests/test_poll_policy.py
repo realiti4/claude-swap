@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from claude_swap import poll_policy
+from claude_swap import oauth, poll_policy
 
 NOW = 1_000_000.0
 HALF = lambda: 0.5  # noqa: E731 — rng midpoint: jitter factor exactly 1.0
@@ -266,6 +266,48 @@ class TestResetCapping:
         )
         assert interval == poll_policy.EXHAUSTED_INTERVAL_S
         assert next_poll == pytest.approx(NOW + interval)
+
+
+class TestRefreshCapping:
+    @staticmethod
+    def _expires_ms(crossing: float) -> int:
+        """``expiresAt`` (epoch ms) of a token entering the buffer at ``crossing``."""
+        return int(crossing * 1000 + oauth.OAUTH_EXPIRY_BUFFER_MS)
+
+    def test_refresh_poll_lands_just_past_the_buffer_crossing(self):
+        crossing = NOW + 90.0
+        expires_ms = self._expires_ms(crossing)
+        early = poll_policy.refresh_poll_ts(expires_ms, rng=lambda: 0.0)
+        late = poll_policy.refresh_poll_ts(expires_ms, rng=lambda: 1.0)
+        assert early == pytest.approx(crossing + 1.0, abs=1e-6)
+        assert late == pytest.approx(
+            crossing + 1.0 + poll_policy.REFRESH_SPREAD_S, abs=1e-6
+        )
+        # One second past the crossing is inside the buffer, so the fetch
+        # path's expiry check agrees the credential is due for refresh.
+        assert (early * 1000) + oauth.OAUTH_EXPIRY_BUFFER_MS >= expires_ms
+
+    @pytest.mark.parametrize("expires_at", [None, "soon"])
+    def test_unknown_expiry_has_no_refresh_poll(self, expires_at):
+        assert poll_policy.refresh_poll_ts(expires_at) is None
+
+    def test_poll_pulled_in_to_an_earlier_refresh_point(self):
+        next_poll, interval = _plan(is_active=True, refresh_at=NOW + 91.0)
+        assert next_poll == pytest.approx(NOW + 91.0, abs=1e-6)
+        # Learned cadence untouched by the clamp.
+        assert interval == poll_policy.MIN_INTERVAL_S
+
+    def test_later_refresh_point_leaves_the_plan_alone(self):
+        next_poll, _ = _plan(is_active=True, refresh_at=NOW + 3_600.0)
+        assert next_poll == pytest.approx(NOW + poll_policy.MIN_INTERVAL_S, abs=1e-6)
+
+    @pytest.mark.parametrize("refresh_at", [NOW - 30.0, NOW])
+    def test_non_future_refresh_point_is_ignored(self, refresh_at):
+        # A fetch that itself refreshed the token was planned from the
+        # pre-fetch read, whose refresh point is already behind it: that
+        # must not schedule an immediate re-poll.
+        next_poll, _ = _plan(is_active=True, refresh_at=refresh_at)
+        assert next_poll == pytest.approx(NOW + poll_policy.MIN_INTERVAL_S, abs=1e-6)
 
 
 class TestJitter:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -1560,6 +1561,85 @@ class TestAdaptiveScheduler:
         assert counts == {}
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons[-1] == "active-idle"
+
+    def test_active_poll_lands_on_the_credential_refresh_point(
+        self, temp_home, monkeypatch
+    ):
+        # The active token enters the expiry buffer 90s after this fetch —
+        # inside the 180s active cadence. Planned at MIN_INTERVAL_S, every
+        # tick from +90s to +180s would read the token as expired, could not
+        # reach the fetch path, and would surface USAGE_TOKEN_EXPIRED. The
+        # poll instead lands on the refresh point, where the fetch path's
+        # locked refresh can run.
+        monkeypatch.setattr("claude_swap.poll_policy.REFRESH_SPREAD_S", 0.0)
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        # The fetch path's expiry check reads the wall clock, so run the
+        # store's clock on it too: the token must still be valid at fetch.
+        h.clock.now = time.time()
+        crossing = h.clock.now + 90.0
+        expires_ms = int(crossing * 1000 + oauth.OAUTH_EXPIRY_BUFFER_MS)
+        h.seed(1, "a@example.com", expires_at=expires_ms)
+        (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-1", "refreshToken": "rt-1",
+                "expiresAt": expires_ms,
+            },
+        }))
+        # A candidate expiring at the same moment keeps its own cadence: its
+        # expiry surfaces nothing between polls, and its refresh belongs to
+        # the consume gate, not to this plan.
+        h.seed(2, "b@example.com", expires_at=expires_ms)
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        assert counts == {"1": 1, "2": 1}
+        entries = h.switcher._usage_store.entries({
+            "1": ("a@example.com", ""), "2": ("b@example.com", ""),
+        })
+        assert entries["1"].next_poll_at == pytest.approx(crossing + 1.0, abs=1e-3)
+        assert entries["1"].poll_interval_s == poll_policy.MIN_INTERVAL_S
+        assert entries["2"].next_poll_at > crossing + 60.0
+        # Not due before the refresh point, due on it.
+        h.clock.now = crossing - 30.0
+        self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        h.clock.now = crossing + 1.0
+        self._tick(h, counts, usage)
+        assert counts["1"] == 2
+
+    def test_refreshing_fetch_keeps_the_normal_active_cadence(
+        self, temp_home, monkeypatch
+    ):
+        # The plan is built from the pre-fetch read. When this fetch is the
+        # one that refreshed the token, that read's refresh point is already
+        # behind the clock and must not schedule an immediate re-poll.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-live",
+                "expiresAt": 1000,
+            },
+        }))
+        h.seed(1, "a@example.com", expires_at=1000)
+        rotated = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-new", "refreshToken": "rt-new",
+                "expiresAt": int((time.time() + 8 * 3600) * 1000),
+            },
+        })
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(rotated, None),
+        ):
+            self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        entry = h.switcher._usage_store.entries({"1": ("a@example.com", "")})["1"]
+        assert entry.poll_interval_s == poll_policy.MIN_INTERVAL_S
+        assert entry.next_poll_at >= h.clock.now + poll_policy.MIN_INTERVAL_S * (
+            1 - poll_policy.JITTER_FRAC
+        )
 
     def test_poll_event_carries_fetch_errors(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch, accounts=2, unhealthy_ticks=3)

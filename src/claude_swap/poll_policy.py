@@ -146,6 +146,14 @@ ESCALATION_MARGIN_PCT = 15.0
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
 
+# Never schedule the active account's poll later than its credential's
+# refresh point either: once the token enters ``oauth.OAUTH_EXPIRY_BUFFER_MS``
+# only a poll reaches the fetch path's locked refresh, and every tick short of
+# one surfaces the token as expired. The poll is spread up to this far past
+# the crossing so machines sharing a synced lineage do not all spend its
+# single-use refresh token in the same second.
+REFRESH_SPREAD_S = 30.0
+
 
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
     """Utilization of the binding (worst) relevant window, or None."""
@@ -181,6 +189,18 @@ def earliest_future_reset_ts(
     return earliest
 
 
+def refresh_poll_ts(
+    expires_at: object, rng: Callable[[], float] = random.random
+) -> float | None:
+    """Epoch to poll a credential expiring at ``expires_at`` (epoch ms) so its
+    refresh runs: one second past its expiry-buffer crossing, spread by up to
+    ``REFRESH_SPREAD_S``. None when the expiry is unknown."""
+    if not isinstance(expires_at, (int, float)):
+        return None
+    crossing = (expires_at - oauth.OAUTH_EXPIRY_BUFFER_MS) / 1000.0
+    return crossing + 1.0 + REFRESH_SPREAD_S * rng()
+
+
 def parse_reset_ts(resets_at: str | None) -> float | None:
     if not resets_at:
         return None
@@ -203,6 +223,7 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     rng: Callable[[], float] = random.random,
+    refresh_at: float | None = None,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
@@ -214,9 +235,11 @@ def plan_after_fetch(
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
-    reset (+ ``RESET_SLACK_S``). An at-limit account keeps a bounded slow
-    poll instead of sleeping until that reset, so an early provider-side
-    quota grant is observed and its decision-grade status stays current.
+    reset (+ ``RESET_SLACK_S``), nor later than a future ``refresh_at`` (the
+    active credential's refresh point, see ``refresh_poll_ts``). An at-limit
+    account keeps a bounded slow poll instead of sleeping until that reset,
+    so an early provider-side quota grant is observed and its decision-grade
+    status stays current.
     """
     default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
     ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
@@ -267,4 +290,6 @@ def plan_after_fetch(
         reset_ts = earliest_future_reset_ts(new_usage, now, models)
         if reset_ts is not None:
             next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
+    if refresh_at is not None and refresh_at > now:
+        next_poll = min(next_poll, refresh_at)
     return next_poll, interval
