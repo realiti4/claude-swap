@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -51,7 +51,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    parse_priority_accounts,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -362,7 +367,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "fallback" | "priority"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -684,6 +689,16 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # One-shot typo guard for ``autoswitch.fallbackAccount``. Unlike the
+        # model check this needs no usage data (it's a static identifier
+        # lookup), so it resolves on the very first tick.
+        self._fallback_check_done = not settings.fallback_account
+        # Same shape, for ``autoswitch.priorityAccounts``.
+        # Also armed with an EMPTY list when the strategy is `priority`:
+        # that combination is a silent no-op the guard has to name.
+        self._priority_check_done = not (
+            settings.priority_accounts or settings.strategy == "priority"
+        )
 
     # -- state file ---------------------------------------------------------
 
@@ -959,6 +974,10 @@ class AutoSwitchEngine:
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
+        if not self._fallback_check_done:
+            self._check_fallback_account()
+        if not self._priority_check_done:
+            self._check_priority_accounts()
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -973,11 +992,38 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # Priority recall is decided BEFORE the below-threshold early exit
+        # below, since its whole point is to act even while the active
+        # account is itself healthy — and SCOPED to exactly that case, like
+        # every sibling anti-flap gate. Unscoped it also pre-empted
+        # `at-limit`/`failover`, where narrowing the candidates to one
+        # rank-chosen account stranded an exhausted active for good if that
+        # account could not be freshened: the ordinary ranking and the
+        # fallback escape both became unreachable. Gated on the same
+        # cooldown the proactive/consume-first triggers already respect,
+        # checked here rather than in their shared gate below, so a cooldown
+        # tick still falls through to that gate's ordinary NO_ACTION.
+        priority_target = None
+        if (
+            active_headroom is not None
+            and (100.0 - active_headroom) < settings.threshold
+            and settings.strategy == "priority"
+            and not self._in_cooldown(state)
+        ):
+            priority_target = self._priority_target(
+                current,
+                headroom,
+                quarantined,
+                self._resolve_priority_accounts(),
+                settings,
+            )
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            if priority_target is not None:
+                trigger = "priority"
+            elif utilization < settings.threshold:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -1174,17 +1220,26 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-        )
+        if trigger == "priority":
+            # Already fully decided above: exactly one candidate, chosen by
+            # rank rather than headroom, so the headroom/hysteresis-based
+            # `_rank_candidates` (and its no-return bar, which exists to
+            # stop a flap back to an account "no better than when we left
+            # it" — the opposite of what a fixed rank order asks for) does
+            # not apply here.
+            ordered, any_known, active_reset_ts = [priority_target], True, None
+        else:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
 
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -1224,7 +1279,53 @@ class AutoSwitchEngine:
             ordered = api_key_candidates
 
         if not ordered:
-            if not any_known:
+            fallback_num = self._resolve_fallback_account_number()
+            # Proactive escape hatch: every other OAuth candidate is known and
+            # over threshold (real headroom left, not literal exhaustion),
+            # and the fallback itself holds no less headroom than the active
+            # account right now — otherwise this would spend known-good
+            # active quota on a destination that is merely unread or
+            # provably worse. Unlike the at-limit/failover escape below, an
+            # unreadable fallback is not excused here: the bet needs a real,
+            # comparable reading first. Without this, a configured fallback
+            # sits inert through the exact "everyone struggling, nobody
+            # literally at zero" case it exists for.
+            other_headrooms = [
+                headroom.get(n) for n in oauth_candidates if n != fallback_num
+            ]
+            fallback_headroom = headroom.get(fallback_num)
+            fleet_struggling = (
+                trigger == "proactive"
+                and active_headroom is not None
+                and (100.0 - active_headroom) >= settings.threshold
+                # `all()` over an empty list is vacuously True: on a fleet
+                # of just the active account and its fallback, there are no
+                # other candidates to fail this check, so it must not gate
+                # on `other_headrooms` being non-empty — that would make the
+                # hatch unreachable on exactly the two-account fleet the
+                # README calls the common case.
+                and all(
+                    h is not None and (100.0 - h) >= settings.threshold
+                    for h in other_headrooms
+                )
+                and fallback_headroom is not None
+                and fallback_headroom >= active_headroom
+            )
+            fallback_ready = (
+                # The active account must be unable to carry on: at-limit
+                # (out of quota), failover (credential dead), or — proactive
+                # — the fleet-struggling case just above. Resolved up front
+                # so an unreadable OTHER candidate can never hide this escape
+                # hatch behind "no candidate has readable usage" below — the
+                # fallback account's OWN unreadability doesn't disqualify it
+                # from the at-limit/failover branch either, since the
+                # freshen step a few lines down is about to try it for real,
+                # not go on a cached, possibly-stale reading.
+                (trigger in ("at-limit", "failover") or fleet_struggling)
+                and fallback_num in candidates
+                and self._oauth_switch_eligible(fallback_num)
+            )
+            if not any_known and not fallback_ready:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -1264,14 +1365,37 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
-            # "All exhausted" (and its bounded reset-aware sleep) only when it's
-            # literally true: every candidate's usage is known and at its
-            # limit. A candidate that merely failed the proactive hysteresis
-            # gate, or one whose usage is unreadable this tick, can become
-            # viable at any moment — and the active account can hit 100% and
-            # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
+            # "All exhausted" (and its bounded reset-aware sleep) fires when
+            # every OTHER candidate's usage is known and at its limit, or
+            # when the fleet-struggling escape hatch above applies and the
+            # fallback is ready (see the comment on `truly_exhausted` below).
+            # A candidate that merely failed the proactive
+            # hysteresis gate, or one whose usage is unreadable this tick,
+            # can become viable at any moment — and the active account can
+            # hit 100% and need the at-limit escape — so those keep the
+            # normal cadence. The one exception is the fallback destination
+            # when it is ready to be tried: it is excused from this "known
+            # and zero" requirement, because the freshen step below judges it
+            # live rather than by whether its cached usage happened to read
+            # as zero. The exemption is gated on `fallback_ready` so it can
+            # never shorten the OTHER path out of here — without the gate, a
+            # merely-proactive tick whose only unreadable peer is the
+            # fallback would drop to `_block_all_exhausted`'s long nap on a
+            # reading it never actually took.
+            candidate_headrooms = [
+                headroom.get(n)
+                for n in oauth_candidates
+                if not (fallback_ready and n == fallback_num)
+            ]
+            # `fleet_struggling` covers the proactive case (real headroom,
+            # all of it over threshold), but only once a usable fallback is
+            # confirmed — gated on `fallback_ready` so a struggling fleet
+            # whose resolved fallback turns out quarantined, ineligible, or
+            # the active account itself doesn't get called "exhausted" on a
+            # bet nobody can actually place. The literal `<= 0` check still
+            # covers at-limit/failover, where a candidate can be over
+            # threshold without yet being fully spent.
+            truly_exhausted = (fleet_struggling and fallback_ready) or all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
             if not truly_exhausted:
@@ -1286,20 +1410,17 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            self._blocked_wait_long = True
-            earliest = self._earliest_recovery(usage)
-            if earliest is not None:
-                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
-            self._emit(
-                AllExhaustedEvent(
-                    earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
-                        else None
-                    )
-                )
-            )
-            return TickOutcome.BLOCKED
+            if fallback_ready:
+                # Everything else OAuth is at 0% headroom (or is the fallback
+                # itself) and no better option exists — a configured fallback
+                # beats sitting BLOCKED until the earliest reset. Reuses the
+                # freshen+switch loop below as its sole candidate rather than
+                # a bespoke switch path, and the loop's own exits restore
+                # this block if it cannot land.
+                ordered = [fallback_num]
+                trigger = "fallback"
+            else:
+                return self._block_all_exhausted(usage)
 
         # -- freshen + switch ----------------------------------------------
         # The departure snapshot of the account we are leaving, taken from the
@@ -1377,7 +1498,44 @@ class AutoSwitchEngine:
                     transient=True,
                 )
             )
+            if trigger == "fallback":
+                # Nowhere left to go: every other candidate is spent and the
+                # escape hatch failed too. The ErrorEvent above says why, but
+                # the tick's OUTCOME is the block — see `_block_all_exhausted`.
+                # Since the fallback may have been excused from the exhaustion
+                # test rather than proven spent, this can now report the block
+                # on a headroom nobody read. That is the same bounded-nap trade
+                # the helper's docstring already takes for a self-clearing
+                # cause, and the fast retry that would shorten it is what
+                # 770d2a6 removed.
+                return self._block_all_exhausted(usage)
+            if trigger == "priority":
+                # See the same arm below the next branch for why a failed
+                # recall is NO_ACTION rather than ERROR.
+                return TickOutcome.NO_ACTION
             return TickOutcome.ERROR
+        if trigger == "fallback":
+            # Nothing systemic and nothing transient, so the loop drained on
+            # a quarantine or `skip-live-session`.
+            return self._block_all_exhausted(usage)
+        if trigger == "priority":
+            # The active account is healthy by construction here — recall is
+            # scoped to below-threshold — so a recall that could not land is
+            # a tick that did nothing. `best` in this same fleet state
+            # returns NO_ACTION without ever entering the loop, and the
+            # exit-code contract has to hold across strategies: cron
+            # wrappers keying on BLOCKED(3) or ERROR(1) must not be paged by
+            # a healthy fleet because a strategy flag is set.
+            self._emit(
+                NoSwitchEvent(
+                    reason="priority-target-unreachable",
+                    detail=(
+                        "the higher-ranked account could not be freshened "
+                        "this tick; staying put"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -1978,7 +2136,9 @@ class AutoSwitchEngine:
         snapshot and, only when a switch would fire, re-runs an escalated
         collection and re-verifies the choice in ``_tick_inner`` (two-phase
         commit), plus a per-target ``UsageEntry.fresh`` gate before
-        performing.
+        performing. Priority recall also fires outside the band and decides
+        on the stored snapshot; it is bounded instead by ``at-limit``
+        bouncing off a target that turned out to be spent, on the next tick.
 
         Stalest-first needs no rotation cursor: it reads the persisted store,
         so the loop and cron-driven ``--once`` runs schedule identically.
@@ -2124,7 +2284,11 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in (
+                "proactive",
+                "consume-first",
+                "priority",
+            ) and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2219,6 +2383,264 @@ class AutoSwitchEngine:
                         f"autoswitch.model: {', '.join(missing)} matches no "
                         "account's usage windows — only the 5h/7d limits are "
                         "being watched for it (typo?)"
+                    )
+                )
+            )
+
+    def _block_all_exhausted(
+        self, usage: dict[str, dict | str | None]
+    ) -> TickOutcome:
+        """Park on the bounded, reset-aware slow cadence and say so.
+
+        Shared by the plain all-exhausted branch and by the fallback paths
+        that end up back in the same state, so a configured-but-unreachable
+        fallback cannot quietly cost the caller what the block provides: the
+        ``AllExhaustedEvent`` the menubar and TUI key on, ``earliestResetAt``
+        for ``--json`` consumers, and the BLOCKED ``--once`` exit code.
+
+        The nap applies even when the cause is self-clearing (a network blip,
+        a live session holding the slot), which does mean the escape hatch
+        can land up to ``MAX_SLEEP_S`` late. That is deliberate. Retrying
+        those at the normal interval saves at most one wake-up in the cases
+        that resolve — a quarantined fallback leaves ``candidates`` and naps
+        on the very next tick to the same reset target — while
+        ``skip-live-session`` never leaves ``candidates`` at all, so a user
+        running ``cswap run`` on their designated seat would spin the tick
+        loop at 10x for the lifetime of that session. Ten minutes late is a
+        rounding error against the hour of idling the fallback exists to
+        avoid; an unattended laptop waking all night is not.
+        """
+        self._blocked_wait_long = True
+        earliest = self._earliest_recovery(usage)
+        if earliest is not None:
+            self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+        self._emit(
+            AllExhaustedEvent(
+                earliest_reset_at=(
+                    earliest.isoformat().replace("+00:00", "Z")
+                    if earliest
+                    else None
+                )
+            )
+        )
+        return TickOutcome.BLOCKED
+
+    def _oauth_switch_eligible(self, num: str | None) -> bool:
+        """Whether a resolved ``fallbackAccount``/``priorityAccounts`` slot
+        can actually be landed on outside the normal candidate ranking.
+
+        One definition for both the decision point and each setting's typo
+        guard, so a warning can never claim a slot the engine would refuse.
+
+        An API-key slot is never eligible, in EITHER setting of
+        ``includeApiKeyAccounts``, because neither setting can honour the
+        designation:
+
+        * with the opt-in off, switching onto a metered slot from here is a
+          one-way door — the next tick's ``active-api-key`` early return
+          holds, so rotation never resumes even once the OAuth accounts
+          reset;
+        * with it on, ``api_key_candidates`` are already reachable through
+          the ordinary ranking, in rotation order — so naming one here buys
+          no control over WHICH metered account gets the traffic, and the
+          bill follows whichever one the engine lands on.
+
+        Refusing both ways means each setting's warning tells the truth in
+        both, rather than implying a control over billing that does not
+        exist.
+        """
+        if num is None:
+            return False
+        return (
+            num in self.switcher.switchable_account_numbers()
+            and self.switcher.account_kind_for(num) != "api_key"
+        )
+
+    def _resolve_fallback_account_number(self) -> str | None:
+        """Resolve ``autoswitch.fallbackAccount`` to an account number, or
+        ``None`` if unset, unmatched, or ambiguous (an ambiguous email is
+        already reported by ``_check_fallback_account``; here it just means
+        "no usable fallback")."""
+        identifier = self.settings.fallback_account
+        if not identifier:
+            return None
+        try:
+            return self.switcher._resolve_account_identifier(identifier)
+        except ConfigError:
+            return None
+
+    def _check_fallback_account(self) -> None:
+        """One-shot ``autoswitch.fallbackAccount`` typo guard, mirroring
+        ``_check_model_names``: a configured identifier that never reaches the
+        candidate list would otherwise look like a safety net while being
+        inert.
+
+        Resolution alone is not the bar, so this asks ``_oauth_switch_eligible``
+        the same question the decision point asks. ``_resolve_account_identifier``
+        returns a bare digit unexamined, so ``--fallback-account 4`` with three
+        accounts resolves to ``"4"`` — the typo most worth catching, and one
+        that resolving alone reports as fine.
+
+        The wording stays one sentence listing every ineligible case rather
+        than naming which one applies, because the remedy does not vary: the
+        setting names something that cannot be the fallback, so it has to be
+        corrected or dropped either way.
+        """
+        self._fallback_check_done = True
+        identifier = self.settings.fallback_account
+        if not identifier:
+            return
+        try:
+            resolved = self.switcher._resolve_account_identifier(identifier)
+        except ConfigError as e:
+            self._emit(
+                ConfigWarningEvent(
+                    message=f"autoswitch.fallbackAccount: {e}",
+                )
+            )
+            return
+        if self._oauth_switch_eligible(resolved):
+            return
+        self._emit(
+            ConfigWarningEvent(
+                message=(
+                    f"autoswitch.fallbackAccount: '{identifier}' cannot serve "
+                    "as the fallback (unknown identifier, or a slot that is "
+                    "disabled, has no usable backup, or is an API-key "
+                    "account) — the exhausted-fallback safety net is inert"
+                )
+            )
+        )
+
+    def _resolve_priority_accounts(self) -> list[str]:
+        """Resolve ``autoswitch.priorityAccounts`` to account numbers, in
+        rank order.
+
+        Re-resolved every tick like ``_resolve_fallback_account_number``
+        (a cheap, in-memory lookup) rather than cached, so an account added,
+        removed, or renamed mid-run is picked up immediately. An identifier
+        that fails to resolve, or resolves to a slot ``_oauth_switch_eligible``
+        refuses, is dropped rather than breaking the rank order for the
+        entries after it; a later duplicate of an already-seen account is
+        dropped too, since a repeated rank has no meaning.
+        """
+        seen: set[str] = set()
+        resolved: list[str] = []
+        for identifier in parse_priority_accounts(self.settings.priority_accounts):
+            try:
+                num = self.switcher._resolve_account_identifier(identifier)
+            except ConfigError:
+                continue
+            if num is None or num in seen or not self._oauth_switch_eligible(num):
+                continue
+            seen.add(num)
+            resolved.append(num)
+        return resolved
+
+    def _priority_target(
+        self,
+        current: str,
+        headroom: dict[str, float | None],
+        quarantined: set[str],
+        priority_numbers: list[str],
+        settings: AutoSwitchSettings,
+    ) -> str | None:
+        """First ready account ranked above ``current`` in ``priority_numbers``.
+
+        ``current``'s own rank is its index in the list, or
+        ``len(priority_numbers)`` (lowest possible) when it isn't listed at
+        all — so any listed, ready account always outranks an unlisted one.
+
+        EVERY entry must read below ``settings.threshold``, the last one
+        included. An uncapped tail was tried and reverted: recall departs a
+        HEALTHY account, so landing on one whose usage is unread or known
+        spent buys an immediate ``at-limit`` bounce back off it, and the
+        pair then flaps forever at cooldown cadence — pinned by
+        ``test_spent_terminal_entry_does_not_flap``.
+
+        A quarantined higher-priority entry is skipped rather than treated
+        as a rank boundary, so a dead #1 can't hide a healthy #2.
+        """
+        current_rank = (
+            priority_numbers.index(current)
+            if current in priority_numbers
+            else len(priority_numbers)
+        )
+        for rank, num in enumerate(priority_numbers):
+            if rank >= current_rank:
+                break
+            if num in quarantined:
+                continue
+            h = headroom.get(num)
+            if h is not None and (100.0 - h) < settings.threshold:
+                return num
+        return None
+
+    def _check_priority_accounts(self) -> None:
+        """One-shot ``autoswitch.priorityAccounts`` typo guard, mirroring
+        ``_check_fallback_account``.
+
+        Each cause gets its own sentence because, unlike the fallback
+        guard's single slot, the remedies differ: an ineligible or ambiguous
+        identifier needs correcting, a duplicate is simply inert, and an
+        empty list under ``strategy=priority`` means the strategy itself
+        never does anything. One wording covering all four would be false
+        for three of them.
+        """
+        self._priority_check_done = True
+        raw = parse_priority_accounts(self.settings.priority_accounts)
+        if not raw:
+            if self.settings.strategy == "priority":
+                self._emit(
+                    ConfigWarningEvent(
+                        message=(
+                            "autoswitch.strategy is 'priority' but "
+                            "priorityAccounts is empty — nothing is ranked, "
+                            "so recall never fires and the engine behaves "
+                            "exactly like 'best'"
+                        )
+                    )
+                )
+            return
+        seen: set[str] = set()
+        unusable: list[str] = []
+        duplicates: list[str] = []
+        for identifier in raw:
+            try:
+                num = self.switcher._resolve_account_identifier(identifier)
+            except ConfigError as e:
+                self._emit(
+                    ConfigWarningEvent(
+                        message=f"autoswitch.priorityAccounts: {e}",
+                    )
+                )
+                continue
+            if not self._oauth_switch_eligible(num):
+                unusable.append(identifier)
+            elif num in seen:
+                duplicates.append(identifier)
+            else:
+                seen.add(num)
+        if unusable:
+            self._emit(
+                ConfigWarningEvent(
+                    message=(
+                        "autoswitch.priorityAccounts: "
+                        f"{', '.join(unusable)} cannot be recalled to "
+                        "(unknown identifier, or a slot that is disabled, "
+                        "has no usable backup, or is an API-key account) — "
+                        "dropped from the rank order"
+                    )
+                )
+            )
+        if duplicates:
+            self._emit(
+                ConfigWarningEvent(
+                    message=(
+                        "autoswitch.priorityAccounts: "
+                        f"{', '.join(duplicates)} duplicate an account "
+                        "already ranked higher in the list — a repeated rank "
+                        "has no meaning, so the later entry is dropped"
                     )
                 )
             )

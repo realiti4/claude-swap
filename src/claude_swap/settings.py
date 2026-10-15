@@ -47,7 +47,9 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom), "consume-first" (soonest weekly reset), or
+    # "priority" (walk priority_accounts in rank order; see that field).
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -57,6 +59,21 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # NUM|EMAIL|ALIAS to force onto once the active account can no longer
+    # carry on — out of quota, or its credential dead — and every OAuth
+    # candidate is at or over the limit on whichever window binds first,
+    # rather than sitting blocked until the earliest reset. Never an API-key
+    # account. None = no fallback (default: block).
+    fallback_account: str | None = None
+    # Comma-separated, rank-ordered NUM|EMAIL|ALIAS list acted on only when
+    # strategy is "priority" (the typo guard validates it under any
+    # strategy). Recall takes the highest-ranked entry below `threshold`
+    # even while the active account is itself still healthy — but only
+    # while the ACTIVE account is below `threshold` too, and every entry is
+    # capped by it, the last one included. Why: `_priority_target` for the
+    # per-entry cap, the gate comment in `tick()` for the active-side one.
+    # None = no list configured (priority strategy then behaves like best).
+    priority_accounts: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,7 +137,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "priority"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -134,6 +151,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "fallbackAccount", "fallback_account", "string",
+            help="NUM|EMAIL|ALIAS to force onto once every OAuth account is spent",
+        ),
+        SettingSpec(
+            "autoswitch", "priorityAccounts", "priority_accounts", "string",
+            help="Rank-ordered NUM|EMAIL|ALIAS list for strategy=priority",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -165,6 +190,27 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def parse_priority_accounts(value: str | None) -> tuple[str, ...]:
+    """Split a comma-separated, rank-ordered account list, trimmed and
+    deduped by exact match (first occurrence wins — order is the whole
+    point, so a later duplicate has no rank of its own). Each identifier
+    is emitted with its input casing intact, because the resolver's email
+    match is case-sensitive: lowercasing one would turn a correctly spelled
+    address into an identifier that resolves to nothing; pinned by
+    ``test_a_mixed_case_email_entry_still_resolves``. Aliases are
+    unaffected either way — ``_find_account_by_alias`` folds them itself."""
+    if not value:
+        return ()
+    seen: set[str] = set()
+    result = []
+    for part in value.split(","):
+        identifier = part.strip()
+        if identifier and identifier not in seen:
+            seen.add(identifier)
+            result.append(identifier)
+    return tuple(result)
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -431,6 +477,8 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("fallback_account", "fallback_account"),
+        ("priority_accounts", "priority_accounts"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

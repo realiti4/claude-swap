@@ -1126,6 +1126,23 @@ class TestAutoCommand:
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
+    def test_priority_flags_reach_the_engine(self, temp_home):
+        # `--priority-accounts` and `--fallback-account` are both new, and
+        # `merged_with_cli` coverage alone never proves the argparse flag
+        # exists: renaming either declaration left the whole suite green.
+        self._run(
+            ["--once", "--strategy", "priority",
+             "--priority-accounts", "enterprise,2"],
+            temp_home,
+        )
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.strategy == "priority"
+        assert settings.priority_accounts == "enterprise,2"
+
+    def test_fallback_account_flag_reaches_the_engine(self, temp_home):
+        self._run(["--once", "--fallback-account", "2"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.fallback_account == "2"
+
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
