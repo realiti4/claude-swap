@@ -381,6 +381,22 @@ service-account keys scoped to a single workspace: a multi-workspace key needs a
 `anthropic-workspace-id` header on every request, which Claude Code does not add for
 a stored key.
 
+**Prepaid credit budgets (opt-in).** API keys have no subscription quota, but a key
+that draws on a fixed prepaid credit (e.g. startup-programme credits) can be given one.
+Create `api-budgets.json` next to `sequence.json`, one entry per organization (every key
+in an org spends from the same pool):
+
+```json
+{"capPct": 95, "refreshSeconds": 900,
+ "orgs": {"acme": {"budgetUsd": 500, "since": "2026-10-01T00:00:00Z",
+                   "expiresAt": "2027-04-01T00:00:00Z", "costKeySlot": "6", "slots": ["5", "6"]}}}
+```
+
+Spend is read from the Admin API cost report with `costKeySlot`'s key (it must be
+organization-scoped) and cached for `refreshSeconds`. `cswap list` then shows
+`credit (acme) · 12% used  $60.00 / $500`, and a slot at/over `capPct` or past
+`expiresAt` is held out of automatic rotation. An unreadable spend never blocks.
+
 ## Uninstall
 
 Remove all data:
