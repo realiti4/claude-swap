@@ -1522,3 +1522,33 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestModelHeadroom:
+    """model_headroom: the named per-model windows alone."""
+
+    def test_ignores_the_session_windows(self):
+        usage = {"five_hour": {"pct": 95.0}, "scoped": [{"name": "Fable", "pct": 40.0}]}
+        assert oauth.model_headroom(usage, ["Fable"]) == 60.0
+
+    def test_none_without_a_matching_window(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Opus", "pct": 100.0}]}
+        assert oauth.model_headroom(usage, ["Fable"]) is None
+        assert oauth.model_headroom({"five_hour": {"pct": 10.0}}, ["Fable"]) is None
+        assert oauth.model_headroom(usage, []) is None
+        assert oauth.model_headroom(None, ["Fable"]) is None
+        assert oauth.model_headroom("no credentials", ["Fable"]) is None
+
+    def test_matches_case_insensitively(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 70.0}]}
+        assert oauth.model_headroom(usage, ["fable"]) == 30.0
+
+    def test_several_models_take_the_worst(self):
+        usage = {
+            "scoped": [
+                {"name": "Fable", "pct": 30.0},
+                {"name": "Opus", "pct": 95.0},
+            ],
+        }
+        assert oauth.model_headroom(usage, ["Fable", "Opus"]) == 5.0
+        assert oauth.model_headroom(usage, ["all"]) == 5.0

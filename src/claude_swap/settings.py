@@ -57,6 +57,12 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # How the ``model`` windows take part. "gate": they bind like the 5h/7d
+    # windows, so an account whose model quota is spent is never a target.
+    # "prefer": a spent model still makes the engine leave, but only the
+    # 5h/7d windows can rule a target out. Among the targets with room
+    # there, the one with the most model quota left wins.
+    model_mode: str = "gate"
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "modelMode", "model_mode", "choice",
+            choices=("gate", "prefer"),
+            help="gate: model limits bind like 5h/7d; prefer: they rank targets but never exclude one",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -430,6 +441,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
+        ("model_mode", "model_mode"),
         ("strategy", "strategy"),
     ):
         value = getattr(args, attr, None)
