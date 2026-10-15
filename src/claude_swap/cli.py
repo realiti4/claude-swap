@@ -660,8 +660,9 @@ Defaults live in settings.json in the backup root; flags override them.
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Allow switching onto managed API-key accounts as a last resort "
-            "(they bill per token; default: excluded)"
+            "Allow switching onto managed API-key accounts as a last resort, "
+            "once the active account is at its limit and no subscription "
+            "account has room (they bill per token; default: excluded)"
         ),
     )
     parser.add_argument(

@@ -1810,6 +1810,38 @@ class TestApiKeyAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    @pytest.mark.parametrize("pct", [80, 99])
+    def test_api_key_not_used_while_subscription_quota_left(self, temp_home, pct):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        h.tick_with_usage({"1": _usage(pct), "2": "api key", "3": _usage(100)})
+        assert h.active_number() == 1
+
+    def test_api_key_not_used_on_usage_unknown_failover(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        for _ in range(5):
+            h.tick_with_usage({"1": None, "2": "api key", "3": _usage(100)})
+        assert h.active_number() == 1
+
+    def test_active_api_key_returns_to_subscription_with_room(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        for _ in range(5):
+            h.tick_with_usage({"1": "api key", "2": _usage(10)})
+        assert h.active_number() == 2
+
     def test_active_api_key_idles_engine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "key@token.local")
