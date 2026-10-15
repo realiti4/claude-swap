@@ -33,6 +33,32 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# A CORRECTNESS FLOOR, not a freshness one: below it, this branch's
+# `apply_pin(identity=...)` is a TypeError at the call rather than a degraded
+# feature. Raise it for each API this branch requires OUTRIGHT, and name the
+# error the old version actually raises. `heal(identity=...)` is deliberately
+# NOT covered -- the caller probes the installed signature and falls back to
+# the positional form -- so do not raise the floor for it and do not delete
+# that probe as redundant. `carry_live_pointers`, `remembered_pin_identity`
+# and `_pointer_owner` are not covered either: absent below 0.1.223, 0.1.215
+# and 0.1.232, `_ask` answers None there -- `_pointer_owner` absent skips the
+# carry outright -- and every caller reads None as the behaviour it had
+# before the seam existed. Degraded, not a TypeError -- which is what keeps
+# this floor a correctness one.
+#
+# 0.1.303 is where `set_pin`, `repin_current` and `pin_run` live: `cswap pin
+# <n>` and the TUI hand off to them, and a release without them raises
+# AttributeError at that call.
+#
+# 0.1.309 is where `apply_pin` takes the keyword-only `everywhere` and the
+# `pin-cleared` marker `cswap pin --clear` writes is honoured: its set arm
+# unlinks it and `load_pin` reads None while it exists. On 0.1.303-0.1.308 a
+# re-pin leaves the marker, so the host reads as cleared after a successful pin.
+#
+# NO `; sys_platform != 'win32'` MARKER (proposed twice): the dev group
+# installs this so the seam test runs on Windows too, and a marker makes that
+# test decorative instead of red.
+pin = ["cswap-pin>=0.1.309"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -51,11 +77,36 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+# `claude-swap[pin]`, NOT a second `cswap-pin>=...`: the extra above is the one
+# floor, and spelling the version again here is how the two drift.
+#
+# The extra has to be installed somewhere or its contract is untested. cswap
+# READS a marker cswap-pin WRITES and the two version independently, so
+# `test_the_marker_still_matches_the_package_that_writes_it` is the only thing
+# standing between a rename there and `--clear` reporting "No cloud account
+# pinned" over a live wiring. `uv sync --locked` installs base + dev only, so
+# without this it never ran.
+#
+# This does NOT weaken "works without the extra": `TestImportSafeWithoutTheExtra`
+# and `TestClearRunsWithTheExtraGone` block `cswap_pin` at `sys.meta_path` or
+# scan the AST, so they hold whether or not the package is present.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
+    "claude-swap[pin]",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# A THREAD THAT DIES ON AN EXCEPTION FAILS THE RUN. Unhandled it is only a
+# warning, and a warning in a list of ~50 is read by nobody: one sat on every
+# run for as long as anyone had looked. This makes the next one fail instead
+# of joining the list.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
 # Parallel by default. The suite is ~1900 tests of mostly-idle work (file
 # locks, subprocess fakes, Textual pilots), so wall clock was dominated by
 # doing them one at a time, not by any single slow test: 25 ms/test spread
@@ -69,4 +120,5 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
     "no_oauth_profile_fake: opt out of the autouse fetch_oauth_profile stub (test exercises fetch_oauth_profile itself against a mocked urlopen)",
+    "no_policy_limits_fake: opt out of the autouse fetch_policy_limits stub (test exercises fetch_policy_limits itself against a mocked urlopen)",
 ]

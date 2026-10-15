@@ -153,6 +153,18 @@ def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
 
 
+def pin_cleared_path(backup_root: Path) -> Path:
+    """This host's "cleared the pin" marker, beside settings.json.
+
+    A settings.json symlinked from a repository shared across machines holds
+    ONE pin record for every host that links it, so a one-host ``cswap pin
+    --clear`` records itself here instead of dropping that record. Its
+    existence is the whole fact, and the cswap-pin package keys its use of the
+    marker on this function being present.
+    """
+    return backup_root / "pin-cleared"
+
+
 def parse_model_names(value: str | None) -> tuple[str, ...]:
     """Split a comma-separated model list, trimmed and case-insensitively
     deduped (first spelling wins). Shared by the auto engine and the manual

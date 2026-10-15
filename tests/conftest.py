@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import functools
 import json
 import os
 import shutil
@@ -431,6 +433,113 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
 
 sys.addaudithook(_real_store_audit_hook)
 
+def _reattach_orphaned_modules() -> list[str]:
+    """Put back any ``claude_swap`` module a ``patch.dict`` restore deleted.
+
+    `unittest.mock`'s `patch.dict(sys.modules, ...)` — which several tests here
+    use to fake `keyring` — restores by CLEARING the dict and repopulating from
+    an ENTRY-TIME snapshot. A module FIRST IMPORTED INSIDE the block is
+    therefore DELETED from `sys.modules` on exit, while surviving as an
+    attribute of its parent package.
+
+    That pair (attribute of parent, absent from `sys.modules`) silently defeats
+    patching. `monkeypatch.setattr("claude_swap.X.f", stub)` resolves by
+    importing the ROOT and walking with `getattr`, so it finds the orphan,
+    patches it, and REPORTS SUCCESS — while `from claude_swap.X import f` finds
+    no `sys.modules` entry, RE-IMPORTS a fresh module, and calls the REAL `f`.
+    Two module objects, nothing raised. Measured: `test_cli_accepts_heal`
+    failed 4 in 32 full-suite runs that way, its stub never called and its own
+    tripwire never fired.
+
+    WHY THIS AND NOT A LIST OF IMPORTS. The first fix imported the three known
+    victims at module scope so they would be in every snapshot. It worked and
+    it was the wrong shape: three names are today's, a fourth joins them the
+    moment some other module is first imported inside such a block, and the
+    list goes stale WHILE STILL PASSING — the same failure as the verify-merge
+    greps deleted this morning. Worse, WHICH modules get orphaned depends on
+    the machine: `pin` alone where the `cswap-pin` extra is installed, and
+    `pin` + `update_check` + `cache` where it is not, because `_impl()` only
+    raises (and `_install_hint()` only runs its lazy import chain) when the
+    extra is absent. A list would have had to enumerate a set that differs per
+    environment, which is not a set anyone can keep correct.
+
+    This asks the question instead, so it holds for any module, on any machine,
+    with or without the extra.
+    """
+    import sys as _sys
+    from types import ModuleType as _ModuleType
+
+    restored: list[str] = []
+    parents = [n for n in list(_sys.modules) if n.startswith("claude_swap")]
+    for parent_name in parents:  # grows below: a restored subpackage's children
+        parent = _sys.modules.get(parent_name)
+        if parent is None:
+            continue
+        for attr in dir(parent):
+            child = getattr(parent, attr, None)
+            if not isinstance(child, _ModuleType):
+                continue
+            name = getattr(child, "__name__", "")
+            if name.startswith("claude_swap") and name not in _sys.modules:
+                _sys.modules[name] = child
+                restored.append(name)
+                parents.append(name)
+    return restored
+
+
+@functools.lru_cache(maxsize=None)
+def source_text(path: Path) -> str:
+    """One read per source file per worker, for every scan that walks a tree."""
+    return path.read_text(encoding="utf-8")
+
+
+@functools.lru_cache(maxsize=None)
+def source_tree(path: Path) -> ast.Module:
+    """One parse per source file per worker. A scan only READS what it gets:
+    one that mutates the tree poisons every later scan in the process."""
+    return ast.parse(source_text(path), filename=str(path))
+
+
+_orphan_walk = {"modules": 0, "cs": [], "stamp": None}
+
+
+def _orphan_stamp() -> tuple[int, int]:
+    """What the orphan walk reads, as two integers: `len(sys.modules)` and the
+    attribute count of the claude_swap modules.
+
+    An orphan is born as a NEW attribute on its parent (the import binds the
+    child there), so a birth moves the second number even when `patch.dict`
+    has already put `sys.modules` back to its old size. The list of claude_swap
+    modules is rebuilt only when `len(sys.modules)` changes, which is what
+    keeps this near zero.
+
+    ponytail: a test that adds one such attribute and removes another between
+    two teardowns is not seen; hashing `sorted(vars(m))` per module is the
+    upgrade if that ever shows.
+    """
+    walk = _orphan_walk
+    if walk["modules"] != len(sys.modules):
+        walk["modules"] = len(sys.modules)
+        walk["cs"] = [m for k, m in list(sys.modules.items())
+                      if k.startswith("claude_swap")]
+    return walk["modules"], sum(len(getattr(m, "__dict__", ())) for m in walk["cs"])
+
+
+@pytest.fixture(autouse=True)
+def _no_orphaned_claude_swap_modules():
+    """Re-attach after every test, so the NEXT test patches what it calls.
+
+    Teardown, not setup: the orphan is created inside the test that runs the
+    `patch.dict` block, and the damage is done to whichever test patches that
+    module afterwards. Repairing at the end of each test closes the window
+    before anything can fall into it. The walk itself repeats only when
+    `_orphan_stamp` has moved since the last one.
+    """
+    yield
+    if _orphan_stamp() != _orphan_walk["stamp"]:
+        _reattach_orphaned_modules()
+        _orphan_walk["stamp"] = _orphan_stamp()
+
 
 class _KeychainStore:
     """In-memory ``(service, account) -> secret`` map standing in for the real
@@ -570,6 +679,29 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
         yield
         return
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def block_real_policy_limits_fetch(request, monkeypatch):
+    """Safety net: no test may make a live ``policy_limits`` request.
+
+    Every switch calls ``switcher.fetch_policy_limits`` unconditionally, and
+    dozens of unrelated switch tests exercise that path without mocking it —
+    each one silently opens a real HTTPS connection with a fixture token.
+    Stub the seam it calls, ``oauth.fetch_policy_limits``, to ``None`` (its
+    documented "unaskable" answer, which is also what a fixture token gets
+    from the server today, so no switch-path test changes meaning) so the
+    whole suite stays hermetic and fast by default. Tests that need to
+    exercise the fetch itself patch ``claude_swap.switcher.fetch_policy_limits``
+    explicitly (tests/test_switcher.py does); ``@pytest.mark.no_policy_limits_fake``
+    opts out for the class in tests/test_oauth.py that mocks ``urlopen``
+    beneath it.
+    """
+    if request.node.get_closest_marker("no_policy_limits_fake"):
+        yield
+        return
+    monkeypatch.setattr("claude_swap.oauth.fetch_policy_limits", lambda *a, **k: None)
     yield
 
 
