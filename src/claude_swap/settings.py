@@ -67,7 +67,19 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class UsageSettings:
+    """Usage-poll knobs (``usage`` section). ``reset_grants`` also asks the
+    usage API for promotional limit resets (Claude Code's ``/limit-reset``);
+    the server only answers Claude Code's User-Agent, so the poll presents as
+    the CLI while this is on (see ``oauth.request_usage_data``)."""
+
+    reset_grants: bool = False
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings, "ui": UiSettings, "usage": UsageSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -79,7 +91,7 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui")
+    section: str  # top-level JSON section ("autoswitch", "ui", "usage")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
     kind: str  # "float" | "int" | "bool" | "choice"
@@ -138,6 +150,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "usage", "resetGrants", "reset_grants", "bool",
+            help="Also poll for promotional limit resets (as Claude Code's User-Agent)",
         ),
     )
 }
@@ -246,6 +262,19 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_usage_settings(backup_root: Path) -> UsageSettings:
+    """Load the usage section; missing/corrupt file or a non-bool → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("usage")
+    default = UsageSettings()
+    if not isinstance(section, dict):
+        return default
+    value = section.get("resetGrants", default.reset_grants)
+    if not isinstance(value, bool):
+        return default
+    return UsageSettings(reset_grants=value)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +441,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "usage": load_usage_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

@@ -416,6 +416,101 @@ class TestFetchUsage:
         assert result is not None
         assert "scoped" not in result
 
+    def test_reset_grants_from_cedar_ember_block(self):
+        """An asked-for cedar_ember block surfaces its grants as result['reset_grants']."""
+        grant = {
+            "id": "opus55-launch-team-20260921",
+            "label": "Claude Opus 5.5 launch: one usage-limit reset for Team members",
+            "resets_total": 1, "resets_left": 1,
+            "starts_at": "2026-09-22T16:00:00+00:00",
+            "ends_at": "2026-10-22T16:00:00+00:00",
+            "clears": ["five_hour", "seven_day"],
+            "paused": False, "usable_now": True, "use_requires_limit": False,
+        }
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 9.0, "resets_at": None},
+            "seven_day": {"utilization": 2.0, "resets_at": None},
+            "cedar_ember": {
+                "eligible": True, "ineligible_reason": None, "at_limit": False,
+                # Claude Code's own UI state rides along and is dropped.
+                "grants": [{**grant, "percent_used": {"five_hour": 9}, "blocking": [], "arm": None}],
+            },
+        })
+        assert result["reset_grants"] == [grant]
+
+    def test_reset_grants_empty_when_eligible_but_none(self):
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 9.0, "resets_at": None},
+            "cedar_ember": {"eligible": True, "grants": []},
+        })
+        assert result["reset_grants"] == []
+
+    def test_reset_grants_absent_without_block_or_grants_list(self):
+        """Not asked for (no block), or a block without a grants list → no key."""
+        plain = self._fetch_with_response({"five_hour": {"utilization": 9.0, "resets_at": None}})
+        assert "reset_grants" not in plain
+        odd = self._fetch_with_response({
+            "five_hour": {"utilization": 9.0, "resets_at": None},
+            "cedar_ember": {"eligible": False, "ineligible_reason": "surface"},
+        })
+        assert "reset_grants" not in odd
+
+    def test_reset_grants_skip_malformed_entries(self):
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 9.0, "resets_at": None},
+            "cedar_ember": {"grants": [
+                "junk",
+                {"label": "no id", "resets_left": 1},
+                {"id": "bool-left", "resets_left": True},
+                {"id": "ok", "resets_left": 0},
+            ]},
+        })
+        assert result["reset_grants"] == [{"id": "ok", "resets_left": 0}]
+
+
+class TestRequestUsageData:
+    """The poll presents as cswap unless it asks for reset grants."""
+
+    @staticmethod
+    def _capture(**kwargs):
+        seen = {}
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"{}"
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        def mock_urlopen(req, timeout=0):
+            seen["url"] = req.full_url
+            seen["ua"] = req.get_header("User-agent")
+            seen["x_app"] = req.get_header("X-app")
+            return mock_response
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            oauth.request_usage_data("sk-test-token", **kwargs)
+        return seen
+
+    def test_default_keeps_cswap_user_agent_and_plain_url(self):
+        assert self._capture() == {
+            "url": "https://api.anthropic.com/api/oauth/usage",
+            "ua": "claude-swap/1.0",
+            "x_app": None,
+        }
+
+    def test_reset_grants_presents_as_claude_code(self):
+        assert self._capture(reset_grants=True) == {
+            "url": "https://api.anthropic.com/api/oauth/usage?cedar_ember=1",
+            "ua": oauth.CLAUDE_CODE_USER_AGENT,
+            "x_app": "cli",
+        }
+
+    def test_try_fetch_forwards_reset_grants(self):
+        creds = TestFetchUsageForAccount._make_credentials()
+        with patch("claude_swap.oauth.request_usage_data", return_value={}) as usage:
+            oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=True, reset_grants=True,
+            )
+        usage.assert_called_once_with("old-access", reset_grants=True)
+
 
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""

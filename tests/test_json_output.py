@@ -90,6 +90,29 @@ class TestJsonHelpers:
         assert out["sevenDay"]["countdown"] == "17h 0m"
         assert out["sevenDay"]["clock"] == "15:59"
 
+    def test_usage_to_json_projects_reset_grants(self):
+        usage = {
+            "five_hour": {"pct": 9.0},
+            "reset_grants": [{
+                "id": "opus55-launch-team-20260921", "label": "Opus 5.5 launch reset",
+                "resets_total": 1, "resets_left": 1,
+                "starts_at": "2026-09-22T16:00:00+00:00",
+                "ends_at": "2026-10-22T16:00:00+00:00",
+                "clears": ["five_hour", "seven_day"],
+                "paused": False, "usable_now": True, "use_requires_limit": False,
+            }],
+        }
+        out = usage_to_json(usage)
+        assert out["resetGrants"] == [{
+            "id": "opus55-launch-team-20260921", "label": "Opus 5.5 launch reset",
+            "resetsTotal": 1, "resetsLeft": 1,
+            "startsAt": "2026-09-22T16:00:00+00:00",
+            "endsAt": "2026-10-22T16:00:00+00:00",
+            "clears": ["five_hour", "seven_day"],
+            "paused": False, "usableNow": True, "useRequiresLimit": False,
+        }]
+        assert "resetGrants" not in usage_to_json({"five_hour": {"pct": 9.0}})
+
     def test_usage_to_json_recomputes_spend_strings(self):
         resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
