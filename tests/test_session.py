@@ -2046,25 +2046,235 @@ class TestShareHistoryPosix:
         assert (proj / "bbb.jsonl").read_text() == "profile-b\n"
 
 
-class TestShareHistoryWindows:
-    def test_sync_never_links_history_in_copy_mode(self, history_setup):
-        source, session_dir, mgr = history_setup
-        mgr.switcher.platform = Platform.WINDOWS
-        mgr._sync_sharing(session_dir, share=True, share_history=True)
+def _history_line(prompt: str, days_ago: float) -> str:
+    import time
 
-        assert not (session_dir / "projects").exists()
-        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
-        assert "projects" not in manifest["items"]
+    return json.dumps(
+        {"display": prompt, "timestamp": int((time.time() - days_ago * 86400) * 1000)}
+    )
 
-    def test_run_rejects_flag(self, history_setup, monkeypatch):
+
+class TestShareHistoryWindowsRun:
+    def test_run_accepts_flag_on_windows(self, history_setup, monkeypatch):
         source, session_dir, mgr = history_setup
         mgr.switcher.platform = Platform.WINDOWS
         monkeypatch.setattr(
             session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
         )
+        monkeypatch.setattr(
+            mgr.switcher, "resolve_account", lambda _id: ("2", "x@y.z", "org")
+        )
+        monkeypatch.setattr(mgr.switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(mgr, "_ensure_not_api_key", lambda *_a: None)
+        seen = {}
 
-        with pytest.raises(SessionError, match="Windows"):
+        def fake_setup(identifier, share, share_history):
+            seen["share_history"] = share_history
+            return session_dir, "2", "x@y.z"
+
+        monkeypatch.setattr(mgr, "setup_session", fake_setup)
+
+        def fake_exec(claude_bin, args, env):
+            raise SystemExit(0)
+
+        monkeypatch.setattr(mgr, "_exec", fake_exec)
+
+        with pytest.raises(SystemExit):
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+        assert seen["share_history"] is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions and hard links")
+class TestShareHistoryWindows:
+    @pytest.fixture
+    def win_history(self, history_setup, monkeypatch):
+        source, session_dir, mgr = history_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        # Developer Mode would let the symlink arm win; pin the no-privilege
+        # path most Windows machines take.
+        def no_symlink(self, *_a, **_k):
+            raise OSError(22, "privilege", None, 1314)
+
+        monkeypatch.setattr(session_mod.Path, "symlink_to", no_symlink)
+        return source, session_dir, mgr
+
+    def test_links_history_with_junction_and_hard_link(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        projects = session_dir / "projects"
+        assert projects.is_junction()
+        assert os.path.samefile(projects, source / "projects")
+        assert (projects / "-home-user-app" / "aaa.jsonl").read_text() == "main-a\n"
+        history = session_dir / "history.jsonl"
+        assert not history.is_symlink()
+        assert os.path.samefile(history, source / "history.jsonl")
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert {"projects", "history.jsonl"} <= set(manifest["items"])
+        # Customizations keep Windows copy-mode.
+        assert (session_dir / "settings.json").is_file()
+        assert not (session_dir / "settings.json").is_symlink()
+
+    def test_writes_are_shared_both_ways(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        (session_dir / "projects" / "-home-user-app" / "new.jsonl").write_text("s\n")
+        with (session_dir / "history.jsonl").open("a") as f:
+            f.write('{"p": "session"}\n')
+
+        assert (source / "projects" / "-home-user-app" / "new.jsonl").exists()
+        assert '{"p": "session"}' in (source / "history.jsonl").read_text()
+
+    def test_idempotent(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "projects").is_junction()
+        assert os.stat(source / "history.jsonl").st_nlink == 2
+
+    def test_uses_symlink_when_allowed(self, history_setup):
+        source, session_dir, mgr = history_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        probe = session_dir / ".probe"
+        try:
+            probe.symlink_to(source / "history.jsonl")
+        except OSError:
+            pytest.skip("symlinks need Developer Mode or admin here")
+        probe.unlink()
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "history.jsonl").is_symlink()
+        assert (session_dir / "projects").is_junction()
+
+    def test_creates_missing_source(self, share_setup, monkeypatch):
+        source, session_dir, mgr = share_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        monkeypatch.setattr(
+            session_mod.Path,
+            "symlink_to",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError(22, "p", None, 1314)),
+        )
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (source / "projects").is_dir()
+        assert (source / "history.jsonl").is_file()
+        assert (session_dir / "projects").is_junction()
+
+    def test_merges_existing_profile_history(self, win_history):
+        source, session_dir, mgr = win_history
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+        (proj / "aaa.jsonl").write_text("profile-duplicate\n")
+        (session_dir / "history.jsonl").write_text('{"p": "main"}\n{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        merged = source / "projects" / "-home-user-app"
+        assert (merged / "aaa.jsonl").read_text() == "main-a\n"
+        assert (merged / "bbb.jsonl").read_text() == "profile-b\n"
+        lines = (source / "history.jsonl").read_text().splitlines()
+        assert lines.count('{"p": "main"}') == 1
+        assert '{"p": "profile"}' in lines
+        assert (session_dir / "projects").is_junction()
+        assert os.path.samefile(session_dir / "history.jsonl", source / "history.jsonl")
+
+    def test_heals_hard_link_broken_by_rewrite(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # Claude Code's retention prune rewrites by rename: the profile's
+        # name now points at a new file holding its recent prompts plus an
+        # entry old enough for the prune to drop.
+        history = session_dir / "history.jsonl"
+        history.unlink()
+        history.write_text(
+            _history_line("ancient", 400) + "\n" + _history_line("recent", 0) + "\n"
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert os.path.samefile(history, source / "history.jsonl")
+        text = (source / "history.jsonl").read_text()
+        assert '"recent"' in text
+        assert '"ancient"' not in text
+        assert '{"p": "main"}' in text
+
+    def test_heal_deferred_while_profile_live(self, win_history, monkeypatch):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        history = session_dir / "history.jsonl"
+        history.unlink()
+        history.write_text(_history_line("recent", 0) + "\n")
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda _dir: ([object()], 0)
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert '"recent"' in history.read_text()
+        assert not os.path.samefile(history, source / "history.jsonl")
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "history.jsonl" in manifest["items"]
+
+    def test_toggle_off_removes_links_keeps_data(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        mgr._sync_sharing(session_dir, share=True, share_history=False)
+
+        assert not (session_dir / "projects").exists()
+        assert not (session_dir / "projects").is_junction()
+        assert not (session_dir / "history.jsonl").exists()
+        assert (source / "projects" / "-home-user-app" / "aaa.jsonl").exists()
+        assert (source / "history.jsonl").read_text() == '{"p": "main"}\n'
+
+    def test_toggle_off_keeps_broken_hard_link_data(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        history = session_dir / "history.jsonl"
+        history.unlink()
+        history.write_text('{"p": "only-here"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=False)
+
+        assert history.read_text() == '{"p": "only-here"}\n'
+
+    def test_repoints_junction_to_elsewhere(self, win_history, tmp_path):
+        source, session_dir, mgr = win_history
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "keep.jsonl").write_text("keep\n")
+        session_mod._winapi_create_junction(elsewhere, session_dir / "projects")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert os.path.samefile(session_dir / "projects", source / "projects")
+        assert (elsewhere / "keep.jsonl").read_text() == "keep\n"
+
+    def test_cross_volume_hard_link_fails_loudly(self, win_history, monkeypatch):
+        source, session_dir, mgr = win_history
+
+        def cross_volume(*_a, **_k):
+            raise OSError(18, "not same device", None, 17)
+
+        monkeypatch.setattr(session_mod.os, "link", cross_volume)
+
+        with pytest.raises(SessionError, match="different drives"):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+        assert not (session_dir / "history.jsonl").exists()
+
+    def test_profile_removal_never_follows_links(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        mgr._cleanup_failed_session(session_dir)
+
+        assert not session_dir.exists()
+        assert (source / "projects" / "-home-user-app" / "aaa.jsonl").exists()
+        assert (source / "history.jsonl").read_text() == '{"p": "main"}\n'
 
 
 class TestReadSessionCredentials:

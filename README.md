@@ -138,6 +138,7 @@ A session refreshes its own copy of the account's token, so once it exits, the c
 <summary>Sharing details — MCP servers & chat history</summary>
 
 - With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
+- On Windows, no admin rights or Developer Mode are needed: `projects/` is shared with a directory junction, and `history.jsonl` with a symlink when Windows allows one, otherwise a hard link (so `~/.claude` and the cswap backup folder must be on the same drive). If Claude Code's history cleanup rewrites `history.jsonl` and separates a hard link, the next `cswap run` merges the new prompts back and re-links it.
 - User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
 
