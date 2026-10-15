@@ -26,7 +26,12 @@ from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
 from claude_swap.models import AccountsSnapshot
-from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
+from claude_swap.tui.widgets import (
+    AccountItem,
+    AccountsPanel,
+    MenuItem,
+    _policy_badges,
+)
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -79,6 +84,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            ("Per-account policy…", "policy-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -115,6 +121,24 @@ class DashboardScreen(Screen):
             state = "  (disabled)" if acc.disabled else ""
             entries.append(
                 (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
+            )
+        entries.append(_BACK)
+        return entries
+
+    def _policy_entries(self) -> MenuEntries:
+        """One row per account, labelled with the policy it carries today.
+
+        The badges come from the same ``_policy_badges`` the account card and
+        the minimized row use, so the menu cannot come to disagree with the
+        panel about how a threshold is spelled.
+        """
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            badges = "".join(_policy_badges(acc, "  "))
+            entries.append(
+                (f"{acc.number}  {name}{badges}", f"policy:{acc.number}")
             )
         entries.append(_BACK)
         return entries
@@ -191,6 +215,12 @@ class DashboardScreen(Screen):
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
+            await self._pop_menu()
+        elif action_id == "policy-menu":
+            await self._push_menu("per-account policy", self._policy_entries())
+        elif action_id.startswith("policy:"):
+            number = action_id.split(":", 1)[1]
+            app.do_edit_policy(number)
             await self._pop_menu()
         else:
             actions[action_id]()
