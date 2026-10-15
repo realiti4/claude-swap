@@ -15,8 +15,10 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    RunSettings,
     UiSettings,
     effective_settings,
+    load_run_settings,
     load_settings,
     load_ui_settings,
     merged_with_cli,
@@ -152,6 +154,24 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestRunSettings:
+    def test_missing_file_defaults_to_per_account_history(self, tmp_path: Path):
+        assert load_run_settings(tmp_path) == RunSettings(share_history=False)
+
+    def test_reads_share_history(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": True}}))
+        assert load_run_settings(tmp_path).share_history is True
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "yes"}}))
+        assert load_run_settings(tmp_path).share_history is False
+
+    def test_set_share_history(self, tmp_path: Path):
+        assert set_setting(tmp_path, "run.shareHistory", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "run": {"shareHistory": True}}
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -163,9 +183,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["run"] == {
+            f.name for f in RunSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "run": RunSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

@@ -20,7 +20,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings
+from claude_swap.settings import load_run_settings, load_ui_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -156,13 +156,14 @@ Examples:
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "per-account history (the default, unless `cswap config set "
+            "run.shareHistory true`). Not supported on Windows."
         ),
     )
     parser.add_argument(
@@ -188,6 +189,8 @@ Examples:
         from claude_swap.session import SessionManager
 
         manager = SessionManager(switcher)
+        if args.share_history is None:
+            args.share_history = load_run_settings(switcher.backup_dir).share_history
 
         if args.account is not None:
             manager.run(
