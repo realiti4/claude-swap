@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1110 590" width="1110" height="590" role="img" aria-labelledby="t d">
+  <title id="t">What claude-swap plugs into</title>
+  <desc id="d">Your saved Claude accounts, kept in the macOS Keychain or in credential files on Windows and Linux, feed one auto-switch engine that polls usage, decides, and swaps. The engine sends one stream of events to three front ends: the command line, a terminal dashboard, and an optional macOS menu bar. claude-swap works with the Claude Code CLI and the VS Code extension on macOS, Windows and Linux or WSL. Nothing in the README or source mentions Codex.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .ttl { font-size: 24px; font-weight: 700; fill: #f0f6fc; }
+    .sub { font-size: 13px; fill: #8b949e; }
+    .h { font-size: 16px; font-weight: 700; fill: #f0f6fc; }
+    .s { font-size: 12.5px; fill: #8b949e; }
+    .head { font-size: 11px; letter-spacing: 1.6px; fill: #8b949e; font-weight: 700; }
+    .pill { font-size: 14px; font-weight: 700; }
+    .code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #79c0ff; }
+    .num { font-size: 12px; font-weight: 700; fill: #0d1117; }
+    .flow { fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-dasharray: 6 9; }
+    @media (prefers-reduced-motion: no-preference) {
+      .flow { animation: dash 1.3s linear infinite; }
+    }
+    @keyframes dash { to { stroke-dashoffset: -30; } }
+  </style>
+
+  <rect x="1" y="1" width="1108" height="588" rx="16" fill="#0d1117" stroke="#30363d"/>
+  <text class="ttl" x="40" y="48">What claude-swap plugs into</text>
+  <text class="sub" x="40" y="72">Built from the README and source: one engine, three ways to drive it, and what it works with.</text>
+
+  <!-- accounts -->
+  <text class="head" x="40" y="104">YOUR ACCOUNTS</text>
+  <g fill="#161b22" stroke="#30363d">
+    <rect x="40" y="116" width="210" height="62" rx="10"/>
+    <rect x="40" y="192" width="210" height="62" rx="10"/>
+    <rect x="40" y="268" width="210" height="62" rx="10"/>
+  </g>
+  <circle cx="64" cy="147" r="7" fill="#f85149"/><circle cx="64" cy="223" r="7" fill="#d29922"/><circle cx="64" cy="299" r="7" fill="#3fb950"/>
+  <text class="h" x="82" y="143">Account 1</text><text class="s" x="82" y="163">saved login, with its usage</text>
+  <text class="h" x="82" y="219">Account 2</text><text class="s" x="82" y="239">saved login, with its usage</text>
+  <text class="h" x="82" y="295">Account 3</text><text class="s" x="82" y="315">saved login, with its usage</text>
+  <rect x="40" y="346" width="210" height="64" rx="10" fill="none" stroke="#30363d" stroke-dasharray="4 4"/>
+  <text class="s" x="56" y="368">macOS: the Keychain</text>
+  <text class="s" x="56" y="388">Windows, Linux/WSL: files</text>
+
+  <!-- accounts -> engine -->
+  <path class="flow" stroke="#8b949e" d="M 250 147 C 290 147, 290 250, 330 250"/>
+  <path class="flow" stroke="#8b949e" d="M 250 223 C 290 223, 290 262, 330 262"/>
+  <path class="flow" stroke="#8b949e" d="M 250 299 C 290 299, 290 274, 330 274"/>
+
+  <!-- engine -->
+  <rect x="330" y="104" width="330" height="306" rx="14" fill="#161b22" stroke="#3fb950" stroke-width="1.6"/>
+  <text class="h" x="352" y="136">Auto-switch engine</text>
+  <text class="s" x="352" y="156">one engine, no screen of its own</text>
+  <g fill="#0d1117" stroke="#30363d">
+    <rect x="352" y="172" width="286" height="62" rx="10"/>
+    <rect x="352" y="256" width="286" height="62" rx="10"/>
+    <rect x="352" y="340" width="286" height="62" rx="10"/>
+  </g>
+  <circle cx="376" cy="203" r="11" fill="#58a6ff"/><text class="num" x="376" y="207" text-anchor="middle">1</text>
+  <text class="h" x="398" y="199">Poll usage</text><text class="s" x="398" y="219">5h and 7d windows, every 60s</text>
+  <circle cx="376" cy="287" r="11" fill="#d29922"/><text class="num" x="376" y="291" text-anchor="middle">2</text>
+  <text class="h" x="398" y="283">Decide</text><text class="s" x="398" y="303">90% line, 10-pt margin, 5m cooldown</text>
+  <circle cx="376" cy="371" r="11" fill="#3fb950"/><text class="num" x="376" y="375" text-anchor="middle">3</text>
+  <text class="h" x="398" y="367">Swap</text><text class="s" x="398" y="387">refresh the token, hold a lock, switch</text>
+  <path d="M 495 236 L 495 254 M 489 248 L 495 255 L 501 248" stroke="#8b949e" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <path d="M 495 320 L 495 338 M 489 332 L 495 339 L 501 332" stroke="#8b949e" stroke-width="2" fill="none" stroke-linecap="round"/>
+
+  <!-- engine -> surfaces -->
+  <text class="s" x="668" y="132">one event stream</text>
+  <path class="flow" stroke="#3fb950" d="M 660 257 C 720 257, 720 156, 770 156"/>
+  <path class="flow" stroke="#3fb950" d="M 660 257 C 710 257, 730 257, 770 257"/>
+  <path class="flow" stroke="#3fb950" d="M 660 257 C 720 257, 720 358, 770 358"/>
+
+  <!-- surfaces -->
+  <text class="head" x="770" y="104">THREE WAYS TO DRIVE IT</text>
+  <g fill="#161b22" stroke="#30363d">
+    <rect x="770" y="116" width="300" height="80" rx="10"/>
+    <rect x="770" y="217" width="300" height="80" rx="10"/>
+    <rect x="770" y="318" width="300" height="80" rx="10"/>
+  </g>
+  <text class="h" x="790" y="146">Command line</text>
+  <text class="code" x="790" y="166">cswap auto</text><text class="s" x="790" y="184">readable lines, or JSON for scripts</text>
+  <text class="h" x="790" y="247">Terminal dashboard</text>
+  <text class="code" x="790" y="267">cswap</text><text class="s" x="790" y="285">live usage bars for every account</text>
+  <text class="h" x="790" y="348">Menu bar</text>
+  <text class="code" x="790" y="368">cswap menubar</text><text class="s" x="790" y="386">macOS only, optional, click to switch</text>
+
+  <!-- works with -->
+  <rect x="40" y="432" width="1030" height="130" rx="14" fill="#161b22" stroke="#30363d"/>
+  <text class="head" x="64" y="462">WORKS WITH</text>
+  <rect x="64" y="474" width="190" height="36" rx="18" fill="#12261a" stroke="#3fb950"/>
+  <text class="pill" x="159" y="497" text-anchor="middle" fill="#3fb950">✓ Claude Code CLI</text>
+  <rect x="270" y="474" width="220" height="36" rx="18" fill="#12261a" stroke="#3fb950"/>
+  <text class="pill" x="380" y="497" text-anchor="middle" fill="#3fb950">✓ VS Code extension</text>
+  <rect x="506" y="474" width="130" height="36" rx="18" fill="#2a1a12" stroke="#d29922"/>
+  <text class="pill" x="571" y="497" text-anchor="middle" fill="#d29922">✕ Codex</text>
+  <text class="s" x="652" y="497">not mentioned anywhere in the README or source</text>
+
+  <text class="head" x="64" y="538">RUNS ON</text>
+  <g fill="none" stroke="#8b949e">
+    <rect x="140" y="523" width="84" height="26" rx="13"/>
+    <rect x="236" y="523" width="96" height="26" rx="13"/>
+    <rect x="344" y="523" width="116" height="26" rx="13"/>
+  </g>
+  <text class="s" x="182" y="540" text-anchor="middle" fill="#f0f6fc">macOS</text>
+  <text class="s" x="284" y="540" text-anchor="middle" fill="#f0f6fc">Windows</text>
+  <text class="s" x="402" y="540" text-anchor="middle" fill="#f0f6fc">Linux / WSL</text>
+</svg>

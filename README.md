@@ -1,6 +1,30 @@
 # claude-swap
 
+<!-- explainmyrepo:link:start -->
+[![Explainer — live](https://img.shields.io/badge/Explainer-live-7c3aed?style=flat-square)](https://claude-swap-explainer.netlify.app)
+
+A visual, newcomer-friendly explainer for **claude-swap**: https://claude-swap-explainer.netlify.app
+<!-- explainmyrepo:link:end -->
+
+
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
+
+<!-- explainmyrepo:start -->
+## Explainer
+
+### Architecture
+
+What claude-swap plugs into: your saved accounts feed one auto-switch engine (poll, decide, swap) that drives the command line, a terminal dashboard and a macOS menu bar. It works with the Claude Code CLI and the VS Code extension on macOS, Windows and Linux/WSL.
+
+![What claude-swap plugs into: your saved accounts feed one auto-switch engine (poll, decide, swap) that drives the command line, a terminal dashboard and a macOS menu bar. It works with the Claude Code CLI and the VS Code extension on macOS, Windows and Linux/WSL.](docs/explainer/architecture.svg)
+
+### How it works
+
+The moment it switches: when the account you are using crosses the threshold, claude-swap skips accounts that are not at least 10 points better, picks the one with the most headroom, and swaps to it before the old one runs dry.
+
+![The moment it switches: when the account you are using crosses the threshold, claude-swap skips accounts that are not at least 10 points better, picks the one with the most headroom, and swaps to it before the old one runs dry.](docs/explainer/flow.svg)
+
+<!-- explainmyrepo:end -->
 
 ## Installation
 
