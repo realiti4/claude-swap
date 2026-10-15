@@ -248,6 +248,8 @@ cswap menubar
 
 Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
 
+*Settings → Dropdown shows → Usage cards* draws each account in the dropdown as a card instead of one line of text: session, weekly, and per-model limits as coloured bars with when each resets, *Active* on the account in use, and a red *Full* (or *Fable full*) on any account that's used up. Click a card to switch to it.
+
 **Keep it running without a terminal.** `cswap menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash, no `.app` bundle:
 
 ```bash
