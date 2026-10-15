@@ -166,6 +166,12 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+Over SSH, the TUI uses keyboard controls without mouse reporting. This prevents
+mouse movements from becoming shell input if the SSH connection drops before
+the TUI can restore the terminal. Local sessions retain mouse support. If an
+older session has already left your terminal in this state, press Ctrl-C, type
+`reset`, and press Enter in the affected terminal.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
