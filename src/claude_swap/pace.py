@@ -62,6 +62,26 @@ def _resets_at_ts(resets_at: object) -> float | None:
         return None
 
 
+def window_elapsed_s(
+    next_reset_ts: float, at: float, period_s: float = WEEKLY_PERIOD_S
+) -> float:
+    """Seconds since the current window started, as seen at ``at``.
+
+    ``next_reset_ts`` is the window's reported reset — the only timestamp the
+    usage API provides — and may be any number of whole cycles ahead of or
+    behind ``at`` (a stale, not-yet-rolled-forward value is normal). Shared by
+    the pace marker and the balance strategy (``balance.weekly_target_pct``)
+    so the two can never disagree about where a week starts.
+    """
+    # (next_reset - at) mod period_s == time remaining until the next reset,
+    # folded into [0, period_s). period_s minus that is elapsed time since the
+    # current window started — works regardless of how many whole cycles
+    # next_reset is ahead of or behind `at`. Exactly on a reset boundary the
+    # new window has just begun: elapsed 0, never a full period.
+    remaining = (next_reset_ts - at) % period_s
+    return 0.0 if remaining == 0 else period_s - remaining
+
+
 def compute_pace(
     window: dict | None,
     *,
@@ -93,12 +113,7 @@ def compute_pace(
     if next_reset is None:
         return None
 
-    # (next_reset - fetched_at) mod period_s == time remaining until the next
-    # reset, folded into [0, period_s). period_s minus that is elapsed time
-    # since the current window started — works regardless of how many whole
-    # cycles next_reset is ahead of or behind fetched_at.
-    remaining = (next_reset - fetched_at) % period_s
-    elapsed = 0.0 if remaining == 0 else period_s - remaining
+    elapsed = window_elapsed_s(next_reset, fetched_at, period_s)
 
     if elapsed < suppress_after_reset_s:
         return None

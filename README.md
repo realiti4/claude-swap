@@ -91,6 +91,7 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
+cswap auto --strategy balance         # keep every account's week on schedule
 ```
 
 <details>
@@ -98,7 +99,9 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
-- **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
+- **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `balance` switches exactly when `best` does, but picks the account that is furthest **behind an even weekly schedule** — so every account's weekly quota gets spent shortly before its own reset instead of one account being drained while the rest sit idle, and several accounts keep 5-hour headroom at the same time.
+  - **How `balance` scores:** among the accounts that clear the usual health checks — below the threshold, better than the current account by the hysteresis margin, and not the one you just switched away from — each account's on-schedule target is `min(100, 100 × elapsed / (7 days − lead))`, where `elapsed` is the time since its weekly window started; `slack = target − weekly %` (positive = behind schedule). An account is then set aside if its projected 5-hour usage would reach `autoswitch.balanceFiveHourCeiling` (default 85), or its weekly or `--model` window is already at the threshold; whatever remains is ranked by `slack − balanceFiveHourWeight × projected 5-hour %`, highest first. If nothing qualifies, `balance` falls back to whichever surviving account's limiting window comes back soonest, so it never refuses to move while any account still has room. The threshold, cooldown, and the "every account above the threshold" fallback all work the same as for `best`.
+  - **Tuning** (`cswap config set …`): `autoswitch.balanceLeadHours` (default 24, 0–96) — finish each week this many hours before its reset; `autoswitch.balanceFiveHourCeiling` (default 85, 10–100); `autoswitch.balanceFiveHourWeight` (default 0.5, 0–5) — how strongly an emptier 5-hour window is preferred; `autoswitch.balanceLoadPerSession` (default 15, 0–100) — 5-hour % each busy Claude Code session is assumed to add (used by upcoming per-session placement; no effect on `cswap auto` yet).
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
@@ -274,6 +277,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.strategy balance  # spend every account's week on schedule (see "auto")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
