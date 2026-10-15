@@ -3247,10 +3247,24 @@ class ClaudeAccountSwitcher:
             )
             return creds
 
+        oauth_data = oauth.extract_oauth_data(creds)
+        if oauth_data is not None and not (
+            oauth_data.get("accessToken") or oauth_data.get("refreshToken")
+        ):
+            # The switch path's ``"wiped"`` shape: Claude Code's
+            # ``invalid_grant`` reaction empties both token fields in place.
+            # Not unverifiable -- provably unusable. Registering it would
+            # overwrite the slot's backup (on refresh-in-place, its only
+            # surviving refresh token) with nothing.
+            raise ConfigError(
+                f"The stored credential for {email} has no access or refresh "
+                f"token: Claude Code clears both after the server rejects a "
+                f"refresh. Nothing was changed. Log in as {email} in THIS "
+                f"environment, then re-run."
+            )
         token = oauth.extract_access_token(creds)
         if not token:
             return unverified("no access token to resolve")
-        oauth_data = oauth.extract_oauth_data(creds)
         if oauth_data and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             # Unresolvable, exactly like an offline profile fetch. NOT a
             # refresh: consuming a grant retires its predecessor server-side,

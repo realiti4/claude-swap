@@ -1522,3 +1522,8 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+@pytest.mark.parametrize("creds", ["[]", '"sk-ant-oat01-x"', "7", "null"])
+def test_extract_oauth_data_is_none_for_json_that_is_not_an_object(creds):
+    assert oauth.extract_oauth_data(creds) is None
