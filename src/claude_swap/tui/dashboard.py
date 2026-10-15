@@ -17,6 +17,7 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+import time
 from functools import partial
 from typing import TYPE_CHECKING, Callable
 
@@ -26,6 +27,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
 from claude_swap.models import AccountsSnapshot
+from claude_swap.tui import data
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -170,7 +172,9 @@ class DashboardScreen(Screen):
         elif action_id == "add-menu":
             await self._push_menu("add account", self._add_entries())
         elif action_id == "remove-menu":
-            await self._push_menu("remove account", self._remove_entries())
+            await self._push_menu(
+                "remove account (slot order: numbers stay put)", self._remove_entries()
+            )
         elif action_id.startswith("remove:"):
             number = action_id.split(":", 1)[1]
             snap = app.snapshot
@@ -187,7 +191,9 @@ class DashboardScreen(Screen):
             app.notify(f"Theme: {name}")
             await self._pop_menu()
         elif action_id == "disable-menu":
-            await self._push_menu("disable / enable", self._disable_entries())
+            await self._push_menu(
+                "disable / enable (slot order: numbers stay put)", self._disable_entries()
+            )
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
@@ -212,7 +218,8 @@ class DashboardScreen(Screen):
 
 
 class AccountListScreen(Screen):
-    """Shared machinery: a live ListView of full account cards.
+    """Shared machinery: a live ListView of full account cards, in the
+    shared ranked order (``data.ordered_accounts``), active first.
 
     Subclasses decide what the cursor does — :class:`SwitchScreen` is
     selection-first, :class:`WatchScreen` is a monitor that can arm
@@ -238,40 +245,50 @@ class AccountListScreen(Screen):
         if snap is None:
             return
         listview = self.query_one("#accounts", ListView)
-        numbers = [acc.number for acc in snap.accounts]
+        by_number = {acc.number: acc for acc in snap.accounts}
+        numbers = data.ordered_accounts(
+            snap, self.app.auto_settings, time.time(),
+            data.read_last_active_at(self.app.switcher.backup_dir),
+        )
+        ordered_accounts_ = [by_number[n] for n in numbers]
         if numbers != self._numbers:
             first_build = not self._numbers
-            previous = listview.index
+            previous_number = (  # the ACCOUNT under the cursor, not its row
+                self._numbers[listview.index]
+                if listview.index is not None and listview.index < len(self._numbers)
+                else None
+            )
             await listview.clear()
-            await listview.extend(AccountItem(acc) for acc in snap.accounts)
+            await listview.extend(AccountItem(acc) for acc in ordered_accounts_)
             self._numbers = numbers
             listview.index = (
-                self._index_after_build(snap, first_build, previous)
+                self._index_after_build(snap, first_build, previous_number)
                 if numbers
                 else None
             )
         else:
-            for item, acc in zip(listview.query(AccountItem), snap.accounts):
+            for item, acc in zip(listview.query(AccountItem), ordered_accounts_):
                 item.set_account(acc)
         self._flash_updated(snap, listview)
 
     def _index_after_build(
-        self, snap: AccountsSnapshot, first_build: bool, previous: int | None
+        self, snap: AccountsSnapshot, first_build: bool, previous_number: str | None
     ) -> int | None:
         """Where the cursor lands after the list is (re)built."""
         if first_build:
             return self._active_index(snap)
-        return min(previous or 0, len(snap.accounts) - 1)
+        if previous_number is not None:
+            idx = self._number_index(previous_number)
+            if idx is not None:
+                return idx
+        return 0  # the account under the cursor is gone (e.g. removed)
+
+    def _number_index(self, number: str | None) -> int | None:
+        return next((i for i, n in enumerate(self._numbers) if n == number), None)
 
     def _active_index(self, snap: AccountsSnapshot) -> int:
-        return next(
-            (
-                i
-                for i, acc in enumerate(snap.accounts)
-                if acc.number == snap.active_number
-            ),
-            0,
-        )
+        idx = self._number_index(snap.active_number)
+        return idx if idx is not None else 0
 
     def _flash_updated(self, snap: AccountsSnapshot, listview: ListView) -> None:
         """Briefly highlight rows whose stored measurement just advanced."""
@@ -374,11 +391,11 @@ class WatchScreen(AccountListScreen):
         return True
 
     def _index_after_build(
-        self, snap: AccountsSnapshot, first_build: bool, previous: int | None
+        self, snap: AccountsSnapshot, first_build: bool, previous_number: str | None
     ) -> int | None:
         if not self._selecting:
             return None  # monitor mode: no cursor at all
-        return super()._index_after_build(snap, first_build, previous)
+        return super()._index_after_build(snap, first_build, previous_number)
 
     def _set_selecting(self, on: bool) -> None:
         self._selecting = on
