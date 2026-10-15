@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -349,6 +350,16 @@ class CredentialStore:
         # superseded generation. A fact about THIS item, which is why neither
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
+        # Whether the current pin came from the OAuth write fallback, i.e. it
+        # points at ``.credentials.json``. The managed-key fallback pins too,
+        # but onto ``primaryApiKey`` — a different file, and no reason to
+        # expect the OAuth one. See _lift_pin_if_oauth_file_gone.
+        self._pinned_to_oauth_file: bool = False
+        # The menu bar's display worker and its engine thread share one store;
+        # the lift's check-then-reset must not interleave with a fresh pin.
+        # Held around every pin and every flag change outside __init__; never
+        # taken inside _pin_file_mode itself, so callers can hold it across it.
+        self._pin_lock = threading.Lock()
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -447,6 +458,11 @@ class CredentialStore:
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
         self._residual_verdict = residual_cleared
+        # Only the OAuth write fallback may mark a pin as liftable, and it does
+        # so right after this call. Every other pin (the managed-key fallback,
+        # whose residual is the "Claude Code" item) resets it here, so a stale
+        # True can never lift a pin it does not describe.
+        self._pinned_to_oauth_file = False
         if residual_cleared:
             # Settle what happened before; later failures are the flags'
             # question again. `_kc_call` re-arms the cooldown on any failure
@@ -456,6 +472,50 @@ class CredentialStore:
             # degraded=False and disarmed the capture guard.
             self._keychain_op_failed = False
             self._active_read_failed = False
+
+    def _lift_pin_if_oauth_file_gone(self) -> None:
+        """End a pinned file mode once the file it points at no longer exists.
+
+        The pin is a claim about ``.credentials.json``: our fallback write put
+        the credential there, and a residual Keychain item might shadow it, so
+        this process keeps reading the file. With the file gone there is
+        nothing left to protect — and nothing left to read. Claude Code removes
+        the plaintext file when it stores a rotation in the Keychain, so on a
+        long-running process (menu bar, ``cswap auto``, TUI) the pin outlives
+        its file within hours, and from then on every active read returns ""
+        for the life of the process: usage is unknown, auto-switch fails over
+        into a switch that refuses ("credential is empty"), and only a fresh
+        process recovers.
+
+        A residual is not a reason to stay pinned here either. Claude Code
+        reads Keychain-first, so with our file gone a surviving item is what
+        Claude Code itself is using — the live credential by definition.
+
+        This only RE-ASKS the Keychain. It records no verdict: the read that
+        follows goes through ``_kc_call`` like any other and reports its own
+        outcome, including a Keychain that is still unreadable.
+        """
+        if not self._pinned_to_oauth_file:
+            return
+        with self._pin_lock:
+            if not self._pinned_to_oauth_file or self._use_keychain():
+                return
+            if self._keychain_disabled_until:
+                return  # a later failure re-armed the cooldown; let it run
+            try:
+                cred_file = get_credentials_path()
+                if cred_file.exists() and cred_file.stat().st_size > 0:
+                    return
+            except OSError:
+                return  # cannot tell; the pin is the conservative answer
+            self._keychain_usable_cache = None
+            self._file_mode_is_ours = False
+            self._pinned_to_oauth_file = False
+            self._residual_verdict = None
+        self._host._logger.info(
+            "Active credentials file is gone; reading the Keychain again "
+            "(file mode had been pinned by a failed Keychain write)."
+        )
 
     @property
     def _keychain_unreadable(self) -> bool:
@@ -618,6 +678,7 @@ class CredentialStore:
         # codebase either: session.keychain_service_name codifies claude's
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
+        self._lift_pin_if_oauth_file_gone()
         if self._use_keychain():
             val, keychain_failed = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
@@ -901,7 +962,8 @@ class CredentialStore:
             # MANAGED one, and nothing deleted it — ``_clear_oauth_credential``
             # above removes the OAuth item, a different service. Unverified, so
             # the conservative verdict is the true one.
-            self._pin_file_mode(residual_cleared=False)
+            with self._pin_lock:
+                self._pin_file_mode(residual_cleared=False)
         self._last_active_credentials_backend = (
             "keychain" if wrote_to_keychain else "file"
         )
@@ -957,7 +1019,13 @@ class CredentialStore:
         Best-effort: a down Keychain or missing file is fine. Removing
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
+
+        WE remove the file here, so its absence says nothing about Claude Code
+        having moved the credential to the Keychain — the premise
+        ``_lift_pin_if_oauth_file_gone`` rests on. Disarm the lift first.
         """
+        with self._pin_lock:
+            self._pinned_to_oauth_file = False
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
@@ -1021,7 +1089,9 @@ class CredentialStore:
             # that residual and resurrect the wrong account (see _pin_file_mode).
             # Its outcome is also the answer to whether the file is now the
             # authority, so hand it over rather than re-deriving it from flags.
-            self._pin_file_mode(residual_cleared=cleared)
+            with self._pin_lock:
+                self._pin_file_mode(residual_cleared=cleared)
+                self._pinned_to_oauth_file = True
         self._last_active_credentials_backend = "file"
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
