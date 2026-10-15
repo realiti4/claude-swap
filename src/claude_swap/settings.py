@@ -67,7 +67,26 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class SwapSettings:
+    """What a switch carries across accounts, beyond the login itself.
+
+    ``design_login`` is Claude Code's separate Claude Design credential, the
+    one ``/design-login`` writes. It sits in the same credential object as the
+    login, so by default it travels with the slot like any other account-bound
+    field. ``design_login=False`` leaves the live one in place instead, so one
+    design login serves every account: Claude Code does not require it to
+    belong to the account logged in beside it.
+    """
+
+    design_login: bool = True
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "swap": SwapSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -138,6 +157,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "swap", "designLogin", "design_login", "bool",
+            help="Give each account its own /design-login; false keeps one for every account",
         ),
     )
 }
@@ -246,6 +269,23 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_swap_settings(backup_root: Path) -> SwapSettings:
+    """Load the swap section; missing/corrupt file or non-bool field → defaults."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("swap")
+    default = SwapSettings()
+    if not isinstance(section, dict):
+        return default
+    value = section.get("designLogin", default.design_login)
+    if not isinstance(value, bool):
+        _logger.warning(
+            "settings.json: swap.designLogin must be true or false, got %r; using %r",
+            value, default.design_login,
+        )
+        return default
+    return SwapSettings(design_login=value)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +452,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "swap": load_swap_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
