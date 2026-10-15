@@ -47,6 +47,8 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
+    # Only for exhausted-to-exhausted switches; usable targets still win.
+    exhausted_reset_margin_seconds: float = 300.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
@@ -117,6 +119,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
             help="A target must beat the active account by this many pct",
+        ),
+        SettingSpec(
+            "autoswitch", "exhaustedResetMarginSeconds",
+            "exhausted_reset_margin_seconds", "float", 0.0, 86400.0,
+            help="Minimum recovery-time gain when switching between exhausted accounts",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",

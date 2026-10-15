@@ -305,6 +305,194 @@ class TestEngineHarnessIsolation:
         ), "h1's seed() bled into h2's store"
 
 
+class TestExhaustedRecoverySwitch:
+    @staticmethod
+    def _seed(temp_home, count=2, **settings):
+        h = EngineHarness(temp_home, **settings)
+        for num in range(1, count + 1):
+            h.seed(num, f"{num}@example.com")
+        h.make_live("1@example.com", 1)
+        return h
+
+    @staticmethod
+    def _blocked(h, seconds):
+        return _usage(100, _iso_at(h.clock() + seconds))
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    @pytest.mark.parametrize("count", [2, 4])
+    def test_moves_to_earliest_then_holds_across_ticks_and_restart(
+        self, temp_home, strategy, count
+    ):
+        h = self._seed(temp_home, count, strategy=strategy, cooldown_seconds=0)
+        usage = {str(n): self._blocked(h, 7200 / n) for n in range(1, count + 1)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == count
+        for _ in range(3):
+            h.clock.advance(60)
+            h.engine = h._make_engine()
+            assert h.tick_with_usage(usage) is TickOutcome.BLOCKED
+            assert h.active_number() == count
+        assert sum(isinstance(e, SwitchEvent) for e in h.events) == 1
+
+    @pytest.mark.parametrize(
+        "margin,gain,switches",
+        [(300, 299, False), (300, 300, True), (300, 301, True),
+         (300, 0, False), (300, -600, False), (600, 300, False),
+         (60, 60, True), (0, 0, False), (0, 1, True)],
+    )
+    def test_minimum_saving_and_equal_time_hold(self, temp_home, margin, gain, switches):
+        h = self._seed(temp_home, exhausted_reset_margin_seconds=margin)
+        outcome = h.tick_with_usage({
+            "1": self._blocked(h, 7200), "2": self._blocked(h, 7200 - gain),
+        })
+        assert outcome is (TickOutcome.SWITCHED if switches else TickOutcome.BLOCKED)
+        assert h.active_number() == (2 if switches else 1)
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    @pytest.mark.parametrize("pct", [90, 95, 99.9])
+    def test_does_not_give_up_remaining_quota_for_an_exhausted_peer(
+        self, temp_home, strategy, pct
+    ):
+        h = self._seed(temp_home, strategy=strategy)
+        assert h.tick_with_usage({
+            "1": _usage(pct, _iso_at(h.clock() + 7200)),
+            "2": self._blocked(h, 600),
+        }) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("pct", [90, 100])
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_usable_peer_wins_including_proactive_switch_with_headroom(
+        self, temp_home, pct, strategy
+    ):
+        h = self._seed(temp_home, 3, strategy=strategy)
+        outcome = h.tick_with_usage({
+            "1": _usage(pct, _iso_at(h.clock() + 7200)),
+            "2": self._blocked(h, 600),
+            "3": _usage(20, _iso_at(h.clock() + 86400)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        event = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert event.trigger == ("proactive" if pct == 90 else "at-limit")
+
+    def test_enabled_api_key_beats_waiting(self, temp_home):
+        h = self._seed(temp_home, 3, include_api_key_accounts=True)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        assert h.tick_with_usage({
+            "1": self._blocked(h, 7200), "2": self._blocked(h, 600), "3": "api key",
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_all_exhausted_windows_must_clear_on_both_sides(self, temp_home):
+        h = self._seed(temp_home, 3, model="Fable")
+        usage = {
+            "1": self._blocked(h, 300),
+            "2": self._blocked(h, 100),
+            "3": self._blocked(h, 1200),
+        }
+        usage["1"]["seven_day"] = {"pct": 100, "resets_at": _iso_at(h.clock() + 7200)}
+        usage["2"]["scoped"] = [
+            {"name": "Fable", "pct": 100, "resets_at": _iso_at(h.clock() + 86400)},
+        ]
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 3  # A returns in 2h, B tomorrow, C in 20min.
+
+    @pytest.mark.parametrize("model,expected", [(None, 2), ("Fable", 3), ("all", 3)])
+    def test_model_selection_controls_blocking_windows(self, temp_home, model, expected):
+        h = self._seed(temp_home, 3, model=model)
+        usage = {"1": self._blocked(h, 7200), "2": self._blocked(h, 600),
+                 "3": self._blocked(h, 1200)}
+        usage["2"]["scoped"] = [
+            {"name": "Fable", "pct": 100, "resets_at": _iso_at(h.clock() + 86400)},
+        ]
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == expected
+
+    @pytest.mark.parametrize("account", ["1", "2"])
+    @pytest.mark.parametrize("reset", [None, "bad", "past", "now"])
+    def test_one_unproven_blocking_reset_prevents_comparison(self, temp_home, account, reset):
+        h = self._seed(temp_home)
+        usage = {"1": self._blocked(h, 7200), "2": self._blocked(h, 600)}
+        if reset in ("past", "now"):
+            reset = _iso_at(h.clock() - (60 if reset == "past" else 0))
+        usage[account]["seven_day"] = {"pct": 100, "resets_at": reset}
+        assert h.tick_with_usage(usage) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        event = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert event.earliest_reset_at is None
+        assert h.engine._sleep_until_ts is None
+
+    def test_non_exhausted_window_does_not_delay_recovery(self, temp_home):
+        h = self._seed(temp_home)
+        usage = {"1": self._blocked(h, 7200), "2": self._blocked(h, 600)}
+        usage["2"]["seven_day"] = {"pct": 99, "resets_at": _iso_at(h.clock() + 86400)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("account", ["1", "2"])
+    def test_untrusted_usage_never_proves_recovery(self, temp_home, account):
+        h = self._seed(temp_home, unhealthy_ticks=1)
+        entries = {n: _entry_for(self._blocked(h, seconds), h.clock())
+                   for n, seconds in [("1", 7200), ("2", 600)]}
+        entries[account] = UsageEntry(
+            last_good=entries[account].last_good, fetched_at=h.clock() - 10000,
+            age_s=10000,
+        )
+        assert h.tick_with_entries(entries) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("excluded", ["disabled", "quarantined", "unknown"])
+    def test_ineligible_peer_does_not_hide_the_next_best(self, temp_home, excluded):
+        h = self._seed(temp_home, 3)
+        usage = {"1": self._blocked(h, 7200), "2": self._blocked(h, 600),
+                 "3": self._blocked(h, 1200)}
+        if excluded == "disabled":
+            h.switcher.set_account_disabled("2", True)
+        elif excluded == "quarantined":
+            h.engine._quarantine("2", "2@example.com", "invalid_grant")
+        else:
+            usage["2"] = None
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_equal_peer_resets_use_account_sequence(self, temp_home):
+        h = self._seed(temp_home, 3)
+        data = h.switcher._get_sequence_data()
+        data["sequence"] = [1, 3, 2]
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        assert h.tick_with_usage({
+            "1": self._blocked(h, 7200), "2": self._blocked(h, 600),
+            "3": self._blocked(h, 600),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_freshening_failure_tries_next_qualifying_reset(self, temp_home):
+        h = self._seed(temp_home, 3)
+        with patch.object(h.engine, "_freshen_target", side_effect=["invalid_grant", "ok"]):
+            assert h.tick_with_usage({
+                "1": self._blocked(h, 7200), "2": self._blocked(h, 600),
+                "3": self._blocked(h, 1200),
+            }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert "2" in h.state()["quarantine"]
+
+    def test_dry_run_reports_without_switching_or_freshening(self, temp_home):
+        h = self._seed(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        with patch.object(h.engine, "_freshen_target") as freshen:
+            assert h.tick_with_usage({
+                "1": self._blocked(h, 7200), "2": self._blocked(h, 600),
+            }) is TickOutcome.SWITCHED
+        freshen.assert_not_called()
+        assert h.active_number() == 1
+        assert h.state() == {}
+        event = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert event.dry_run and event.to_ref["number"] == 2
+
+
 class TestDecisionTable:
     def test_below_threshold_is_no_action(self, harness):
         outcome = harness.tick_with_usage({
@@ -542,7 +730,7 @@ class TestDecisionTable:
         assert switch.trigger == "at-limit"
         assert harness.active_number() == 2
 
-    def test_at_limit_never_targets_another_at_limit_account(self, harness):
+    def test_at_limit_without_known_resets_holds(self, harness):
         outcome = harness.tick_with_usage({
             "1": _usage(100), "2": _usage(100), "3": _usage(100),
         })
@@ -574,15 +762,15 @@ class TestDecisionTable:
         assert reasons == ["unmanaged-active-account"]
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
-    def test_all_exhausted_carries_earliest_reset(self, harness):
+    def test_all_exhausted_stays_on_earliest_reset_and_schedules_recheck(self, harness):
         outcome = harness.tick_with_usage({
-            "1": _usage(100, "2026-07-03T12:00:00Z"),
+            "1": _usage(100, "2026-07-03T10:00:00Z"),
             "2": _usage(100, "2026-07-03T10:30:00Z"),
             "3": _usage(100, "2026-07-03T11:00:00Z"),
         })
         assert outcome is TickOutcome.BLOCKED
         event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
-        assert event.earliest_reset_at == "2026-07-03T10:30:00Z"
+        assert event.earliest_reset_at == "2026-07-03T10:00:00Z"
         assert harness.engine._sleep_until_ts is not None
 
     @pytest.mark.parametrize("offset", [-60.0, 0.0])
@@ -3490,12 +3678,11 @@ class TestEveryAccountAboveThreshold:
         assert outcome is TickOutcome.NO_ACTION
         assert harness.active_number() == 1
 
-    def test_all_at_limit_still_reports_exhausted(self, harness):
-        """h <= 0 is still never a target: with everything truly maxed there
-        is nowhere to go and the exhausted path must still own that case."""
+    def test_all_at_limit_holds_without_a_meaningful_recovery_gain(self, harness):
+        """A gain below five minutes leaves the exhausted account in place."""
         outcome = harness.tick_with_usage({
             "1": _usage(100, self._at(harness, 600)),
-            "2": _usage(100, self._at(harness, 300)),
+            "2": _usage(100, self._at(harness, 301)),
             "3": _usage(100, self._at(harness, 900)),
         })
         assert outcome is TickOutcome.BLOCKED

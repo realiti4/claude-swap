@@ -530,7 +530,6 @@ def _window_pcts(
 
 # Reset math moved to poll_policy with the cadence numbers; aliased for the
 # engine's sleep scheduling and the test suite.
-_limiting_reset_ts = poll_policy.limiting_reset_ts
 _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
 
@@ -612,6 +611,26 @@ def _every_account_above_threshold(
     if not measured:
         return False
     return all((100.0 - h) >= threshold for h in measured)
+
+
+def _exhausted_recovery_ts(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float | None:
+    """Proven usable time: the latest reset of ALL exhausted relevant windows.
+
+    Unlike a near-limit binding-window estimate, every exhausted window must
+    clear before this account can work. Missing or elapsed resets require a
+    new reading; neither is evidence that an account will recover sooner.
+    """
+    latest = None
+    for _, pct, resets_at in oauth.relevant_windows(usage, models):
+        if pct < 100.0:
+            continue
+        ts = _parse_reset_ts(resets_at)
+        if ts is None or ts <= now:
+            return None
+        latest = ts if latest is None else max(latest, ts)
+    return latest
 
 
 def _ref(number: str, email: str) -> dict:
@@ -1223,6 +1242,14 @@ class AutoSwitchEngine:
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
 
+        if not ordered and trigger == "at-limit":
+            # Usable OAuth targets and opted-in API keys take precedence.
+            # Never give up the active account's remaining quota to wait on
+            # an exhausted peer, or guess a recovery for an unreadable active.
+            ordered = self._rank_exhausted_candidates(
+                oauth_candidates, usage, current, settings, decided_now
+            )
+
         if not ordered:
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
@@ -1832,7 +1859,7 @@ class AutoSwitchEngine:
                 continue
             any_known = True          # it EXISTS and is readable either way
             if h <= 0:
-                continue  # itself at its limit — never a target
+                continue  # considered only by the exhausted-account fallback
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
@@ -1949,6 +1976,35 @@ class AutoSwitchEngine:
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
+
+    def _rank_exhausted_candidates(
+        self,
+        candidates: Sequence[str],
+        usage: dict[str, dict | str | None],
+        current: str,
+        settings: AutoSwitchSettings,
+        now: float,
+    ) -> list[str]:
+        """Choose where to wait only for a proven, meaningful time saving.
+
+        The caller supplies the same enabled, non-quarantined OAuth pool as
+        the normal ranking. Keeping the active account wins ties, even with
+        a zero margin; stable sorting preserves sequence order among peers.
+        """
+        active_reset = _exhausted_recovery_ts(usage.get(current), self._models, now)
+        if active_reset is None:
+            return []
+        ranked = []
+        for num in candidates:
+            reset = _exhausted_recovery_ts(usage.get(num), self._models, now)
+            if (
+                reset is not None
+                and reset < active_reset
+                and active_reset - reset >= settings.exhausted_reset_margin_seconds
+            ):
+                ranked.append((reset, num))
+        ranked.sort(key=lambda item: item[0])
+        return [num for _, num in ranked]
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -2233,8 +2289,8 @@ class AutoSwitchEngine:
         windows — an account blocked on both 5h and a scoped weekly limit
         isn't usable when the 5h rolls over — then the minimum across
         accounts, the active one included (its recovery also ends the
-        blocked state). A blocked account whose exhausted windows carry no
-        reset time at all could recover at any moment, so it makes the whole
+        blocked state). A blocked account with any unproven exhausted-window
+        reset could recover at an unknown time, so it makes the whole
         answer unprovable: return None and let the bounded blocked-cadence
         fallback re-check, rather than sleeping toward another account's
         later known reset."""
@@ -2250,8 +2306,8 @@ class AutoSwitchEngine:
             ]
             if not blocked:
                 continue  # not exhausted — doesn't gate the blocked state
-            usable_at = _limiting_reset_ts(value, self._models)
-            if usable_at is None or usable_at <= now:
+            usable_at = _exhausted_recovery_ts(value, self._models, now)
+            if usable_at is None:
                 return None  # blocked with unprovable recovery — don't oversleep
             if earliest is None or usable_at < earliest:
                 earliest = usable_at

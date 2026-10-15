@@ -171,6 +171,18 @@ class TestSettingSpecs:
 
 
 class TestSetUnsetSetting:
+    def test_exhausted_reset_margin_roundtrip_and_bounds(self, tmp_path):
+        key = "autoswitch.exhaustedResetMarginSeconds"
+        assert load_settings(tmp_path).exhausted_reset_margin_seconds == 300
+        for value in (0, 600, 86400):
+            set_setting(tmp_path, key, str(value))
+            assert load_settings(tmp_path).exhausted_reset_margin_seconds == value
+        for value in (-1, 86401, "nan", "inf", "oops"):
+            with pytest.raises(ConfigError):
+                set_setting(tmp_path, key, str(value))
+        assert unset_setting(tmp_path, key)
+        assert load_settings(tmp_path).exhausted_reset_margin_seconds == 300
+
     def test_set_writes_minimal_file(self, tmp_path: Path):
         value = set_setting(tmp_path, "autoswitch.threshold", "80")
         assert value == 80.0
