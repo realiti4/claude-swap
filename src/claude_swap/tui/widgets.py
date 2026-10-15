@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap import oauth, pace
+from claude_swap.json_output import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
@@ -160,6 +160,20 @@ def usage_rows(
     return rows
 
 
+_LOGIN_LABEL = "login"
+
+
+def _append_login_line(
+    text: Text, acc: AccountSnapshot, label_width: int, now: float, palette: Palette
+) -> None:
+    """One "login <countdown>" row, label-padded like the card's other rows."""
+    quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+    value = oauth.format_login_expiry(acc.login_expires_at, quarantined, now)
+    text.append("\n    ")
+    text.append(f"{_LOGIN_LABEL:<{label_width}} ", style=palette.muted)
+    text.append(value, style=palette.muted)
+
+
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
@@ -201,6 +215,7 @@ def account_card_text(
             if last_seen is not None:
                 text.append("\n    ")
                 text.append(f"└ {last_seen}", style=palette.muted)
+        _append_login_line(text, acc, len(_LOGIN_LABEL), now, palette)
         return text
 
     rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
@@ -213,10 +228,13 @@ def account_card_text(
             # identically.
             note = ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)
             text.append(f" · {note}", style=palette.muted)
+        _append_login_line(text, acc, len(_LOGIN_LABEL), now, palette)
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
-    label_width = max(len(label) for label, _pct, _suffix, _full in rows)
+    label_width = max(
+        [len(label) for label, _pct, _suffix, _full in rows] + [len(_LOGIN_LABEL)]
+    )
     bar_width = max(12, min(30, width - 42 - label_width))
     # everything on a row except the suffix: indent, label, bar, " NNN%", gap
     row_overhead = 4 + label_width + 1 + bar_width + 5 + 2
@@ -237,11 +255,19 @@ def account_card_text(
                 palette=palette,
             )
         )
+    _append_login_line(text, acc, label_width, now, palette)
     return text
 
 
+def mini_row_display_name(acc: AccountSnapshot) -> str:
+    """The name shown in a mini row: ``alias (email)`` when aliased, else the
+    plain email — what ``email_width`` below must be measured over, so an
+    aliased slot's login column lines up with the rest."""
+    return f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+
+
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot, now: float, *, email_width: int = 0, palette: Palette = Palette.DARK
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -257,6 +283,10 @@ def mini_account_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
+    text.append(" " * max(0, email_width - len(mini_row_display_name(acc))))
+    quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+    login_value = oauth.format_login_expiry(acc.login_expires_at, quarantined, now)
+    text.append(f"  {_LOGIN_LABEL} {login_value}", style=palette.muted)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
@@ -334,6 +364,13 @@ class AccountsPanel(Static):
             )
         now = time.time()
         width = (self.size.width or 80) - 2
+        # Widest displayed name (alias included) among the mini rows, so
+        # their login columns start at the same offset regardless of which
+        # account's name is longest.
+        email_width = max(
+            (len(mini_row_display_name(acc)) for acc in snap.accounts if not acc.is_active),
+            default=0,
+        )
         blocks: list[Text] = []
         for acc in snap.accounts:
             if acc.is_active:
@@ -344,7 +381,9 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(
+                    mini_account_text(acc, now, email_width=email_width, palette=palette)
+                )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
