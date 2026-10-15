@@ -88,6 +88,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
+cswap auto --notify            # desktop notification on switch/quarantine/exhaustion
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
@@ -105,6 +106,7 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
+- **Desktop notifications** (`--notify`, or `cswap config set autoswitch.notify true`): pop up a native notification when the loop switches accounts, quarantines one, or finds every account exhausted — useful when `cswap auto` lives in a corner terminal you don't watch. Off by default, because the [menu bar](#menu-bar-macos) already notifies on its own; turn it on if you run the CLI loop without the menu bar. Poll ticks and no-switch reasons stay terminal-only. macOS uses `osascript`, Linux needs `notify-send`; delivery is best-effort and never affects switching.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
