@@ -1522,3 +1522,60 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestCreditsAndExtraWindows:
+    """Usage-credit state and every other non-null window reach the result."""
+
+    RESPONSE = {
+        "five_hour": {"utilization": 73.0, "resets_at": "2026-10-16T12:40:00+00:00"},
+        "seven_day": None,
+        "seven_day_opus": None,
+        "omelette_promotional": {"utilization": 12.0, "resets_at": "2026-10-20T00:00:00+00:00"},
+        "iguana_necktie": None,
+        "extra_usage": {
+            "is_enabled": False, "monthly_limit": None, "used_credits": None, "utilization": None,
+            "currency": "USD", "disabled_reason": "out_of_credits", "credits_ever_enabled": True,
+        },
+        "spend": {
+            "used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+            "enabled": False, "disabled_reason": "out_of_credits",
+            "balance": {"amount_minor": 1250, "currency": "USD", "exponent": 2},
+            "auto_reload": False, "can_purchase_credits": True,
+        },
+        "limits": [],
+    }
+
+    def test_credits_are_reported_when_off(self):
+        result = oauth.build_usage_result(self.RESPONSE)
+        assert "spend" not in result
+        assert result["credits"] == {
+            "enabled": False, "disabled_reason": "out_of_credits", "ever_enabled": True,
+            "balance": 12.5, "auto_reload": False, "can_purchase": True, "currency": "USD",
+        }
+
+    def test_non_null_unknown_windows_are_surfaced_by_name(self):
+        result = oauth.build_usage_result(self.RESPONSE)
+        assert [(w["name"], w["pct"]) for w in result["extra_windows"]] == [("omelette_promotional", 12.0)]
+        assert result["extra_windows"][0]["resets_at"] == "2026-10-20T00:00:00+00:00"
+
+    def test_extra_windows_never_count_toward_headroom(self):
+        result = oauth.build_usage_result(self.RESPONSE)
+        assert [label for label, _, _ in oauth.relevant_windows(result)] == ["5h"]
+
+    def test_no_credit_blocks_means_no_credits_entry(self):
+        result = oauth.build_usage_result({"five_hour": {"utilization": 1.0, "resets_at": None}})
+        assert "credits" not in result
+        assert "extra_windows" not in result
+
+    def test_odd_shapes_do_not_break_the_reading(self):
+        result = oauth.build_usage_result({
+            "five_hour": {"utilization": 1.0, "resets_at": None},
+            "extra_usage": {"is_enabled": "yes", "currency": 5},
+            "spend": {"used": 7, "balance": 12, "auto_reload": "on"},
+        })
+        assert result["five_hour"]["pct"] == 1.0
+        assert result["credits"] == {
+            "enabled": None, "disabled_reason": None, "ever_enabled": None,
+            "balance": None, "auto_reload": None, "can_purchase": None, "currency": "USD",
+        }

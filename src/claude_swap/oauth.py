@@ -507,6 +507,14 @@ def build_usage_result(data: dict) -> dict | None:
             except (TypeError, ValueError) as e:
                 _logger.debug("extra_usage parse failed: %r", e)
 
+    credits = _credits_entry(data.get("extra_usage"), data.get("spend"))
+    if credits:
+        result["credits"] = credits
+
+    extra_windows = _extra_windows(data)
+    if extra_windows:
+        result["extra_windows"] = extra_windows
+
     # Per-model weekly limits live in the newer ``limits`` array as
     # ``weekly_scoped`` entries carrying a ``scope.model.display_name`` (e.g.
     # "Fable"). The legacy five_hour/seven_day keys above never expose these, so
@@ -533,6 +541,80 @@ def build_usage_result(data: dict) -> dict | None:
             result["scoped"] = scoped
 
     return result if result else None
+
+
+# Top-level usage keys that are not extra windows: the two legacy windows
+# (already surfaced) and the structured blocks handled elsewhere.
+_NOT_EXTRA_WINDOWS = frozenset({"five_hour", "seven_day", "extra_usage", "limits", "spend"})
+
+
+def _money(value: object) -> float | None:
+    """Dollars from a ``{"amount_minor", "exponent"}`` money object, else None."""
+    if not isinstance(value, dict):
+        return None
+    amount, exponent = value.get("amount_minor"), value.get("exponent", 2)
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+        return None
+    if not isinstance(exponent, int) or isinstance(exponent, bool):
+        return None
+    return float(amount) / (10 ** exponent)
+
+
+def _credits_entry(extra_usage: object, spend: object) -> dict | None:
+    """Usage-credit state, whether or not credits are on.
+
+    ``spend`` above covers only an enabled account with a monthly limit. This
+    keeps what an account owner needs to plan around credits when they are
+    off too: whether they were ever enabled, why they are off (for example
+    ``out_of_credits``), the prepaid balance, auto-reload, and whether this
+    login can buy more. Fields the API leaves null stay None.
+    """
+    eu = extra_usage if isinstance(extra_usage, dict) else {}
+    sp = spend if isinstance(spend, dict) else {}
+    if not eu and not sp:
+        return None
+    enabled = eu.get("is_enabled") if isinstance(eu.get("is_enabled"), bool) else sp.get("enabled")
+    reason = eu.get("disabled_reason") or sp.get("disabled_reason")
+    used = sp.get("used")
+    currency = eu.get("currency") or (used.get("currency") if isinstance(used, dict) else None)
+    entry: dict = {
+        "enabled": enabled if isinstance(enabled, bool) else None,
+        "disabled_reason": reason if isinstance(reason, str) else None,
+        "ever_enabled": eu.get("credits_ever_enabled") if isinstance(eu.get("credits_ever_enabled"), bool) else None,
+        "balance": _money(sp.get("balance")),
+        "auto_reload": sp.get("auto_reload") if isinstance(sp.get("auto_reload"), bool) else None,
+        "can_purchase": sp.get("can_purchase_credits") if isinstance(sp.get("can_purchase_credits"), bool) else None,
+        "currency": currency if isinstance(currency, str) and currency else "USD",
+    }
+    return entry
+
+
+def _extra_windows(data: dict) -> list[dict]:
+    """Every other top-level window the API returned non-null.
+
+    The response carries more windows than the 5-hour and 7-day ones, most
+    of them null for most accounts: per-model weeklies (``seven_day_opus``),
+    per-surface ones (``seven_day_oauth_apps``) and promotional ones
+    (``omelette_promotional``). A window that starts reporting a
+    ``utilization`` is surfaced under its API name, so a new or temporary
+    limit is visible without a release that knows its name.
+    """
+    windows: list[dict] = []
+    for key in sorted(data):
+        if key in _NOT_EXTRA_WINDOWS:
+            continue
+        window = data[key]
+        if not isinstance(window, dict):
+            continue
+        pct = window.get("utilization")
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            continue
+        entry: dict = {"name": key, "pct": float(pct)}
+        if window.get("resets_at"):
+            entry["resets_at"] = window["resets_at"]
+            entry["countdown"], entry["clock"] = format_reset(window["resets_at"])
+        windows.append(entry)
+    return windows
 
 
 def relevant_windows(
