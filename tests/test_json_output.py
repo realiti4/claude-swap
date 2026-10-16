@@ -801,3 +801,31 @@ class TestUsageFromJson:
 
         with pytest.raises(ValueError):
             usage_from_json(usage)
+
+
+class TestCreditsAndExtraWindowsJson:
+    def test_round_trip(self):
+        from claude_swap import json_output, oauth
+        usage = oauth.build_usage_result({
+            "five_hour": {"utilization": 5.0, "resets_at": "2026-10-16T12:40:00+00:00"},
+            "omelette_promotional": {"utilization": 12.0, "resets_at": "2026-10-20T00:00:00+00:00"},
+            "extra_usage": {"is_enabled": False, "disabled_reason": "out_of_credits",
+                            "credits_ever_enabled": True, "currency": "USD"},
+            "spend": {"balance": {"amount_minor": 1250, "currency": "USD", "exponent": 2},
+                      "auto_reload": True, "can_purchase_credits": False},
+        })
+        out = json_output.usage_to_json(usage)
+        assert out["credits"] == {"enabled": False, "disabledReason": "out_of_credits", "everEnabled": True,
+                                  "balance": 12.5, "autoReload": True, "canPurchase": False, "currency": "USD"}
+        assert out["extraWindows"][0]["name"] == "omelette_promotional"
+        assert out["extraWindows"][0]["pct"] == 12.0
+        back = json_output.usage_from_json(out)
+        assert back["credits"] == usage["credits"]
+        assert [(w["name"], w["pct"], w["resets_at"]) for w in back["extra_windows"]] == [
+            ("omelette_promotional", 12.0, "2026-10-20T00:00:00+00:00")]
+
+    def test_malformed_credits_are_refused(self):
+        import pytest
+        from claude_swap import json_output
+        with pytest.raises(ValueError):
+            json_output.usage_from_json({"fiveHour": {"pct": 1.0}, "credits": {"balance": "lots"}})

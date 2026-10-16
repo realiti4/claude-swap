@@ -349,6 +349,8 @@ An account row also carries an additive `alias` field once one is set with `cswa
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 
+`usage` additively carries `credits` whenever the usage API reports usage-credit state, enabled or not: `enabled`, `disabledReason` (e.g. `"out_of_credits"`), `everEnabled`, `balance` (in `currency`, e.g. `12.5`), `autoReload` and `canPurchase`, each `null` when the API leaves it out. `spend` stays as before (present only while credits are on with a monthly limit). `usage.extraWindows` lists any other top-level window the API returned with a `utilization`, under its API name (for example a promotional window such as `omelette_promotional`), in the same `pct`/`resetsAt`/`countdown`/`clock` shape as `fiveHour`. Neither counts toward headroom or switching. Both round-trip through `import-usage`.
+
 </details>
 
 `cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.

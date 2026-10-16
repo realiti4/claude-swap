@@ -130,6 +130,24 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    if "credits" in usage:
+        credits = usage["credits"]
+        out["credits"] = {
+            "enabled": credits.get("enabled"),
+            "disabledReason": credits.get("disabled_reason"),
+            "everEnabled": credits.get("ever_enabled"),
+            "balance": credits.get("balance"),
+            "autoReload": credits.get("auto_reload"),
+            "canPurchase": credits.get("can_purchase"),
+            "currency": credits.get("currency", "USD"),
+        }
+    if "extra_windows" in usage:
+        extra = []
+        for window in usage["extra_windows"]:
+            entry = _window_to_json(window)
+            entry["name"] = window["name"]
+            extra.append(entry)
+        out["extraWindows"] = extra
     return out
 
 
@@ -202,6 +220,37 @@ def usage_from_json(usage: object) -> dict:
                 raise ValueError(f"{label}.name must be a non-empty string")
             scoped.append({"name": name, **entry})
         out["scoped"] = scoped
+    if "extraWindows" in usage:
+        if not isinstance(usage["extraWindows"], list):
+            raise ValueError("extraWindows must be a list")
+        extra = []
+        for i, window in enumerate(usage["extraWindows"]):
+            label = f"extraWindows[{i}]"
+            entry = _window_from_json(window, label)
+            name = window.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{label}.name must be a non-empty string")
+            extra.append({"name": name, **entry})
+        out["extra_windows"] = extra
+    if "credits" in usage:
+        credits = usage["credits"]
+        if not isinstance(credits, dict):
+            raise ValueError("credits must be an object")
+        kinds = {"enabled": bool, "disabledReason": str, "everEnabled": bool, "balance": (int, float),
+                 "autoReload": bool, "canPurchase": bool, "currency": str}
+        for key, kind in kinds.items():
+            value = credits.get(key)
+            if value is not None and (not isinstance(value, kind) or (kind != bool and isinstance(value, bool))):
+                raise ValueError(f"credits.{key} has the wrong type")
+        out["credits"] = {
+            "enabled": credits.get("enabled"),
+            "disabled_reason": credits.get("disabledReason"),
+            "ever_enabled": credits.get("everEnabled"),
+            "balance": float(credits["balance"]) if credits.get("balance") is not None else None,
+            "auto_reload": credits.get("autoReload"),
+            "can_purchase": credits.get("canPurchase"),
+            "currency": credits.get("currency") or "USD",
+        }
     if not out:
         raise ValueError("usage carries no windows")
     return out
