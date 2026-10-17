@@ -325,6 +325,21 @@ The export file is plaintext JSON and, by default, carries only each account's o
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
 
+### Share usage readings between machines
+
+Machines that hold the same accounts can end up spending one usage-endpoint budget: when they share a login (moved between them with `export`/`import`, so the same token is live on each), or when the account's usage requests are limited per account rather than per token. Their polling then adds up. `import-usage` lets one machine poll and hand its readings to the others:
+
+```bash
+cswap list --json | ssh laptop cswap import-usage - --hold 600
+```
+
+<details>
+<summary>How it works — matching, holds & when a hold ends</summary>
+
+The input is `cswap list --json` output. Each row with `usageStatus: "ok"` is matched to a local account by email and organization, and adopted when it is newer than the reading already stored. Its age comes from `usageAgeSeconds`, so the two machines' clocks never have to agree; a script that delays the hand-over should add the delay to that field. `--hold SECONDS` keeps every collector on the receiving machine (`list`, `status`, `auto`, the dashboard, the menu bar) from fetching those accounts for that long, and the held reading stays trusted for switch decisions meanwhile. A hold never runs past the reading's earliest window reset (per-model windows included), nor past an hour after the reading was taken. Renew it with each hand-over, or lift it early with `--hold 0`; when it lapses, the machine goes back to fetching for itself.
+
+</details>
+
 ### JSON output for scripting
 
 Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
@@ -368,13 +383,14 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
-or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+or a Console API key (`sk-ant-api03-...` workspace key, `sk-ant-usr-...` personal
+key, or a service-account key) and you don't want to log in via the browser
 flow first — useful on headless servers or when receiving a token from another
 machine — register it directly. The token type is auto-detected:
 
 ```bash
 cswap add-token sk-ant-oat01-...             # OAuth setup-token
-cswap add-token sk-ant-api03-...             # managed API key
+cswap add-token sk-ant-api03-...             # API key (any Console key family)
 cswap add-token sk-ant-oat01-... --slot 3
 cswap add-token - --slot 3                   # read token from stdin
 cswap add-token --email user@example.com     # optional label override
@@ -383,11 +399,14 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
-**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
-(the kind Claude Code uses after `/login` with a key) rather than an OAuth
-setup-token. It switches like any other account; since API keys have no subscription
-quota, they show no usage and the usage-aware `switch` strategies never skip them as
-rate-limited.
+**API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
+(`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses
+after `/login` with a key) rather than an OAuth setup-token. It switches like any
+other account; since API keys have no subscription quota, they show no usage and the
+usage-aware `switch` strategies never skip them as rate-limited. Create personal and
+service-account keys scoped to a single workspace: a multi-workspace key needs an
+`anthropic-workspace-id` header on every request, which Claude Code does not add for
+a stored key.
 
 ## Uninstall
 

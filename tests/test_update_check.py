@@ -104,6 +104,60 @@ class TestCheckForUpdate:
         assert "0.4.0" in result
 
 
+class TestCheckForUpdatePrereleases:
+    """claude-swap ships every cycle as a pre-release first, so the version
+    cli.main hands to check_for_update is routinely something like 0.27.0b1."""
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_prerelease_is_told_about_later_release(self, mock_urlopen, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        mock_urlopen.return_value = _make_pypi_response("0.28.0")
+
+        result = check_for_update("0.27.0b1")
+
+        assert result is not None
+        assert "0.28.0" in result
+        assert "0.27.0b1" in result
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_prerelease_is_told_about_its_own_final_release(
+        self, mock_urlopen, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        mock_urlopen.return_value = _make_pypi_response("0.27.0")
+
+        result = check_for_update("0.27.0b1")
+
+        assert result is not None
+        assert "0.27.0" in result
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_prerelease_is_told_about_later_prerelease(self, mock_urlopen, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        mock_urlopen.return_value = _make_pypi_response("0.27.0rc1")
+
+        result = check_for_update("0.27.0b2")
+
+        assert result is not None
+        assert "0.27.0rc1" in result
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_final_release_is_not_pushed_onto_a_prerelease(
+        self, mock_urlopen, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        mock_urlopen.return_value = _make_pypi_response("0.28.0b1")
+
+        assert check_for_update("0.27.0") is None
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_unparseable_version_stays_silent(self, mock_urlopen, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        mock_urlopen.return_value = _make_pypi_response("0.28.0")
+
+        assert check_for_update("main") is None
+
+
 class TestDetectInstallMethod:
     def _set_prefix(self, monkeypatch, prefix: str) -> None:
         monkeypatch.setattr("claude_swap.update_check.sys.prefix", prefix)

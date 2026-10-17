@@ -1155,7 +1155,7 @@ class TestPollPlan:
 
 
 class TestDueCandidate:
-    """Candidate selection shared by the auto engine and the TUI watch view."""
+    """The auto engine's one-alternate-per-tick candidate pick."""
 
     NOW = 1_000_000.0
 
@@ -1237,6 +1237,32 @@ class TestDueCandidate:
         # due_candidate has no current scoped-model selection: repair keys on
         # the impossible deadline shape rather than stale policy semantics.
         assert due_candidate(["2"], entries, self.NOW) == "2"
+
+    def test_attempted_but_unmeasured_slot_yields_to_an_older_due_row(self):
+        """A fetch-path sentinel (a live session's expired or refused
+        credential) records no measurement, plan or backoff. Keyed on
+        fetchedAt alone it stayed the stalest due row every tick and the
+        other alternates were never polled; the pick keys on the attempt
+        stamp reserve() writes, so a no-op pick rotates to the back."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 400, last_attempt_at=self.NOW - 400),
+            "3": UsageEntry(last_attempt_at=self.NOW - 60),  # picked last tick, no data
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "2"
+        # ...and comes back around once nothing was touched more recently,
+        # so a rotated credential is noticed on the next idle tick.
+        entries["2"] = UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 30)
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
+
+    def test_adopted_reading_counts_as_a_touch(self):
+        """``UsageStore.adopt`` moves fetchedAt without an attempt: the later
+        of the two stamps is the touch, so a freshly adopted row is not the
+        least recent."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 900),
+            "3": UsageEntry(fetched_at=self.NOW - 600, last_attempt_at=self.NOW - 600),
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
 
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
@@ -1696,3 +1722,152 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestAdopt:
+    """Readings another machine took for the same account (``import-usage``)."""
+
+    def test_reading_is_backdated_by_its_age(self, store, clock):
+        assert store.adopt({"1": (USAGE, 40.0)}, IDENT) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == USAGE
+        assert entry.fetched_at == clock.now - 40.0
+        assert entry.age_s == 40.0
+
+    def test_never_downgrades_a_newer_local_reading(self, store, clock):
+        local = {"five_hour": {"pct": 60.0}}
+        store.record({"1": FetchRecord(usage=local)}, IDENT)
+        clock.advance(10)
+        # Measured 30s ago elsewhere: older than this machine's own fetch.
+        assert store.adopt({"1": (USAGE, 30.0)}, IDENT) == set()
+        assert store.entries(IDENT)["1"].last_good == local
+
+    def test_fetch_state_is_left_alone(self, store, clock):
+        # Failures, backoff and the 429 marker describe this machine's own
+        # requests; a reading from elsewhere is no evidence about them.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        store.adopt({"1": (USAGE, 0.0)}, IDENT)
+        after = store.entries(IDENT)["1"]
+        assert after.last_good == USAGE
+        assert after.consecutive_failures == before.consecutive_failures == 1
+        assert after.last_error == "http-429"
+        assert after.backoff_until == before.backoff_until
+        assert after.last_429_at == before.last_429_at
+
+    def test_hold_keeps_every_mode_off_until_it_lapses(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=600.0)
+        clock.advance(SERVE_TTL_S + 1)  # stale: every mode would fetch now
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=False, repair_overslept=True
+        ) == {}
+        clock.advance(600.0)  # nobody renewed it
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_held_reading_stays_decision_trusted(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        clock.advance(STALE_OK_S + 1)
+        entry = store.entries(IDENT)["1"]
+        assert entry.held(clock.now)
+        assert entry.decision_value() == USAGE
+        clock.advance(900.0)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_hold_never_outlives_the_trust_ceiling(self, store, clock):
+        # A reading already 3000s old may be trusted for 600s more, so a 3600s
+        # hold is cut to that: a slot never sits unfetched on data too old to
+        # act on.
+        store.adopt({"1": (USAGE, 3000.0)}, IDENT, hold_s=3600.0)
+        entry = store.entries(IDENT)["1"]
+        assert entry.held_until == pytest.approx(entry.fetched_at + TRUST_MAX_AGE_S)
+        clock.advance(TRUST_MAX_AGE_S - 3000.0)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_latest_hold_wins(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=60.0)
+        assert store.entries(IDENT)["1"].held_until == clock.now + 60.0
+
+    def _usage_resetting_in(self, clock, five_hour_s, scoped_s=None):
+        from datetime import datetime, timezone
+
+        def iso(ahead):
+            return (
+                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        usage = {
+            "five_hour": {"pct": 25.0, "resets_at": iso(five_hour_s)},
+            "seven_day": {"pct": 10.0, "resets_at": iso(86_400.0)},
+        }
+        if scoped_s is not None:
+            usage["scoped"] = [{"name": "Fable", "pct": 5.0, "resets_at": iso(scoped_s)}]
+        return usage
+
+    def test_hold_stops_at_the_readings_earliest_reset(self, store, clock):
+        # Once a window rolls over, the held reading no longer describes it:
+        # the hold must not keep this machine from reading the new window.
+        usage = self._usage_resetting_in(clock, 300.0)
+        store.adopt({"1": (usage, 0.0)}, IDENT, hold_s=900.0)
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 300.0)
+        clock.advance(300.0)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_a_scoped_windows_reset_caps_the_hold_too(self, store, clock):
+        # A scoped window counts whichever models this machine watches.
+        usage = self._usage_resetting_in(clock, 3000.0, scoped_s=120.0)
+        store.adopt({"1": (usage, 0.0)}, IDENT, hold_s=900.0)
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 120.0)
+
+    def test_the_cap_comes_from_the_reading_kept(self, store, clock):
+        # This machine's own reading is newer, so it is the one kept, and its
+        # reset is the one the hold must not outrun.
+        store.record({"1": FetchRecord(usage=self._usage_resetting_in(clock, 120.0))}, IDENT)
+        imported = self._usage_resetting_in(clock, 3000.0)
+        assert store.adopt({"1": (imported, 30.0)}, IDENT, hold_s=900.0) == set()
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 120.0)
+
+    def test_a_reading_from_before_a_reset_is_not_held(self, store, clock):
+        usage = self._usage_resetting_in(clock, -60.0)
+        assert store.adopt({"1": (usage, 600.0)}, IDENT, hold_s=900.0) == {"1"}
+        assert store.entries(IDENT)["1"].held_until is None
+
+    def test_zero_hold_lifts_an_existing_hold(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=0.0)
+        assert store.entries(IDENT)["1"].held_until is None
+        clock.advance(SERVE_TTL_S + 1)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_no_hold_leaves_an_existing_hold_alone(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT)
+        assert store.entries(IDENT)["1"].held_until == clock.now + 900.0
+
+    def test_due_candidate_skips_a_held_slot(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0), "2": (USAGE, 0.0)}, IDENT, hold_s=600.0)
+        plan = (clock.now + 60.0, 60.0)
+        store.set_poll_plan({"1": plan, "2": plan}, IDENT)
+        clock.advance(61)  # both plans due
+        assert due_candidate(["1", "2"], store.entries(IDENT), clock.now) is None
+
+    def test_a_claimed_fetch_still_records(self, store, clock):
+        # A local collector already won the fetch when the reading arrives:
+        # its lease is untouched, and its own newer result lands normally.
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        store.adopt({"1": (USAGE, 5.0)}, IDENT, hold_s=600.0)
+        local = {"five_hour": {"pct": 61.0}}
+        assert store.record({"1": FetchRecord(usage=local)}, IDENT, claims) == {"1"}
+        assert store.entries(IDENT)["1"].last_good == local
+
+    def test_row_of_another_account_is_replaced(self, store):
+        store.record({"2": FetchRecord(usage=USAGE)}, {"2": ("old@x.com", "")})
+        store.adopt({"2": (USAGE, 0.0)}, IDENT)
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
+        assert (row["email"], row["organizationUuid"]) == IDENT["2"]

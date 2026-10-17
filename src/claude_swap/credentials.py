@@ -117,7 +117,7 @@ SECURITY_SERVICE = "claude-swap"
 CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 # Service name of Claude Code's *active* managed API key (``/login`` with an
-# ``sk-ant-api…`` key) in the macOS Keychain. Distinct from the OAuth service above
+# ``sk-ant-…`` key) in the macOS Keychain. Distinct from the OAuth service above
 # (no ``-credentials`` suffix); Claude Code resolves it on a separate auth axis
 # (``getApiKeyFromConfigOrMacOSKeychain``). On non-macOS the managed key instead
 # lives in ``~/.claude.json`` as ``primaryApiKey`` (see below).
@@ -163,18 +163,33 @@ class ActiveCredentials(NamedTuple):
     degraded: bool = False
 
 
+# Prefixes of Anthropic OAuth tokens: the access/setup-token and the refresh token.
+# A bare value carrying one is OAuth material, never a managed API key, however it
+# arrived. Mirrors Claude Code's own ``isAnthropicOAuthToken`` (``sk-ant-oat`` is
+# the only prefix it ever tests for; its API-key validation is charset-only).
+_OAUTH_TOKEN_PREFIXES = ("sk-ant-oat", "sk-ant-ort")
+
+
 def looks_like_api_key(credentials: str | None) -> bool:
     """Whether a stored active credential is a raw managed API key vs OAuth JSON.
 
-    Strict on purpose: a managed key is a bare ``sk-ant-api…`` string, while every
-    OAuth/setup-token credential is a JSON object (``{"claudeAiOauth": …}``). Requiring
-    the ``sk-ant-api`` prefix (and that it isn't JSON) keeps a raw/garbled
-    ``sk-ant-oat…`` setup token from ever being misclassified as an API key.
+    A managed key is a bare ``sk-ant-…`` string, while every OAuth/setup-token
+    credential is a JSON object (``{"claudeAiOauth": …}``). The Console issues
+    several key families — legacy workspace keys (``sk-ant-api03-…``), personal
+    keys (``sk-ant-usr-…``) and service-account keys — and Claude Code never
+    inspects the prefix of a key it stores, so neither does this: any bare
+    ``sk-ant-`` value is a key UNLESS it carries an OAuth token prefix. That
+    exclusion (rather than an allowlist of key prefixes) is what keeps a raw or
+    garbled ``sk-ant-oat…`` setup token from ever being misclassified — and
+    activated — as an API key; an allowlist instead wrapped every newer key family
+    as a setup-token, which is the #465 failure.
     """
     if not credentials:
         return False
     text = credentials.strip()
-    return text.startswith("sk-ant-api") and not text.startswith("{")
+    if text.startswith("{"):
+        return False
+    return text.startswith("sk-ant-") and not text.startswith(_OAUTH_TOKEN_PREFIXES)
 
 
 def _credential_object(credentials: str | None) -> dict | None:
@@ -573,7 +588,7 @@ class CredentialStore:
         Keychain "Claude Code", then ``~/.claude.json`` ``primaryApiKey``). Trying
         OAuth fully first means a macOS OAuth login that only has a file fallback
         (Keychain empty) is never misread as an API key. A returned managed key is a
-        raw ``sk-ant-api…`` string — callers distinguish it via ``looks_like_api_key``.
+        raw ``sk-ant-…`` string — callers distinguish it via ``looks_like_api_key``.
         Non-mutating.
 
         Reports ``keychain_unavailable`` when the OAuth Keychain read failed and
@@ -797,7 +812,7 @@ class CredentialStore:
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
 
-        Detects the kind from the payload (raw ``sk-ant-api…`` key vs OAuth JSON) and
+        Detects the kind from the payload (raw ``sk-ant-…`` key vs OAuth JSON) and
         mirrors Claude Code's own ``saveApiKey``/``removeApiKey``: activating one axis
         clears the other so a stale credential can't shadow the switch.
 

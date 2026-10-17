@@ -1701,6 +1701,71 @@ class TestAdaptiveScheduler:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
 
+    def test_sentinel_slot_does_not_starve_the_other_alternates(
+        self, temp_home, monkeypatch
+    ):
+        """A live session's refused credential makes #2 a fetch-path sentinel
+        every tick (stamped, no request). A sentinel record moves none of
+        the staleness the picker used to key on, so #2 was the stalest due
+        row forever and #3 never got the one alternate poll per tick. The
+        picker keys on the last attempt instead, which reserve() stamps on
+        every claim, so the no-op pick rotates to the back of the queue and
+        the healthy alternate is polled when due."""
+        import time
+
+        h = self._harness(temp_home, monkeypatch)
+        session_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-session-2",
+                "refreshToken": "rt-session-2",
+                "expiresAt": int((time.time() + 7200) * 1000),
+            },
+        })
+        session_dir_2 = h.switcher._session_dir("2", "b@example.com")
+        monkeypatch.setattr(
+            h.switcher,
+            "_live_session_pids",
+            lambda num, email: [4242] if str(num) == "2" else [],
+        )
+        counts: dict[str, int] = {}
+        fetch_sets: list[set] = []
+        real_collect = h.switcher.usage_entries_by_account
+
+        def spying_collect(*args, **kwargs):
+            # Each tick first reads the store with fetch=set(); only the
+            # planned collections are of interest here.
+            if kwargs.get("fetch"):
+                fetch_sets.append(set(kwargs["fetch"]))
+            return real_collect(*args, **kwargs)
+
+        def network(num, email, creds, is_active=False, **kwargs):
+            counts[num] = counts.get(num, 0) + 1
+            if creds == session_creds:
+                return oauth.UsageOutcome(None, error="http-401")
+            return oauth.UsageOutcome(_usage(10))
+
+        with (
+            patch(
+                "claude_swap.session.read_session_credentials",
+                side_effect=lambda d: session_creds if d == session_dir_2 else None,
+            ),
+            patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=network),
+            patch.object(
+                h.switcher, "usage_entries_by_account", side_effect=spying_collect
+            ),
+        ):
+            for _ in range(8):  # t0 .. t420
+                assert h.engine.tick() is TickOutcome.NO_ACTION
+                h.clock.advance(60)
+        # The refused credential drew exactly one request, then its stamp held.
+        assert counts["2"] == 1
+        # The healthy alternate was polled (first at t60, again once due).
+        assert counts.get("3", 0) >= 1
+        # An idle tick still re-derives the stamped slot at zero request cost,
+        # so a rotated credential is noticed on the next tick, not minutes later.
+        assert fetch_sets[:3] == [{"1", "2"}, {"3"}, {"2"}]  # t0, t60, t120
+
+
 
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
