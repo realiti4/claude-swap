@@ -21,9 +21,11 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     HORIZON_HEADROOM_RATIO,
     SPENT_HEADROOM_PCT,
+    ErrorEvent,
     NoSwitchEvent,
     PollEvent,
     SwitchEvent,
@@ -488,7 +490,6 @@ class TestRankCandidatesStaysPure:
             "account_policies",
             "_get_sequence_data",
             "switchable_account_numbers",
-            "standby_account_numbers",
         ):
             monkey = getattr(h.switcher, name, None)
             if monkey is not None:
@@ -1038,3 +1039,83 @@ class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
         assert outcome is not TickOutcome.SWITCHED
         assert h.active_number() == 1
         assert self._switches(h) == []
+
+
+def _tick(h: EngineHarness, snapshots: list[dict]):
+    """Drive one real tick, serving `snapshots` to successive collector calls.
+
+    The last snapshot repeats, so a fixture only lists as many as it needs to
+    distinguish. Returns `(outcome, mock)`.
+    """
+    seq = [
+        {num: _entry_for(value, h.clock.now) for num, value in snap.items()}
+        for snap in snapshots
+    ]
+    calls = {"n": 0}
+
+    def _fetch(**_kwargs):
+        index = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return seq[index]
+
+    with patch.object(
+        h.switcher, "usage_entries_by_account", side_effect=_fetch
+    ) as mock:
+        return h.engine.tick(), mock
+
+
+class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
+    """A departure decided by a per-account line ends like any other when no
+    target can be freshened.
+
+    Account 1 carries a 50 line and sits at 60%, so it departs on its own
+    threshold where the global 90 would hold. The only other account ranks on
+    a readable usage row but cannot be committed to - a live session pins it,
+    or its refresh fails transiently - and the tick must take the target
+    loop's ordinary exits: `BLOCKED` with `no-viable-target`, or `ERROR` with
+    an `ErrorEvent`.
+    """
+
+    _EMAILS = {1: "a@example.com", 2: "b@example.com", 3: "c@example.com"}
+
+    def _stage(self, temp_home, *, expires_at=None, n: int = 2):
+        h = EngineHarness(temp_home)
+        for num in range(1, n + 1):
+            h.seed(num, self._EMAILS[num],
+                   expires_at=None if num == 1 else expires_at)
+        h.make_live(self._EMAILS[1], 1)
+        return h
+
+    def _snapshot(self, n: int = 2, active: float = 20.0):
+        snap = {"1": _usage(active)}
+        for num in range(2, n + 1):
+            snap[str(num)] = _usage(10.0)
+        return snap
+
+    def test_threshold_departure_with_no_viable_target_blocks(self, temp_home):
+        live = self._stage(temp_home,
+                           expires_at=int(1_000_000.0 * 1000) + 3_600_000)
+        # `ACCOUNT_THRESHOLD_MIN` is 50: the lowest line the store accepts,
+        # crossed here at 60%.
+        live.switcher.set_account_threshold("1", 50.0)
+        live.engine = live._make_engine()
+        with patch.object(
+            live.switcher, "live_session_pids_for", return_value=[4242]
+        ):
+            outcome, _ = _tick(live, [self._snapshot(active=60.0)])
+        assert outcome is TickOutcome.BLOCKED
+        assert "no-viable-target" in _reasons(live)
+
+    def test_threshold_departure_with_a_transient_refresh_failure_errors(
+        self, temp_home
+    ):
+        h = self._stage(temp_home, expires_at=1)
+        h.switcher.set_account_threshold("1", 50.0)
+        h.engine = h._make_engine()
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
+        ):
+            outcome, _ = _tick(h, [self._snapshot(active=60.0)])
+        assert outcome is TickOutcome.ERROR
+        assert any(isinstance(e, ErrorEvent) for e in h.events)

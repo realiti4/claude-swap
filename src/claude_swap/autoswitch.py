@@ -364,7 +364,6 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
-    #                | "failback" — a standby account handing back to a primary
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1095,28 +1094,7 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < thresholds[current]:
-                if self._failback_available(current, quarantined):
-                    # A standby ("last man standing") account is only supposed
-                    # to carry the fleet while nothing else can. It was taken
-                    # BECAUSE every primary was out, so waiting for it to
-                    # cross its own threshold before handing back is the
-                    # wrong test entirely — the reserve may sit at 20% for a
-                    # week while a primary's window rolls over on the hour.
-                    #
-                    # The predicate is deliberately store-only (standby flag,
-                    # disabled, kind, quarantine) so it is decidable HERE,
-                    # before any usage ranking: it answers "should we be
-                    # looking to leave?", never "where should we go?". The
-                    # OAuth clause is load-bearing — a fleet whose only peer
-                    # is an API-key account must keep today's quiet hold
-                    # rather than fall through to a `no-candidates` BLOCKED.
-                    #
-                    # Fall through; never switch from inside the gate. Every
-                    # landing gate, cooldown and freshness check downstream
-                    # still applies, and if none of them yields a target the
-                    # tick holds exactly as it does today.
-                    trigger = "failback"
-                elif settings.strategy != "consume-first":
+                if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1129,13 +1107,11 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                else:
-                    # consume-first: below the threshold we still proactively
-                    # move to whichever account's weekly window resets soonest,
-                    # to burn the most-perishable quota first. Candidate
-                    # selection decides whether a sooner-resetting account with
-                    # room actually exists.
-                    trigger = "consume-first"
+                # consume-first: below the threshold we still proactively move to
+                # whichever account's weekly window resets soonest, to burn the
+                # most-perishable quota first. Candidate selection decides whether
+                # a sooner-resetting account with room actually exists.
+                trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1186,10 +1162,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if (
-            trigger in ("proactive", "consume-first", "failback")
-            and self._in_cooldown(state)
-        ):
+        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1202,12 +1175,6 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
-        # `oauth_candidates` keeps its FULL-SET meaning on purpose: the
-        # "everything is exhausted" census below is a statement about the
-        # whole fleet, and a reserve holding quota means the fleet is not
-        # exhausted. The reserve is filtered out of the *ranking* instead —
-        # inside `_rank`, so both consume-first commit phases inherit it.
-        standbys = set(self.switcher.standby_account_numbers())
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -1297,53 +1264,32 @@ class AutoSwitchEngine:
             # values. Computed once, the bar answered from a snapshot the
             # ranking had already thrown away — `left=20 active=30` bars,
             # `left=90 active=10` releases, and phase 2 is where that flips.
-            def _one_pass(pool):
-                pass_kw = {**kw, "oauth_candidates": pool}
-                recovered = self._left_account_recovered(
-                    state,
-                    pass_kw["usage"],
-                    pass_kw["headroom"],
-                    pass_kw["active_headroom"],
-                    pass_kw["settings"],
-                    pass_kw["now"],
-                    pass_kw["current"],
-                    thresholds=pass_kw["thresholds"],
-                )
-                no_return = self._no_return_account(
-                    trigger,
-                    state,
-                    pass_kw["headroom"],
-                    pass_kw["active_headroom"],
-                    recovered,
-                    pass_kw["settings"],
-                    pass_kw["current"],
-                    thresholds=pass_kw["thresholds"],
-                )
-                ranked = self._rank_candidates(no_return=no_return, **pass_kw)
-                if no_return is not None and not ranked[0] and recovered:
-                    unbarred = self._rank_candidates(no_return=None, **pass_kw)
-                    if unbarred[0]:
-                        return unbarred
-                return ranked
-
-            # Pass 1 over the primaries only. A reserve must lose to a WORSE
-            # primary, so this cannot be a sort key — an `order: 999` tie-break
-            # still promotes the reserve the moment it holds more headroom,
-            # which is precisely when it looks most attractive and is most
-            # wrong. Two passes make the exclusion absolute, and `all_above`
-            # (computed inside `_rank_candidates` from the pool it is given)
-            # correctly ignores the reserve's untouched quota.
-            #
-            # Pass 2 restores the reserve when the primaries yield nothing —
-            # the "last man standing" contract. It is skipped entirely when no
-            # account is marked standby, so an unconfigured fleet ranks exactly
-            # once, on exactly today's list.
-            primaries = [n for n in kw["oauth_candidates"] if n not in standbys]
-            if len(primaries) != len(kw["oauth_candidates"]):
-                first = _one_pass(primaries)
-                if first[0]:
-                    return first
-            return _one_pass(kw["oauth_candidates"])
+            recovered = self._left_account_recovered(
+                state,
+                kw["usage"],
+                kw["headroom"],
+                kw["active_headroom"],
+                kw["settings"],
+                kw["now"],
+                kw["current"],
+                thresholds=kw["thresholds"],
+            )
+            no_return = self._no_return_account(
+                trigger,
+                state,
+                kw["headroom"],
+                kw["active_headroom"],
+                recovered,
+                kw["settings"],
+                kw["current"],
+                thresholds=kw["thresholds"],
+            )
+            ranked = self._rank_candidates(no_return=no_return, **kw)
+            if no_return is not None and not ranked[0] and recovered:
+                unbarred = self._rank_candidates(no_return=None, **kw)
+                if unbarred[0]:
+                    return unbarred
+            return ranked
 
         decided_now = self.clock()
         ordered, any_known, active_reset_ts = _rank(
@@ -1359,7 +1305,7 @@ class AutoSwitchEngine:
             thresholds=thresholds,
         )
 
-        if trigger in ("consume-first", "failback") and ordered:
+        if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1391,81 +1337,13 @@ class AutoSwitchEngine:
                 thresholds=thresholds,
             )
 
-        if trigger == "consume-first" and current not in standbys and ordered:
-            # The active account is a non-standby too — and it is the ONE
-            # non-standby `_rank`'s pass 1 can never see, because the candidate
-            # list is built with `num != current`. On a fleet whose only other
-            # OAuth account is the reserve, pass 1 therefore ranks an empty
-            # pool, falls through to pass 2, and burns the reserve while a
-            # perfectly healthy primary is active — the exact inverse of the
-            # "only used once all the others are at their limit" contract, and
-            # a fleet that then ping-pongs back on the next `failback` tick.
-            #
-            # Scoped to `consume-first` because that is the only trigger that
-            # departs a still-usable account: under `proactive`/`at-limit`/
-            # `failover` the active primary is by definition NOT usable, which
-            # is precisely when promoting the reserve is right. `current not in
-            # standbys` excludes `failback`, whose active account IS the reserve.
-            #
-            # Applied HERE rather than inside `_rank` on purpose. The reserve's
-            # provisional rank is what arms the two-phase commit's forced
-            # refetch, and that refetch is how a spent primary is discovered to
-            # have recovered (AC-29). Filtering earlier would suppress the
-            # escalation and lose a legitimate primary→primary move; filtering
-            # after phase 2 keeps the escalation and rejects only the commit.
-            #
-            # `any_known` is deliberately left as `_rank` reported it: a
-            # `standbys` entry in `ordered` can only have come from the
-            # full-pool pass, so the census still sees the reserve and the
-            # empty list below lands on the quiet `already-consuming-soonest`
-            # hold rather than a `no-comparison` BLOCK.
-            ordered = [num for num in ordered if num not in standbys]
-
-        def _failback_hold() -> TickOutcome:
-            """The failback tick found nowhere better; hold exactly as today.
-
-            Every one of these ticks returns `NO_ACTION` on unmodified source,
-            because the departure gate stops at `below-threshold` before any
-            ranking happens. The whole contract of this trigger is that a
-            fleet which merely *configures* a reserve never starts seeing
-            `BLOCKED` or `ERROR` where it used to see a quiet hold — so the
-            hold reuses the gate's own event verbatim rather than inventing a
-            reason string. A diagnostic reason ("primaries still exhausted")
-            is a new observable and ships with its TUI surfacing in PR 2.
-            """
-            self._emit(
-                NoSwitchEvent(
-                    reason="below-threshold",
-                    detail=(
-                        f"{pct_label(100.0 - (active_headroom or 0.0))}% < "
-                        f"{pct_label(thresholds[current])}%"
-                    ),
-                )
-            )
-            return TickOutcome.NO_ACTION
-
-        if not ordered and api_key_candidates and trigger not in (
-            "consume-first",
-            "failback",
-        ):
+        if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
-            # Never for a failback either: the reserve is quiet by definition,
-            # so there is nothing to escape and metered credit is the most
-            # expensive thing in the fleet. The same two-pass filter applies
-            # here, so a reserve that happens to be an API-key account is the
-            # last thing reached rather than the first.
-            primary_api_keys = [n for n in api_key_candidates if n not in standbys]
-            ordered = primary_api_keys or api_key_candidates
+            ordered = api_key_candidates
 
         if not ordered:
-            if trigger == "failback":
-                # ABOVE `if not any_known:` deliberately. The predicate is
-                # store-only, so it fires even when no primary has readable
-                # usage this tick — and that tick returns a quiet NO_ACTION
-                # today, not `no-comparison`/BLOCKED.
-                return _failback_hold()
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
@@ -1555,7 +1433,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger in ("consume-first", "failback"):
+            if trigger == "consume-first":
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1610,15 +1488,6 @@ class AutoSwitchEngine:
                 continue
             return self._perform(num, email, trigger, left_snapshot)
 
-        if trigger == "failback":
-            # AFTER the loop, never in place of it: the `identity-conflict`
-            # and `invalid_grant` quarantines written above are durable
-            # findings about a credential and are correct regardless of why
-            # the engine was looking. An early return would silently drop
-            # them. Only the terminal outcome changes — and on the error leg
-            # no `ErrorEvent` is emitted, because today's tick emits none and
-            # "indistinguishable from today" is the contract.
-            return _failback_hold()
         if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
@@ -1631,33 +1500,6 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
-
-    def _failback_available(self, current: str, quarantined: set[str]) -> bool:
-        """Is the active account a reserve with a usable primary to hand back to?
-
-        Store-only by design — standby flag, disabled, kind, quarantine — so it
-        is decidable at the departure gate, before any usage is ranked. It
-        answers "should we be looking to leave?"; the ranking answers "where
-        to?", and every landing gate downstream still applies.
-
-        The OAuth clause is load-bearing rather than tidy. Without it, a fleet
-        whose only non-standby peer is an API-key account classifies as
-        `failback`, both candidate lists come back empty, and the tick reaches
-        the generic `no-candidates` exit and returns BLOCKED — where today it
-        returns a quiet NO_ACTION. `include_api_key_accounts` widens the
-        candidate list, never this predicate: metered credit is not somewhere
-        a quiet reserve should hand back to.
-        """
-        standbys = set(self.switcher.standby_account_numbers())
-        if current not in standbys:
-            return False
-        return any(
-            num != current
-            and num not in standbys
-            and num not in quarantined
-            and self.switcher.account_kind_for(num) != "api_key"
-            for num in self.switcher.switchable_account_numbers()
-        )
 
     def _no_return_account(
         self,
@@ -2141,23 +1983,14 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first", "failback"):
+            if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                #
-                # `all_above` relaxes the gate so a fleet with nothing below
-                # the line still rotates instead of freezing. Failback must
-                # NOT borrow that: the reserve is quiet, so "everyone is over
-                # their line" is a reason to stay, not to move. Note the
-                # phase-2 refetch can flip `all_above` to True on a failback
-                # tick, so this is a live interaction, not a theoretical one.
-                if (100.0 - h) >= thresholds[num] and (
-                    not all_above or trigger == "failback"
-                ):
+                if (100.0 - h) >= thresholds[num] and not all_above:
                     continue
-                if all_above and trigger != "failback":
+                if all_above:
                     # Checked before the strategies, because with nothing below
                     # the threshold the strategy question is moot: consume-first
                     # exists to spend perishable WEEKLY quota, and every account
@@ -2223,18 +2056,10 @@ class AutoSwitchEngine:
                     # is a 25-point gain, not a 5-point loss. Written as the
                     # raw headroom gap plus the threshold gap, so with equal
                     # lines it is today's compare plus an exact 0.0.
-                    #
-                    # Not for failback. That bar compares the reserve against
-                    # the primary on headroom, and the reserve almost always
-                    # wins it — it has been idle. Applying it would make the
-                    # trigger inert in the exact fleet it exists for. The
-                    # anti-flap property is supplied instead by the landing
-                    # gate above (the primary must be under its OWN line) plus
-                    # the no-return bar on the following tick.
                     margin = (h - active_headroom) + (
                         thresholds[num] - thresholds[current]
                     )
-                    if margin < settings.hysteresis_pct and trigger != "failback":
+                    if margin < settings.hysteresis_pct:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
@@ -2447,11 +2272,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in (
-                "proactive",
-                "consume-first",
-                "failback",
-            ) and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

@@ -107,28 +107,21 @@ def normalize_account_threshold(value: object) -> float:
 class AccountPolicy:
     """Per-account auto-switch overrides, stored in the sequence record.
 
-    Both knobs are unset by default, so a fleet with no policy set behaves
+    Its one knob is unset by default, so a fleet with no policy set behaves
     exactly as it did before this existed — the default-identity property
     the acceptance criteria assert throughout.
 
     ``threshold``
-        This account's own switch-away cap, in binding-window utilization
+        This account's own switch-away line, in binding-window utilization
         percent. ``None`` inherits ``autoswitch.threshold``. Reserving headroom
         on one shared account no longer means taxing the whole fleet with a
-        global cap set to the strictest member's.
-
-    ``standby``
-        "Last man standing": held out of candidate selection while any
-        non-standby account can still be landed on, and offered only when none
-        can. Orthogonal to ``disabled``, which removes an account from
-        auto-rotation entirely; ``disabled`` is applied first and wins.
+        global line set to the strictest member's.
 
     Frozen because ``AccountSnapshot`` is frozen — a mutable member would
     silently break that guarantee for the whole row.
     """
 
     threshold: float | None = None
-    standby: bool = False
 
 
 class Platform(Enum):

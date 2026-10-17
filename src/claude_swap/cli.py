@@ -59,8 +59,6 @@ _SUBCOMMAND_FLAGS = {
     "rm": "--remove-account",
     "disable": "--disable-account",
     "enable": "--enable-account",
-    "standby": "--standby-account",
-    "unstandby": "--unstandby-account",
     "export": "--export",
     "import": "--import",
     "purge": "--purge",
@@ -1160,8 +1158,6 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
-  %(prog)s standby <num|email>        hold an account back as a last resort
-  %(prog)s unstandby <num|email>      return a standby account to rotation
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
   %(prog)s threshold                  list the global default and overrides
@@ -1338,16 +1334,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
-        "--standby-account",
-        metavar="NUM|EMAIL",
-        help=argparse.SUPPRESS,
-    )
-    group.add_argument(
-        "--unstandby-account",
-        metavar="NUM|EMAIL",
-        help=argparse.SUPPRESS,
-    )
-    group.add_argument(
         "--list",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1430,8 +1416,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.remove_account is not None
         or args.disable_account is not None
         or args.enable_account is not None
-        or args.standby_account is not None
-        or args.unstandby_account is not None
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
@@ -1528,10 +1512,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
-        elif args.standby_account is not None:
-            switcher.set_account_standby(args.standby_account, True)
-        elif args.unstandby_account is not None:
-            switcher.set_account_standby(args.unstandby_account, False)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,

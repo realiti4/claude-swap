@@ -171,8 +171,6 @@ def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
     badges (three spaces on the card, two on the minimized row).
     """
     badges: list[str] = []
-    if acc.policy.standby:
-        badges.append(f"{gap}(standby)")
     if acc.policy.threshold is not None:
         # ``:g`` so 75.0 reads as "75%" and 82.5 keeps its fraction — the store
         # accepts one decimal place and the row shows back exactly what was set.

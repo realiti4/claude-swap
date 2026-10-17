@@ -1,13 +1,12 @@
 """TUI policy display — MEU-PAP-05 (AC-39, AC-40).
 
-The per-account policy set through ``cswap threshold`` / ``cswap standby`` has
+The per-account policy set through ``cswap threshold`` has
 to be visible where the operator already looks, on both account render paths:
 
 * ``account_card_text`` — the expanded card for the selected account.
 * ``mini_account_text`` — the one-line minimized row for every other account.
 
-AC-39  Both render paths show ``(standby)`` and the threshold override on the
-       account row.
+AC-39  Both render paths show the threshold override on the account row.
 AC-40  An account carrying no policy renders byte-identically to today, on both
        paths — asserted against goldens captured from the pre-change engine.
 
@@ -59,31 +58,6 @@ def mini(acc) -> str:
     return mini_account_text(acc, NOW).plain
 
 
-class TestStandbyBadge:
-    """AC-39, first half — the reserve is legible on both paths."""
-
-    def test_the_card_marks_a_standby_account(self):
-        acc = with_policy(make_account(2, active=True, alias="dev"), standby=True)
-        assert "(standby)" in card(acc).splitlines()[0]
-
-    def test_the_mini_row_marks_a_standby_account(self):
-        acc = with_policy(make_account(2, active=True, alias="dev"), standby=True)
-        assert "(standby)" in mini(acc)
-
-    def test_a_primary_account_carries_no_standby_badge(self):
-        acc = with_policy(make_account(2, active=True, alias="dev"), standby=False)
-        assert "(standby)" not in card(acc)
-        assert "(standby)" not in mini(acc)
-
-    def test_the_badge_survives_alongside_disabled(self):
-        # A reserve can also be disabled; neither badge may swallow the other.
-        acc = with_policy(make_account(3, disabled=True), standby=True)
-        header = card(acc).splitlines()[0]
-        assert "(disabled)" in header and "(standby)" in header
-        row = mini(acc)
-        assert "(disabled)" in row and "(standby)" in row
-
-
 class TestThresholdBadge:
     """AC-39, second half — a per-account override is legible on both paths."""
 
@@ -117,12 +91,12 @@ class TestThresholdBadge:
 
     def test_both_badges_render_together(self):
         acc = with_policy(
-            make_account(2, active=True, alias="dev"), threshold=60.0, standby=True
+            make_account(2, active=True, alias="dev"), threshold=60.0
         )
         header = card(acc).splitlines()[0]
-        assert "(standby)" in header and "60%" in header
+        assert "60%" in header
         row = mini(acc)
-        assert "(standby)" in row and "60%" in row
+        assert "60%" in row
 
 
 class TestUnpolicedAccountsRenderExactlyAsBefore:
@@ -162,5 +136,5 @@ class TestUnpolicedAccountsRenderExactlyAsBefore:
         assert len(lines) == 3
         assert lines[1].startswith("    5h ")
         assert lines[2].startswith("    7d ")
-        for token in ("(standby)", "th "):
+        for token in ("th ",):
             assert token not in "\n".join(lines[1:])

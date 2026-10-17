@@ -94,12 +94,11 @@ class TestPolicyFromData(PolicyStoreBase):
         data = s._get_sequence_data() or {}
         assert s._policy_from_data(data, "1") == AccountPolicy()
 
-    def test_reads_threshold_and_standby(self, temp_home: Path):
+    def test_reads_threshold(self, temp_home: Path):
         s = self._fleet(temp_home)
         s.set_account_threshold("1", 85.0)
-        s.set_account_standby("1", True)
         data = s._get_sequence_data() or {}
-        assert s._policy_from_data(data, "1") == AccountPolicy(threshold=85.0, standby=True)
+        assert s._policy_from_data(data, "1") == AccountPolicy(threshold=85.0)
 
     def test_is_a_staticmethod_like_disabled_from_data(self):
         """Mirrors `_disabled_from_data`: no instance state, so it is safe to
@@ -128,18 +127,6 @@ class TestPolicyFromData(PolicyStoreBase):
 
         reloaded = s._get_sequence_data() or {}
         assert s._policy_from_data(reloaded, "1") == AccountPolicy(threshold=None)
-
-    @pytest.mark.parametrize("truthy,expected", [(True, True), ("yes", True), (1, True),
-                                                 (False, False), ("", False), (0, False),
-                                                 (None, False)])
-    def test_standby_is_read_as_a_bool(self, temp_home: Path, truthy, expected):
-        """Mirrors `_disabled_from_data`'s `bool(record.get(...))` exactly."""
-        s = self._fleet(temp_home)
-        data = s._get_sequence_data() or {}
-        data["accounts"]["1"]["standby"] = truthy
-        s._write_json(s.sequence_file, data)
-        reloaded = s._get_sequence_data() or {}
-        assert s._policy_from_data(reloaded, "1").standby is expected
 
     def test_numeric_string_threshold_is_read(self, temp_home: Path):
         """JSON hand-edited to a string should still be usable, not discarded."""
@@ -223,34 +210,6 @@ class TestSetAccountThreshold(PolicyStoreBase):
         assert self._record(s, "1")["threshold"] == pytest.approx(90.0)
 
 
-class TestSetAccountStandby(PolicyStoreBase):
-    """AC-9 - the standby flag, same shape as `disabled`."""
-
-    def test_true_writes_and_false_pops(self, temp_home: Path):
-        s = self._fleet(temp_home)
-        s.set_account_standby("2", True)
-        assert self._record(s, "2")["standby"] is True
-        s.set_account_standby("2", False)
-        assert "standby" not in self._record(s, "2")
-
-    def test_clearing_an_unset_flag_is_a_no_op(self, temp_home: Path):
-        s = self._fleet(temp_home)
-        s.set_account_standby("1", False)
-        assert "standby" not in self._record(s, "1")
-
-    def test_unknown_identifier_raises_and_writes_nothing(self, temp_home: Path):
-        s = self._fleet(temp_home)
-        before = s.sequence_file.read_bytes()
-        with pytest.raises(AccountNotFoundError):
-            s.set_account_standby("nope@example.test", True)
-        assert s.sequence_file.read_bytes() == before
-
-    def test_resolves_an_email(self, temp_home: Path):
-        s = self._fleet(temp_home)
-        s.set_account_standby("account-3@example.test", True)
-        assert self._record(s, "3")["standby"] is True
-
-
 class TestOmitWhenDefault(PolicyStoreBase):
     """AC-10 - an untouched record is unchanged by a write to a different one."""
 
@@ -258,7 +217,6 @@ class TestOmitWhenDefault(PolicyStoreBase):
         s = self._fleet(temp_home)
         before = json.loads(s.sequence_file.read_text(encoding="utf-8"))["accounts"]["2"]
         s.set_account_threshold("1", 85.0)
-        s.set_account_standby("1", True)
         after = json.loads(s.sequence_file.read_text(encoding="utf-8"))["accounts"]["2"]
         assert after == before
 
@@ -267,52 +225,14 @@ class TestOmitWhenDefault(PolicyStoreBase):
         s = self._fleet(temp_home)
         raw = s.sequence_file.read_text(encoding="utf-8")
         assert "threshold" not in raw
-        assert "standby" not in raw
 
     def test_setting_then_unsetting_restores_the_record_exactly(self, temp_home: Path):
         s = self._fleet(temp_home)
         before = json.loads(s.sequence_file.read_text(encoding="utf-8"))["accounts"]["1"]
         s.set_account_threshold("1", 85.0)
-        s.set_account_standby("1", True)
         s.set_account_threshold("1", None)
-        s.set_account_standby("1", False)
         after = json.loads(s.sequence_file.read_text(encoding="utf-8"))["accounts"]["1"]
         assert after == before, "round-tripping a policy must leave no residue"
-
-
-class TestStandbyAccountNumbers(PolicyStoreBase):
-    """AC-11 - mirrors `disabled_account_numbers():1852`."""
-
-    def test_returns_standby_slots_in_sequence_order(self, temp_home: Path):
-        s = self._fleet(temp_home, count=4)
-        s.set_account_standby("3", True)
-        s.set_account_standby("1", True)
-        assert s.standby_account_numbers() == ["1", "3"], "sequence order, not call order"
-
-    def test_empty_when_none_marked(self, temp_home: Path):
-        assert self._fleet(temp_home).standby_account_numbers() == []
-
-    def test_excludes_non_switchable_slots(self, temp_home: Path):
-        """A slot without usable stored backups is not a candidate for anything."""
-        s = self._fleet(temp_home)
-        s.set_account_standby("2", True)
-        for path in s.credentials_dir.glob("*2*"):
-            path.unlink()
-        for path in s.configs_dir.glob("*2*"):
-            path.unlink()
-        assert "2" not in s.standby_account_numbers()
-
-    def test_excludes_disabled_slots(self, temp_home: Path):
-        """AC-31's store half: `disabled` wins over `standby`.
-
-        Applied earlier in `switchable_account_numbers()`, so an account that
-        is both must appear in neither pass of the two-pass filter.
-        """
-        s = self._fleet(temp_home)
-        s.set_account_standby("2", True)
-        s.set_account_disabled("2", True)
-        assert s.standby_account_numbers() == []
-        assert "2" in s.disabled_account_numbers()
 
 
 class TestAccountPolicies(PolicyStoreBase):
@@ -327,11 +247,9 @@ class TestAccountPolicies(PolicyStoreBase):
     def test_reflects_written_values(self, temp_home: Path):
         s = self._fleet(temp_home)
         s.set_account_threshold("2", 85.0)
-        s.set_account_standby("3", True)
         policies = s.account_policies()
         assert policies["1"] == AccountPolicy()
         assert policies["2"] == AccountPolicy(threshold=85.0)
-        assert policies["3"] == AccountPolicy(standby=True)
 
     def test_reads_the_sequence_once(self, temp_home: Path, monkeypatch):
         """Single-read pattern, as `switchable_account_numbers:1824` uses.
@@ -367,14 +285,12 @@ class TestSnapshotCarriesPolicy(PolicyStoreBase):
     def test_snapshot_row_carries_a_written_policy(self, temp_home: Path):
         s = self._fleet(temp_home)
         s.set_account_threshold("2", 85.0)
-        s.set_account_standby("2", True)
         snapshot = s.accounts_snapshot()
         row = next(a for a in snapshot.accounts if a.number == "2")
-        assert row.policy == AccountPolicy(threshold=85.0, standby=True)
+        assert row.policy == AccountPolicy(threshold=85.0)
 
     def test_plain_account_row_carries_the_default(self, temp_home: Path):
         s = self._fleet(temp_home)
-        s.set_account_standby("2", True)
         snapshot = s.accounts_snapshot()
         assert next(a for a in snapshot.accounts if a.number == "1").policy == AccountPolicy()
 
@@ -388,17 +304,15 @@ class TestSnapshotCarriesPolicy(PolicyStoreBase):
 
         row = account_row(1, "a@example.test", "", "", True, None)
         assert "threshold" not in row
-        assert "standby" not in row
 
     def test_json_row_emits_policy_when_set(self, temp_home: Path):
         from claude_swap.json_output import account_row
 
         row = account_row(
             1, "a@example.test", "", "", True, None,
-            policy=AccountPolicy(threshold=85.0, standby=True),
+            policy=AccountPolicy(threshold=85.0),
         )
         assert row["threshold"] == pytest.approx(85.0)
-        assert row["standby"] is True
 
 
 class TestExportImportIgnorePolicy(PolicyStoreBase):
@@ -415,7 +329,6 @@ class TestExportImportIgnorePolicy(PolicyStoreBase):
 
         s = self._fleet(temp_home)
         s.set_account_threshold("1", 85.0)
-        s.set_account_standby("2", True)
 
         out_file = temp_home / "backup.cswap"
         export_accounts(s, str(out_file))
@@ -423,7 +336,6 @@ class TestExportImportIgnorePolicy(PolicyStoreBase):
 
         for entry in envelope["accounts"]:
             assert "threshold" not in entry, f"export leaked a threshold: {entry['email']}"
-            assert "standby" not in entry, f"export leaked a standby flag: {entry['email']}"
 
     def test_import_ignores_foreign_policy_keys(self, temp_home: Path, monkeypatch):
         """A hand-edited or future-version export must not inject policy.
@@ -444,7 +356,6 @@ class TestExportImportIgnorePolicy(PolicyStoreBase):
         envelope = json.loads(out_file.read_text(encoding="utf-8"))
         for entry in envelope["accounts"]:
             entry["threshold"] = 85.0
-            entry["standby"] = True
         out_file.write_text(json.dumps(envelope), encoding="utf-8")
 
         dst_home = temp_home.parent / "policy-import-dst"
@@ -461,7 +372,6 @@ class TestExportImportIgnorePolicy(PolicyStoreBase):
                 assert seq["accounts"], "import produced no accounts - fixture is degenerate"
                 for num, record in seq["accounts"].items():
                     assert "threshold" not in record, f"import injected a threshold at {num}"
-                    assert "standby" not in record, f"import injected a standby flag at {num}"
                     assert dst._policy_from_data(seq, num) == AccountPolicy()
 
 
@@ -473,17 +383,14 @@ class TestPolicySurvivesRenumber(PolicyStoreBase):
     slot silently reassigns every policy the moment a user renumbers.
     """
 
-    def test_swap_carries_threshold_and_standby(self, temp_home: Path):
+    def test_swap_carries_threshold(self, temp_home: Path):
         s = self._fleet(temp_home, count=3)
         s.set_account_threshold("1", 85.0)
-        s.set_account_standby("1", True)
 
         s.swap_accounts("1", "3")
 
         assert self._record(s, "3")["threshold"] == pytest.approx(85.0)
-        assert self._record(s, "3")["standby"] is True
         assert "threshold" not in self._record(s, "1"), "policy was left behind on slot 1"
-        assert "standby" not in self._record(s, "1")
 
     def test_swap_does_not_invent_policy_on_the_other_slot(self, temp_home: Path):
         s = self._fleet(temp_home, count=3)
@@ -494,22 +401,12 @@ class TestPolicySurvivesRenumber(PolicyStoreBase):
 
     def test_move_carries_policy(self, temp_home: Path):
         s = self._fleet(temp_home, count=3)
-        s.set_account_standby("2", True)
         s.set_account_threshold("2", 90.0)
 
         s.move_account("2", "5")
 
-        assert self._record(s, "5")["standby"] is True
         assert self._record(s, "5")["threshold"] == pytest.approx(90.0)
         assert "2" not in (s._get_sequence_data() or {})["accounts"]
-
-    def test_standby_numbers_follow_the_renumber(self, temp_home: Path):
-        """The accessor must agree with the record after a move."""
-        s = self._fleet(temp_home, count=3)
-        s.set_account_standby("2", True)
-        assert s.standby_account_numbers() == ["2"]
-        s.move_account("2", "5")
-        assert s.standby_account_numbers() == ["5"]
 
 
 class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
@@ -543,7 +440,6 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
     def _policy_fleet(self, temp_home: Path) -> ClaudeAccountSwitcher:
         s = self._fleet(temp_home)
         s.set_account_threshold("2", 85.0)
-        s.set_account_standby("2", True)
         return s
 
     @staticmethod
@@ -554,21 +450,12 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         payload = self._payload(self._policy_fleet(temp_home))
         row = self._row(payload, 2)
         assert row["threshold"] == pytest.approx(85.0)
-        assert row["standby"] is True
 
     def test_a_threshold_only_account_carries_only_the_threshold(self, temp_home: Path):
         s = self._fleet(temp_home)
         s.set_account_threshold("1", 60.0)
         row = self._row(self._payload(s), 1)
         assert row["threshold"] == pytest.approx(60.0)
-        assert "standby" not in row
-
-    def test_a_standby_only_account_carries_only_the_flag(self, temp_home: Path):
-        s = self._fleet(temp_home)
-        s.set_account_standby("1", True)
-        row = self._row(self._payload(s), 1)
-        assert row["standby"] is True
-        assert "threshold" not in row
 
     def test_an_untouched_row_in_a_policied_fleet_stays_bare(self, temp_home: Path):
         """The negative half, and the one that makes the pair discriminating.
@@ -578,11 +465,9 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         """
         row = self._row(self._payload(self._policy_fleet(temp_home)), 1)
         assert "threshold" not in row
-        assert "standby" not in row
 
     def test_a_fleet_with_no_policy_emits_rows_identical_to_before(self, temp_home: Path):
         """AC-13's omit-when-default contract at the caller, not the helper."""
         payload = self._payload(self._fleet(temp_home))
         for row in payload["accounts"]:
             assert "threshold" not in row
-            assert "standby" not in row

@@ -1884,7 +1884,7 @@ class ClaudeAccountSwitcher:
                 # Hand-edited garbage, out-of-range, NaN/inf: inherit the
                 # global default rather than propagate an unusable number.
                 threshold = None
-        return AccountPolicy(threshold=threshold, standby=bool(record.get("standby")))
+        return AccountPolicy(threshold=threshold)
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -1898,24 +1898,6 @@ class ClaudeAccountSwitcher:
             str(num): self._policy_from_data(data, str(num))
             for num in data.get("sequence", [])
         }
-
-    def standby_account_numbers(self) -> list[str]:
-        """Managed slots marked as standby ("last man standing"), in sequence order.
-
-        Mirrors :meth:`disabled_account_numbers`, with the same two exclusions
-        as :meth:`switchable_account_numbers`: a slot without usable stored
-        standbys is not a candidate for anything, and ``disabled`` is applied
-        first and wins — an account that is both disabled and standby appears in
-        neither pass of the engine's two-pass candidate filter.
-        """
-        data = self._get_sequence_data() or {}
-        return [
-            str(num)
-            for num in data.get("sequence", [])
-            if self._policy_from_data(data, str(num)).standby
-            and self._account_is_switchable(str(num))
-            and not self._disabled_from_data(data, str(num))
-        ]
 
     def is_account_disabled(self, account_num: str) -> bool:
         """Whether a slot is currently held out of rotation."""
@@ -1934,8 +1916,7 @@ class ClaudeAccountSwitcher:
     def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
         """Resolve an identifier and fetch its record, ready for a policy write.
 
-        Shared by :meth:`set_account_threshold` and :meth:`set_account_standby`
-        so the two cannot drift in how they resolve, validate, or fail. Every
+        Called by :meth:`set_account_threshold`. Every
         raising path here happens **before** any write, so a rejected call
         leaves ``sequence.json`` byte-identical.
 
@@ -2020,50 +2001,6 @@ class ClaudeAccountSwitcher:
             )
             print(f"{accent('Set')} Account-{account_num} ({email}) "
                   f"threshold to {normalized:g}%.")
-
-    def set_account_standby(self, identifier: str, standby: bool) -> None:
-        """Mark an account as standby ("last man standing") or clear the mark.
-
-        A standby account is held out of automatic selection while any
-        non-standby account can still be landed on, and is offered only when
-        none can. It stays a valid explicit ``cswap switch <num|email>``
-        target, exactly like a disabled slot.
-
-        Orthogonal to ``disabled``: an account that is both is excluded
-        entirely, because ``disabled`` is applied first in
-        :meth:`switchable_account_numbers`.
-
-        Args:
-            identifier: Slot number, email, or alias.
-            standby: ``True`` to mark, ``False`` to clear.
-
-        Raises:
-            ConfigError: No accounts are managed yet, or the email is ambiguous.
-            AccountNotFoundError: The identifier matches no managed account.
-        """
-        account_num, email, data, record = self._resolve_for_policy_write(identifier)
-
-        verb = "marked as standby" if standby else "cleared as standby"
-        if bool(record.get("standby")) == standby:
-            state = "already a standby" if standby else "not a standby"
-            print(dimmed(f"Account-{account_num} ({email}) is {state}."))
-            return
-
-        if standby:
-            record["standby"] = True
-        else:
-            record.pop("standby", None)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        self._logger.info(f"Account {account_num} {verb}: {email}")
-
-        print(f"{accent('Account-' + account_num)} ({email}) {verb}.")
-
-        if standby:
-            print(dimmed(
-                "  It will be skipped by auto-switch while any other account "
-                "can still be used, and taken only when none can."
-            ))
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.

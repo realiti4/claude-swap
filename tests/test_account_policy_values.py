@@ -150,7 +150,6 @@ class TestAccountPolicy:
     def test_default_is_empty(self):
         policy = AccountPolicy()
         assert policy.threshold is None
-        assert policy.standby is False
 
     def test_two_defaults_compare_equal(self):
         """Equality is what makes the omit-when-default record convention testable.
@@ -161,15 +160,12 @@ class TestAccountPolicy:
         assert AccountPolicy() == AccountPolicy()
         assert AccountPolicy(threshold=85.0) == AccountPolicy(threshold=85.0)
         assert AccountPolicy(threshold=85.0) != AccountPolicy(threshold=90.0)
-        assert AccountPolicy(standby=True) != AccountPolicy()
 
     def test_is_frozen(self):
         """`AccountSnapshot` is `frozen=True`; a mutable member would break that."""
         policy = AccountPolicy()
         with pytest.raises(dataclasses.FrozenInstanceError):
             policy.threshold = 85.0  # type: ignore[misc]
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            policy.standby = True  # type: ignore[misc]
 
     def test_is_hashable(self):
         """A frozen dataclass with no `eq=False` is hashable; pin it.
@@ -181,11 +177,10 @@ class TestAccountPolicy:
 
     def test_field_types_are_declared_as_specified(self):
         fields = {f.name: f for f in dataclasses.fields(AccountPolicy)}
-        assert set(fields) == {"threshold", "standby"}, (
+        assert set(fields) == {"threshold"}, (
             "AC-3 fixes the field set; `order` belongs to PR 2 and must not appear here"
         )
         assert fields["threshold"].default is None
-        assert fields["standby"].default is False
 
 
 class TestAccountSnapshotPolicyField:
@@ -196,7 +191,7 @@ class TestAccountSnapshotPolicyField:
         assert snapshot.policy == AccountPolicy()
 
     def test_policy_can_be_supplied(self):
-        policy = AccountPolicy(threshold=85.0, standby=True)
+        policy = AccountPolicy(threshold=85.0)
         assert _snapshot(policy=policy).policy == policy
 
     def test_policy_is_last_so_positional_callers_are_unaffected(self):
@@ -210,7 +205,7 @@ class TestAccountSnapshotPolicyField:
         assert names.index("policy") > names.index("disabled")
 
     def test_snapshot_is_still_frozen_and_still_has_display_tag(self):
-        snapshot = _snapshot(policy=AccountPolicy(standby=True))
+        snapshot = _snapshot(policy=AccountPolicy())
         with pytest.raises(dataclasses.FrozenInstanceError):
             snapshot.policy = AccountPolicy()  # type: ignore[misc]
         assert snapshot.display_tag == "Example Org"
