@@ -26,6 +26,7 @@ from claude_swap.autoswitch import (
     SPENT_HEADROOM_PCT,
     NoSwitchEvent,
     PollEvent,
+    SwitchEvent,
     ThresholdMap,
     TickOutcome,
     _every_account_above_threshold,
@@ -944,3 +945,96 @@ class TestPollCadenceFollowsALivePolicyChange:
             )
             assert h.switcher._poll_inputs_override[0] == pytest.approx(GLOBAL)
         assert h.switcher._poll_inputs_override[1] == h.engine._models
+
+
+class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
+    """The `best` hysteresis margin is measured on room, not raw headroom.
+
+    Room is what an account has left under **its own** line:
+    `threshold - utilization`. The margin a candidate must clear is
+    `room_candidate - room_active`, written as
+    `(h - active_headroom) + (thresholds[num] - thresholds[current])` so that
+    with equal thresholds it is today's compare plus an exact `+ 0.0`.
+
+    Account 3 is parked at 99% on the global line in every case: the landing
+    gate rejects it, so it can never rescue a move the margin refused, and no
+    fixture is in the all-above regime (2 always sits under its own line).
+    """
+
+    PARKED = 99.0
+
+    def _tick(self, h: EngineHarness, active: float, cand: float) -> TickOutcome:
+        return h.tick_with_usage({
+            "1": _usage(active),
+            "2": _usage(cand),
+            "3": _usage(self.PARKED),
+        })
+
+    def _switches(self, h: EngineHarness) -> list[SwitchEvent]:
+        return [e for e in h.events if isinstance(e, SwitchEvent)]
+
+    def test_the_maintainers_case_switches_on_the_first_tick(self, temp_home):
+        """1 at 60% on a 60 line, 2 at 65% on a 90 line.
+
+        Raw headroom margin `35 - 40 = -5` refuses; room margin
+        `(35 - 40) + (90 - 60) = 25` clears the 10-point bar.
+        """
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.switcher.set_account_threshold("2", 90.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 60.0, 65.0)
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+        assert [e.trigger for e in self._switches(h)] == ["proactive"]
+
+    def test_too_little_room_still_refuses(self, temp_home):
+        """1 at 60/60, 2 at 85% on a 90 line: room margin `-25 + 30 = 5`."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.switcher.set_account_threshold("2", 90.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 60.0, 85.0)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+
+    def test_room_replaces_raw_headroom_rather_than_relaxing_it(self, temp_home):
+        """1 at 95% on a 95 line, 2 at 80% on an 85 line.
+
+        Raw margin `20 - 5 = 15` would accept; room margin
+        `15 + (85 - 95) = 5` refuses. A gate that takes the looser of the two
+        still switches here.
+        """
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 95.0)
+        h.switcher.set_account_threshold("2", 85.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 95.0, 80.0)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+
+    def test_equal_lines_switch_at_exactly_the_margin(self, temp_home):
+        """Both on an 85 line, 1 at 90%, 2 at 80%: margin exactly 10.
+
+        The compare is strict `<`, as on main, so exactly 10 clears it.
+        """
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 85.0)
+        h.switcher.set_account_threshold("2", 85.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 90.0, 80.0)
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+
+    def test_equal_lines_refuse_just_under_the_margin(self, temp_home):
+        """Both on an 85 line, 1 at 90%, 2 at 80.5%: margin 9.5."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 85.0)
+        h.switcher.set_account_threshold("2", 85.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 90.0, 80.5)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert self._switches(h) == []

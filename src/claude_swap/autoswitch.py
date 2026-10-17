@@ -2217,7 +2217,12 @@ class AutoSwitchEngine:
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
+                    # qualifies; near-line pairs can't flap back). The margin
+                    # is measured on room — what each account has left under
+                    # its OWN line — so 60% on a 60 line vs 65% on a 90 line
+                    # is a 25-point gain, not a 5-point loss. Written as the
+                    # raw headroom gap plus the threshold gap, so with equal
+                    # lines it is today's compare plus an exact 0.0.
                     #
                     # Not for failback. That bar compares the reserve against
                     # the primary on headroom, and the reserve almost always
@@ -2226,10 +2231,10 @@ class AutoSwitchEngine:
                     # anti-flap property is supplied instead by the landing
                     # gate above (the primary must be under its OWN line) plus
                     # the no-return bar on the following tick.
-                    if (
-                        h - active_headroom < settings.hysteresis_pct
-                        and trigger != "failback"
-                    ):
+                    margin = (h - active_headroom) + (
+                        thresholds[num] - thresholds[current]
+                    )
+                    if margin < settings.hysteresis_pct and trigger != "failback":
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
