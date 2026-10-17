@@ -18,6 +18,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
+from claude_swap.autoswitch import proactive_switch_bar_pct
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
@@ -73,9 +74,10 @@ class CswapApp(App):
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            _settings = load_settings(switcher.backup_dir)
+            self.threshold_pct: float | None = proactive_switch_bar_pct(
+                _settings.strategy, _settings.threshold
+            )
         except Exception:
             self.threshold_pct = None
         try:
@@ -94,6 +96,13 @@ class CswapApp(App):
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
+        elif self._start == "auto":
+            # ONLY the explicit `cswap tui --auto` opens on the auto view,
+            # and only it starts the engine LIVE. A bare `cswap tui` lands on
+            # the dashboard, and reaching the auto view from the menu watches
+            # without switching — opening a view must never begin switching
+            # accounts.
+            self.push_screen(AutoScreen(start_live=True))
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()
@@ -271,7 +280,18 @@ class CswapApp(App):
             if payload.get("switched"):
                 to = payload.get("to") or {}
                 target = to.get("email") or f"account {to.get('number')}"
-                self.notify(f"Switched to {target}", title="Switch")
+                if payload.get("needsLogin"):
+                    # Landing on a credential-less slot leaves the machine
+                    # LOGGED OUT. "Switched to <email>" describes that exactly
+                    # like a working account, and the recovery step (`/login`)
+                    # is only in the payload's own message.
+                    self.notify(
+                        str(payload.get("message") or f"Switched to {target}"),
+                        title="Switch",
+                        severity="warning",
+                    )
+                else:
+                    self.notify(f"Switched to {target}", title="Switch")
             else:
                 reason = str(payload.get("reason") or "no switch performed")
                 self.notify(reason, title="No switch", severity="warning")
@@ -286,13 +306,20 @@ class CswapApp(App):
     def do_switch(self, number: str) -> None:
         self._start_action(
             f"Switch to account {number}",
-            partial(self.switcher.switch_to, number, json_output=True),
+            partial(
+                self.switcher.switch_to, number, json_output=True, manual_source="tui"
+            ),
         )
 
     def action_switch_best(self) -> None:
         self._start_action(
             "Switch (best)",
-            partial(self.switcher.switch, strategy="best", json_output=True),
+            partial(
+                self.switcher.switch,
+                strategy="best",
+                json_output=True,
+                manual_source="tui",
+            ),
         )
 
     def do_toggle_disabled(self, number: str) -> None:
@@ -309,6 +336,13 @@ class CswapApp(App):
         self._start_action(
             f"{verb} account {number}",
             partial(self.switcher.set_account_disabled, number, target),
+        )
+
+    def do_set_switch_threshold(self, number: str, pct: float | None) -> None:
+        """Give the account its own switch threshold (``None``: the strategy's)."""
+        self._start_action(
+            f"Set switch threshold of account {number}",
+            partial(self.switcher.set_account_switch_threshold, number, pct),
         )
 
     def confirm_remove(self, number: str, email: str) -> None:

@@ -139,7 +139,13 @@ class AccountSnapshot:
     switchable: bool
     usage: UsageEntry
     alias: str = ""
-    disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # Held out of auto-rotation. Still an explicit `cswap switch` target, but a
+    # RUNNING engine leaves a disabled ACTIVE on its next tick, so the explicit
+    # switch holds only while auto is stopped.
+    disabled: bool = False
+    # Own auto-switch threshold (used %) overriding the strategy's bar; None
+    # follows the strategy.
+    switch_threshold: float | None = None
 
     @property
     def display_tag(self) -> str:
