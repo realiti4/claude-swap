@@ -33,7 +33,9 @@ import enum
 import json
 import logging
 import math
+import os
 import random
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -95,6 +97,9 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 # a long engine sleep must not suppress the fetch that discovers it.
 MAX_SLEEP_S = poll_policy.EXHAUSTED_INTERVAL_S
 NO_RESET_FALLBACK_S = 300.0
+# Budget for the autoswitch.onModelChange command. It runs inside the tick, so
+# a hung command must not stall rotation for longer than about one interval.
+MODEL_CHANGE_COMMAND_TIMEOUT_S = 60.0
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
@@ -491,6 +496,37 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class ModelChangeEvent(AutoSwitchEvent):
+    """The model fallback engaged (``fallback``) or released (``restored``).
+
+    ``model`` is what sessions should run on from now on. The engine cannot
+    move them itself — a credential swap is all it can do — so this event (and
+    the ``autoswitch.onModelChange`` command) is the whole interface."""
+
+    kind: ClassVar[str] = "model-change"
+    change: str  # "fallback" | "restored"
+    model: str
+    primary_model: str
+    fallback_model: str
+
+    def _fields(self) -> dict:
+        return {
+            "change": self.change,
+            "model": self.model,
+            "primaryModel": self.primary_model,
+            "fallbackModel": self.fallback_model,
+        }
+
+    def human(self) -> str:
+        if self.change == "fallback":
+            return (
+                f"every account's {self.primary_model} limit is hit; "
+                f"falling back to {self.model}"
+            )
+        return f"{self.primary_model} is available again; back from {self.fallback_model}"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -526,6 +562,21 @@ def _window_pcts(
     return {
         name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
     }
+
+
+def _model_pct(usage: dict | None, models: Sequence[str]) -> float | None:
+    """Highest utilization among the named per-model windows alone, or None
+    when the account reports none of them.
+
+    The model fallback reads this rather than headroom: a full 5h/7d window
+    binds every model alike, so it says nothing about whether a DIFFERENT
+    model would still run."""
+    pcts = [
+        pct
+        for label, pct, _ in oauth.relevant_windows(usage, models)
+        if label not in ("5h", "7d")
+    ]
+    return max(pcts) if pcts else None
 
 
 # Reset math moved to poll_policy with the cadence numbers; aliased for the
@@ -655,7 +706,15 @@ class AutoSwitchEngine:
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
-        self._models = parse_model_names(settings.model)
+        self._primary_models = parse_model_names(settings.model)
+        # Fallback axes are meaningless without a primary to fall back FROM.
+        self._fallback_models = (
+            parse_model_names(settings.fallback_model) if self._primary_models else ()
+        )
+        # Persisted, so a restart or a cron ``--once`` run resumes on the axes
+        # the last tick decided on instead of re-announcing the fallback.
+        self._fallback_active = False
+        self._models = self._primary_models
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -683,7 +742,8 @@ class AutoSwitchEngine:
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
-        self._model_check_done = not self._models
+        self._model_check_done = not self._primary_models
+        self._fallback_config_checked = False
 
     # -- state file ---------------------------------------------------------
 
@@ -934,9 +994,14 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        self._sync_model_axes(state)
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        if self._update_model_fallback(quarantined, usage):
+            # The axes changed under this tick's feet: re-derive headroom so
+            # the decision below (and the poll event) read the new ones.
+            headroom = _headroom_by_account(usage, self._models)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -2190,7 +2255,11 @@ class AutoSwitchEngine:
         polling legitimately leaves gaps before that — and never worth a
         forced refresh of its own.
         """
-        wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
+        # Primary names only: a fallback model legitimately may have no window
+        # of its own (then only 5h/7d gate it).
+        wanted = {
+            m.lower(): m for m in self._primary_models if m.lower() != "all"
+        }
         if not wanted:
             self._model_check_done = True  # bare "all" needs no name match
             return
@@ -2220,6 +2289,159 @@ class AutoSwitchEngine:
                         "account's usage windows — only the 5h/7d limits are "
                         "being watched for it (typo?)"
                     )
+                )
+            )
+
+    # -- model fallback -------------------------------------------------------
+
+    def _rotatable_accounts(self, quarantined: set[str]) -> list[str]:
+        return [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+
+    def _set_model_axes(self, fallback_active: bool) -> None:
+        self._fallback_active = fallback_active
+        self._models = (
+            self._fallback_models if fallback_active else self._primary_models
+        )
+        self.switcher.set_poll_policy_inputs(self.settings.threshold, self._models)
+
+    def _sync_model_axes(self, state: dict) -> None:
+        """Adopt the persisted fallback state (another engine, or a previous
+        run, may have flipped it). Silent: whoever flipped it announced it."""
+        if not self._fallback_config_checked:
+            self._fallback_config_checked = True
+            if self.settings.fallback_model and not self._primary_models:
+                self._emit(
+                    ConfigWarningEvent(
+                        message=(
+                            "autoswitch.fallbackModel is set without "
+                            "autoswitch.model — there is no model limit to "
+                            "fall back from, so it is ignored"
+                        )
+                    )
+                )
+        record = state.get("modelFallback")
+        active = (
+            bool(self._fallback_models)
+            and isinstance(record, dict)
+            and record.get("active") is True
+        )
+        if active != self._fallback_active:
+            self._set_model_axes(active)
+
+    def _update_model_fallback(
+        self, quarantined: set[str], usage: dict[str, dict | str | None]
+    ) -> bool:
+        """Engage or release the model fallback; True when the axes changed.
+
+        Engage only on proof: every rotatable account has readable usage and
+        each one's primary-model window is at or over the threshold. An
+        unreadable account might be the one with room, and a wrong fallback
+        downgrades every session for nothing.
+
+        Release on the first account measured back under the threshold by
+        ``hysteresis_pct`` — the same margin that stops two accounts at the
+        line from ping-ponging stops the model from flapping at it. An account
+        reporting no such window is not limited on it, so it counts as free.
+        """
+        if not self._fallback_models:
+            return False
+        settings = self.settings
+        relevant = self._rotatable_accounts(quarantined)
+        values = [usage.get(n) for n in relevant]
+        readable = [v for v in values if isinstance(v, dict)]
+        if not readable:
+            return False
+        pcts = [_model_pct(v, self._primary_models) for v in readable]
+        if not self._fallback_active:
+            if len(readable) != len(values):
+                return False
+            if not all(p is not None and p >= settings.threshold for p in pcts):
+                return False
+            change, engaged = "fallback", True
+        else:
+            release_below = settings.threshold - settings.hysteresis_pct
+            if not any(p is None or p < release_below for p in pcts):
+                return False
+            change, engaged = "restored", False
+
+        primary = ",".join(self._primary_models)
+        fallback = ",".join(self._fallback_models)
+        event = ModelChangeEvent(
+            change=change,
+            model=fallback if engaged else primary,
+            primary_model=primary,
+            fallback_model=fallback,
+        )
+        if self.dry_run:
+            # Report what would happen, on this tick's decision only: nothing
+            # is persisted and no command runs.
+            self._emit(event)
+            self._set_model_axes(engaged)
+            return True
+
+        def record(state: dict) -> None:
+            state["modelFallback"] = {"active": engaged, "since": _now_iso()}
+
+        self._mutate_state(record)
+        self._set_model_axes(engaged)
+        self._emit(event)
+        self._run_model_change_command(event)
+        return True
+
+    def _run_model_change_command(self, event: ModelChangeEvent) -> None:
+        """Run ``autoswitch.onModelChange``. Never raises: a broken command
+        must not stop the engine from rotating on the new axes."""
+        command = self.settings.on_model_change
+        if not command:
+            return
+        env = dict(os.environ)
+        env.update(
+            CSWAP_MODEL_EVENT=event.change,
+            CSWAP_MODEL=event.model,
+            CSWAP_PRIMARY_MODEL=event.primary_model,
+            CSWAP_FALLBACK_MODEL=event.fallback_model,
+        )
+        try:
+            # Output is captured, never inherited: --json owns stdout.
+            result = subprocess.run(
+                command,
+                shell=True,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=MODEL_CHANGE_COMMAND_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            self._emit(
+                ErrorEvent(
+                    message=(
+                        "onModelChange command timed out after "
+                        f"{MODEL_CHANGE_COMMAND_TIMEOUT_S:.0f}s"
+                    ),
+                    transient=False,
+                )
+            )
+            return
+        except OSError as e:
+            self._emit(
+                ErrorEvent(message=f"onModelChange command failed: {e}", transient=False)
+            )
+            return
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()[-1:]
+            detail = f": {tail[0]}" if tail else ""
+            self._emit(
+                ErrorEvent(
+                    message=(
+                        f"onModelChange command exited {result.returncode}{detail}"
+                    ),
+                    transient=False,
                 )
             )
 
@@ -2277,8 +2499,8 @@ class AutoSwitchEngine:
 
     def apply_threshold(self, threshold: float) -> None:
         """Session override from the TUI: retarget the trigger and poll
-        cadence mid-run. Threshold only — the model axes (and their derived
-        state) are fixed at construction. The frozen-settings swap is atomic
+        cadence mid-run. Threshold only — the model axes are the engine's own
+        (``_update_model_fallback``). The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)

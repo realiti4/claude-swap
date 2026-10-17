@@ -277,6 +277,21 @@ class TestMergedWithCli:
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"
 
+    def test_model_fallback_overrides(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(fallback_model="Sonnet"),
+            _args(fallback_model="Opus", on_model_change="notify-sessions"),
+        )
+        assert merged.fallback_model == "Opus"
+        assert merged.on_model_change == "notify-sessions"
+
+    def test_model_fallback_settings_round_trip(self, tmp_path):
+        set_setting(tmp_path, "autoswitch.fallbackModel", "Opus")
+        set_setting(tmp_path, "autoswitch.onModelChange", "notify-sessions --now")
+        loaded = load_settings(tmp_path)
+        assert loaded.fallback_model == "Opus"
+        assert loaded.on_model_change == "notify-sessions --now"
+
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"

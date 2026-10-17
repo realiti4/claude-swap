@@ -1151,6 +1151,67 @@ class TestAutoCommand:
             assert payload["event"] == "no-switch"
             assert payload["schemaVersion"] == 1
 
+    def test_model_fallback_flags_reach_the_engine(self, temp_home):
+        self._run(
+            ["--once", "--model", "Fable", "--fallback-model", "Opus",
+             "--on-model-change", "notify-sessions --now"],
+            temp_home,
+        )
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.model == "Fable"
+        assert settings.fallback_model == "Opus"
+        assert settings.on_model_change == "notify-sessions --now"
+
+    def test_model_fallback_settings_json_is_the_default_for_the_flags(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "model": "Fable",
+                "fallbackModel": "Sonnet",
+                "onModelChange": "from-settings",
+            },
+        }))
+        self._run(["--once", "--fallback-model", "Opus"], temp_home)
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.fallback_model == "Opus"              # CLI wins
+        assert settings.on_model_change == "from-settings"    # settings.json kept
+        assert settings.model == "Fable"
+
+    def test_model_change_event_is_one_json_line(self, temp_home, capsys):
+        from claude_swap.autoswitch import ModelChangeEvent, TickOutcome
+
+        class EmittingEngine(self.FakeEngine):
+            def tick(self):
+                self.on_event(ModelChangeEvent(
+                    change="fallback", model="Opus",
+                    primary_model="Fable", fallback_model="Opus",
+                ))
+                return TickOutcome.NO_ACTION
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", EmittingEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once", "--json"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        (line,) = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        payload = json.loads(line)
+        assert payload["event"] == "model-change"
+        assert payload["change"] == "fallback"
+        assert payload["model"] == "Opus"
+
+    def test_auto_help_documents_the_model_fallback(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        out = capsys.readouterr().out
+        assert "--fallback-model" in out
+        assert "--on-model-change" in out
+        assert "CSWAP_MODEL_EVENT" in out
+
     def test_unknown_flag_errors(self, temp_home, capsys):
         with patch.object(sys, "argv", ["claude-swap", "auto", "--bogus"]):
             with pytest.raises(SystemExit) as excinfo:
