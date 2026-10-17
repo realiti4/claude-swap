@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
@@ -213,6 +215,61 @@ class TestActiveReadStaysOnOneProfile:
         ]
 
 
+class TestTheManagedReadVerdictIsPerThread:
+    def test_a_sibling_read_does_not_reset_this_thread_s_verdict(self, tmp_path):
+        """One store, several readers, and this verdict spans statements.
+
+        The TUI's two refresh lanes, the auto engine's worker and the fetch
+        pool share a `CredentialStore`. As a plain attribute, a sibling
+        entering `_read_active_credentials` cleared it mid-flight and the
+        first reader then returned `("", False, False)` -- a live, billing
+        managed key reported as a genuinely empty slot.
+
+        Swapping `threading.local()` for a shared attribute left the whole
+        suite green, so nothing but this stands between that race and a
+        future simplification.
+        """
+        import threading as _threading
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+
+        # THROUGH `_read_active_credentials`, not by poking the attribute.
+        # Reading the flag directly only pins its TYPE: leaving
+        # `threading.local()` in place and pointing the three real uses at a
+        # plain attribute restores the race and a type check stays green.
+        inside = _threading.Event()
+        release = _threading.Event()
+        real_managed = store._read_managed_key
+
+        def blocking_managed():
+            store._managed_read_tls.failed = True   # what a failed read records
+            inside.set()
+            release.wait(5)
+            return ""
+
+        store._read_managed_key = blocking_managed
+        out = {}
+
+        def reader_a():
+            out["a"] = store._read_active_credentials()
+
+        a = _threading.Thread(target=reader_a)
+        a.start()
+        assert inside.wait(5), "premise: thread A never reached the managed read"
+
+        store._read_managed_key = real_managed
+        store._read_active_credentials()            # a complete sibling read
+        release.set()
+        a.join(5)
+
+        assert "a" in out, "premise: thread A never finished"
+        assert out["a"].keychain_unavailable is True, (
+            "a sibling read entering `_read_active_credentials` cleared this "
+            "thread's verdict mid-flight, so a live keychain failure came "
+            "back as a genuinely empty slot"
+        )
+
+
 class TestSecureStorageOverride:
     """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` takes precedence when *defined*.
 
@@ -271,3 +328,387 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestTheClearReachesEveryStoreTheReadDoes:
+    """The read walks `_active_oauth_keychain_services()`; the delete named
+    one service.
+
+    Under a custom profile the read resolves a SUFFIXED item while the delete
+    removed the unsuffixed one, returned True (a clean rc-44 is a success),
+    and the landing then believed the live store was empty. The two must
+    resolve the same set or the delete's verdict is about a different item
+    than the read's.
+    """
+
+    def test_the_delete_covers_the_same_services_the_read_walks(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap import credentials as creds_mod
+
+        class _Host:
+            platform = Platform.MACOS
+            _logger = logging.getLogger("claude-swap")
+
+        store = CredentialStore(_Host())
+        wanted = ["claude-suffixed", "Claude Code"]
+        monkeypatch.setattr(
+            creds_mod, "_active_oauth_keychain_services", lambda: wanted)
+
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            creds_mod.macos_keychain, "keychain_account_name", lambda: "acct")
+        monkeypatch.setattr(
+            creds_mod.macos_keychain, "delete_password",
+            lambda service, account: deleted.append(service))
+
+        assert store._delete_active_keychain_entry() is True
+        assert deleted == wanted, (
+            f"the read walks {wanted} and the delete touched {deleted} — a "
+            "survivor in a store the read would have found keeps "
+            "authenticating under the new slot's name"
+        )
+
+
+class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
+    """macOS has two live stores and they DO come apart.
+
+    MEASURED on a host where every login appeared to vanish:
+
+        plaintext file   refreshTokenExpiresAt 09-26 18:01   (the login just made)
+        Keychain         refreshTokenExpiresAt 09-06 15:28   (weeks older)
+        what cswap read  the Keychain
+
+    The read took the Keychain and stopped, so the login was never seen — and
+    cswap then wrote what it had read back over both stores, destroying it.
+    The plaintext file is not merely a fallback for an EMPTY Keychain; either
+    side can be the newer one, because a Keychain write that fails once sends
+    Claude Code to the file while later Keychain READS keep succeeding with the
+    older item.
+
+    A later WRITE (the Keychain item's `mdat` vs the file's mtime) is the
+    comparison for two DIFFERENT logins, not `refreshTokenExpiresAt`: the
+    server re-mints that stamp per-account from its own token TTL, so it
+    does not order two different logins. It still gates which pairs the
+    write-time comparison may decide for the file: only when the file's
+    own stamp is confidently later than the Keychain's (undated, or
+    confidently earlier -- a stale generation copied in later -- keep the
+    Keychain whatever the mtimes say). `expiresAt` is a different arm
+    entirely, ordering two GENERATIONS of the SAME login within a jitter
+    window.
+    """
+
+    @staticmethod
+    def _creds(tag: str, refresh_exp: int) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-" + tag, "refreshToken": "rt-" + tag,
+            "expiresAt": 9999999999000, "refreshTokenExpiresAt": refresh_exp}})
+
+    def _store(
+        self, tmp_path, monkeypatch, kc: str, fl: str, *,
+        kc_mdat: "float | None" = None,
+    ):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            _keychain({CLAUDE_CODE_KEYCHAIN_SERVICE: kc} if kc else {}, []),
+        )
+        # The cross-lineage arm now asks which STORE WAS WRITTEN LAST (file
+        # mtime vs the Keychain item's `mdat`), not `refreshTokenExpiresAt` —
+        # so every test in this class must say what the Keychain's `mdat`
+        # was. Default None: no evidence, same as an item `security` cannot
+        # be asked about in this fake.
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.item_modified_at",
+            lambda service, account: kc_mdat,
+        )
+        d = tmp_path / ".claude"
+        d.mkdir(parents=True, exist_ok=True)
+        if fl:
+            (d / ".credentials.json").write_text(fl, encoding="utf-8")
+        return CredentialStore(_Host(tmp_path / "backups"))
+
+    @pytest.mark.parametrize("kc_refresh, fl_refresh", [
+        # THE MEASURED CASE: the file holds the login just made, whose
+        # stamp is also later.
+        (1_000, 9_000),
+        # T1312 [C]: stamps are not ordered ACROSS accounts (a later login
+        # can carry an EARLIER `refreshTokenExpiresAt`), so the file must
+        # still win on mtime evidence alone even with the earlier stamp --
+        # the old code's direction gate (file wins only when ITS stamp is
+        # later) silently kept the Keychain here instead.
+        (9_000, 1_000),
+    ])
+    def test_a_newer_login_in_the_FILE_wins(
+        self, tmp_path, monkeypatch, kc_refresh, fl_refresh,
+    ):
+        """The file's write is later than the Keychain item's last
+        modification, so it wins whatever the two stamps say."""
+        kc = self._creds("keychain-old", kc_refresh)
+        fl = self._creds("file-login", fl_refresh)
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
+        assert got.value == fl, (
+            "the Keychain's older item won and the login in the file was never "
+            "read — which is how a login disappears without a trace"
+        )
+
+    def test_CONTROL_refreshTokenExpiresAt_alone_no_longer_orders_different_logins(
+        self, tmp_path, monkeypatch
+    ):
+        """T1312: the server does not order two DIFFERENT logins'
+        ``refreshTokenExpiresAt`` (each account's own token TTL sets it), so
+        a later stamp alone must not win the cross-lineage arm — only a
+        later WRITE (``mdat``) does. Same bytes as the measured case above,
+        but with no ``mdat`` evidence for the file to beat."""
+        kc = self._creds("keychain-old", 1_000)
+        fl = self._creds("file-login", 9_000)
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=None,
+        )._read_active_credentials()
+        assert got.value == kc, (
+            "a later refreshTokenExpiresAt alone (no mdat evidence) let the "
+            "file win — that ordering is not valid across different logins"
+        )
+
+    @pytest.mark.parametrize("kc_exp, kc_refresh, fl_exp, fl_refresh", [
+        # THE ORDINARY CASE: same expiresAt on both sides, refresh stamps
+        # only a few thousand ms apart.
+        (9_999_999_999_000, 9_000, 9_999_999_999_000, 1_000),
+        # T1312: a YEAR-older file login (refreshTokenExpiresAt far outside
+        # the same-lineage jitter) must not win even when its expiresAt is
+        # LATER than the Keychain's -- that stamp does not order two
+        # different logins, and this gap is nowhere near the same-lineage
+        # tiebreak either.
+        (1_788_399_592_015, 1_790_380_487_015,
+         1_788_399_592_015 + 3_600_000, 1_790_380_487_015 - 31_536_000_000),
+    ])
+    def test_CONTROL_a_newer_KEYCHAIN_still_wins(
+        self, tmp_path, monkeypatch, kc_exp, kc_refresh, fl_exp, fl_refresh,
+    ):
+        """CC writes rotations to the Keychain on macOS, so a stale file
+        must not win. T1312: the direction of the stamp gap is not
+        evidence either way -- both stamps are dated and outside the
+        jitter, so mtime vs ``kc_mdat`` decides, whatever ``expiresAt``
+        says. ``kc_mdat`` is LATER than the file's own mtime here (the
+        Keychain really was written last), which is the right reason the
+        Keychain wins."""
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-keychain", "refreshToken": "rt-keychain",
+            "expiresAt": kc_exp, "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-file", "refreshToken": "rt-file",
+            "expiresAt": fl_exp, "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() + 3600,
+        )._read_active_credentials()
+        assert got.value == kc, (
+            "a file mtime-older than the Keychain's write still won, "
+            "whatever its stamp or expiresAt said"
+        )
+
+    def test_CONTROL_equal_lifetimes_keep_the_keychain(self, tmp_path, monkeypatch):
+        """Same generation in both — the steady state on a healthy host. No
+        reason to change which backend answers, and changing it would churn."""
+        same = self._creds("same", 5_000)
+        got = self._store(tmp_path, monkeypatch, same, same)._read_active_credentials()
+        assert got.value == same
+
+    def test_CONTROL_an_undated_file_cannot_win(self, tmp_path, monkeypatch):
+        """No `refreshTokenExpiresAt` is no evidence of a newer login. A row
+        that could win on absence would hand the older bytes the decision.
+        ``kc_mdat`` is a REAL value, older than the file's own mtime: mtime
+        evidence alone would hand the file the win, so this only passes
+        because an UNDATED pair must never reach the mtime arm at all."""
+        kc = self._creds("keychain", 1_000)
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-undated", "refreshToken": "rt-undated",
+            "expiresAt": 9999999999000}})
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
+        assert got.value == kc, (
+            "an undated file won on mtime evidence alone, with no stamp to "
+            "say it is even a later generation of anything"
+        )
+
+    def test_CONTROL_an_empty_keychain_still_falls_back(self, tmp_path, monkeypatch):
+        """The original fallback must survive: nothing in the Keychain means
+        the file is the only source, dated or not."""
+        fl = self._creds("file-only", 1_000)
+        got = self._store(tmp_path, monkeypatch, "", fl)._read_active_credentials()
+        assert got.value == fl
+
+    def test_a_same_lineage_rotation_jittered_by_ms_keeps_the_keychain(
+        self, tmp_path, monkeypatch
+    ):
+        """One login, two generations of the SAME lineage: the server
+        re-mints `refreshTokenExpiresAt` on every refresh with sub-second
+        jitter, so a file stamp a few hundred ms later than the Keychain's is
+        not a newer login. The Keychain here also carries the fresher access
+        token (later `expiresAt`); the file's is already expired — the
+        opposite of what a real newer login would show."""
+        kc_refresh = 1_790_380_487_015
+        fl_refresh = kc_refresh + 427
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-keychain", "refreshToken": "rt-keychain",
+            "expiresAt": 1_788_399_592_015,
+            "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-file", "refreshToken": "rt-file",
+            "expiresAt": 1_788_371_089_449,
+            "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == kc, (
+            "a 427ms-later file stamp from the same rotation lineage won "
+            "over the Keychain's current generation"
+        )
+
+    def test_a_same_lineage_rotation_jittered_by_ms_lets_the_fresher_generation_win(
+        self, tmp_path, monkeypatch
+    ):
+        """Same rotation lineage, jittered by 427ms — but this time the file
+        also carries the LATER access-token expiry, the signature of the
+        newer generation of the SAME login rather than an older or newer one.
+        Both stores hold the same login; only ``expiresAt`` says which
+        generation of it is current, and the file's must win."""
+        kc_refresh = 1_790_380_487_015
+        fl_refresh = kc_refresh + 427
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-superseded", "refreshToken": "rt-superseded",
+            "expiresAt": 1_788_371_089_449,
+            "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-current", "refreshToken": "rt-current",
+            "expiresAt": 1_788_399_592_015,
+            "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == fl, (
+            "the Keychain's superseded generation won even though the file "
+            "held the later generation of the same login"
+        )
+
+    def test_a_same_lineage_pair_is_never_decided_by_mtime_vs_mdat(
+        self, tmp_path, monkeypatch
+    ):
+        """T1312 regression: the mtime-vs-``mdat`` (cross-lineage) rule must
+        never even be CONSULTED for a same-lineage pair, whatever the
+        mtimes say. The file here is written by this very test (so its
+        mtime is "now", far later than the stale ``kc_mdat`` below) and
+        would win under the old ordering, which checked mtime/mdat BEFORE
+        classifying the pair as same- or cross-lineage. But it is the OLDER
+        generation of the SAME login (earlier access-token ``expiresAt``),
+        so the same-lineage arm's own tiebreak must keep the Keychain."""
+        kc_refresh = 1_790_380_487_015
+        fl_refresh = kc_refresh + 300  # within LINEAGE_STAMP_JITTER_MS
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-newer-gen", "refreshToken": "rt-newer-gen",
+            "expiresAt": 2_000_000_000_000,
+            "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-older-gen", "refreshToken": "rt-older-gen",
+            "expiresAt": 1_000_000_000_000,
+            "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
+        assert got.value == kc, (
+            "a stale mtime-newer file from the SAME lineage's older "
+            "generation won by the mtime/mdat rule, masking the Keychain's "
+            "current generation"
+        )
+
+    def test_a_strict_tie_between_file_mtime_and_keychain_mdat_keeps_the_keychain(
+        self, tmp_path, monkeypatch
+    ):
+        """The file wins only when its mtime is STRICTLY later than
+        ``kc_mdat`` -- an exact tie (both floored to the same second) must
+        not flip the verdict to the file."""
+        kc = self._creds("keychain", 1_000)
+        fl = self._creds("file-newer-generation", 9_000)
+        store = self._store(tmp_path, monkeypatch, kc, fl, kc_mdat=None)
+        file_mtime = (tmp_path / ".claude" / ".credentials.json").stat().st_mtime
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.item_modified_at",
+            lambda service, account: file_mtime,
+        )
+        got = store._read_active_credentials()
+        assert got.value == kc, (
+            "an exact tie between the file's mtime and the Keychain's mdat "
+            "let the file win -- only a STRICTLY later mtime may"
+        )
+
+    def test_a_corrupt_plaintext_file_does_not_crash_the_read(
+        self, tmp_path, monkeypatch
+    ):
+        """``_stamp``'s docstring promises "any read or parse failure answers
+        None", but ``except (TypeError, ValueError)`` misses the
+        ``AttributeError`` a non-dict JSON scalar (``42``) raises on
+        ``.get`` -- so a corrupt plaintext file crashed ``_read_active_credentials``
+        itself, the ordinary read path every consumer of the active
+        credential goes through, not only the later credentials-sync helper."""
+        kc = self._creds("keychain-only", 1_000)
+        got = self._store(tmp_path, monkeypatch, kc, "42")._read_active_credentials()
+        assert got.value == kc, (
+            "DEFECT: a corrupt plaintext file crashed the read instead of "
+            "just losing the freshness comparison"
+        )
+
+
+class TestMdatLookupIsPinnedToTheServingService:
+    """T1312 [m]: ``_active_oauth_keychain_mdat`` must read the ``mdat`` of
+    the EXACT service ``_read_active_oauth_keychain`` served its value
+    from -- a second, independent scan of the same try-order could stop at
+    a different service than the one that produced the value."""
+
+    def test_the_mdat_lookup_never_wanders_to_a_different_service(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(
+            "claude_swap.credentials._active_oauth_keychain_services",
+            lambda: ["svc-a", "svc-b"],
+        )
+        store = CredentialStore(_Host(tmp_path / "backups"))
+
+        monkeypatch.setattr(
+            macos_keychain, "get_password",
+            lambda service, account: "kc-value" if service == "svc-a" else None,
+        )
+        monkeypatch.setattr(
+            macos_keychain, "item_modified_at",
+            # Only svc-b (which never served the value) has an mdat here --
+            # a naive re-scan would wrongly attribute it to svc-a's value.
+            lambda service, account: 1_000_000.0 if service == "svc-b" else None,
+        )
+
+        val, failed, kc_service = store._read_active_oauth_keychain()
+        assert (val, failed, kc_service) == ("kc-value", False, "svc-a")
+        assert store._active_oauth_keychain_mdat(kc_service) is None, (
+            "the mdat lookup wandered to svc-b, which never served the value"
+        )
+        # CONTROL: an unpinned (scanning) lookup DOES find svc-b's mdat --
+        # proving pinning, not an unreachable fake, is what the assertion
+        # above depends on.
+        assert store._active_oauth_keychain_mdat(None) == 1_000_000.0
+
+
+class TestTheLineageJitterToleranceIsPublic:
+    """A second reader outside the package (the requirements gate, on the
+    tool's interpreter) must import this package's jitter decision instead
+    of carrying its own copy — so the constant must be importable by name,
+    not underscore-private."""
+
+    def test_the_constant_is_importable_under_its_public_name(self):
+        from claude_swap.credentials import LINEAGE_STAMP_JITTER_MS
+
+        assert LINEAGE_STAMP_JITTER_MS == 5_000
+
+    def test_newer_login_treats_the_public_constant_as_the_boundary(self):
+        from claude_swap.credentials import LINEAGE_STAMP_JITTER_MS, newer_login
+
+        assert not newer_login(LINEAGE_STAMP_JITTER_MS, 0)
+        assert newer_login(LINEAGE_STAMP_JITTER_MS + 1, 0)

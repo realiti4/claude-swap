@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -438,6 +440,7 @@ class _KeychainStore:
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], str] = {}
+        self.mtimes: dict[tuple[str, str], float] = {}
 
     # Mirrors the ``macos_keychain`` (security CLI) contract.
     def get_password(self, service: str, account: str) -> str | None:
@@ -448,9 +451,18 @@ class _KeychainStore:
 
     def set_password(self, service: str, account: str, password: str) -> None:
         self.data[(service, account)] = password
+        self.mtimes[(service, account)] = time.time()
 
     def delete_password(self, service: str, account: str) -> None:
         self.data.pop((service, account), None)  # absent = no-op (rc 44)
+        self.mtimes.pop((service, account), None)
+
+    def item_modified_at(self, service: str, account: str) -> float | None:
+        """Fake ``macos_keychain.item_modified_at``: the fake store's own
+        write time, or ``None`` for an item never set here (mirrors the
+        real ``security`` wrapper's "absent/unparseable is no evidence").
+        """
+        return self.mtimes.get((service, account))
 
 
 def _make_fake_keyring() -> types.ModuleType:
@@ -531,7 +543,9 @@ def block_real_keychain(request, monkeypatch):
     """Safety net: no test may touch the real macOS Keychain.
 
     Replaces the ``security``-CLI wrapper (``claude_swap.macos_keychain``) with an
-    in-memory fake and injects a fake ``keyring`` module (for the lazy
+    in-memory fake -- including ``item_modified_at``, or a test exercising the
+    mtime-vs-``mdat`` freshness arbitration would shell out to the real
+    ``security`` for it -- and injects a fake ``keyring`` module (for the lazy
     ``import keyring`` paths in purge/migrations). Tests marked
     ``@pytest.mark.no_keychain_fake`` opt out — either because they mock
     ``subprocess`` themselves (the wrapper's own unit tests) or because they run
@@ -547,6 +561,7 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "item_exists", store.item_exists)
     monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
     monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
+    monkeypatch.setattr(_macos_keychain, "item_modified_at", store.item_modified_at)
     monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
     yield store
 
@@ -571,6 +586,38 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
         return
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
     yield
+
+
+@pytest.fixture(autouse=True)
+def block_real_switch_target_probe(request, monkeypatch):
+    """Safety net: no test may make a live switch-target liveness probe.
+
+    ``_probe_target_credential`` (the switch-time guard against activating a
+    credential the API has already revoked) calls
+    ``oauth.probe_oauth_profile_live`` on every switch target that will be
+    written live — which is most seeded test accounts, in dozens of
+    unrelated switch tests that don't mock it. Stub it to ``None`` (its
+    documented "transport failure — no verdict" answer, which the guard
+    already treats as "proceed as before") so the suite stays hermetic; a
+    test exercising the guard itself patches this explicitly.
+    ``@pytest.mark.no_probe_oauth_profile_live_fake`` opts out for
+    ``TestProbeOauthProfileLive``, which mocks ``urlopen`` beneath it — the
+    same escape hatch ``no_oauth_profile_fake`` gives its sibling stub above.
+    """
+    if request.node.get_closest_marker("no_probe_oauth_profile_live_fake"):
+        yield
+        return
+    monkeypatch.setattr(
+        "claude_swap.oauth.probe_oauth_profile_live",
+        lambda token, timeout_s=5.0: None,
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def no_keychain_retry_wait(monkeypatch):
+    """A locked-Keychain read retries after a real 0.3 s sleep; no test waits it out."""
+    monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
 
 
 @pytest.fixture
@@ -721,6 +768,12 @@ def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_fetch_stagger(monkeypatch):
+    """A real 0.25 s per-account sleep in the fetch pool that no test needs."""
+    monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
 
 
 @pytest.fixture(autouse=True)
@@ -878,3 +931,34 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    # trylast: pytest's own tmpdir sessionfinish has already run cleanup_numbered_dir and released this process's lock on pytest-N (unregistering its atexit) by the time this runs, so nothing here touches that freed path.
+    # "Green" is per process: a worker whose own tests passed drops its share even inside a red -n run; a failing worker and the controller of a red run keep theirs.
+    # Measured: a green run leaves ~45k entries in the shared /tmp/pytest-of-<user>, a ~3.8s serial rmtree landing on whichever later session evicts it, which made the -n 10 wall bimodal ~19s/~23s.
+    # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
+    # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
+    # The removal is a detached child, so the run never waits on it: in-process it held the -n 10 wall.
+    # The workers' children and the controller's child then remove nested paths (pytest-N/popen-gwX under pytest-N) at the same time; ignore_errors makes them converge.
+    # A spawn that fails (EAGAIN/ENOMEM under a process cap) must not turn a green run into an INTERNALERROR: remove in-process then.
+    if exitstatus != 0:
+        return
+    factory = session.config._tmp_path_factory
+    basetemp = factory._basetemp
+    if basetemp is None:
+        return
+    is_worker = hasattr(session.config, "workerinput")
+    if factory._given_basetemp is not None and not is_worker:
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, "-S", "-c", "import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)", str(basetemp)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        shutil.rmtree(basetemp, ignore_errors=True)
