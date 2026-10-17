@@ -56,11 +56,13 @@ from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
+    AccountPolicy,
     AccountSnapshot,
     AccountsSnapshot,
     Platform,
     SwitchTransaction,
     get_timestamp,
+    normalize_account_threshold,
     normalize_alias,
 )
 from claude_swap.printer import (
@@ -1774,6 +1776,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    policy=self._policy_from_data(seq_data, n),
                 )
             )
         return AccountsSnapshot(
@@ -1853,6 +1856,58 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num))
         return bool(record and record.get("disabled"))
 
+    @staticmethod
+    def _policy_from_data(data: dict, account_num: str) -> AccountPolicy:
+        """Per-account auto-switch overrides from already-loaded data.
+
+        A staticmethod for the same reason ``_disabled_from_data`` is one: the
+        engine reads every slot's policy inside a single pass over one
+        ``_get_sequence_data()`` result, and a method that re-entered the store
+        per slot would turn one file read into N.
+
+        **Degrades, never raises.** The strict validator runs at the write
+        boundary (``set_account_threshold``); by the time a value is in the
+        file it may have been hand-edited, and a corrupt record must leave the
+        account on the global default rather than crash the auto-switch loop.
+        An unusable threshold reads as ``None``, which is exactly "inherit".
+
+        Args:
+            data: An already-loaded ``sequence.json`` mapping.
+            account_num: Slot number, as ``str`` or ``int``.
+
+        Returns:
+            The slot's :class:`AccountPolicy`, or the default if the record or
+            its keys are missing or unusable.
+        """
+        record = data.get("accounts", {}).get(str(account_num))
+        if not record:
+            return AccountPolicy()
+        raw = record.get("threshold")
+        threshold: float | None
+        if raw is None:
+            threshold = None
+        else:
+            try:
+                threshold = normalize_account_threshold(raw)
+            except ValueError:
+                # Hand-edited garbage, out-of-range, NaN/inf: inherit the
+                # global default rather than propagate an unusable number.
+                threshold = None
+        return AccountPolicy(threshold=threshold)
+
+    def account_policies(self) -> dict[str, AccountPolicy]:
+        """Every managed slot's auto-switch policy, from one sequence read.
+
+        Keyed by slot number in sequence order. The auto-switch engine calls
+        this once per tick and resolves effective thresholds from the result,
+        so it must not re-enter the store per account.
+        """
+        data = self._get_sequence_data() or {}
+        return {
+            str(num): self._policy_from_data(data, str(num))
+            for num in data.get("sequence", [])
+        }
+
     def is_account_disabled(self, account_num: str) -> bool:
         """Whether a slot is currently held out of rotation."""
         data = self._get_sequence_data() or {}
@@ -1866,6 +1921,95 @@ class ClaudeAccountSwitcher:
             for num in data.get("sequence", [])
             if self._disabled_from_data(data, str(num))
         ]
+
+    def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
+        """Resolve an identifier and fetch its record, ready for a policy write.
+
+        Called by :meth:`set_account_threshold`. Every
+        raising path here happens **before** any write, so a rejected call
+        leaves ``sequence.json`` byte-identical.
+
+        Returns:
+            ``(account_num, email, data, record)``.
+
+        Raises:
+            ConfigError: No accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: The identifier matches no managed account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        # resolve_account migrates org fields and hard-errors on ambiguity.
+        account_num, email, _ = self.resolve_account(identifier)
+
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        return account_num, email, data, record
+
+    def set_account_threshold(self, identifier: str, threshold: object | None) -> None:
+        """Set or clear one account's own switch-away threshold.
+
+        The per-account value replaces ``autoswitch.threshold`` for this
+        account only, in both directions: the departure gate uses the *active*
+        account's value to decide when to leave, and the landing gate uses each
+        *candidate's* own value to decide whether it is an acceptable target.
+        Reserving headroom on one shared account therefore no longer means
+        taxing the whole fleet with a global cap set to the strictest member's.
+
+        ``threshold=None`` removes the override and returns the account to the
+        global default. The key is popped rather than written as ``null``, so a
+        fleet that has never set a policy keeps a ``sequence.json`` byte-identical
+        to one from before this feature existed.
+
+        Args:
+            identifier: Slot number, email, or alias.
+            threshold: Percentage in ``[ACCOUNT_THRESHOLD_MIN,
+                ACCOUNT_THRESHOLD_MAX]``, or ``None`` to clear.
+
+        Raises:
+            ConfigError: No accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: The identifier matches no managed account.
+            ValueError: The value is not a number in range. Raised *before* any
+                write, so a rejected value leaves the store untouched.
+        """
+        # Validate first: a bad value must never reach the file. Resolution
+        # order matters only in that both checks precede the single write.
+        normalized = None if threshold is None else normalize_account_threshold(threshold)
+
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+
+        current = record.get("threshold")
+        if normalized is None and "threshold" not in record:
+            print(dimmed(
+                f"Account-{account_num} ({email}) has no threshold override "
+                f"— already using the global default."
+            ))
+            return
+        if normalized is not None and current == normalized:
+            print(dimmed(
+                f"Account-{account_num} ({email}) is already at {normalized:g}%."
+            ))
+            return
+
+        if normalized is None:
+            record.pop("threshold", None)
+        else:
+            record["threshold"] = normalized
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        if normalized is None:
+            self._logger.info(f"Cleared threshold for account {account_num}: {email}")
+            print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
+                  f"— now using the global default.")
+        else:
+            self._logger.info(
+                f"Set threshold {normalized:g} for account {account_num}: {email}"
+            )
+            print(f"{accent('Set')} Account-{account_num} ({email}) "
+                  f"threshold to {normalized:g}%.")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.
@@ -5551,6 +5695,7 @@ class ClaudeAccountSwitcher:
                     ),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                 )
             )
