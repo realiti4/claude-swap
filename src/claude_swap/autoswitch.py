@@ -1761,7 +1761,19 @@ class AutoSwitchEngine:
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        # A `pace` departure is not a move this bar can be asked to protect:
+        # the account was left for being AHEAD of its schedule, not for being
+        # near its limit, so going back to it at the threshold undoes nothing.
+        # Barred, a two-account fleet stayed on the new account until it hit
+        # 100% (the at-limit escape) while the old one sat under the line.
+        # `pace` itself is not in the trigger list: its own margin is the
+        # anti-flap bound on its axis. The next switch records its own
+        # trigger, so the bar is back after one move.
+        if (
+            trigger not in ("proactive", "consume-first")
+            or came_from is None
+            or state.get("leftTrigger") == "pace"
+        ):
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to

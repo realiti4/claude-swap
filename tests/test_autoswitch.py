@@ -7494,3 +7494,20 @@ class TestPaceStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
+    def test_returns_at_the_threshold_to_the_account_a_pace_move_left(self, temp_home):
+        h = self._harness(temp_home, threshold=80.0)
+        h.tick_with_usage({
+            "1": self._usage(h, 3, 69, 3),
+            "2": self._usage(h, 0, 0, 6),
+        })
+        assert h.active_number() == 2
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 3, 69, 3),
+            "2": self._usage(h, 80, 10, 6),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
