@@ -1,8 +1,5 @@
 """Per-account policy persistence and accessors (switcher.py).
 
-MEU-PAP-02 - AC-6 ... AC-15 of
-`.agent/plans/2026-09-02-per-account-threshold-backup/implementation-plan.md`.
-
 Mirrors the `disabled` machinery exactly: `_policy_from_data` reads from
 already-loaded data the way `_disabled_from_data` does, the setters mirror
 `set_account_disabled`, and both honour the omit-when-default record
@@ -82,7 +79,7 @@ class PolicyStoreBase:
 
 
 class TestPolicyFromData(PolicyStoreBase):
-    """AC-6 - reading a policy out of already-loaded sequence data."""
+    """Reading a policy out of already-loaded sequence data."""
 
     def test_missing_record_yields_the_default(self, temp_home: Path):
         s = self._fleet(temp_home)
@@ -116,9 +113,9 @@ class TestPolicyFromData(PolicyStoreBase):
         """A corrupt record must degrade, not explode.
 
         This is the *read* path. The strict validator runs at the *write*
-        boundary (AC-38); by the time a value is in the file it may have been
-        hand-edited, and the engine must keep running on the global default
-        rather than crash the auto-switch loop.
+        boundary (`set_account_threshold`); by the time a value is in the file
+        it may have been hand-edited, and the engine must keep running on the
+        global default rather than crash the auto-switch loop.
         """
         s = self._fleet(temp_home)
         data = s._get_sequence_data() or {}
@@ -141,7 +138,7 @@ class TestPolicyFromData(PolicyStoreBase):
 
 
 class TestSetAccountThreshold(PolicyStoreBase):
-    """AC-7, AC-8 - the threshold setter, mirroring `set_account_disabled:1860`."""
+    """The threshold setter, mirroring `set_account_disabled`."""
 
     def test_writes_the_value_and_stamps_last_updated(self, temp_home: Path):
         s = self._fleet(temp_home)
@@ -152,7 +149,7 @@ class TestSetAccountThreshold(PolicyStoreBase):
         assert data["lastUpdated"] != before
 
     def test_resolves_an_alias_or_email(self, temp_home: Path):
-        """AC-37's mechanism, exercised at the store layer via `resolve_account`."""
+        """Number/email/alias lookup, via `resolve_account` at the store layer."""
         s = self._fleet(temp_home)
         s.set_account_threshold("account-3@example.test", 90.0)
         assert self._record(s, "3")["threshold"] == pytest.approx(90.0)
@@ -174,10 +171,10 @@ class TestSetAccountThreshold(PolicyStoreBase):
 
     @pytest.mark.parametrize("bad", [20, 100, "abc", float("nan"), float("inf")])
     def test_invalid_value_raises_and_writes_nothing(self, temp_home: Path, bad):
-        """AC-38 at the store boundary: validation happens before any write.
+        """Refused at the store boundary: validation happens before any write.
 
-        Python `assert` and type hints are not runtime validation (AGENTS.md
-        §Boundary Input Contract); this setter must call the normalizer.
+        Python `assert` and type hints are not runtime validation (`assert` is
+        stripped under `python -O`); this setter must call the normalizer.
         """
         s = self._fleet(temp_home)
         before = s.sequence_file.read_bytes()
@@ -197,7 +194,7 @@ class TestSetAccountThreshold(PolicyStoreBase):
         assert "threshold" in self._record(s, "1")
         s.set_account_threshold("1", None)
         assert "threshold" not in self._record(s, "1"), (
-            "unset must remove the key, not write null - AC-10's omit-when-default"
+            "unset must remove the key, not write null - omit-when-default"
         )
 
     def test_popping_an_absent_key_is_a_no_op_not_a_keyerror(self, temp_home: Path):
@@ -213,7 +210,7 @@ class TestSetAccountThreshold(PolicyStoreBase):
 
 
 class TestOmitWhenDefault(PolicyStoreBase):
-    """AC-10 - an untouched record is unchanged by a write to a different one."""
+    """An untouched record is unchanged by a write to a different one."""
 
     def test_untouched_record_is_byte_identical(self, temp_home: Path):
         s = self._fleet(temp_home)
@@ -238,7 +235,7 @@ class TestOmitWhenDefault(PolicyStoreBase):
 
 
 class TestAccountPolicies(PolicyStoreBase):
-    """AC-12 - the bulk read the engine uses once per tick."""
+    """The bulk read the engine uses once per tick."""
 
     def test_covers_every_slot_in_sequence(self, temp_home: Path):
         s = self._fleet(temp_home, count=3)
@@ -254,7 +251,7 @@ class TestAccountPolicies(PolicyStoreBase):
         assert policies["2"] == AccountPolicy(threshold=85.0)
 
     def test_reads_the_sequence_once(self, temp_home: Path, monkeypatch):
-        """Single-read pattern, as `switchable_account_numbers:1824` uses.
+        """Single-read pattern, as `switchable_account_numbers` uses.
 
         The engine calls this on every tick of the auto-switch loop; one read
         per call is the difference between a poll and a file-system hammer.
@@ -273,15 +270,12 @@ class TestAccountPolicies(PolicyStoreBase):
 
 
 class TestSnapshotCarriesPolicy(PolicyStoreBase):
-    """AC-13 - every surface that already carries `disabled` also carries policy.
+    """Every surface that already carries `disabled` also carries policy.
 
-    *Plan discrepancy, recorded here rather than resolved silently:* the AC
-    calls `switcher.py:1765` and `switcher.py:5353` "both `AccountsSnapshot`
-    build sites". Only the first is one - `AccountSnapshot(` appears exactly
-    once in the package (now `switcher.py:1756`). `:5353` is the `--json`
-    `account_row(...)` call. Both *sites* are correctly identified and both
-    already pass `disabled=`, so the intent - mirror `disabled` everywhere it
-    is surfaced - is unambiguous; only the label is wrong. Both are covered.
+    There are two: the `AccountSnapshot(...)` row `accounts_snapshot` builds
+    (the one place in the package that constructs one), and the `--json`
+    `account_row(...)` call in `_build_list_payload`. Both already pass
+    `disabled=`; both are covered.
     """
 
     def test_snapshot_row_carries_a_written_policy(self, temp_home: Path):
@@ -318,9 +312,9 @@ class TestSnapshotCarriesPolicy(PolicyStoreBase):
 
 
 class TestExportImportIgnorePolicy(PolicyStoreBase):
-    """AC-14 - policy is machine-local, like `disabled`, and does not travel.
+    """Policy is machine-local, like `disabled`, and does not travel.
 
-    `transfer.py:262-275` builds each export entry from an explicit field list
+    `export_accounts` builds each export entry from an explicit field list
     and adds `alias` deliberately; `disabled` is just as deliberately absent.
     A threshold tuned to one machine's usage pattern is not a property of the
     *account*, so it must not ride along on an export.
@@ -378,7 +372,7 @@ class TestExportImportIgnorePolicy(PolicyStoreBase):
 
 
 class TestPolicySurvivesRenumber(PolicyStoreBase):
-    """AC-15 - `swap` and `move` carry policy with the account record.
+    """`swap` and `move` carry policy with the account record.
 
     This is the decisive argument for storing policy *in the account record*
     rather than in a parallel settings map keyed by slot number: a map keyed by
@@ -412,26 +406,27 @@ class TestPolicySurvivesRenumber(PolicyStoreBase):
 
 
 class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
-    """VR-2 - AC-13's JSON half, asserted at the caller instead of the helper.
+    """The `--json` half of `TestSnapshotCarriesPolicy`, asserted at the caller
+    instead of the helper.
 
     `TestSnapshotCarriesPolicy::test_json_row_emits_policy_when_set` passes
     `policy=` to `account_row()` by hand. That proves the *helper* honours the
     argument; it says nothing about whether the one production caller actually
     supplies it. Validation reproduced the gap: deleting
-    `policy=self._policy_from_data(...)` from `_build_list_payload`
-    (`switcher.py:5562`) left the entire suite green while the real
-    `--list --json` output silently lost both fields.
+    `policy=self._policy_from_data(...)` from `_build_list_payload` left the
+    entire suite green while the real `--list --json` output silently lost
+    both fields.
 
     So this drives `list_accounts(json_output=True)` - the actual runtime entry
     point - and asserts on the row it returns.
 
     `fetch=set()` is load-bearing, not decoration. The CLI default `fetch=None`
-    means "every stale account is eligible" (`switcher.py:5031-5036`), so an
+    means "every stale account is eligible" (`_collect_usage_entries`), so an
     unqualified call here would issue real usage-endpoint requests with the
     fixture's synthetic tokens - slow, flaky, and a charge against a shared
     budget. An empty set satisfies `fetch is None or num in fetch` for nobody
-    (`switcher.py:5084`), so nothing is collected and this stays a pure
-    payload-assembly oracle.
+    (the candidate filter in `_collect_usage_entries`), so nothing is
+    collected and this stays a pure payload-assembly oracle.
     """
 
     @staticmethod
@@ -469,7 +464,7 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         assert "threshold" not in row
 
     def test_a_fleet_with_no_policy_emits_rows_identical_to_before(self, temp_home: Path):
-        """AC-13's omit-when-default contract at the caller, not the helper."""
+        """The omit-when-default contract at the caller, not the helper."""
         payload = self._payload(self._fleet(temp_home))
         for row in payload["accounts"]:
             assert "threshold" not in row

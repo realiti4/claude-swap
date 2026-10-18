@@ -1,14 +1,15 @@
-"""MEU-PAP-03 - per-account threshold across every gate call site.
+"""Per-account threshold across every gate call site.
 
-Covers AC-16..AC-23 plus AC-41 (escalation band), AC-42 (`PollEvent.threshold`)
-and AC-47 (the departure-gate detail string).
+Covers the departure and landing gates, the ranking, the anti-flap checks,
+poll cadence, the escalation band, `PollEvent.threshold` and the
+departure-gate detail string.
 
 The engine resolves a threshold **map** once per tick and passes it down as a
 parameter; `_rank_candidates` is documented pure and is called twice per tick
 under the consume-first two-phase commit, so nothing here may read the store
 from inside the ranking. Every integration test below drives a **real tick**
-through `EngineHarness`, not a helper in isolation - the plan's AC-41 and AC-47
-are specifically written that way because a helper-level assertion passes
+through `EngineHarness`, not a helper in isolation - the escalation-band and
+detail-string classes most of all, because a helper-level assertion passes
 against the defect each is meant to catch.
 
 Synthetic fixtures only: `EngineHarness` seeds a throwaway store under
@@ -136,7 +137,7 @@ class TestResolveThresholds:
 
 
 class TestDepartureGateUsesActiveThreshold:
-    """AC-16 - the gate fires on the **active account's own** threshold."""
+    """The gate fires on the **active account's own** threshold."""
 
     def test_active_above_its_lower_override_switches(self, temp_home):
         h = _fleet(temp_home)
@@ -181,7 +182,7 @@ class TestDepartureGateUsesActiveThreshold:
 
 
 class TestLandingGateIsPerCandidate:
-    """AC-17 - the discriminating case: two candidates, one tick, opposite verdicts.
+    """The discriminating case: two candidates, one tick, opposite verdicts.
 
     Fixture shape, chosen so the assertion cannot pass by accident: candidate 2
     holds **more** headroom than candidate 3, so today's engine picks 2. Giving
@@ -268,7 +269,7 @@ class TestLandingGateIsPerCandidate:
 
 
 class TestEveryAccountAboveThreshold:
-    """AC-18 - each account is compared against **its own** line."""
+    """Each account is compared against **its own** line."""
 
     HEADROOM = {"2": 12.0, "3": 11.0}     # utilization 88 / 89
     ACTIVE_HEADROOM = 1.0                 # utilization 99
@@ -346,7 +347,7 @@ class TestEveryAccountAboveThreshold:
 
 
 class TestAntiFlapUsesTheBarredAccountsThreshold:
-    """AC-19 - the anti-flap machinery evaluates the **barred** account against
+    """The anti-flap machinery evaluates the **barred** account against
     *its own* line, so it cannot contradict the gate that barred it.
 
     Both reachable sites take the unreadable-active fallback leg, which asks
@@ -455,7 +456,7 @@ class TestAntiFlapUsesTheBarredAccountsThreshold:
 
 
 class TestPollPolicyMinimumThreshold:
-    """AC-20 - `set_poll_policy_inputs` receives the fleet **minimum**.
+    """`set_poll_policy_inputs` receives the fleet **minimum**.
 
     `poll_policy`'s urgent mode compares `new_pct >= threshold - 15`, so a
     minimum can only make collection *earlier*, never lazier - the safe
@@ -505,7 +506,7 @@ class TestPollPolicyMinimumThreshold:
 
 
 class TestRankCandidatesStaysPure:
-    """AC-21 - thresholds arrive as a parameter; the ranking never reads the store.
+    """Thresholds arrive as a parameter; the ranking never reads the store.
 
     `consume-first` calls `_rank_candidates` **twice per tick** under a
     two-phase commit, so a store read inside it would re-resolve mid-tick and
@@ -572,7 +573,7 @@ class TestRankCandidatesStaysPure:
 
 
 class TestRawHeadroomGuardsDoNotMove:
-    """AC-22 - `HORIZON_HEADROOM_RATIO` and `SPENT_HEADROOM_PCT` stay on raw
+    """`HORIZON_HEADROOM_RATIO` and `SPENT_HEADROOM_PCT` stay on raw
     headroom (upstream #262 reasoned this out and it applies identically).
 
     A ratio against distance-to-100 means something; a ratio against a policy
@@ -636,14 +637,14 @@ class TestRawHeadroomGuardsDoNotMove:
 
 
 class TestEscalationBandUsesActiveThreshold:
-    """AC-41 - the escalation band asks about the **active** account, so it
+    """The escalation band asks about the **active** account, so it
     reads that account's own line.
 
     Driven through a real tick, never `_collect_scheduled_usage` in isolation:
     the defect this discriminates against is a *stale-snapshot switch*, which
     only exists once ranking runs on what the collector returned.
 
-    Discriminating tuple from the plan: global `99.9`, active override `50`,
+    The discriminating tuple: global `99.9`, active override `50`,
     active utilization `60`. The departure gate fires at 50, but a collector
     still holding the global tests `60 >= 99.9 - 15` (i.e. `>= 84.9`), does
     not escalate, and the proactive selection that follows runs on the
@@ -723,7 +724,7 @@ class TestEscalationBandUsesActiveThreshold:
 
 
 class TestPollEventCarriesTheActiveThreshold:
-    """AC-42 - the number the UI renders equals the number the gate used."""
+    """The number the UI renders equals the number the gate used."""
 
     def test_it_carries_the_active_accounts_override(self, temp_home):
         h = _fleet(temp_home)
@@ -745,8 +746,8 @@ class TestPollEventCarriesTheActiveThreshold:
         assert _polls(h)[0].threshold == pytest.approx(GLOBAL)
 
     def test_the_no_active_account_path_keeps_the_global(self, temp_home):
-        """`:911` is the deliberate non-move in the inventory: with no active
-        account there is no account whose line could be read."""
+        """The no-active-account `PollEvent` deliberately keeps the global:
+        with no active account there is no account whose line could be read."""
         h = EngineHarness(temp_home, threshold=77.0)
         outcome = h.tick_with_usage({})
         assert outcome is TickOutcome.NO_ACTION
@@ -766,14 +767,15 @@ class TestPollEventCarriesTheActiveThreshold:
 
 
 class TestDepartureGateDetailString:
-    """AC-47 - `:989` quotes the *active account's own* effective threshold.
+    """The departure gate's detail string quotes the *active account's own*
+    effective threshold.
 
-    The plan is explicit that a hold-only assertion is insufficient: it passes
-    against the defect, because row 1 already holds correctly. The emitted
-    string is the oracle. Leaving this site on the global scalar makes the
-    engine hold on one number and display another - `90% < 85%` is not merely
-    misleading but arithmetically false, and invites the operator to conclude
-    the engine is broken.
+    A hold-only assertion is insufficient: it passes against the defect,
+    because row 1 already holds correctly. The emitted string is the oracle.
+    Leaving this site on the global scalar makes the engine hold on one
+    number and display another - `90% < 85%` is not merely misleading but
+    arithmetically false, and invites the operator to conclude the engine is
+    broken.
     """
 
     def test_the_detail_quotes_the_active_override(self, temp_home):
@@ -828,14 +830,13 @@ class TestDepartureGateDetailString:
 
 
 class TestDefaultIdentity:
-    """AC-23 - with no per-account thresholds anywhere, nothing changes.
+    """With no per-account thresholds anywhere, nothing changes.
 
-    The whole-suite form of this AC is the phase gate (`2056 passed, 75
-    skipped, 3 warnings` baseline, and `tests/test_autoswitch.py` unchanged).
-    What is asserted here is the property that makes that outcome expected
-    rather than lucky: on a fleet with no overrides, every resolved value is
-    the global scalar, so each rewritten call site receives exactly the
-    argument it receives today.
+    The whole-suite form of this is `tests/test_autoswitch.py` passing
+    unchanged. What is asserted here is the property that makes that outcome
+    expected rather than lucky: on a fleet with no overrides, every resolved
+    value is the global scalar, so each rewritten call site receives exactly
+    the argument it receives today.
     """
 
     def test_no_policy_keys_exist_on_a_fresh_fleet(self, temp_home):
@@ -885,7 +886,7 @@ class TestDefaultIdentity:
 
 
 class TestPollCadenceFollowsALivePolicyChange:
-    """VR-1 - the pinned minimum is refreshed every tick, not only at birth.
+    """The pinned minimum is refreshed every tick, not only at birth.
 
     `cswap threshold 1 50` is written by a **different process** while
     `cswap auto` is already running - that is the ordinary way a threshold
@@ -895,12 +896,13 @@ class TestPollCadenceFollowsALivePolicyChange:
     `apply_threshold()`, and a persisted write goes through neither. Cadence
     therefore stayed pinned to the minimum as it stood when the engine booted.
 
-    That contradicts AC-20's rationale, which is not "the minimum is a tidy
-    value" but "the collector is then never lazier than the earliest possible
-    trigger, so no switch is missed". `poll_policy`'s urgent mode fires at
-    `new_pct >= threshold - 15`, so a stale 90 against a live 50 goes urgent
-    at 75% when it should go urgent at 35% - lazier, in the one direction the
-    AC-20 rationale rules out, for every tick until the engine restarts.
+    That contradicts the reason the cadence is pinned to the minimum, which
+    is not "the minimum is a tidy value" but "the collector is then never
+    lazier than the earliest possible trigger, so no switch is missed".
+    `poll_policy`'s urgent mode fires at `new_pct >= threshold - 15`, so a
+    stale 90 against a live 50 goes urgent at 75% when it should go urgent at
+    35% - lazier, in the one direction that reason rules out, for every tick
+    until the engine restarts.
 
     `TestPollPolicyMinimumThreshold` above cannot catch this: every case there
     writes the policy and *then* builds the engine, except the `apply_threshold`

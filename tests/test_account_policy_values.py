@@ -1,12 +1,10 @@
 """Per-account policy value objects and threshold normalization (models.py).
 
-MEU-PAP-01 — AC-1 … AC-5 of
-`.agent/plans/2026-09-02-per-account-threshold-backup/implementation-plan.md`.
-
-`models.py` is a leaf module and must not import `settings` (AGENTS.md
-§Architecture). The threshold bounds are therefore *declared* in `models.py` and
-*cross-checked* against `SETTING_SPECS` here, in the test layer, where importing
-both is allowed. AC-2 and AC-5 are the two halves of that arrangement.
+`models.py` is a leaf module and must not import `settings`. The threshold
+bounds are therefore *declared* in `models.py` and *cross-checked* against
+`SETTING_SPECS` here, in the test layer, where importing both is allowed.
+`TestThresholdBoundsMatchSettings` and `TestModelsRemainsALeaf` are the two
+halves of that arrangement.
 """
 
 from __future__ import annotations
@@ -31,8 +29,9 @@ from claude_swap.usage_store import UsageEntry
 def _snapshot(**overrides) -> AccountSnapshot:
     """An AccountSnapshot built the way every pre-change caller builds one.
 
-    Deliberately passes no ``policy=``: AC-4 is precisely the claim that adding
-    the field does not break existing construction sites.
+    Deliberately passes no ``policy=``: `TestAccountSnapshotPolicyField` is
+    precisely the claim that adding the field does not break existing
+    construction sites.
     """
     fields = {
         "number": "1",
@@ -49,7 +48,7 @@ def _snapshot(**overrides) -> AccountSnapshot:
 
 
 class TestNormalizeAccountThreshold:
-    """AC-1 — the write-boundary validator for a per-account threshold."""
+    """The write-boundary validator for a per-account threshold."""
 
     @pytest.mark.parametrize(
         "raw,expected",
@@ -100,7 +99,7 @@ class TestNormalizeAccountThreshold:
     def test_error_message_names_the_valid_range(self, raw):
         """The message must name the range — a bare 'invalid value' is not enough.
 
-        This is what `cswap threshold 2 20` prints to the user (AC-38).
+        This is what `cswap threshold 2 20` prints to the user.
         """
         with pytest.raises(ValueError) as excinfo:
             normalize_account_threshold(raw)
@@ -123,7 +122,7 @@ class TestNormalizeAccountThreshold:
 
 
 class TestThresholdBoundsMatchSettings:
-    """AC-2 — the bounds are declared in `models.py` but owned by `SETTING_SPECS`."""
+    """The bounds are declared in `models.py` but owned by `SETTING_SPECS`."""
 
     def test_constants_have_the_documented_values(self):
         assert ACCOUNT_THRESHOLD_MIN == 50.0
@@ -145,7 +144,7 @@ class TestThresholdBoundsMatchSettings:
 
 
 class TestAccountPolicy:
-    """AC-3 — the value object carried on every snapshot row."""
+    """The value object carried on every snapshot row."""
 
     def test_default_is_empty(self):
         policy = AccountPolicy()
@@ -154,8 +153,9 @@ class TestAccountPolicy:
     def test_two_defaults_compare_equal(self):
         """Equality is what makes the omit-when-default record convention testable.
 
-        AC-10 asserts an untouched record is unchanged; that check is written in
-        terms of policy equality, so it must be value equality, not identity.
+        The store tests assert an untouched record is unchanged; that check is
+        written in terms of policy equality, so it must be value equality, not
+        identity.
         """
         assert AccountPolicy() == AccountPolicy()
         assert AccountPolicy(threshold=85.0) == AccountPolicy(threshold=85.0)
@@ -178,13 +178,13 @@ class TestAccountPolicy:
     def test_field_types_are_declared_as_specified(self):
         fields = {f.name: f for f in dataclasses.fields(AccountPolicy)}
         assert set(fields) == {"threshold"}, (
-            "AC-3 fixes the field set; `order` belongs to PR 2 and must not appear here"
+            "the policy carries exactly one field, the threshold"
         )
         assert fields["threshold"].default is None
 
 
 class TestAccountSnapshotPolicyField:
-    """AC-4 — adding the field must not break any existing construction site."""
+    """Adding the field must not break any existing construction site."""
 
     def test_construction_without_policy_yields_the_default(self):
         snapshot = _snapshot()
@@ -226,12 +226,12 @@ class TestAccountSnapshotPolicyField:
 
 
 class TestModelsRemainsALeaf:
-    """AC-5 — `models.py` must not import `settings`.
+    """`models.py` must not import `settings`.
 
     The dependency direction is presentation → policy → store → platform I/O →
-    leaf data types (AGENTS.md §Architecture). `settings` sits above `models`;
-    an import here would make the leaf cyclic and is the reason AC-2's bounds
-    are cross-checked in the test layer instead.
+    leaf data types. `settings` sits above `models`; an import here would make
+    the leaf cyclic and is the reason the threshold bounds are cross-checked in
+    the test layer instead.
     """
 
     def test_no_settings_import_in_source(self):
@@ -242,7 +242,7 @@ class TestModelsRemainsALeaf:
             if ("import" in line and "settings" in line and not line.strip().startswith("#"))
         ]
         assert offenders == [], (
-            "models.py must not import settings (AGENTS.md §Architecture): "
+            "models.py must not import settings (it is a leaf module): "
             f"{offenders}"
         )
 

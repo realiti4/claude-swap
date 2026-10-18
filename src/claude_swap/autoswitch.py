@@ -1035,18 +1035,19 @@ class AutoSwitchEngine:
         new line for its DECISION every tick (``_resolve_thresholds``) while
         its CADENCE stayed pinned to the minimum as it stood at boot.
 
-        That inverts AC-20's rationale. The minimum is chosen because
-        ``poll_policy``'s urgent mode fires at ``new_pct >= threshold - 15``,
-        so the fleet minimum can only make collection *earlier* — never
-        lazier, and no crossing is missed. A stale 90 against a live 50 goes
-        urgent at 75% instead of 35%, which is lazier in exactly the direction
-        the rationale rules out, on every tick until the process restarts.
+        That defeats the reason the cadence is pinned to the fleet minimum at
+        all. The minimum is chosen because ``poll_policy``'s urgent mode
+        fires at ``new_pct >= threshold - 15``, so the fleet minimum can only
+        make collection *earlier* — never lazier, and no crossing is missed.
+        A stale 90 against a live 50 goes urgent at 75% instead of 35%, which
+        is lazier in exactly the direction that reason rules out, on every
+        tick until the process restarts.
 
         Called before ``_collect_scheduled_usage`` so the tick that discovers
         the change also plans on it. The pin itself is a bare attribute write
-        (``switcher.py:1800``); the only added per-tick cost is one
-        ``switchable_account_numbers()`` read, which ``_tick_inner`` already
-        performs for candidate construction.
+        (``ClaudeAccountSwitcher.set_poll_policy_inputs``); the only added
+        per-tick cost is one ``switchable_account_numbers()`` read, which
+        ``_tick_inner`` already performs for candidate construction.
         """
         self.switcher.set_poll_policy_inputs(
             self._min_effective_threshold(thresholds),

@@ -1,4 +1,4 @@
-"""TUI policy display — MEU-PAP-05 (AC-39, AC-40).
+"""TUI policy display.
 
 The per-account policy set through ``cswap threshold`` has
 to be visible where the operator already looks, on both account render paths:
@@ -6,13 +6,13 @@ to be visible where the operator already looks, on both account render paths:
 * ``account_card_text`` — the expanded card for the selected account.
 * ``mini_account_text`` — the one-line minimized row for every other account.
 
-AC-39  Both render paths show the threshold override on the account row.
-AC-40  An account carrying no policy renders byte-identically to today, on both
-       paths — asserted against goldens captured from the pre-change engine.
+Both render paths show the threshold override on the account row, and an
+account carrying no policy renders byte-identically to before, on both paths —
+asserted against goldens captured from the pre-change engine. The auto screen's
+"Next best" list ranks each account against its own line, as the engine does.
 
 This module is display-only. Editing a policy from inside the TUI is out of
-scope for this PR (plan §Scope, Deferred D-2); these tests must not grow an
-input path.
+scope for this PR; these tests must not grow an input path.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def mini(acc) -> str:
 
 
 class TestThresholdBadge:
-    """AC-39, second half — a per-account override is legible on both paths."""
+    """A per-account override is legible on both paths."""
 
     def test_the_card_shows_the_override(self):
         acc = with_policy(make_account(2, active=True, alias="dev"), threshold=75.0)
@@ -108,7 +108,7 @@ class TestThresholdBadge:
 
 
 class TestUnpolicedAccountsRenderExactlyAsBefore:
-    """AC-40 — the negative half, and the reason this file has goldens.
+    """The negative half, and the reason this file has goldens.
 
     Every account in an untouched store carries ``AccountPolicy()``.  If the
     badge code path leaks so much as a stray space onto those rows, the whole

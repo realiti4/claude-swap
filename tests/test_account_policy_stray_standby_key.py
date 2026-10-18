@@ -43,7 +43,7 @@ def _write_stray_key(s: ClaudeAccountSwitcher, num: str) -> None:
 
 
 class TestTheRankingIgnoresTheStrayKey:
-    """AC-8 - the marked account is ranked like any other."""
+    """The marked account is ranked like any other."""
 
     def test_the_marked_account_with_the_most_headroom_is_picked(self, temp_home):
         h = EngineHarness(temp_home)
@@ -62,7 +62,7 @@ class TestTheRankingIgnoresTheStrayKey:
 
 
 class TestThePolicyReaderIgnoresTheStrayKey(PolicyStoreBase):
-    """AC-9 - the record loads to the default policy without raising."""
+    """The record loads to the default policy without raising."""
 
     def test_the_record_reads_as_the_default_policy(self, temp_home: Path):
         s = self._fleet(temp_home)
@@ -75,7 +75,7 @@ class TestThePolicyReaderIgnoresTheStrayKey(PolicyStoreBase):
 
 
 class TestAnUnrelatedWriteKeepsTheStrayKey(PolicyStoreBase):
-    """AC-10 - setting a threshold does not strip keys it does not own."""
+    """Setting a threshold does not strip keys it does not own."""
 
     def test_setting_a_threshold_preserves_the_key(self, temp_home: Path):
         s = self._fleet(temp_home)
@@ -87,7 +87,7 @@ class TestAnUnrelatedWriteKeepsTheStrayKey(PolicyStoreBase):
 
 
 class TestTheJsonRowDoesNotSurfaceTheStrayKey(PolicyStoreBase):
-    """AC-11 - `--list --json`, offline (`fetch=set()`; see
+    """`--list --json`, offline (`fetch=set()`; see
     `test_account_policy_store.py`'s JSON class docstring for why)."""
 
     def test_the_row_has_no_such_key_and_keeps_its_threshold(self, temp_home: Path):
@@ -101,7 +101,7 @@ class TestTheJsonRowDoesNotSurfaceTheStrayKey(PolicyStoreBase):
 
 
 class TestTheVerbIsGone(PolicyStoreBase):
-    """AC-12 - `cswap standby 1` is not a command and writes nothing."""
+    """`cswap standby 1` is not a command and writes nothing."""
 
     def test_the_verb_is_not_in_the_subcommand_map(self):
         assert "standby" not in cli._SUBCOMMAND_FLAGS

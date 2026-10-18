@@ -1,15 +1,13 @@
-"""Per-account policy CLI verbs (cli.py).
-
-MEU-PAP-05 - AC-33 ... AC-38 of
-`.agent/plans/2026-09-02-per-account-threshold-backup/implementation-plan.md`.
+"""Per-account policy CLI verbs (cli.py): setting, clearing and listing a
+per-account threshold, and refusing a bad value.
 
 `cswap threshold` mirrors `_alias_command` (pre-dispatched before the main
 parser, because the main parser's required mutually-exclusive group cannot hold
 a positional subcommand).
 
-The validation contract is AGENTS.md §Boundary Input Contract: an out-of-range
-or non-numeric value is rejected **at the write boundary**, before any file is
-touched, so a rejected write leaves `sequence.json` byte-identical. AC-38
+The validation contract: an out-of-range or non-numeric value is rejected
+**at the write boundary**, before any file is touched, so a rejected write
+leaves `sequence.json` byte-identical. `TestValidationAtTheWriteBoundary`
 asserts exactly that with a byte comparison, not a field comparison.
 
 Synthetic fixtures only. The real store at the user home is never read or
@@ -36,7 +34,7 @@ class PolicyCliBase(PolicyStoreBase):
 
     @staticmethod
     def _bytes(s: ClaudeAccountSwitcher) -> bytes:
-        """`sequence.json` verbatim - the AC-38 byte-identity oracle."""
+        """`sequence.json` verbatim - the byte-identity oracle for a rejected write."""
         return Path(s.sequence_file).read_bytes()
 
     @staticmethod
@@ -61,7 +59,7 @@ class PolicyCliBase(PolicyStoreBase):
 
 
 class TestThresholdSet(PolicyCliBase):
-    """AC-33 - `cswap threshold 2 85` writes the override and confirms it."""
+    """`cswap threshold 2 85` writes the override and confirms it."""
 
     def test_it_writes_the_override_and_prints_a_confirmation(
         self, temp_home: Path, capsys
@@ -102,7 +100,7 @@ class TestThresholdSet(PolicyCliBase):
 
 
 class TestThresholdUnset(PolicyCliBase):
-    """AC-34 - `--unset` removes the key and returns the account to the global."""
+    """`--unset` removes the key and returns the account to the global."""
 
     def test_it_removes_the_key(self, temp_home: Path, capsys):
         self._fleet(temp_home)
@@ -140,7 +138,7 @@ class TestThresholdUnset(PolicyCliBase):
 
 
 class TestThresholdListing(PolicyCliBase):
-    """AC-35 - bare `cswap threshold` lists the global default and every override."""
+    """Bare `cswap threshold` lists the global default and every override."""
 
     def test_it_names_the_global_default(self, temp_home: Path, capsys):
         self._fleet(temp_home)
@@ -175,7 +173,7 @@ class TestThresholdListing(PolicyCliBase):
 
 
 class TestIdentifierResolution(PolicyCliBase):
-    """AC-37 - `cswap threshold` accepts a number, an email, or an alias."""
+    """`cswap threshold` accepts a number, an email, or an alias."""
 
     def test_threshold_accepts_an_email(self, temp_home: Path, capsys):
         self._fleet(temp_home)
@@ -198,7 +196,7 @@ class TestIdentifierResolution(PolicyCliBase):
 
 
 class TestValidationAtTheWriteBoundary(PolicyCliBase):
-    """AC-38 - a rejected value names the range and leaves the store untouched.
+    """A rejected value names the range and leaves the store untouched.
 
     Byte-identity, not field-identity: a write that rejected the value but still
     restamped `lastUpdated` would pass a field check and fail this one, and it
