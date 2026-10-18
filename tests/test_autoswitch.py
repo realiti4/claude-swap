@@ -7431,3 +7431,66 @@ class TestHeaderProbeReadings:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+class TestPaceStrategy:
+    def _harness(self, temp_home: Path, accounts: int = 2, **settings) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="pace", **settings)
+        for num in range(1, accounts + 1):
+            h.seed(num, f"{num}@example.com")
+        h.make_live("1@example.com", 1)
+        return h
+
+    def _usage(self, h: EngineHarness, pct5: float, pct7: float, days_to_reset: float):
+        return _usage7(pct5, pct7, _iso_at(h.clock.now + days_to_reset * 86400))
+
+    def test_below_threshold_moves_to_the_account_with_less_deficit(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 3, 69, 3),
+            "2": self._usage(h, 0, 0, 6),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "pace"
+
+    def test_holds_inside_the_margin(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 3, 50, 3.5),
+            "2": self._usage(h, 0, 0, 6.5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["on-best-pace"]
+
+    def test_holds_when_the_target_pace_is_unknown(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 3, 69, 3),
+            "2": _usage7(0, 0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_never_lands_above_the_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 3, 69, 3),
+            "2": self._usage(h, 95, 0, 6),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_at_the_threshold_least_deficit_beats_most_headroom(self, temp_home):
+        h = self._harness(temp_home, accounts=3)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 95, 50, 3.5),
+            "2": self._usage(h, 0, 40, 6),
+            "3": self._usage(h, 50, 10, 3),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+

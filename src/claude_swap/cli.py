@@ -850,8 +850,9 @@ Defaults live in settings.json in the backup root; flags override them.
             "'weekly-first' (switch at the threshold like best, onto the "
             "account whose weekly window resets soonest), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest), or 'priority-consume-first' (highest account "
-            "priority, then soonest weekly reset; only targets below all switch lines)"
+            "resets soonest), 'priority-consume-first' (highest account "
+            "priority, then soonest weekly reset; only targets below all switch lines), "
+            "or 'pace' (proactively use the account furthest behind its weekly pace)"
         ),
     )
     parser.add_argument(
