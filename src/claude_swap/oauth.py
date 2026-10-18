@@ -535,6 +535,13 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
+# Label of the 5-hour window as ``relevant_windows`` reports it. The only
+# window that is NOT weekly: every consumer that treats the 5h window
+# differently (``lines.window_line``, the TUI's per-row switch-line tick) keys
+# on this constant, so the label is spelled in one place.
+FIVE_HOUR_LABEL = "5h"
+
+
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
@@ -553,7 +560,7 @@ def relevant_windows(
     if not isinstance(usage, dict):
         return []
     windows: list[tuple[str, float, str | None]] = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = usage.get(key)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             windows.append((label, float(window["pct"]), window.get("resets_at")))

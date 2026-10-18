@@ -4032,6 +4032,125 @@ class TestPerformSwitchPostDisplay:
         assert live_state["creds"] == original_live_creds
         assert config_path.read_text() == original_config_text
 
+    def _direct_activation_with_failing_sequence_write(
+        self, temp_home: Path, on_sequence_write,
+    ):
+        """Seed an untracked login + one managed slot, then switch to it with
+        the sequence write failing after ~/.claude.json was already replaced.
+        ``on_sequence_write`` runs right before the injected failure. Returns
+        (config_path, original_config_text)."""
+        config_path = temp_home / ".claude.json"
+        original_config_text = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com",
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
+        config_path.write_text(original_config_text)
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "target-token",
+                    "refreshToken": "target-refresh",
+                }
+            }),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "target@example.com",
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }),
+        }
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "live-untracked-token",
+                "refreshToken": "live-untracked-refresh",
+            }
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        original_write_json = switcher._write_json
+
+        def failing_write_json(path, data):
+            if path == switcher.sequence_file and data.get(
+                "activeAccountNumber"
+            ) == 1:
+                on_sequence_write()
+                raise OSError("disk full")
+            return original_write_json(path, data)
+
+        try:
+            with patch.object(
+                switcher, "_write_json", side_effect=failing_write_json,
+            ), pytest.raises(OSError, match="disk full"):
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+        return config_path, original_config_text
+
+    def test_direct_activation_rollback_publishes_config_by_rename(
+        self, temp_home: Path,
+    ):
+        """The config restore must not rewrite ~/.claude.json in place: a
+        running Claude Code watches the file, and a truncate-then-write shows
+        it an empty file (#419). Published by rename, the inode changes."""
+        seen = {}
+        config_path, original_config_text = (
+            self._direct_activation_with_failing_sequence_write(
+                temp_home,
+                lambda: seen.setdefault(
+                    "ino", (temp_home / ".claude.json").stat().st_ino
+                ),
+            )
+        )
+        assert config_path.read_text() == original_config_text
+        if sys.platform != "win32":
+            assert config_path.stat().st_ino != seen["ino"]
+            assert config_path.stat().st_mode & 0o777 == 0o600
+        assert not list(temp_home.glob(".claude.*.tmp"))
+
+    def test_direct_activation_rollback_failure_leaves_config_intact(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """A restore that cannot publish leaves the file as it was -- still
+        the complete post-switch config, never a truncated one (#419)."""
+        def refuse(src, dst, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        config_path, _ = self._direct_activation_with_failing_sequence_write(
+            temp_home,
+            lambda: monkeypatch.setattr(
+                "claude_swap.fsutil.replace_with_retry", refuse
+            ),
+        )
+        written = json.loads(config_path.read_text())
+        assert written["oauthAccount"]["emailAddress"] == "target@example.com"
+        assert not list(temp_home.glob(".claude.*.tmp"))
+
     def test_direct_activation_fails_fast_when_live_creds_unreadable(
         self,
         temp_home: Path,
@@ -4424,7 +4543,7 @@ class TestDeadTokenQuarantine:
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        switcher._poll_inputs_override = (90.0, ("Fable",))
+        switcher._poll_inputs_override = (90.0, None, ("Fable",))
         store = switcher._usage_store
         now = time.time()
 
@@ -12627,3 +12746,130 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestPollPolicyInputsCarryTheWeeklyLine:
+    """The poll planner must see the same two switch lines the engine decides
+    with: pinned by a hosted engine, else read from the settings file through
+    the existing mtime memo."""
+
+    def test_inputs_come_from_the_file_then_the_pin_then_the_file_again(
+        self, temp_home
+    ):
+        import os
+
+        from claude_swap.settings import set_setting, settings_path
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "autoswitch.threshold", "85")
+        set_setting(switcher.backup_dir, "autoswitch.weeklyThreshold", "97")
+        set_setting(switcher.backup_dir, "autoswitch.model", "Fable")
+        assert switcher._poll_policy_inputs() == (85.0, 97.0, ("Fable",))
+
+        # A later edit is picked up through the mtime key (bumped explicitly
+        # so a same-second rewrite cannot hide behind filesystem granularity).
+        set_setting(switcher.backup_dir, "autoswitch.weeklyThreshold", "99")
+        path = settings_path(switcher.backup_dir)
+        later = path.stat().st_mtime + 5
+        os.utime(path, (later, later))
+        assert switcher._poll_policy_inputs() == (85.0, 99.0, ("Fable",))
+
+        switcher.set_poll_policy_inputs(80.0, None, ())
+        assert switcher._poll_policy_inputs() == (80.0, None, ())
+        switcher.clear_poll_policy_inputs()
+        assert switcher._poll_policy_inputs() == (85.0, 99.0, ("Fable",))
+
+    def test_plans_after_fetch_hands_the_planner_both_lines(self, temp_home):
+        from claude_swap import poll_policy
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._poll_inputs_override = (85.0, 97.0, ("Fable",))
+        info = {"2": (2, "test@example.com", "Org", "", True, "", "")}
+        record = FetchRecord(usage={"five_hour": {"pct": 5.0}, "seven_day": {"pct": 93.0}})
+        with patch.object(
+            poll_policy, "plan_after_fetch", return_value=(1.0, 2.0)
+        ) as plan:
+            plans = switcher._plans_after_fetch({"2": record}, {}, info)
+        assert plans == {"2": (1.0, 2.0)}
+        kwargs = plan.call_args.kwargs
+        assert kwargs["threshold"] == 85.0
+        assert kwargs["weekly_threshold"] == 97.0
+        assert kwargs["models"] == ("Fable",)
+        assert kwargs["is_active"] is True
+
+
+class TestSwitchTransactionRollback:
+    """``SwitchTransaction.rollback`` restores ``~/.claude.json`` by rename,
+    never by truncating the live file in place (#419)."""
+
+    def _transaction(self, tmp_path: Path, original: str):
+        from claude_swap.models import SwitchTransaction
+
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(original)
+        tx = SwitchTransaction(
+            original_credentials="",
+            original_config=original,
+            original_account_num="1",
+            original_email="a@example.com",
+            config_path=config_path,
+        )
+        tx.record_step("config_written")
+        return tx, config_path
+
+    def test_config_restore_is_published_by_rename(self, tmp_path: Path):
+        from unittest.mock import MagicMock
+
+        original = json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}})
+        tx, config_path = self._transaction(tmp_path, original)
+        config_path.write_text("{}")  # the half-finished switch's write
+        ino = config_path.stat().st_ino
+        assert tx.rollback(MagicMock()) is True
+        assert config_path.read_text() == original
+        if sys.platform != "win32":
+            assert config_path.stat().st_ino != ino
+            assert config_path.stat().st_mode & 0o777 == 0o600
+        assert list(tmp_path.iterdir()) == [config_path]
+
+    def test_failed_config_restore_leaves_the_file_as_it_was(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from unittest.mock import MagicMock
+
+        original = json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}})
+        tx, config_path = self._transaction(tmp_path, original)
+        config_path.write_text('{"half": "written"}')
+
+        def refuse(src, dst, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("claude_swap.fsutil.replace_with_retry", refuse)
+        assert tx.rollback(MagicMock()) is False
+        assert config_path.read_text() == '{"half": "written"}'
+        assert list(tmp_path.iterdir()) == [config_path]
+
+
+class TestSalvageCopyMode:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_salvage_copy_is_private_from_creation(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """The aside copy of an unparseable ~/.claude.json can hold
+        primaryApiKey: it must be 0600 from the instant it exists, not
+        world-readable until a later chmod. With the mode call neutralised,
+        the published mode is the one the file was created with."""
+        config_path = temp_home / ".claude.json"
+        config_path.write_text('{"primaryApiKey": "sk-test", "torn":')
+        switcher = ClaudeAccountSwitcher()
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
+        old_umask = os.umask(0o022)
+        try:
+            salvage = switcher._salvage_unreadable(config_path, False, [])
+        finally:
+            os.umask(old_umask)
+        assert salvage.read_bytes() == config_path.read_bytes()
+        assert salvage.stat().st_mode & 0o777 == 0o600
+        assert not list(temp_home.glob("*.tmp"))

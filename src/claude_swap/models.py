@@ -13,6 +13,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.usage_store import UsageEntry
 
 if TYPE_CHECKING:
@@ -268,11 +269,8 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
-                    )
-                    if sys.platform != "win32":
-                        os.chmod(self.config_path, 0o600)
+                    # By rename, never in place (#419): see atomic_write_text.
+                    atomic_write_text(self.config_path, self.original_config)
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()
                     if data:

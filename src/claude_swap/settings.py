@@ -14,14 +14,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -33,17 +33,27 @@ _logger = logging.getLogger("claude-swap")
 class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``cswap auto``).
 
-    ``threshold`` is binding-window utilization (max of the 5h/7d percentages):
-    at or above it the engine looks for a better account. 90 rather than 95
-    leaves margin for the macOS ~30s Keychain pickup tail and for heavy
-    subagent turns burning past the mark before a swap lands. A proactive
-    candidate must itself sit below the threshold (never land somewhere that
-    re-triggers next tick) and beat the active account's utilization by at
-    least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    ``threshold`` is the switch line for the 5-hour window and, while
+    ``weekly_threshold`` is unset, for every window: each of an account's
+    usage windows (5h, 7d, and any per-model window named by ``model``) is
+    judged against its own line, and the engine looks for a better account
+    once any of them is at or over it. 90 rather than 95 leaves margin for the
+    macOS ~30s Keychain pickup tail and for heavy subagent turns burning past
+    the mark before a swap lands. ``weekly_threshold`` gives the 7-day window
+    and the per-model windows (they all reset weekly) their own line: the
+    weekly window is the budget, so it is worth running closer to its ceiling
+    than the 5-hour window, which recycles in hours. A proactive candidate
+    must itself sit below each of its lines (never land somewhere that
+    re-triggers next tick) and beat the active account by at least
+    ``hysteresis_pct`` points of headroom measured against those lines, so two
+    accounts hovering at the line never ping-pong while a strictly better
+    account is always taken.
     """
 
     threshold: float = 90.0
+    # Switch line for the 7-day window and every per-model scoped window.
+    # None = ``threshold`` governs every window (the default, today's policy).
+    weekly_threshold: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -104,7 +114,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Switch when the 5h window (or any window, if no weekly line) reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 50.0, 99.9,
+            help="Switch line for the 7d and per-model windows (unset: threshold)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -116,7 +130,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must beat the active account by this many pct",
+            help="A target must beat the active account by this many pct of headroom",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
@@ -170,8 +184,17 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
 
-    def num(value, default: float, lo: float, hi: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+    def num(value, default: float | None, lo: float, hi: float) -> float | None:
+        # json.loads accepts NaN/Infinity literals and min/max pass NaN
+        # through unclamped, so a non-finite float is garbage too (a NaN line
+        # would silently never be crossed). Floats only: an int is always
+        # finite, and isfinite() would overflow on one too large for a float
+        # — the clamp below handles that without ever converting it.
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+        ):
             return default
         return float(min(max(value, lo), hi))
 
@@ -313,8 +336,15 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:
         noun = "an integer" if spec.kind == "int" else "a number"
+        # An optional number has no spelling for "unset" here; point at the
+        # command that clears it instead of leaving "none" as a dead end.
+        hint = (
+            f"; use 'cswap config unset {spec.dotted}' to clear it"
+            if spec.default is None
+            else ""
+        )
         raise ConfigError(
-            f"{spec.dotted} expects {noun}, got '{raw_value}'"
+            f"{spec.dotted} expects {noun}, got '{raw_value}'{hint}"
         ) from None
     if not spec.lo <= value <= spec.hi:
         raise ConfigError(
@@ -426,6 +456,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     overrides = {}
     for attr, field in (
         ("threshold", "threshold"),
+        ("weekly_threshold", "weekly_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
@@ -465,24 +496,9 @@ def atomic_write_json(path: Path, data: dict) -> None:
       ours to chmod. The written file still gets 0600, and ``mkstemp``
       creates it 0600 to begin with, so the secret is never exposed.
     """
-    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target = publish_target(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
-    try:
-        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
-        os.close(fd)
-        fd = -1
-        replace_with_retry(tmp_path, str(target))
-        if sys.platform != "win32":
-            os.chmod(str(target), 0o600)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(target, json.dumps(data, indent=2))

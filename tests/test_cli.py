@@ -1126,6 +1126,46 @@ class TestAutoCommand:
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
+    def test_weekly_threshold_flag_overrides_settings_json(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90.0, "weeklyThreshold": 95.0},
+        }))
+        self._run(["--once", "--weekly-threshold", "97"], temp_home)
+        engine = self.FakeEngine.instances[-1]
+        assert engine.settings.weekly_threshold == 97.0  # CLI wins
+        assert engine.settings.threshold == 90.0         # settings.json kept
+
+    def test_threshold_flag_keeps_the_configured_weekly_line(self, temp_home):
+        """Both lines come from the one settings object the engine holds —
+        `--threshold 85` must not drop a configured weekly line (the anchor
+        bug yunjeongiya hit on #355 came from two sources of truth)."""
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90.0, "weeklyThreshold": 97.0},
+        }))
+        self._run(["--once", "--threshold", "85"], temp_home)
+        engine = self.FakeEngine.instances[-1]
+        assert (engine.settings.threshold, engine.settings.weekly_threshold) == (85.0, 97.0)
+
+    def test_auto_help_mentions_the_weekly_line(self, temp_home, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "--weekly-threshold" in out
+        assert "switch at 90% used" in out  # the epilog's % renders literally
+
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True

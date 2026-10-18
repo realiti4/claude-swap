@@ -19,6 +19,10 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
 
 
+def _usage7(pct5: float, pct7: float) -> dict:
+    return {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}}
+
+
 def _plan(**overrides):
     kwargs = dict(
         prev_interval_s=None,
@@ -313,3 +317,119 @@ class TestBudgetInvariants:
         # (which absorbs any overshoot) is considered.
         polls = poll_policy.ESCALATION_MARGIN_PCT / poll_policy.MOVEMENT_DELTA_PCT
         assert polls < 27
+
+
+class TestPerWindowUrgency:
+    """Urgent mode is judged per window, rising only, against each window's
+    own line. The halving/decay rule stays on the raw max, so the default
+    cadence is unchanged outside the band."""
+
+    def _active(self, prev, new, **overrides):
+        kwargs = dict(
+            prev_interval_s=poll_policy.MIN_INTERVAL_S,
+            prev_usage=prev,
+            new_usage=new,
+            is_active=True,
+            threshold=90.0,
+        )
+        kwargs.update(overrides)
+        return _plan(**kwargs)[1]
+
+    def test_the_existing_urgent_plan_is_unchanged_with_weekly_unset(self):
+        assert self._active(_usage(78), _usage(82)) == poll_policy.URGENT_INTERVAL_S
+
+    def test_a_non_max_window_rising_in_its_band_goes_urgent(self):
+        # 5h 76 -> 78 under a flat 7d 85 max: the max rule read "no movement"
+        # and decayed while the 5h closed on the line.
+        assert (
+            self._active(_usage7(76, 85), _usage7(78, 85.2))
+            == poll_policy.URGENT_INTERVAL_S
+        )
+
+    def test_s10_the_5h_rising_under_a_flat_weekly_binding(self):
+        # 85/97: the raw max (7d 94) is flat, so no halving — but the 5h rose
+        # 4 points into its own band, which is the burn that matters.
+        assert (
+            self._active(
+                _usage7(80, 94), _usage7(84, 94), threshold=85.0, weekly_threshold=97.0
+            )
+            == poll_policy.URGENT_INTERVAL_S
+        )
+        # A candidate never goes urgent; its unmoved max decays as before.
+        _, interval = _plan(
+            prev_interval_s=300.0,
+            prev_usage=_usage7(80, 94),
+            new_usage=_usage7(84, 94),
+            threshold=85.0,
+            weekly_threshold=97.0,
+        )
+        assert interval == 450.0
+
+    def test_s5_the_weekly_window_burning_toward_its_own_line(self):
+        assert (
+            self._active(
+                _usage7(20, 90.5), _usage7(20, 96.9), threshold=85.0, weekly_threshold=97.0
+            )
+            == poll_policy.URGENT_INTERVAL_S
+        )
+        _, halved = _plan(
+            prev_interval_s=600.0,
+            prev_usage=_usage7(20, 90.5),
+            new_usage=_usage7(20, 96.9),
+            threshold=85.0,
+            weekly_threshold=97.0,
+        )
+        assert halved == 300.0
+
+    def test_a_rise_outside_its_own_band_is_not_urgent(self):
+        # 5h 60 -> 62 is 23 points from its line; the flat 7d max decays.
+        assert (
+            self._active(
+                _usage7(60, 94), _usage7(62, 94), threshold=85.0, weekly_threshold=97.0
+            )
+            == 270.0
+        )
+
+    def test_a_window_dropping_into_the_band_is_not_urgent(self):
+        # A drop is a rollover (or another machine's), not a burn: the max
+        # moved, so the interval halves, but no 60s polls on an account that
+        # just gained room.
+        assert self._active(_usage(90), _usage(80)) == poll_policy.MIN_INTERVAL_S
+        assert self._active(_usage7(90, 80), _usage7(60, 80)) == poll_policy.MIN_INTERVAL_S
+
+    def test_a_binding_flip_is_not_movement(self):
+        # 5h 84 -> 84.1 while the 7d sits at 95.9 under 85/97: by policy the
+        # binding window flips to the 5h, but the raw max is flat (decays)
+        # and the 5h rose 0.1 (no urgency). Reading the flip as 11.8 points
+        # of movement would halve the interval on nothing.
+        assert (
+            self._active(
+                _usage7(84, 95.9), _usage7(84.1, 95.9), threshold=85.0, weekly_threshold=97.0
+            )
+            == 270.0
+        )
+
+    def test_a_window_present_on_one_side_only_is_ignored(self):
+        prev = {"five_hour": {"pct": 10.0}}  # no weekly window reported yet
+        assert self._active(prev, _usage7(10, 85)) == poll_policy.MIN_INTERVAL_S
+
+    def test_a_scoped_window_rises_against_the_weekly_line(self):
+        def usage(fable):
+            return {
+                "five_hour": {"pct": 10.0},
+                "seven_day": {"pct": 10.0},
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        assert (
+            self._active(
+                usage(80.0), usage(83.0), threshold=85.0, weekly_threshold=97.0,
+                models=("Fable",),
+            )
+            == poll_policy.URGENT_INTERVAL_S
+        )
+        # Unconfigured, the scoped window is invisible to the planner too.
+        assert (
+            self._active(usage(80.0), usage(83.0), threshold=85.0, weekly_threshold=97.0)
+            == 270.0
+        )

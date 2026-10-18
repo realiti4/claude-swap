@@ -41,6 +41,7 @@ class TestConfigList:
         assert code == 0
         for key in (
             "autoswitch.threshold",
+            "autoswitch.weeklyThreshold",
             "autoswitch.intervalSeconds",
             "autoswitch.cooldownSeconds",
             "autoswitch.hysteresisPct",
@@ -51,7 +52,7 @@ class TestConfigList:
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 10
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,9 +79,13 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 10
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
+        # An unset weekly line reports null, not the threshold it falls back
+        # to: a JSON consumer must be able to see that the user never set one.
+        assert by_key["autoswitch.weeklyThreshold"]["value"] is None
+        assert by_key["autoswitch.weeklyThreshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
 
 
@@ -268,3 +273,58 @@ class TestConfigMisc:
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0
+
+
+class TestWeeklyThresholdConfig:
+    """`autoswitch.weeklyThreshold`: an optional float with the threshold's
+    bounds — loud on `set`, clearable with `unset`, null in JSON."""
+
+    def test_out_of_range_and_garbage_exit_1(self, temp_home, capsys):
+        code, _, err = _run(["set", "autoswitch.weeklyThreshold", "970"], capsys)
+        assert code == 1
+        assert "between 50 and 99.9" in err
+        code, _, err = _run(["set", "autoswitch.weeklyThreshold", "banana"], capsys)
+        assert code == 1
+        assert "expects a number" in err
+        # No number spells "unset"; the error names the command that does.
+        assert "cswap config unset autoswitch.weeklyThreshold" in err
+        assert not _settings_file(capsys).exists()
+
+    def test_set_get_unset_round_trip(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.weeklyThreshold", "97"], capsys)
+        assert code == 0
+        code, out, _ = _run(["get", "autoswitch.weeklyThreshold"], capsys)
+        assert code == 0 and "97" in out
+        code, out, _ = _run(["get", "--json", "autoswitch.weeklyThreshold"], capsys)
+        assert json.loads(out)["value"] == 97.0
+        code, out, _ = _run(["unset", "autoswitch.weeklyThreshold"], capsys)
+        assert code == 0
+        assert "(none)" in out
+        code, out, _ = _run(["get", "--json", "autoswitch.weeklyThreshold"], capsys)
+        assert json.loads(out)["value"] is None
+
+    def test_auto_picks_up_configured_weekly_threshold(self, temp_home, capsys):
+        """End-to-end: the configured weekly line reaches the engine's settings
+        object, alongside the threshold."""
+        _run(["set", "autoswitch.threshold", "85"], capsys)
+        _run(["set", "autoswitch.weeklyThreshold", "97"], capsys)
+
+        captured = {}
+
+        class FakeEngine:
+            def __init__(self, switcher, settings, on_event, *, dry_run=False,
+                         state_path=None, clock=None):
+                captured["settings"] = settings
+
+            def tick(self):
+                from claude_swap.autoswitch import TickOutcome
+
+                return TickOutcome.NO_ACTION
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert captured["settings"].threshold == 85.0
+        assert captured["settings"].weekly_threshold == 97.0

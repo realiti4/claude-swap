@@ -2955,3 +2955,22 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypatch):
+    """The manifest writer swallows OSError on purpose (best effort), but a
+    Ctrl-C must still propagate and must not strand the temp."""
+    from types import SimpleNamespace
+
+    from claude_swap.session import SessionManager
+
+    mgr = SessionManager.__new__(SessionManager)
+    mgr.switcher = SimpleNamespace(platform=object())  # anything but WINDOWS
+
+    def interrupt(fd):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("claude_swap.fsutil.os.fsync", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        mgr._write_manifest(tmp_path / ".cswap-shared.json", ["a"])
+    assert not list(tmp_path.glob("*.tmp"))

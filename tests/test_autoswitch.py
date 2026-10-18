@@ -2282,7 +2282,7 @@ class TestSessionThreshold:
         harness.engine.apply_threshold(72.0)
         assert harness.engine.settings.threshold == 72.0
         # Poll-cadence planning follows the new value immediately.
-        assert harness.switcher._poll_inputs_override == (72.0, ())
+        assert harness.switcher._poll_inputs_override == (72.0, None, ())
         # And the very next tick decides with it: 80% ≥ 72 switches, where
         # the constructed 90 would not have.
         outcome = harness.tick_with_usage({
@@ -2349,7 +2349,7 @@ class TestPctLabel:
         details = [
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         ]
-        assert details == ["50% < 99.9%"]
+        assert details == ["5h 50% < 99.9%"]
 
     def test_below_threshold_detail_never_shows_impossible_comparison(
         self, temp_home
@@ -2364,7 +2364,7 @@ class TestPctLabel:
         details = [
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         ]
-        assert details == ["99.85% < 99.9%"]
+        assert details == ["5h 99.85% < 99.9%"]
 
 
 class TestTokenIdentity:
@@ -4559,17 +4559,20 @@ class TestHorizonAxisDoesNotFlap:
         # so the ratio release cannot fire and only the trigger check can
         # answer. A peer far ahead would pass for the wrong reason.
         headroom = {"1": 15.0, "2": 10.0, "3": 1.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         for trigger in ("at-limit", "failover"):
             for active in (10.0, None):
                 assert harness.engine._no_return_account(
-                    trigger, state, headroom, active, ["1", "3"], harness.settings
+                    trigger, state, headroom, active, ["1", "3"], harness.settings,
+                    usage=usage,
                 ) is None, (
                     f"trigger={trigger} active_headroom={active} barred the "
                     "account we left; an escape must reach every candidate"
                 )
         # The control: the SAME state bars on a proactive tick.
         assert harness.engine._no_return_account(
-            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
+            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings,
+            usage=usage,
         ) == "1", "premise: these inputs are barred when the trigger allows it"
 
     @pytest.mark.parametrize(
@@ -4831,8 +4834,10 @@ class TestHorizonAxisDoesNotFlap:
         """
         state = {"lastSwitchFrom": 1}
         headroom = {"2": 10.0, "3": 40.0}       # slot 1 unreadable — absent
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         assert harness.engine._no_return_account(
-            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
+            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings,
+            usage=usage,
         ) == "1", (
             "an unreadable barred account must still bar — unknown headroom "
             "is not evidence it beats us"
@@ -5245,12 +5250,15 @@ class TestHorizonAxisDoesNotFlap:
         """
         state = {"lastSwitchFrom": "2", "leftHeadroom": 40.0, "leftRecoveryAt": None}
         headroom = {"2": 40.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         for trigger in ("proactive", "consume-first"):
             readable = harness.engine._no_return_account(
-                trigger, state, headroom, 2.0, recovered=True, settings=harness.settings
+                trigger, state, headroom, 2.0, recovered=True, settings=harness.settings,
+                usage=usage,
             )
             unreadable = harness.engine._no_return_account(
-                trigger, state, headroom, None, recovered=True, settings=harness.settings
+                trigger, state, headroom, None, recovered=True, settings=harness.settings,
+                usage=usage,
             )
             assert readable is None, f"premise: {trigger} releases when readable"
             assert unreadable is None, (
@@ -5330,9 +5338,10 @@ class TestHorizonAxisDoesNotFlap:
         """
         state = {"lastSwitchFrom": "2"}
         headroom = {"2": 5.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         no_return = harness.engine._no_return_account(
             "proactive", state, headroom, None, recovered=True,
-            settings=harness.settings,
+            settings=harness.settings, usage=usage,
         )
         assert no_return == "2", (
             "the barred peer at 5 pts is below the landing floor (10); an "
@@ -6532,10 +6541,12 @@ class TestTheReleasePredicateOneStateShapePerTest:
         """
         state = {"lastSwitchFrom": "2"}
         headroom = {"1": 0.0, "2": 100.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         for active in (0.0, None):
             for recovered in (True, False):
                 assert harness.engine._no_return_account(
-                    "at-limit", state, headroom, active, recovered, harness.settings
+                    "at-limit", state, headroom, active, recovered, harness.settings,
+                    usage=usage,
                 ) is None, (
                     "at-limit must escape the bar regardless of "
                     "active_headroom or the recovered predicate's answer"
@@ -6959,3 +6970,374 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestWeeklyThreshold:
+    """`autoswitch.weeklyThreshold`: a separate switch line for the 7d and
+    per-model windows, applied where the engine compares (lines.py) while
+    every logged number stays raw.
+
+    Fleet shapes are yunjeongiya's on #355: two accounts, threshold 85 —
+    account 3 at 5h 5 / 7d 93 was evacuated three ticks running (93 >= 85)
+    onto account 2 at 5h 95, which then hit its limit.
+
+    Not covered here, by design: with EVERY account over its lines the
+    all-above escape still ranks by binding reset (#342 / PR #473); and an
+    account over BOTH its lines reports the reset of the window with the
+    least policy headroom although it stays over on the other (T85/W97: 5h
+    99 resetting in an hour beside 7d 98 resetting in days) — "landable
+    again" is that escape fix's axis, not this change's.
+    """
+
+    _EMAILS = {1: "a@example.com", 2: "b@example.com", 3: "c@example.com"}
+
+    def _harness(self, temp_home, accounts=(1, 2), **settings_kwargs):
+        kwargs = dict(threshold=85.0, weekly_threshold=97.0, hysteresis_pct=10.0)
+        kwargs.update(settings_kwargs)
+        h = EngineHarness(temp_home, **kwargs)
+        for num in accounts:
+            h.seed(num, self._EMAILS[num])
+        h.make_live(self._EMAILS[accounts[0]], accounts[0])
+        return h
+
+    @staticmethod
+    def _reasons(h):
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    @staticmethod
+    def _details(h):
+        return [e.detail for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_s1_a_weekly_window_under_its_own_line_holds(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(5, 93), "2": _usage7(95, 47)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        # The detail quotes the comparison made: that window, its own line.
+        assert self._details(h) == ["7d 93% < 97%"]
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["windowsPct"]["1"] == {"5h": 5.0, "7d": 93.0}  # raw
+        assert payload["headroomPct"]["1"] == 7.0                      # raw
+        assert payload["threshold"] == 85.0
+        assert payload["weeklyThreshold"] == 97.0
+        assert "Account-1 (a@example.com): 7d 93% used (switch at 97%)" in poll.human()
+        assert "#2: 5h 95% · 7d 47%" in poll.human()                   # raw
+
+    def test_poll_event_omits_the_weekly_line_when_unset(self, temp_home):
+        h = self._harness(temp_home, weekly_threshold=None)
+        h.tick_with_usage({"1": _usage7(42, 10), "2": _usage7(5, 5)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "weeklyThreshold" not in poll.to_json()
+        assert "5h 42% used (switch at 85%)" in poll.human()
+
+    def test_poll_event_human_names_the_binding_window_and_its_line(self):
+        active = {"number": 1, "email": "a@example.com"}
+        with_windows = PollEvent(
+            active=active, headroom={"1": 7.0}, threshold=85.0,
+            windows={"1": {"5h": 5.0, "7d": 93.0}}, weekly_threshold=97.0,
+        )
+        assert "7d 93% used (switch at 97%)" in with_windows.human()
+        # No window data (older stores, sentinels): the account-wide form.
+        bare = PollEvent(active=active, headroom={"1": 7.0}, threshold=85.0,
+                         weekly_threshold=97.0)
+        assert "93% used (switch at 85%)" in bare.human()
+        default = PollEvent(
+            active=active, headroom={"1": 58.0}, threshold=90.0,
+            windows={"1": {"5h": 42.0, "7d": 10.0}},
+        )
+        assert "5h 42% used (switch at 90%)" in default.human()
+
+    def test_s2_a_weekly_bound_candidate_is_taken_over_a_5h_bound_active(
+        self, temp_home
+    ):
+        # Raw headroom 7 vs 5 fails the margin and parks on the 95% account
+        # until at-limit; policy headroom 18.5 vs 5 moves.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(95, 47), "2": _usage7(5, 93)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_s2_control_the_same_fleet_parks_without_a_weekly_line(self, temp_home):
+        h = self._harness(temp_home, weekly_threshold=None)
+        outcome = h.tick_with_usage({"1": _usage7(95, 47), "2": _usage7(5, 93)})
+        assert outcome is TickOutcome.BLOCKED
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+
+    def test_an_active_over_its_weekly_line_still_clears_hysteresis(self, temp_home):
+        # A two-anchor rescale left 7d 98 at 14 policy points against a
+        # 5h 80 candidate's 20 (5.9 < 10: parked until at-limit, where
+        # today's engine switches). The third anchor sends the over-line band
+        # to 0 at exhaustion: 10 vs 20.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(5, 98), "2": _usage7(80, 47)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("pct5", [86.7, 86.8])
+    def test_the_binding_flip_is_continuous(self, temp_home, pct5):
+        # Both 5.0 policy points: choosing the window by one score and
+        # ranking by another made the second read 13.2 and refuse.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(pct5, 99), "2": _usage7(80, 10)})
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_the_exact_boundary_at_the_weekly_line(self, temp_home):
+        # T92/W86/hyst 10: the active sits exactly AT its weekly line (8.0
+        # policy points) and the candidate exactly `hysteresis` better (18.0).
+        h = self._harness(temp_home, threshold=92.0, weekly_threshold=86.0)
+        outcome = h.tick_with_usage({"1": _usage7(0, 86), "2": _usage7(82, 0)})
+        assert outcome is TickOutcome.SWITCHED
+
+    @pytest.mark.parametrize(
+        "pct7,expected", [(96.9, TickOutcome.NO_ACTION), (97.0, TickOutcome.SWITCHED)]
+    )
+    def test_s3_the_weekly_window_binds_exactly_at_its_line(
+        self, temp_home, pct7, expected
+    ):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({"1": _usage7(5, pct7), "2": _usage7(5, 5)}) is expected
+
+    @pytest.mark.parametrize(
+        "pct7,expected", [(97.0, TickOutcome.BLOCKED), (96.9, TickOutcome.SWITCHED)]
+    )
+    def test_s3_a_candidate_at_its_weekly_line_is_not_landable(
+        self, temp_home, pct7, expected
+    ):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({"1": _usage7(95, 10), "2": _usage7(5, pct7)}) is expected
+
+    @pytest.mark.parametrize("base", [90.0, 95.0])
+    @pytest.mark.parametrize("window", ["5h", "7d"])
+    @pytest.mark.parametrize(
+        "offset,expected",
+        [(-0.1, TickOutcome.NO_ACTION), (0.0, TickOutcome.SWITCHED)],
+    )
+    def test_s4_with_weekly_unset_the_trigger_flips_where_the_scalar_did(
+        self, temp_home, base, window, offset, expected
+    ):
+        """The backward-compatibility control (PR #329's shape): with no
+        weekly line every window's line IS the threshold, on the boundary,
+        on both windows, and on a non-default threshold."""
+        h = self._harness(temp_home, threshold=base, weekly_threshold=None)
+        pct = base + offset
+        active = _usage7(pct, 0) if window == "5h" else _usage7(0, pct)
+        assert h.tick_with_usage({"1": active, "2": _usage7(0, 0)}) is expected
+
+    def _fetch_sets(self, h, active_usage, **lines):
+        entries = {
+            n: _entry_for(active_usage if n == "1" else _usage7(10, 10), h.clock.now)
+            for n in ("1", "2", "3")
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ) as collect:
+            h.engine._collect_scheduled_usage("1", **lines)
+        return [c.kwargs.get("fetch") for c in collect.call_args_list]
+
+    def test_s5_escalation_is_measured_against_each_windows_own_line(self, temp_home):
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        full = {"1", "2", "3"}
+        lines = dict(threshold=85.0, weekly_threshold=97.0)
+        assert full in self._fetch_sets(h, _usage7(20, 83), **lines)      # 83 >= 97 - 15
+        assert full not in self._fetch_sets(h, _usage7(20, 81), **lines)  # 81 < 82
+        assert full in self._fetch_sets(h, _usage7(20, 81), threshold=85.0)  # one line: 81 >= 70
+        # No threshold passed: BOTH lines come from the engine's own settings.
+        assert full not in self._fetch_sets(h, _usage7(20, 81))
+
+    def test_the_phase2_refetch_reads_fresh_windows(self, temp_home):
+        # consume-first decides on the stored snapshot, then re-decides on a
+        # full refetch: a candidate that crossed its weekly line since the
+        # snapshot must not be landed on.
+        h = self._harness(temp_home, accounts=(1, 2, 3), strategy="consume-first")
+        stored = {
+            "1": _usage7(5, 50, _R_LATER),
+            "2": _usage7(5, 90, _R_SOON),
+            "3": _usage7(5, 50, _R_LATEST),
+        }
+        fresh = {**stored, "2": _usage7(5, 97, _R_SOON)}
+        fetch_sets: list[set] = []
+
+        def collect(fetch=None, **_kwargs):
+            requested = set(fetch or ())
+            fetch_sets.append(requested)
+            view = fresh if requested == {"1", "2", "3"} else stored
+            return {num: _entry_for(v, h.clock.now) for num, v in view.items()}
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._reasons(h) == ["already-consuming-soonest"]
+        assert fetch_sets.count({"1", "2", "3"}) == 1  # phase 2 fired once
+
+    def test_s6_exhaustion_is_physical(self, temp_home):
+        h = self._harness(temp_home)
+        reset = _iso_at(h.clock.now + 3600)
+        outcome = h.tick_with_usage({"1": _usage7(5, 100, reset), "2": _usage7(5, 5)})
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_s6_an_exhausted_weekly_window_is_never_a_target(self, temp_home):
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        far = _iso_at(h.clock.now + 5 * 86400)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10), "2": _usage7(5, 100, far), "3": _usage7(5, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_s6_the_all_exhausted_sleep_is_unchanged(self, temp_home):
+        h = self._harness(temp_home)
+        r1, r2 = h.clock.now + 7200, h.clock.now + 3600
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 100, _iso_at(r1)), "2": _usage7(5, 100, _iso_at(r2)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._sleep_until_ts == pytest.approx(r2 + poll_policy.RESET_SLACK_S)
+
+    def test_s7_the_lines_come_from_the_settings_object_not_the_file(self, temp_home):
+        # The #355 anchor bug class: an engine running `--threshold 85` while
+        # the file says 90, with the file's weekly line set to something that
+        # would evacuate 7d 93 if anything read it.
+        from claude_swap.settings import set_setting
+
+        h = self._harness(temp_home)
+        set_setting(h.switcher.backup_dir, "autoswitch.threshold", "90")
+        set_setting(h.switcher.backup_dir, "autoswitch.weeklyThreshold", "50")
+        outcome = h.tick_with_usage({"1": _usage7(5, 93), "2": _usage7(95, 47)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._details(h) == ["7d 93% < 97%"]
+        assert h.switcher._poll_inputs_override == (85.0, 97.0, ())
+
+    @pytest.mark.parametrize(
+        "active,expected,detail",
+        [
+            (_usage7(10, 85), TickOutcome.SWITCHED, None),
+            (_usage7(85, 10), TickOutcome.NO_ACTION, "5h 85% < 90%"),
+        ],
+    )
+    def test_a_weekly_line_below_the_5h_line_is_honoured(
+        self, temp_home, active, expected, detail
+    ):
+        # "Keep a weekly reserve": T90/W80 is a legitimate policy.
+        h = self._harness(temp_home, threshold=90.0, weekly_threshold=80.0)
+        assert h.tick_with_usage({"1": active, "2": _usage7(5, 5)}) is expected
+        if detail is not None:
+            assert self._details(h) == [detail]
+
+    @pytest.mark.parametrize(
+        "fable,weekly,expected,detail",
+        [
+            (90.0, 97.0, TickOutcome.NO_ACTION, "Fable 90% < 97%"),
+            (97.0, 97.0, TickOutcome.SWITCHED, None),
+            (90.0, None, TickOutcome.SWITCHED, None),
+        ],
+    )
+    def test_a_scoped_window_uses_the_weekly_line(
+        self, temp_home, fable, weekly, expected, detail
+    ):
+        h = self._harness(temp_home, weekly_threshold=weekly, model="Fable")
+        outcome = h.tick_with_usage({"1": _model_usage(5, fable), "2": _model_usage(5, 5)})
+        assert outcome is expected
+        if detail is not None:
+            assert self._details(h) == [detail]
+
+    @pytest.mark.parametrize(
+        "pct7,expected", [(93.0, TickOutcome.BLOCKED), (90.0, TickOutcome.SWITCHED)]
+    )
+    def test_hysteresis_is_measured_in_policy_headroom(self, temp_home, pct7, expected):
+        # Active 5h 90 -> 10 policy points. 7d 93 -> 18.5 (8.5 short of the
+        # margin); 7d 90 -> 21.1. Raw headroom (10 vs 7 / 10) refuses both.
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({"1": _usage7(90, 10), "2": _usage7(5, pct7)}) is expected
+
+    def test_ranking_sorts_by_policy_headroom(self, temp_home):
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10), "2": _usage7(75, 10), "3": _usage7(5, 80),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        # 29.9 policy points beat 25; raw headroom (20 < 25) would pick 2.
+        assert h.active_number() == 3
+
+    def test_the_census_reads_each_windows_own_line(self, temp_home):
+        # A single-line census would call 7d 93 "over" too, flip to the
+        # all-above escape and take 3 by its sooner reset (the #342 shape).
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        outcome = h.tick_with_usage({
+            "1": _usage7(92, 10),
+            "2": _usage7(5, 93, _R_LATEST),
+            "3": _usage7(5, 98, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_consume_first_hold_names_the_window(self, temp_home):
+        h = self._harness(temp_home, accounts=(1,), strategy="consume-first")
+        assert h.tick_with_usage({"1": _usage7(5, 93)}) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert self._details(h) == ["7d 93% < 97%"]
+
+    def test_the_no_return_release_reads_the_barred_accounts_own_lines(self, temp_home):
+        h = self._harness(temp_home)
+        state = {"lastSwitchFrom": "2"}
+        usage = {"2": _usage7(5, 93)}
+        released = h.engine._no_return_account(
+            "proactive", state, {"2": 7.0}, None, True, h.settings, None, usage=usage
+        )
+        assert released is None
+        held = h.engine._no_return_account(
+            "proactive", state, {"2": 7.0}, None, True,
+            AutoSwitchSettings(threshold=85.0), None, usage=usage,
+        )
+        assert held == "2"
+
+    def test_the_failover_landing_leg_reads_the_peers_own_lines(self):
+        class Fake(AutoSwitchEngine):
+            def __init__(self):
+                self._models = ()   # no self.settings: the parameter must do
+
+        e = Fake()
+        state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": None,
+            "leftRecoveryAt": None,
+            "leftTrigger": "failover",
+        }
+        usage = {"1": _usage7(5, 93), "2": _usage7(95, 10)}
+        headroom = {"1": 7.0}
+        now = 1_000_000.0
+        assert e._left_account_recovered(
+            state, usage, headroom, 5.0,
+            AutoSwitchSettings(threshold=85.0, weekly_threshold=97.0), now, "2",
+        ) is True
+        assert e._left_account_recovered(
+            state, usage, headroom, 5.0, AutoSwitchSettings(threshold=85.0), now, "2",
+        ) is False
+
+    def test_binding_recovery_reads_the_window_with_the_least_policy_headroom(self):
+        from claude_swap.autoswitch import _binding_recovery_ts
+
+        now = 1_000_000.0
+        usage = {
+            "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 3600)},
+            "seven_day": {"pct": 93.0, "resets_at": _iso_at(now + 100 * 3600)},
+        }
+        assert _binding_recovery_ts(
+            usage, (), now, threshold=85.0, weekly_threshold=97.0
+        ) == pytest.approx(now + 3600)
+        # Today's max-pct answer without a weekly line.
+        assert _binding_recovery_ts(usage, (), now) == pytest.approx(now + 100 * 3600)
+        with pytest.raises(ValueError):
+            _binding_recovery_ts(usage, (), now, weekly_threshold=97.0)
+
+    def test_apply_threshold_keeps_the_weekly_pin(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine.apply_threshold(72.0)
+        assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
+        assert h.engine.settings.weekly_threshold == 97.0

@@ -741,6 +741,25 @@ class TestFilePermissions:
         mode = os.stat(out).st_mode & 0o777
         assert mode == 0o600
 
+    def test_export_onto_a_symlink_replaces_the_link_not_its_target(
+        self, temp_home: Path
+    ):
+        """The destination is user-typed and may sit in a shared directory:
+        a planted link must not redirect the export (refresh tokens) onto
+        another file. The link is replaced; its old target is untouched."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        decoy = temp_home / "decoy.txt"
+        decoy.write_text("decoy", encoding="utf-8")
+        out = temp_home / "x.cswap"
+        out.symlink_to(decoy)
+
+        export_accounts(s, str(out))
+
+        assert not out.is_symlink()
+        assert '"accounts"' in out.read_text(encoding="utf-8")
+        assert decoy.read_text(encoding="utf-8") == "decoy"
+
     def test_export_temp_file_never_created_world_readable(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
     ):

@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -33,7 +32,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -746,45 +745,13 @@ class CredentialStore:
         data = data or {}
         mutator(data)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        try:
-            os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            replace_with_retry(tmp_path, str(path))
-            if sys.platform != "win32":
-                os.chmod(str(path), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(path, json.dumps(data, indent=2))
 
     def _write_active_credentials_file(self, credentials: str) -> None:
         """Atomically write Claude Code's plaintext active-credentials file."""
         cred_dir = get_claude_config_home()
         cred_dir.mkdir(parents=True, exist_ok=True)
-        cred_file = cred_dir / ".credentials.json"
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
-        try:
-            os.write(fd, credentials.encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            replace_with_retry(tmp_path, str(cred_file))
-            if sys.platform != "win32":
-                os.chmod(str(cred_file), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(cred_dir / ".credentials.json", credentials)
 
     def _delete_active_keychain_entry(self) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
@@ -1132,25 +1099,8 @@ class CredentialStore:
     def _atomic_b64_write(self, target: Path, credentials: str) -> None:
         """Atomically write a base64-encoded credential file (0600)."""
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
-        enc_file = target
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(self._host.credentials_dir), suffix=".tmp")
-        try:
-            os.write(fd, encoded.encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            replace_with_retry(tmp_path, str(enc_file))
-            if sys.platform != "win32":
-                os.chmod(str(enc_file), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(target, encoded)
 
     def _reconcile_enc_after_keychain_write(
         self, account_num: str, email: str, credentials: str

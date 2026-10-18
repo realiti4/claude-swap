@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import stat
+import os
 import sys
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from claude_swap.settings import (
 def _args(**kwargs) -> argparse.Namespace:
     defaults = {
         "threshold": None,
+        "weekly_threshold": None,
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
@@ -303,6 +305,10 @@ class TestAtomicWriteThroughSymlink:
         assert link.is_symlink(), "the dotfiles link must survive the write"
         assert json.loads(tracked.read_text()) == {"written": "through"}
 
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
     def test_dangling_link_writes_where_it_points(self, tmp_path):
         target = tmp_path / "gone" / "settings.json"
         link = tmp_path / "settings.json"
@@ -324,7 +330,6 @@ class TestAtomicWriteThroughSymlink:
         another mount — the write fails outright. Assert the placement
         directly; staging two filesystems in a unit test is not portable."""
         import tempfile
-        from claude_swap import settings as S
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
@@ -332,7 +337,7 @@ class TestAtomicWriteThroughSymlink:
         seen = []
         real_mkstemp = tempfile.mkstemp
         monkeypatch.setattr(
-            S.tempfile, "mkstemp",
+            tempfile, "mkstemp",
             lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
         )
 
@@ -355,3 +360,80 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestWeeklyThreshold:
+    """`weekly_threshold`: optional, same bounds as `threshold`, forgiving on
+    load and loud on `set` — the registry's first optional float."""
+
+    def test_defaults_to_none(self, tmp_path: Path):
+        assert AutoSwitchSettings().weekly_threshold is None
+        assert load_settings(tmp_path).weekly_threshold is None
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [("97", 97.0), ("970", 99.9), ("10", 50.0), ('"banana"', None), ("null", None)],
+    )
+    def test_load_clamps_numbers_and_drops_garbage(self, tmp_path: Path, raw, expected):
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"weeklyThreshold": %s}}' % raw
+        )
+        assert load_settings(tmp_path).weekly_threshold == expected
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_non_finite_numbers_fall_back_to_defaults(self, tmp_path: Path, literal):
+        # json.loads accepts these literals and min/max pass NaN through, so
+        # the clamp must treat non-finite as garbage for both lines — a NaN
+        # line would never be crossed.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s, "weeklyThreshold": %s}}'
+            % (literal, literal)
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold == AutoSwitchSettings().threshold
+        assert loaded.weekly_threshold is None
+
+    def test_an_integer_too_large_for_a_float_still_clamps(self, tmp_path: Path):
+        # Python ints are unbounded; isfinite() on one past float range raises
+        # OverflowError. The clamp must keep answering 99.9 for both lines.
+        huge = "1" + "0" * 400
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s, "weeklyThreshold": %s}}' % (huge, huge)
+        )
+        loaded = load_settings(tmp_path)
+        assert (loaded.threshold, loaded.weekly_threshold) == (99.9, 99.9)
+
+    def test_set_validates_loudly_and_unset_clears(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between 50 and 99.9"):
+            set_setting(tmp_path, "autoswitch.weeklyThreshold", "970")
+        with pytest.raises(ConfigError, match="expects a number.*config unset"):
+            set_setting(tmp_path, "autoswitch.weeklyThreshold", "banana")
+        assert not settings_path(tmp_path).exists()
+        assert set_setting(tmp_path, "autoswitch.weeklyThreshold", "97") == 97.0
+        assert load_settings(tmp_path).weekly_threshold == 97.0
+        assert unset_setting(tmp_path, "autoswitch.weeklyThreshold") is True
+        assert load_settings(tmp_path).weekly_threshold is None
+
+    def test_a_weekly_line_below_the_5h_line_is_accepted(self, tmp_path: Path):
+        # "Keep a weekly reserve" is a legitimate policy; no cross-field rule.
+        set_setting(tmp_path, "autoswitch.threshold", "90")
+        assert set_setting(tmp_path, "autoswitch.weeklyThreshold", "80") == 80.0
+        loaded = load_settings(tmp_path)
+        assert (loaded.threshold, loaded.weekly_threshold) == (90.0, 80.0)
+
+    def test_cli_override_and_anchor(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(weekly_threshold=95.0), _args(weekly_threshold=97.0)
+        )
+        assert merged.weekly_threshold == 97.0
+        # --threshold alone leaves a configured weekly line in force (the
+        # #355 anchor bug class: both lines come from the one settings object).
+        merged = merged_with_cli(
+            AutoSwitchSettings(threshold=90.0, weekly_threshold=97.0),
+            _args(threshold=85.0),
+        )
+        assert (merged.threshold, merged.weekly_threshold) == (85.0, 97.0)
+
+    def test_cli_value_is_clamped(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
+        assert merged.weekly_threshold == 99.9

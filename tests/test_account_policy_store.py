@@ -123,7 +123,9 @@ class TestPolicyFromData(PolicyStoreBase):
         s = self._fleet(temp_home)
         data = s._get_sequence_data() or {}
         data["accounts"]["1"]["threshold"] = garbage
-        s._write_json(s.sequence_file, data)
+        # Written as a hand edit would be: `_write_json` refuses NaN/Infinity
+        # (`allow_nan=False`), but a hand-edited file can still carry them.
+        s.sequence_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
         reloaded = s._get_sequence_data() or {}
         assert s._policy_from_data(reloaded, "1") == AccountPolicy(threshold=None)
