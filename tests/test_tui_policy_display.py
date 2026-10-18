@@ -18,13 +18,21 @@ input path.
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pytest
 
 from claude_swap.models import AccountPolicy
 from claude_swap.tui.widgets import account_card_text, mini_account_text
 
-from tests.test_tui import make_account
+from tests.test_tui import (
+    FakeSwitcher,
+    fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
+    make_account,
+    make_app,
+    make_entry,
+    settle,
+)
 
 # Goldens captured from the unmodified engine at
 # 4f6c6ac6f303bd910d51bf5bf2fb36d553f4f37f60a50e438291d4feb5cadfbe, rendered
@@ -138,3 +146,75 @@ class TestUnpolicedAccountsRenderExactlyAsBefore:
         assert lines[2].startswith("    7d ")
         for token in ("th ",):
             assert token not in "\n".join(lines[1:])
+
+
+@pytest.mark.asyncio
+class TestNextBestRanksEachAccountOnItsOwnLine:
+    """The auto screen's "Next best" list ranks with the engine's own key:
+    room under each account's own line, measured on the global threshold.
+
+    Global 90, no weekly line. Account 2 is at 5h 50% under a 60% line of its
+    own: 10 + 90 * 10 / 60 = 25 points. Account 3 is at 5h 55% under the
+    global line: 45 points. Raw headroom (50 vs 45) would put account 2 first.
+    """
+
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    def _fleet(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90},
+        }))
+        return FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(2, entry=make_entry(50.0, 10.0)), threshold=60.0
+                ),
+                make_account(3, entry=make_entry(55.0, 10.0)),
+            ],
+            tmp_path,
+        )
+
+    @staticmethod
+    def _row(plain: str, email: str) -> str:
+        return next(line for line in plain.splitlines() if email in line)
+
+    async def test_room_under_the_accounts_own_line_orders_the_list(
+        self, tmp_path, fake_engine
+    ):
+        app = make_app(self._fleet(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "(line" not in self._row(plain, "user3@example.com")
+
+    async def test_a_session_adjust_moves_only_the_global_line(
+        self, tmp_path, fake_engine
+    ):
+        # At 93 account 2 scores 7 + 93 * 10 / 60 = 22.5 and account 3 45:
+        # the order holds, and account 2 is still judged against its own 60%.
+        app = make_app(self._fleet(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            await pilot.press("t", "right", "right", "right")
+            await pilot.pause()
+            assert app.screen._settings.threshold == 93.0
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")

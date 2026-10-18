@@ -309,9 +309,11 @@ class AutoScreen(Screen):
         """Switch targets ranked by headroom against their own switch lines
         (best first) — the engine's own ordering."""
         # Same window set AND the same lines as the engine: autoswitch.model,
-        # the threshold (the session value — `_settings` is what
-        # `_set_threshold` replaces) and the weekly line, so the displayed
-        # ranking can never disagree with the account it picks.
+        # each account's own line (its policy threshold, else the session
+        # threshold — `_settings` is what `_set_threshold` replaces), the
+        # weekly line, and the session threshold as the ruler every account is
+        # scored on, so the displayed ranking can never disagree with the
+        # account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
@@ -322,8 +324,14 @@ class AutoScreen(Screen):
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
+            line = (
+                acc.policy.threshold if acc.policy.threshold is not None else threshold
+            )
             binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models), threshold, weekly
+                oauth.relevant_windows(acc.usage.last_good, models),
+                line,
+                weekly,
+                scale=threshold,
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
@@ -338,12 +346,13 @@ class AutoScreen(Screen):
                 ranked.append((999.0, acc.number))
             else:
                 # The raw pct of the window that binds, and — only once the
-                # lines differ — the line it is judged against.
+                # lines differ, globally or for this account — the line it is
+                # judged against.
                 entry.append(
                     f"  {binding.label} {binding.pct:3.0f}% used",
                     style=palette.severity(binding.pct),
                 )
-                if weekly is not None:
+                if weekly is not None or acc.policy.threshold is not None:
                     entry.append(
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
