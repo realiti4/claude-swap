@@ -49,6 +49,7 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.notify",
             "ui.theme",
         ):
             assert key in out
