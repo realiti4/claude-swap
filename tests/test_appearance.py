@@ -297,6 +297,10 @@ class TestCliShouldProbe:
         # --json must stay machine-readable; the OSC query can't precede it.
         assert appearance.cli_should_probe(["list", "--json"], colors_enabled=True) is False
 
+    def test_prometheus_flag_never_probes(self):
+        # --prometheus must stay machine-readable too; no OSC query before the page.
+        assert appearance.cli_should_probe(["list", "--prometheus"], colors_enabled=True) is False
+
     def test_colors_disabled_never_probes(self):
         assert appearance.cli_should_probe(["list"], colors_enabled=False) is False
 

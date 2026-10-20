@@ -173,14 +173,14 @@ def cli_should_probe(argv: list[str], *, colors_enabled: bool) -> bool:
 
     False when colors are off (nothing will render the theme anyway), when
     the first token is ``run`` (execs a child that takes over the terminal),
-    or when ``--json`` is present (the OSC query must never precede
-    machine-readable output on stdout).
+    or when ``--json`` or ``--prometheus`` is present (the OSC query must never
+    precede machine-readable output on stdout).
     """
     if not colors_enabled:
         return False
     if argv and argv[0] == "run":
         return False
-    if "--json" in argv:
+    if "--json" in argv or "--prometheus" in argv:
         return False
     return True
 
