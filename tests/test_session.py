@@ -150,7 +150,7 @@ def auth_status_tracks_seed(monkeypatch):
             payload = {"loggedIn": False, "authMethod": "none"}
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
-    monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(session_mod, "run_and_reap", fake_run)
     return probe_envs
 
 
@@ -451,7 +451,7 @@ class TestBootstrap:
                 stderr="",
             )
 
-        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        monkeypatch.setattr(session_mod, "run_and_reap", always_invalid)
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
@@ -528,7 +528,7 @@ class TestBootstrap:
         def raise_timeout(*a, **k):
             raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
 
-        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+        monkeypatch.setattr(session_mod, "run_and_reap", raise_timeout)
 
         manager.setup_session("2", share=False)
 
@@ -587,8 +587,8 @@ class TestIsSessionValid:
     def check(self, manager, tmp_path, monkeypatch, payload, rc=0) -> bool:
         tmp_path.mkdir(exist_ok=True)
         monkeypatch.setattr(
-            session_mod.subprocess,
-            "run",
+            session_mod,
+            "run_and_reap",
             lambda *a, **k: SimpleNamespace(
                 returncode=rc, stdout=json.dumps(payload), stderr=""
             ),
@@ -635,7 +635,7 @@ class TestIsSessionValid:
         def raise_timeout(*a, **k):
             raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
 
-        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+        monkeypatch.setattr(session_mod, "run_and_reap", raise_timeout)
 
     def test_probe_timeout_leans_valid(self, manager, tmp_path, monkeypatch):
         """A probe timeout is a busy machine, not a bad login.
@@ -757,7 +757,7 @@ class TestIsSessionValid:
         def raise_oserror(*a, **k):
             raise OSError("spawn failed")
 
-        monkeypatch.setattr(session_mod.subprocess, "run", raise_oserror)
+        monkeypatch.setattr(session_mod, "run_and_reap", raise_oserror)
         assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
     def test_invokes_pathext_resolved_launcher(
@@ -779,7 +779,7 @@ class TestIsSessionValid:
                 returncode=0, stdout=json.dumps(valid_payload), stderr=""
             )
 
-        monkeypatch.setattr(session_mod.subprocess, "run", capture_run)
+        monkeypatch.setattr(session_mod, "run_and_reap", capture_run)
         assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
         assert seen_argv["argv"][0] == resolved
 
@@ -2834,7 +2834,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         def unresolvable(*args, **kwargs):
             raise FileNotFoundError(2, "No such file or directory", "claude")
 
-        monkeypatch.setattr(session_mod.subprocess, "run", unresolvable)
+        monkeypatch.setattr(session_mod, "run_and_reap", unresolvable)
 
         with pytest.raises(SessionError, match="could not be verified"):
             manager.setup_session(ACCOUNT_NUM, share=False)
@@ -2859,7 +2859,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
                 returncode=0, stdout=json.dumps({"loggedIn": False}), stderr=""
             )
 
-        monkeypatch.setattr(session_mod.subprocess, "run", not_logged_in)
+        monkeypatch.setattr(session_mod, "run_and_reap", not_logged_in)
 
         with pytest.raises(SessionError, match="failed validation"):
             manager.setup_session(ACCOUNT_NUM, share=False)
