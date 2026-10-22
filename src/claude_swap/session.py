@@ -25,10 +25,13 @@ A manifest records what cswap created so removal never touches user data.
 History sharing (``--share-history``, opt-in): additionally links
 ``projects/`` (conversation transcripts — what ``claude --resume`` lists) and
 ``history.jsonl`` (prompt history) from ``~/.claude``, so all accounts see one
-unified conversation history. POSIX-only: Windows shares by re-synced copy,
-which would fork history rather than share it. If the profile already
-accumulated its own history, it is merged into ``~/.claude`` first so nothing
-disappears from ``--resume``.
+unified conversation history. Never by copy, which would fork history rather
+than share it: symlinks on macOS/Linux; on Windows, where symlinks need
+Developer Mode or admin, ``projects/`` is a directory junction and
+``history.jsonl`` a symlink when the OS allows one, else a hard link (see
+``_link_history_windows``). If the profile already accumulated its own
+history, it is merged into ``~/.claude`` first so nothing disappears from
+``--resume``.
 
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
@@ -83,7 +86,8 @@ SHARED_ITEMS = (
 )
 
 # Conversation-history items linked additionally under --share-history.
-# POSIX symlinks only: Windows copy-mode would fork history, not share it.
+# Always true links (never copy-mode, which would fork history): symlinks on
+# POSIX, a junction / symlink-or-hard-link on Windows.
 HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
@@ -526,6 +530,79 @@ def profile_is_quiescent(session_dir: Path) -> bool:
     return not sessions and unreadable == 0
 
 
+# Windows error codes for the history-link fallbacks.
+_ERROR_PRIVILEGE_NOT_HELD = 1314  # symlink without Developer Mode / admin
+_ERROR_NOT_SAME_DEVICE = 17  # hard link across volumes
+
+# Claude Code's default ``cleanupPeriodDays``.
+_DEFAULT_CLEANUP_PERIOD_DAYS = 30
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
+def _links_to(dest: Path, target: Path) -> bool:
+    """Whether ``dest`` is a symlink, junction or hard link to ``target``."""
+    if dest.is_symlink() or dest.is_junction() or dest.is_file():
+        return _same_file(dest, target)
+    return False
+
+
+def _holds_own_history(src: Path, dest: Path) -> bool:
+    """Whether a profile's history item is real data rather than our link.
+
+    A symlink or junction is ours whatever it points at. A regular file that
+    is the same file as ``src`` is a hard link (Windows) and holds nothing
+    of its own; any other existing entry is user history that must never be
+    deleted, only merged.
+    """
+    if dest.is_symlink() or dest.is_junction() or not dest.exists():
+        return False
+    return not (dest.is_file() and _same_file(src, dest))
+
+
+def _remove_link(dest: Path) -> None:
+    if dest.is_junction():
+        os.rmdir(dest)  # the junction only; never its target
+    else:
+        dest.unlink()
+
+
+def _winapi_create_junction(target: Path, dest: Path) -> None:
+    import _winapi  # Windows-only module; callers are Windows-only
+
+    _winapi.CreateJunction(str(target), str(dest))
+
+
+def _history_retention_cutoff(claude_home: Path) -> float:
+    """Epoch ms before which Claude Code's retention prune drops history."""
+    days = _DEFAULT_CLEANUP_PERIOD_DAYS
+    try:
+        settings = json.loads(
+            (claude_home / "settings.json").read_text(encoding="utf-8")
+        )
+        value = settings.get("cleanupPeriodDays")
+        if isinstance(value, (int, float)) and value > 0:
+            days = value
+    except (OSError, ValueError, AttributeError):
+        pass
+    return (time.time() - days * 86400) * 1000
+
+
+def _history_line_older_than(line: str, cutoff: float | None) -> bool:
+    if cutoff is None:
+        return False
+    try:
+        timestamp = json.loads(line).get("timestamp")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(timestamp, (int, float)) and timestamp < cutoff
+
+
 def _mkdir_private(path: Path) -> None:
     """mkdir -p with 0o700 on every created level.
 
@@ -579,13 +656,6 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        if share_history and self.switcher.platform == Platform.WINDOWS:
-            raise SessionError(
-                "--share-history is not supported on Windows yet: sharing uses "
-                "re-synced copies there, which would fork the history instead "
-                "of sharing it."
-            )
-
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
@@ -1089,10 +1159,7 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
-        if self.switcher.platform == Platform.WINDOWS:
-            share_history = False
+        windows = self.switcher.platform == Platform.WINDOWS
         active_items = (SHARED_ITEMS if share else ()) + (
             HISTORY_ITEMS if share_history else ()
         )
@@ -1108,23 +1175,36 @@ class SessionManager:
         for name in managed:
             if name not in active_items:
                 dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                if name in HISTORY_ITEMS and _holds_own_history(
+                    source_root / name, dest
+                ):
                     continue
                 self._remove_managed(dest)
         if not active_items:
             manifest_path.unlink(missing_ok=True)
             return
 
-        use_symlinks = self.switcher.platform != Platform.WINDOWS
+        use_symlinks = not windows
         new_managed: list[str] = []
 
         for name in active_items:
             src = source_root / name
             dest = session_dir / name
 
+            relink = windows and name in managed
             if name in HISTORY_ITEMS and not self._prepare_history_share(
-                src, dest, session_dir
+                src, dest, session_dir, relink=relink
             ):
+                if relink:
+                    # Keep the claim so the deferred heal still knows this was
+                    # our link; the removal guard never deletes real history.
+                    new_managed.append(name)
+                continue
+
+            if name in HISTORY_ITEMS and windows:
+                # Copy-mode (the Windows path below) would fork history.
+                self._link_history_windows(src, dest)
+                new_managed.append(name)
                 continue
 
             if not src.exists():
@@ -1378,7 +1458,7 @@ class SessionManager:
         return data is not None and isinstance(data.get(MCP_KEY), dict)
 
     def _prepare_history_share(
-        self, src: Path, dest: Path, session_dir: Path
+        self, src: Path, dest: Path, session_dir: Path, relink: bool = False
     ) -> bool:
         """Make a history item linkable; returns False to skip it this launch.
 
@@ -1389,8 +1469,16 @@ class SessionManager:
         (created empty so there is something to link). Real history is merged
         even when the manifest claims the entry is managed: a stale manifest
         (lock-free launches race) must never let the generic loop delete it.
+
+        ``relink`` (Windows, the item was linked on an earlier launch): a
+        regular file here is a hard link Claude Code broke. Its history
+        retention prune rewrites ``history.jsonl`` by rename, which replaces
+        one name with a new file and leaves the other on the old one. The
+        file's own prompts are merged back, except entries old enough for
+        Claude Code's retention prune to remove, which would otherwise
+        undo the prune and break the link again on its next pass.
         """
-        if dest.exists() and not dest.is_symlink():
+        if _holds_own_history(src, dest):
             # Real per-account history accumulated before the flag existed.
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
@@ -1402,8 +1490,11 @@ class SessionManager:
                     )
                 )
                 return False
+            older_than = None
+            if relink and dest.is_file():
+                older_than = _history_retention_cutoff(src.parent)
             try:
-                self._merge_history_into_source(src, dest)
+                self._merge_history_into_source(src, dest, older_than)
             except OSError as e:
                 self._logger.warning(
                     f"Could not merge {dest.name} into {src}: {e}"
@@ -1438,15 +1529,62 @@ class SessionManager:
                 return False
         return True
 
+    def _link_history_windows(self, src: Path, dest: Path) -> None:
+        """Point a Windows profile's history item at the shared copy.
+
+        A symlink needs Developer Mode or admin, so it cannot be the
+        baseline. ``projects/`` becomes a directory junction (no privilege,
+        works across local volumes; Claude Code, like any libuv program,
+        sees it as a symlink, so its cleanup sweeps skip it the way they skip
+        a POSIX symlink). ``history.jsonl`` becomes a symlink when the OS
+        allows one and a hard link otherwise; hard links cannot cross
+        volumes, and a copy would fork history, so that case fails loudly.
+        Raises SessionError when no true link can be made.
+        """
+        target = src.resolve()
+        if _links_to(dest, target):
+            return
+        if dest.is_symlink() or dest.is_junction():
+            _remove_link(dest)  # a link to somewhere else: re-point it
+        try:
+            if target.is_dir():
+                _winapi_create_junction(target, dest)
+                return
+            try:
+                dest.symlink_to(target)
+                return
+            except OSError as e:
+                if getattr(e, "winerror", None) != _ERROR_PRIVILEGE_NOT_HELD:
+                    raise
+            os.link(target, dest)
+        except OSError as e:
+            hint = ""
+            if getattr(e, "winerror", None) == _ERROR_NOT_SAME_DEVICE:
+                hint = (
+                    f" {dest.parent} and {target.parent} are on different "
+                    "drives, and a hard link cannot cross drives. Keep the "
+                    "cswap backup folder on the same drive as ~/.claude, or "
+                    "turn on Windows Developer Mode so cswap can use a "
+                    "symlink."
+                )
+            raise SessionError(
+                f"Could not share {dest.name} with {target}: {e}.{hint} "
+                "Not copying it instead, which would fork the history."
+            ) from e
+
     @staticmethod
-    def _merge_history_into_source(src: Path, dest: Path) -> None:
+    def _merge_history_into_source(
+        src: Path, dest: Path, older_than: float | None = None
+    ) -> None:
         """Move the profile's own history at ``dest`` into ``src``.
 
         Directories merge file-by-file (transcript filenames are UUIDs, so
         collisions mean identical sessions — first writer wins and the
         duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        not already present, skipping entries whose ``timestamp`` (ms) is
+        below ``older_than`` when given. ``dest`` is removed once empty; any
+        failure raises OSError and leaves remaining files in place for the
+        next try.
         """
         if dest.is_dir():
             _mkdir_private(src)
@@ -1469,7 +1607,9 @@ class SessionManager:
             lines = [
                 line
                 for line in dest.read_text(encoding="utf-8").splitlines()
-                if line and line not in existing
+                if line
+                and line not in existing
+                and not _history_line_older_than(line, older_than)
             ]
             if lines:
                 src.parent.mkdir(parents=True, exist_ok=True)
@@ -1502,7 +1642,9 @@ class SessionManager:
         """Remove a cswap-created share entry (link or copy), never user data
         beyond it — callers guarantee `dest` is manifest-listed or a symlink."""
         try:
-            if dest.is_symlink() or dest.is_file():
+            if dest.is_junction():
+                os.rmdir(dest)  # the junction only; never its target
+            elif dest.is_symlink() or dest.is_file():
                 dest.unlink(missing_ok=True)
             elif dest.is_dir():
                 shutil.rmtree(dest, ignore_errors=True)

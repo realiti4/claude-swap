@@ -163,7 +163,7 @@ Examples:
             "~/.claude into the session profile, so every account sees one "
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "per-account history (the default)."
         ),
     )
     parser.add_argument(
