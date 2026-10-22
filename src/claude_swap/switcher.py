@@ -228,7 +228,7 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
-def _usage_entry_lines(entry: UsageEntry) -> list[str]:
+def _usage_entry_lines(entry: UsageEntry, budget_line: str | None = None) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
@@ -242,6 +242,8 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
         last_seen = last_seen_note(entry)
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
+        if budget_line and entry.sentinel == USAGE_API_KEY:
+            out.append(f"{dimmed('└')} {muted(budget_line)}")
         return out
     if entry.last_good is not None:
         lines = _format_usage_lines(entry.last_good, entry.fetched_at)
@@ -1878,6 +1880,7 @@ class ClaudeAccountSwitcher:
             for num in data.get("sequence", [])
             if self._account_is_switchable(str(num))
             and not self._disabled_from_data(data, str(num))
+            and not self.api_budget_blocked(str(num))
         ]
 
     @staticmethod
@@ -2096,6 +2099,42 @@ class ClaudeAccountSwitcher:
                 )
         else:
             print(dimmed("  It is back in the rotation."))
+
+    @property
+    def api_budgets(self):
+        """Prepaid-credit budgets for API-key slots (``api-budgets.json``)."""
+        budgets = getattr(self, "_api_budgets", None)
+        if budgets is None:
+            from claude_swap.api_budget import ApiBudgets
+
+            def _slot_key(slot: str) -> str:
+                creds = self._read_account_credentials(slot, self.account_email(slot)) if slot else ""
+                return creds.strip() if looks_like_api_key(creds) else ""
+
+            budgets = self._api_budgets = ApiBudgets(self.sequence_file.parent, _slot_key)
+        return budgets
+
+    def api_budget_blocked(self, account_num: str) -> bool:
+        """An API-key slot whose prepaid credit is exhausted (≥ cap) or expired."""
+        if self._account_kind(str(account_num)) != "api_key":
+            return False
+        try:
+            st = self.api_budgets.status(str(account_num))
+        except Exception:  # never let a budget read break rotation; fail open
+            self._logger.warning("API budget read failed for %s", account_num, exc_info=True)
+            return False
+        return bool(st and st.blocked)
+
+    def _budget_line(self, account_num: str, entry: UsageEntry) -> str | None:
+        if entry.sentinel != USAGE_API_KEY:
+            return None
+        try:
+            from claude_swap.api_budget import describe
+
+            st = self.api_budgets.status(str(account_num))
+        except Exception:  # display must never break `list`
+            return None
+        return describe(st) if st else None
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -5801,7 +5840,9 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
-            for line in _usage_entry_lines(entries[str(num)]):
+            for line in _usage_entry_lines(
+                entries[str(num)], self._budget_line(str(num), entries[str(num)])
+            ):
                 print(f"     {line}")
 
             if show_token_status:
@@ -5964,7 +6005,7 @@ class ClaudeAccountSwitcher:
             entry = self._active_account_usage(
                 account_num, current_email, current_org_uuid
             )
-            for line in _usage_entry_lines(entry):
+            for line in _usage_entry_lines(entry, self._budget_line(account_num, entry)):
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
