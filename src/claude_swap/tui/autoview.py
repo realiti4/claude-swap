@@ -327,11 +327,12 @@ class AutoScreen(Screen):
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
             )
-            binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models),
-                line,
-                weekly,
-                scale=threshold,
+            usage = acc.usage.last_good
+            incomplete = isinstance(usage, dict) and (
+                usage.get("partial") or oauth.scoped_axis_unseen(usage, models)
+            )
+            binding = None if incomplete else binding_window(
+                oauth.relevant_windows(usage, models), line, weekly, scale=threshold
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
@@ -341,6 +342,9 @@ class AutoScreen(Screen):
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
                 ranked.append((998.0, acc.number))
+            elif incomplete:
+                entry.append("  usage incomplete", style=palette.muted)
+                ranked.append((999.0, acc.number))
             elif binding is None:
                 entry.append("  usage unknown", style=palette.muted)
                 ranked.append((999.0, acc.number))

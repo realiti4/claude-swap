@@ -754,6 +754,85 @@ class TestAccountRowDisabled:
         assert "disabled" not in row
 
 
+class TestUsageProvenanceInJson:
+    """A header-probe measurement (issue #220's 429 fallback) is a different
+    kind of number from an endpoint one: it cost the account's own inference
+    quota, and it can be missing a gating window. The cache carries ``source``
+    and ``partial``; a script reading --json could not see either, so it would
+    rank a partial measurement exactly the way the auto engine used to.
+    Additive fields: nothing existing is renamed or dropped.
+    """
+
+    RESCUED = {
+        "five_hour": {"pct": 11.0},
+        "seven_day": {"pct": 10.0},
+        "source": "headers",
+    }
+
+    def test_usage_to_json_projects_the_source(self):
+        out = usage_to_json(self.RESCUED)
+        assert out["source"] == "headers"
+        assert out["fiveHour"] == {"pct": 11.0}
+
+    def test_usage_to_json_projects_partial(self):
+        out = usage_to_json({"five_hour": {"pct": 11.0}, "partial": True})
+        assert out["partial"] is True
+
+    def test_an_endpoint_measurement_carries_neither(self):
+        out = usage_to_json({"five_hour": {"pct": 11.0}})
+        assert "source" not in out
+        assert "partial" not in out
+
+    def test_list_rows_carry_the_source(self):
+        row = account_row(1, "a@example.com", "", "", True, self.RESCUED)
+        assert row["usageStatus"] == "ok"
+        assert row["usage"]["source"] == "headers"
+
+    def test_the_status_projection_carries_the_source(self):
+        _status, usage = usage_fields(self.RESCUED)
+        assert usage["source"] == "headers"
+
+    def test_list_payload_carries_the_source(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(
+                       dict(self.RESCUED), rescued_from="http-429")):
+            payload = switcher.list_accounts(json_output=True)
+
+        acct1 = next(a for a in payload["accounts"] if a["number"] == 1)
+        assert acct1["usage"]["source"] == "headers"
+
+    def test_status_payload_carries_the_source(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(
+                       dict(self.RESCUED), rescued_from="http-429")):
+            payload = switcher.status(json_output=True)
+
+        assert payload["active"]["usage"]["source"] == "headers"
+
+
 class TestUsageFromJson:
     """``list --json`` usage read back into the internal dict (import-usage)."""
 
@@ -783,6 +862,33 @@ class TestUsageFromJson:
         from claude_swap.json_output import usage_from_json
 
         assert usage_from_json({"fiveHour": {"pct": 3}}) == {"five_hour": {"pct": 3.0}}
+
+    @pytest.mark.parametrize("usage,models", [
+        ({"five_hour": {"pct": 0.0}, "partial": True, "source": "headers"}, ()),
+        ({"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}, "source": "headers"}, ("Fable",)),
+    ])
+    def test_import_preserves_unrankable_header_measurements(self, usage, models):
+        from claude_swap.json_output import usage_from_json
+
+        restored = usage_from_json(usage_to_json(usage))
+        assert oauth.account_headroom(restored, models) is None
+        assert restored["source"] == "headers"
+        assert restored.get("partial", False) == usage.get("partial", False)
+
+    @pytest.mark.parametrize("metadata", [
+        {"source": None},
+        {"source": ""},
+        {"source": 1},
+        {"source": "unsupported"},
+        {"partial": None},
+        {"partial": "false"},
+        {"partial": 0},
+    ])
+    def test_import_refuses_malformed_measurement_metadata(self, metadata):
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError):
+            usage_from_json({"fiveHour": {"pct": 0.0}, **metadata})
 
     @pytest.mark.parametrize("usage", [
         None,

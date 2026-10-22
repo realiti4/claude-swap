@@ -109,6 +109,13 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     return every window or pay-as-you-go spend). ``fetched_at`` is the
     measurement's fetch time; passing it adds pace fields to the weekly
     windows (``seven_day``, ``scoped``) only — never ``five_hour`` (issue #125).
+
+    ``source`` and ``partial`` are additive provenance, present only on a
+    measurement the usage endpoint did not serve (today: the unified-header
+    probe, issue #220). They answer two questions a script otherwise cannot:
+    the measurement cost the account's own inference quota, and a ``partial``
+    one is missing a gating window, so its windows are for display and its
+    headroom is unknown (see ``oauth.account_headroom``).
     """
     out: dict = {}
     if "five_hour" in usage:
@@ -131,6 +138,10 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    if usage.get("source"):
+        out["source"] = usage["source"]
+    if usage.get("partial"):
+        out["partial"] = True
     return out
 
 
@@ -205,6 +216,14 @@ def usage_from_json(usage: object) -> dict:
         out["scoped"] = scoped
     if not out:
         raise ValueError("usage carries no windows")
+    if "source" in usage:
+        if usage["source"] != "headers":
+            raise ValueError("usage.source must be headers")
+        out["source"] = usage["source"]
+    if "partial" in usage:
+        if not isinstance(usage["partial"], bool):
+            raise ValueError("usage.partial must be a boolean")
+        out["partial"] = usage["partial"]
     return out
 
 

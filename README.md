@@ -134,7 +134,7 @@ cswap run 2 --require-session   # refuse rather than run plain claude if 2 is th
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations.
 
 Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
-  
+
 A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account. While a session runs, its account's usage is read with the session's own credential and never refreshed by cswap; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
 
 <details>
@@ -227,6 +227,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
+- The usage endpoint rate-limits busy accounts on their own inference activity, so a heavily-used account can 429 there indefinitely. When that happens, cswap falls back to a throwaway 1-token completion and reads the same 5-hour/7-day utilization off that response's headers instead, so the dashboard still shows real numbers rather than `usage unavailable`. This fallback spends about 10 tokens of the account's own quota, fires on a 429 only (never on an expired or invalid token, which quota can't fix), and runs at most once per scheduled check, so it stays inside the same adaptive cadence as the normal usage poll. Turn it off with `cswap config set usage.headerFallback false` if you would rather a rate-limited account read as `usage unavailable` than spend any quota on metadata. A rescued measurement is marked `"source": "headers"` in `--json`, and if the response carried only some of the windows it is also marked `"partial": true`: those numbers are for display, and auto-switch treats the account's headroom as unknown rather than ranking it on a single window. The response headers carry the 5-hour and 7-day windows only, never the per-model weekly limits, so if you use `autoswitch.model` a rescued account counts as unknown for switching (its 5h/7d numbers are still shown) instead of being ranked on windows that cannot see your model's limit.
 
 ## Data locations
 
@@ -283,6 +284,7 @@ cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/per-model windows
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set usage.headerFallback false  # never spend quota rescuing a rate-limited usage fetch
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives

@@ -1593,6 +1593,47 @@ class TestAutoScreen:
             assert "weekly" not in summary
             assert app.weekly_threshold_pct is None
 
+    @pytest.mark.parametrize(
+        ("partial", "model", "incomplete"),
+        [(True, None, True), (False, "Fable", True), (False, None, False)],
+    )
+    async def test_header_candidates_only_rank_when_usage_is_complete(
+        self, tmp_path, fake_engine, partial, model, incomplete
+    ):
+        settings = {"threshold": 85, "weeklyThreshold": 97}
+        if model is not None:
+            settings["model"] = model
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": settings,
+        }))
+        entry = make_entry(0.0, None if partial else 0.0)
+        entry = dataclasses.replace(
+            entry, last_good={**entry.last_good, "source": "headers", "partial": partial}
+        )
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=entry),
+                make_account(3, entry=make_entry(40.0, 40.0, scoped=[("Fable", 40.0)])),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            row = next(line for line in plain.splitlines() if "user2@example.com" in line)
+            if incomplete:
+                assert "usage incomplete" in row
+                assert "% used" not in row
+                assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            else:
+                assert "5h   0% used" in row
+                assert plain.index("user2@example.com") < plain.index("user3@example.com")
+
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
     ):
