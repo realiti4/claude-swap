@@ -2016,6 +2016,44 @@ class TestListAccountsUsage:
         assert mock_fetch.call_count == 1
         assert mock_fetch.call_args.args[0] == "2"
 
+    def test_empty_inactive_backup_read_is_retried_into_usage_fetch(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """An empty inactive-slot backup read is retried once at the source so
+        the usage fetch sees the recovered credential, not ""."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        retried = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-retried", "refreshToken": "rt-retried"},
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        reads: dict[str, int] = {}
+
+        def read_backup(account_num: str, email: str) -> str:
+            n = reads.get(account_num, 0)
+            reads[account_num] = n + 1
+            if account_num == "2" and n == 0:
+                return ""
+            return retried
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials",
+                          side_effect=read_backup), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)) as mock_fetch:
+            info = switcher._build_accounts_info()
+            switcher._collect_usage_entries(info, fetch={"2"})
+
+        assert reads["2"] == 2
+        slot_calls = [c for c in mock_fetch.call_args_list if c.args[0] == "2"]
+        assert len(slot_calls) == 1
+        assert slot_calls[0].args[2] == retried
+
 
 class TestUsageFetchStamps:
     def test_stamps_reflect_store_without_fetching(
