@@ -453,6 +453,30 @@ class TestCLI:
         assert exc.value.code == 0
         assert called.get("ran") is True
 
+    def test_desktop_subcommand_dispatches(self, monkeypatch):
+        """Bare `cswap desktop` should route to desktop.run on any platform."""
+        called = {}
+
+        class _FakeSwitcher:
+            def __init__(self, *a, **k):
+                pass
+            def _is_running_in_container(self):
+                return False
+
+        def _fake_run(switcher):
+            called["ran"] = True
+            return 0
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", ["cswap", "desktop"])
+        monkeypatch.setattr("claude_swap.desktop.run", _fake_run)
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0
+        assert called.get("ran")
+
     def test_menubar_subcommand_dispatches(self, monkeypatch):
         """Bare `cswap menubar` should route exactly like `cswap --menubar`."""
         called = {}

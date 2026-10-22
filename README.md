@@ -268,6 +268,25 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 
 </details>
 
+## Desktop app
+
+A small window with the same account cards, actions and optional auto-switch as the TUI. It renders an HTML page in the system webview (WebView2 on Windows, WebKit on macOS, GTK/Qt WebKit on Linux) via the optional `desktop` extra:
+
+```bash
+uv tool install 'claude-swap[desktop]'   # or: pipx install 'claude-swap[desktop]'
+cswap desktop
+```
+
+With **Auto** on, the window sends a desktop notification when something needs your attention while it is in the background: an auto-switch, an account quarantined (or back in rotation), every account at its limit, or auto-switch stopping or ignoring a setting. Routine polls and retried errors stay quiet, and the same alert is not repeated within an hour. Windows shows these as "cswap" toasts (the first run registers that name under `HKCU\Software\Classes\AppUserModelId`); macOS uses `osascript`, Linux `notify-send`.
+
+For a standalone Windows exe with no console window, build it with PyInstaller (run via `uvx`, not a project dependency; `--with .` and `--copy-metadata` bundle the package version the app reads at import):
+
+```bash
+uvx --with . --with pywebview pyinstaller --onefile --windowed --name cswap-desktop --icon "$PWD/src/claude_swap/cswap.ico" --add-data "$(pwd -W)/src/claude_swap/cswap.ico;claude_swap" --copy-metadata claude-swap --paths "$PWD/src" --specpath build src/claude_swap/desktop.py
+```
+
+Run it from Git Bash (`$(pwd -W)` gives PyInstaller a Windows path for `--add-data`). The result is `dist/cswap-desktop.exe`. It is a onefile build, so it unpacks itself on each launch and the window takes a few seconds to appear. It needs the Microsoft Edge WebView2 runtime, which ships with Windows 11.
+
 ## Advanced
 
 ### Configuration
