@@ -253,6 +253,73 @@ def test_CONTROL_refresh_in_place_still_accepts_the_owning_token(
     assert "MINE-ROTATED" in stored
 
 
+# Claude Code's ``invalid_grant`` reaction: both token fields emptied in place,
+# wrapper and metadata kept -- the switch path's ``"wiped"`` shape.
+WIPED = json.dumps({"claudeAiOauth": {
+    "accessToken": "", "refreshToken": "", "expiresAt": 0,
+    "scopes": ["user:inference"], "subscriptionType": "max"}})
+
+
+def test_refresh_in_place_refuses_a_wiped_credential(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """A wiped blob has no access token, so the profile oracle is silent and
+    the guard used to fail open: "could not verify ... Registering anyway"
+    -- then overwrite the slot's working backup with empty tokens. The
+    TUI's "Add current login" takes this branch, so one click after a dead
+    refresh destroyed the slot's only refresh token."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    OWN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-MINE", "refreshToken": "rt-mine",
+        "expiresAt": 99999999999000}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=OWN), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=7, assume_yes=True)
+
+    with patch.object(s, "_read_capture_credentials", return_value=WIPED), \
+         patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
+        with pytest.raises(ConfigError, match="no access or refresh token"):
+            s.add_account()  # slot=None -> refresh-in-place
+
+    mock_fetch.assert_not_called()
+    stored = s._read_account_credentials("7", "ax@example.com")
+    assert "rt-mine" in stored, (
+        "DEFECT: the wiped credential replaced the slot's working backup"
+    )
+
+
+def test_add_refuses_a_wiped_credential(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The CREATE branch must not register a slot that can never log in."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+
+    with patch.object(s, "_read_capture_credentials", return_value=WIPED):
+        with pytest.raises(ConfigError, match="no access or refresh token"):
+            s.add_account(slot=7)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
+def test_CONTROL_refresh_token_without_access_token_still_registers(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """Only BOTH tokens empty is provably dead. A surviving refresh token can
+    still revive the slot, so a missing access token stays unverifiable and
+    registers with the notice, as before."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    REFRESH_ONLY = json.dumps({"claudeAiOauth": {
+        "accessToken": "", "refreshToken": "rt-live", "expiresAt": 0}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=REFRESH_ONLY):
+        s.add_account(slot=7, assume_yes=True)
+
+    assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
+
+
 def test_org_slot_registers_when_the_resolved_profile_has_no_org(
     temp_home: Path, mock_claude_config: Path,
 ):
