@@ -407,6 +407,66 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+def _api_headers(access_token: str) -> dict:
+    """Headers for Messages/Models API calls made with an OAuth token."""
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+
+
+def find_warmup_model(access_token: str) -> str | None:
+    """Newest Haiku model the account can use, via the Models API.
+
+    Resolved at run time rather than pinned, so warm-ups keep using the
+    cheapest tier as models are released and retired. The API lists the
+    most recently released models first. None when no Haiku is listed.
+    """
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models?limit=1000",
+        headers=_api_headers(access_token),
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        models = json.loads(resp.read().decode()).get("data") or []
+    for model in models:
+        model_id = model.get("id") if isinstance(model, dict) else None
+        if isinstance(model_id, str) and "haiku" in model_id:
+            return model_id
+    return None
+
+
+# Measured: a 1-token reply succeeds but is too small to open the 5-hour
+# window (its reset keeps sliding with the clock); ~200 output tokens opens it.
+WARMUP_MAX_TOKENS = 200
+
+
+def send_warmup_message(access_token: str, model: str) -> None:
+    """Send a short message so the account's 5-hour usage window starts.
+
+    Mirrors Claude Code's request shape (OAuth beta header + its system
+    prompt), which subscription tokens need on the Messages API. Raises
+    ``urllib.error.HTTPError`` / ``URLError`` on failure.
+    """
+    body = json.dumps({
+        "model": model,
+        "max_tokens": WARMUP_MAX_TOKENS,
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [
+            {"role": "user", "content": "Count from 1 to 150, comma separated."}
+        ],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers=_api_headers(access_token),
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        resp.read()
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
