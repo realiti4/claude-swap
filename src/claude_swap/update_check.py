@@ -21,7 +21,16 @@ _VERSION_RE = re.compile(
     r"(\d+(?:\.\d+)*)(?:[-_.]?(alpha|beta|preview|pre|rc|a|b|c)[-_.]?(\d+)?)?",
     re.IGNORECASE,
 )
-_PRE_RANKS = {"alpha": 0, "a": 0, "beta": 1, "b": 1, "preview": 2, "pre": 2, "rc": 2, "c": 2}
+_PRE_RANKS = {
+    "alpha": 0,
+    "a": 0,
+    "beta": 1,
+    "b": 1,
+    "preview": 2,
+    "pre": 2,
+    "rc": 2,
+    "c": 2,
+}
 _FINAL_RANK = 3
 
 
@@ -64,7 +73,10 @@ def _is_newer(latest: str, current: str) -> bool:
     # Nobody on a final release asked to be moved onto a pre-release, so we
     # stay quiet for them; people already running one still hear about later
     # pre-releases.
-    if latest_version.pre_rank != _FINAL_RANK and current_version.pre_rank == _FINAL_RANK:
+    if (
+        latest_version.pre_rank != _FINAL_RANK
+        and current_version.pre_rank == _FINAL_RANK
+    ):
         return False
     return latest_version > current_version
 
@@ -138,11 +150,69 @@ def check_for_update(current_version: str) -> str | None:
         return None
 
 
+def _uv_pin_specifier() -> str | None:
+    """The exact version claude-swap was pinned to at install time, if any.
+
+    `uv tool install claude-swap==X.Y.Z` records the specifier in the tool's
+    uv-receipt.toml, and once pinned, `uv tool upgrade` refuses to move the
+    tool: it prints "Nothing to upgrade" plus an easy-to-miss hint and exits
+    0 without touching anything (#491). Users who followed the update banner
+    into `cswap upgrade` saw that dead end with no explanation from us.
+    """
+    receipt = Path(sys.prefix) / "uv-receipt.toml"
+    try:
+        text = receipt.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.search(r'specifier\s*=\s*"==([^"]+)"', text)
+    return m.group(1) if m else None
+
+
+def _installed_tool_version(method: str) -> str | None:
+    """The version the package manager currently has on disk, best effort.
+
+    importlib.metadata can't answer this from inside the running process: it
+    still resolves the pre-upgrade environment. A fresh subprocess reads the
+    tool directory after uv/pipx has (or hasn't) rewritten it, which is what
+    lets us report an honest before -> after instead of forwarding whatever
+    the package manager chose to print (#491).
+    """
+    if method == "uv":
+        cmd = ["uv", "tool", "list"]
+    elif method == "pipx":
+        cmd = ["pipx", "list", "--short"]
+    else:
+        return None
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    for line in result.stdout.splitlines():
+        # uv prints "claude-swap v0.27.2"; pipx --short prints "claude-swap 0.27.2".
+        m = re.match(r"claude-swap\s+v?(\S+)", line.strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+def _running_version() -> str | None:
+    """The version of the claude-swap package this process was started from."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("claude-swap")
+    except PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
 def run_self_upgrade() -> int:
     """Run the appropriate upgrade command for the current install method.
 
-    Returns the subprocess exit code, or 1 if detection failed or the package
-    manager is missing from PATH.
+    Returns the subprocess exit code, or 1 if detection failed, the package
+    manager is missing from PATH, or the install is pinned in a way the
+    package manager won't move.
     """
     from claude_swap.printer import accent, error
 
@@ -165,6 +235,20 @@ def run_self_upgrade() -> int:
         )
         return 1
 
+    # uv refuses to move exact-pinned installs: `uv tool upgrade` exits 0
+    # having done nothing, which reads like a failed upgrade attempt when it
+    # is really a dead end (#491). Surface the pin and the way out instead.
+    if method == "uv":
+        pin = _uv_pin_specifier()
+        if pin is not None:
+            print(
+                f"claude-swap is pinned to {pin} (installed with an exact version),\n"
+                "so `uv tool upgrade` will not upgrade it.\n"
+                "To upgrade and drop the pin, run:\n"
+                f"  {accent('uv tool install --reinstall claude-swap@latest')}"
+            )
+            return 1
+
     # Windows: the running cswap.exe launcher is locked, so an in-process
     # uv/pipx upgrade fails when it tries to replace the executable even
     # though the package itself updates. cswap exits right after this, which
@@ -173,12 +257,28 @@ def run_self_upgrade() -> int:
         print(f"To upgrade claude-swap on Windows, run:\n  {accent(' '.join(cmd))}")
         return 1
 
+    before = _running_version()
     try:
-        result = subprocess.run(cmd, check=False)
-        return result.returncode
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except FileNotFoundError:
         error(
             f"Detected {method} install but `{cmd[0]}` is not on PATH. "
             "Run the upgrade manually from a shell where it is available."
         )
         return 1
+
+    sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.returncode != 0:
+        return result.returncode
+
+    # The package manager can exit 0 without changing anything. Verify what
+    # actually landed on disk and say so, rather than letting uv/pipx wording
+    # stand in for the result (#491).
+    after = _installed_tool_version(method)
+    if before and after and after != before:
+        print(accent(f"claude-swap upgraded: {before} -> {after}"))
+    elif before and after:
+        print(f"claude-swap is still at {after}.")
+    return result.returncode
