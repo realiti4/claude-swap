@@ -12791,7 +12791,7 @@ class TestPollPolicyInputsCarryTheWeeklyLine:
     ):
         import os
 
-        from claude_swap.settings import set_setting, settings_path
+        from claude_swap.settings import set_setting
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
@@ -12803,7 +12803,7 @@ class TestPollPolicyInputsCarryTheWeeklyLine:
         # A later edit is picked up through the mtime key (bumped explicitly
         # so a same-second rewrite cannot hide behind filesystem granularity).
         set_setting(switcher.backup_dir, "autoswitch.weeklyThreshold", "99")
-        path = settings_path(switcher.backup_dir)
+        path = switcher.backup_dir / "settings.local.json"
         later = path.stat().st_mtime + 5
         os.utime(path, (later, later))
         assert switcher._poll_policy_inputs() == (85.0, 99.0, ("Fable",))

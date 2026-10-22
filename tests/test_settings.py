@@ -18,6 +18,8 @@ from claude_swap.settings import (
     AutoSwitchSettings,
     UiSettings,
     UpdateSettings,
+    _read_raw,
+    _read_raw_for_write,
     effective_settings,
     load_settings,
     load_ui_settings,
@@ -28,6 +30,19 @@ from claude_swap.settings import (
     settings_path,
     unset_setting,
 )
+
+
+def _local(root: Path) -> Path:
+    return root / "settings.local.json"
+
+
+def _local_data(root: Path) -> dict:
+    return json.loads(_local(root).read_text())
+
+
+def _base(root: Path, data: dict) -> bytes:
+    settings_path(root).write_text(json.dumps(data))
+    return settings_path(root).read_bytes()
 
 
 def _args(**kwargs) -> argparse.Namespace:
@@ -116,7 +131,7 @@ class TestSaveSettings:
             "autoswitch": {"threshold": 80, "futureKnob": True},
         }))
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
-        raw = json.loads(settings_path(tmp_path).read_text())
+        raw = _read_raw(settings_path(tmp_path))
         assert raw["futureSection"] == {"x": 1}
         assert raw["autoswitch"]["futureKnob"] is True
         assert raw["autoswitch"]["threshold"] == 70.0
@@ -124,7 +139,7 @@ class TestSaveSettings:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
     def test_file_mode_is_0600(self, tmp_path: Path):
         save_settings(tmp_path, AutoSwitchSettings())
-        mode = stat.S_IMODE(settings_path(tmp_path).stat().st_mode)
+        mode = stat.S_IMODE(_local(tmp_path).stat().st_mode)
         assert mode == 0o600
 
 
@@ -146,10 +161,9 @@ class TestUiSettings:
 
     def test_set_and_unset_ui_theme(self, tmp_path: Path):
         assert set_setting(tmp_path, "ui.theme", "light") == "light"
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw == {"schemaVersion": 1, "ui": {"theme": "light"}}
+        assert _local_data(tmp_path) == {"schemaVersion": 1, "ui": {"theme": "light"}}
         assert unset_setting(tmp_path, "ui.theme") is True
-        assert "ui" not in json.loads(settings_path(tmp_path).read_text())
+        assert "ui" not in _local_data(tmp_path)
 
     def test_set_rejects_bad_choice(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="dark, light"):
@@ -170,11 +184,10 @@ class TestUpdateSettings:
 
     def test_set_and_unset_updates_check(self, tmp_path: Path):
         assert set_setting(tmp_path, "updates.check", "false") is False
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw == {"schemaVersion": 1, "updates": {"check": False}}
+        assert _local_data(tmp_path) == {"schemaVersion": 1, "updates": {"check": False}}
         assert load_update_settings(tmp_path).check is False
         assert unset_setting(tmp_path, "updates.check") is True
-        assert "updates" not in json.loads(settings_path(tmp_path).read_text())
+        assert "updates" not in _local_data(tmp_path)
 
 
 class TestSettingSpecs:
@@ -206,8 +219,9 @@ class TestSetUnsetSetting:
     def test_set_writes_minimal_file(self, tmp_path: Path):
         value = set_setting(tmp_path, "autoswitch.threshold", "80")
         assert value == 80.0
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw == {"schemaVersion": 1, "autoswitch": {"threshold": 80.0}}
+        assert _local_data(tmp_path) == {
+            "schemaVersion": 1, "autoswitch": {"threshold": 80.0},
+        }
 
     def test_set_int_kind_coerces_and_rejects_floats(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.unhealthyTicks", "5") == 5
@@ -225,8 +239,7 @@ class TestSetUnsetSetting:
 
     def test_set_string_kind_round_trips(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.model", "Fable") == "Fable"
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw["autoswitch"]["model"] == "Fable"
+        assert _local_data(tmp_path)["autoswitch"]["model"] == "Fable"
         assert load_settings(tmp_path).model == "Fable"
 
     def test_set_string_kind_rejects_empty(self, tmp_path: Path):
@@ -254,16 +267,14 @@ class TestSetUnsetSetting:
     def test_unset_removes_key_and_empty_section(self, tmp_path: Path):
         set_setting(tmp_path, "autoswitch.threshold", "80")
         assert unset_setting(tmp_path, "autoswitch.threshold") is True
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert "autoswitch" not in raw
+        assert "autoswitch" not in _local_data(tmp_path)
 
     def test_unset_stamps_schema_version_on_unversioned_file(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"threshold": 80}})
         )
         assert unset_setting(tmp_path, "autoswitch.threshold") is True
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw["schemaVersion"] == 1
+        assert _read_raw(settings_path(tmp_path))["schemaVersion"] == 1
 
     def test_unset_absent_key_is_noop(self, tmp_path: Path):
         assert unset_setting(tmp_path, "autoswitch.threshold") is False
@@ -323,14 +334,16 @@ class TestAtomicWriteThroughSymlink:
     a foreign one)."""
 
     def test_write_preserves_the_link_and_updates_the_target(self, tmp_path):
+        """The overlay file is what a settings write lands in, so it is the
+        one that must be written through."""
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
-        tracked = repo / "settings.json"
+        tracked = repo / "settings.local.json"
         tracked.write_text(json.dumps({"tracked": True}))
-        link = live / "settings.json"
+        link = _local(live)
         link.symlink_to(tracked)
 
-        atomic_write_json(link, {"written": "through"})
+        atomic_write_json(settings_path(live), {"written": "through"})
 
         assert link.is_symlink(), "the dotfiles link must survive the write"
         assert json.loads(tracked.read_text()) == {"written": "through"}
@@ -340,8 +353,8 @@ class TestAtomicWriteThroughSymlink:
         reason="pre-3.12.11 resolver refuses a dangling link",
     )
     def test_dangling_link_writes_where_it_points(self, tmp_path):
-        target = tmp_path / "gone" / "settings.json"
-        link = tmp_path / "settings.json"
+        target = tmp_path / "gone" / "state.json"
+        link = tmp_path / "state.json"
         link.symlink_to(target)
 
         atomic_write_json(link, {"dangling": "ok"})
@@ -350,7 +363,7 @@ class TestAtomicWriteThroughSymlink:
         assert json.loads(target.read_text()) == {"dangling": "ok"}
 
     def test_plain_file_write_unchanged(self, tmp_path):
-        p = tmp_path / "settings.json"
+        p = tmp_path / "state.json"
         atomic_write_json(p, {"plain": 1})
         assert not p.is_symlink()
         assert json.loads(p.read_text()) == {"plain": 1}
@@ -362,8 +375,8 @@ class TestAtomicWriteThroughSymlink:
         import tempfile
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
-        tracked = repo / "settings.json"; tracked.write_text("{}")
-        link = live / "settings.json"; link.symlink_to(tracked)
+        tracked = repo / "state.json"; tracked.write_text("{}")
+        link = live / "state.json"; link.symlink_to(tracked)
         seen = []
         real_mkstemp = tempfile.mkstemp
         monkeypatch.setattr(
@@ -382,14 +395,161 @@ class TestAtomicWriteThroughSymlink:
         that parent cannot be chmod'ed at all."""
         repo = tmp_path / "repo"; repo.mkdir(mode=0o755)
         live = tmp_path / "live"; live.mkdir()
-        tracked = repo / "settings.json"; tracked.write_text("{}")
-        link = live / "settings.json"; link.symlink_to(tracked)
+        tracked = repo / "state.json"; tracked.write_text("{}")
+        link = live / "state.json"; link.symlink_to(tracked)
 
         atomic_write_json(link, {"x": 1})
 
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+_PIN = {"pinnedEmail": "a@x.test", "pinnedOrganizationUuid": "org-1"}
+
+
+def _pin(root: Path, email: str | None) -> None:
+    """The external pin writer's read-modify-write, done by hand."""
+    path = settings_path(root)
+    raw = _read_raw_for_write(path)
+    section = raw.get("remoteControl")
+    section = section if isinstance(section, dict) else {}
+    section.pop("pinnedEmail", None)
+    section.pop("pinnedOrganizationUuid", None)
+    if email:
+        raw["remoteControl"] = {**_PIN, "pinnedEmail": email, **section}
+    elif section:
+        raw["remoteControl"] = section
+    else:
+        raw.pop("remoteControl", None)
+    atomic_write_json(path, raw)
+
+
+class TestLocalOverlay:
+    """``settings.local.json`` overrides the tracked ``settings.json``, and
+    every runtime write lands in it alone."""
+
+    @pytest.mark.parametrize(
+        "base, local, merged",
+        [
+            pytest.param(
+                {"remoteControl": {**_PIN, "debugSlowMs": 1500}},
+                {"remoteControl": {"debugSlowMs": 2000}},
+                {"remoteControl": {**_PIN, "debugSlowMs": 2000}},
+                id="section-merges-key-by-key-local-wins",
+            ),
+            pytest.param({"x": [1], "y": 1}, {"x": [2]}, {"x": [2], "y": 1}, id="other-values-local-wins"),
+            pytest.param({"a": {"k": 1}, "b": 2}, {"a": None}, {"b": 2}, id="top-level-null-deletes"),
+            pytest.param({"a": {"k": 1, "j": 2}}, {"a": {"k": None}}, {"a": {"j": 2}}, id="inner-null-deletes"),
+            pytest.param({}, {"a": {"k": 1}}, {"a": {"k": 1}}, id="local-only-section"),
+        ],
+    )
+    def test_reads_see_local_over_base(self, tmp_path, base, local, merged):
+        _base(tmp_path, base)
+        _local(tmp_path).write_text(json.dumps(local))
+        assert _read_raw(settings_path(tmp_path)) == merged
+        assert _read_raw_for_write(settings_path(tmp_path)) == merged
+
+    def test_pin_writes_local_only_and_keeps_neighbours(self, tmp_path):
+        before = _base(tmp_path, {"remoteControl": {"debugSlowMs": 1500}})
+        _pin(tmp_path, "a@x.test")
+        assert settings_path(tmp_path).read_bytes() == before
+        assert _local_data(tmp_path) == {"remoteControl": _PIN}
+        assert _read_raw(settings_path(tmp_path))["remoteControl"]["debugSlowMs"] == 1500
+
+    def test_same_pin_twice_is_byte_identical(self, tmp_path):
+        _base(tmp_path, {"remoteControl": {"debugSlowMs": 1500}})
+        _local(tmp_path).write_text(json.dumps({"remoteControl": {"debugSlowMs": 2000}}))
+        _pin(tmp_path, "a@x.test")
+        first = _local(tmp_path).read_bytes()
+        _pin(tmp_path, "a@x.test")
+        assert _local(tmp_path).read_bytes() == first
+
+    @pytest.mark.parametrize(
+        "base_section, local_section",
+        [
+            pytest.param(
+                {**_PIN, "debugSlowMs": 1500},
+                {"pinnedEmail": None, "pinnedOrganizationUuid": None},
+                id="neighbour-kept",
+            ),
+            pytest.param(_PIN, {"pinnedEmail": None, "pinnedOrganizationUuid": None}, id="emptied-section"),
+        ],
+    )
+    def test_clearing_a_base_pin_leaves_a_tombstone(self, tmp_path, base_section, local_section):
+        before = _base(tmp_path, {"remoteControl": base_section})
+        _pin(tmp_path, None)
+        assert settings_path(tmp_path).read_bytes() == before
+        assert _local_data(tmp_path) == {"remoteControl": local_section}
+        merged = _read_raw(settings_path(tmp_path)).get("remoteControl", {})
+        assert "pinnedEmail" not in merged
+        assert merged.get("debugSlowMs") == base_section.get("debugSlowMs")
+
+    def test_a_cleared_pin_section_still_sees_keys_the_base_adds_later(self, tmp_path):
+        _base(tmp_path, {"remoteControl": _PIN})
+        _pin(tmp_path, None)
+        _base(tmp_path, {"remoteControl": {**_PIN, "debugSlowMs": 1500}})
+        assert _read_raw(settings_path(tmp_path))["remoteControl"] == {"debugSlowMs": 1500}
+
+    def test_unsetting_the_last_base_key_still_sees_keys_the_base_adds_later(self, tmp_path):
+        _base(tmp_path, {"autoswitch": {"threshold": 80}})
+        assert unset_setting(tmp_path, "autoswitch.threshold") is True
+        _base(tmp_path, {"autoswitch": {"threshold": 80, "strategy": "best"}})
+        assert _read_raw(settings_path(tmp_path))["autoswitch"] == {"strategy": "best"}
+
+    def test_dropping_an_empty_base_section_removes_it(self, tmp_path):
+        _base(tmp_path, {"a": {}, "b": 1})
+        atomic_write_json(settings_path(tmp_path), {"b": 1})
+        assert _read_raw(settings_path(tmp_path)) == {"b": 1}
+
+    def test_set_writes_local_only(self, tmp_path):
+        before = _base(tmp_path, {"schemaVersion": 1, "autoswitch": {"threshold": 80}})
+        set_setting(tmp_path, "autoswitch.cooldownSeconds", "600")
+        assert settings_path(tmp_path).read_bytes() == before
+        assert _local_data(tmp_path) == {"autoswitch": {"cooldownSeconds": 600.0}}
+        loaded = load_settings(tmp_path)
+        assert (loaded.threshold, loaded.cooldown_seconds) == (80.0, 600.0)
+
+    def test_local_value_equal_to_base_is_not_kept(self, tmp_path):
+        _base(tmp_path, {"autoswitch": {"threshold": 80}})
+        set_setting(tmp_path, "autoswitch.threshold", "70")
+        set_setting(tmp_path, "autoswitch.threshold", "80")
+        assert "autoswitch" not in _local_data(tmp_path)
+
+    def test_unset_of_a_base_key_reads_default_and_not_set(self, tmp_path):
+        before = _base(tmp_path, {"autoswitch": {"threshold": 80, "strategy": "best"}})
+        assert unset_setting(tmp_path, "autoswitch.threshold") is True
+        assert settings_path(tmp_path).read_bytes() == before
+        assert _local_data(tmp_path)["autoswitch"] == {"threshold": None}
+        _, value, is_set = next(
+            row for row in effective_settings(tmp_path) if row[0].dotted == "autoswitch.threshold"
+        )
+        assert (value, is_set) == (90.0, False)
+
+    def test_a_key_set_only_in_local_counts_as_set_and_unsets_cleanly(self, tmp_path):
+        _base(tmp_path, {"schemaVersion": 1})
+        set_setting(tmp_path, "ui.theme", "light")
+        rows = {spec.dotted: (v, s) for spec, v, s in effective_settings(tmp_path)}
+        assert rows["ui.theme"] == ("light", True)
+        assert unset_setting(tmp_path, "ui.theme") is True
+        assert "ui" not in _local_data(tmp_path)
+
+    def test_corrupt_local_degrades_reads_and_refuses_writes(self, tmp_path):
+        _base(tmp_path, {"autoswitch": {"threshold": 80}})
+        _local(tmp_path).write_text("{not json")
+        assert load_settings(tmp_path).threshold == 80.0
+        with pytest.raises(ConfigError, match="not valid JSON"):
+            _read_raw_for_write(settings_path(tmp_path))
+        with pytest.raises(ConfigError, match="not valid JSON"):
+            set_setting(tmp_path, "autoswitch.cooldownSeconds", "600")
+        assert _local(tmp_path).read_text() == "{not json"
+
+    def test_save_settings_cannot_diff_against_a_corrupt_base(self, tmp_path):
+        settings_path(tmp_path).write_text("{not json")
+        with pytest.raises(ConfigError, match="not valid JSON"):
+            save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        assert settings_path(tmp_path).read_text() == "{not json"
+        assert not _local(tmp_path).exists()
 
 
 class TestWeeklyThreshold:
