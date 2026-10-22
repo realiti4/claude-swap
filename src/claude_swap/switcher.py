@@ -2255,8 +2255,10 @@ class ClaudeAccountSwitcher:
         # window where a second gate re-read the unchanged backup and POSTed
         # the same one-time-use grant (freshen vs collector). This dedicated
         # lock is contended ONLY by other gates — waiting on it is exactly
-        # the serialization wanted, and the POST is bounded (10 s), so a
-        # loser waits briefly or defers.
+        # the serialization wanted. The POST is bounded
+        # (oauth.OAUTH_REFRESH_TIMEOUT_S) but may outlast a loser's acquire;
+        # that loser defers (`consume-busy`) rather than POSTing a grant that
+        # is still on the wire.
         consume_lock = FileLock(
             self.credentials_dir / f".consume-{account_num}.lock"
         )
