@@ -76,6 +76,8 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
+![Quota table with anonymized example accounts](assets/quota-table.svg)
+
 Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
