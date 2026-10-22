@@ -26,6 +26,7 @@ from claude_swap.process_detection import (
     process_is_claude,
     process_start_ticks,
     process_started_at,
+    remote_control_sessions,
 )
 from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 
@@ -573,6 +574,41 @@ class TestListIdeInstances:
             result = list_ide_instances(tmp_path)
 
         assert result[0].workspace_folders == ["/a", "/b"]
+
+
+# --- Remote Control (bridgeSessionId) ---
+
+
+class TestBridgeSessionId:
+    @pytest.mark.parametrize("overrides, expected", [
+        ({"bridgeSessionId": "bridge-abc"}, "bridge-abc"),
+        ({"bridgeSessionId": None}, None),
+        ({}, None),
+        ({"bridgeSessionId": 123}, None),
+        ({"bridgeSessionId": ""}, None),
+    ])
+    def test_parsing(self, tmp_path, overrides, expected):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 1001, **overrides)
+
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True):
+            result = list_sessions(tmp_path)
+
+        assert result[0].bridge_session_id == expected
+
+    def test_remote_control_sessions_only_live_bridged(self, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 1001, bridgeSessionId="b1")
+        _write_session(sessions_dir, 1002, bridgeSessionId=None)
+        _write_session(sessions_dir, 1003, bridgeSessionId="b3")
+
+        with patch("claude_swap.process_detection.is_pid_alive",
+                   side_effect=lambda pid: pid != 1003):
+            result = remote_control_sessions(tmp_path)
+
+        assert [s.pid for s in result] == [1001]
 
 
 # --- get_running_instances ---
