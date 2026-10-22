@@ -1982,6 +1982,21 @@ class TestFreshening:
         assert (q.number, q.reason) == ("2", "invalid_grant")
         assert "2" in h.state()["quarantine"]
 
+    def test_quarantine_exposes_persisted_entries_to_a_host(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=1)
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.engine.quarantine() == {}
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            h.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(20)})
+        entry = h.engine.quarantine()["2"]
+        assert (entry["email"], entry["reason"]) == ("b@example.com", "invalid_grant")
+
     def test_transient_failure_skips_without_quarantine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
