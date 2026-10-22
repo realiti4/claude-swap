@@ -28,6 +28,8 @@ batch, not one request.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import json
 import time
 import uuid
@@ -314,6 +316,7 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    gateway: dict | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -974,10 +977,159 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                sentinel="gateway" if isinstance(row.get("gateway"), dict) else None,
+                gateway=row.get("gateway"),
             )
         return out
 
     # -- writes ---------------------------------------------------------------
+
+    def forget(self, num: str, identity: Identity) -> None:
+        """Remove a deleted account's cache and invalidate in-flight probes."""
+        with self._lock():
+            rows = self._read_rows()
+            if self._matches(rows.get(num), identity):
+                del rows[num]
+                self._write_rows(rows)
+
+    def _reset_gateway_row(self, row: dict, identity: Identity) -> None:
+        if "gateway" in row or "gatewayFingerprint" in row:
+            # Kind changes can keep the same slot/email/org. Discard the
+            # gateway verdict, lease and schedule before OAuth uses the row.
+            row.clear()
+            row.update(self._fresh_row(identity))
+
+    def collect_gateway(
+        self,
+        num: str,
+        identity: Identity,
+        record: dict,
+        key: str,
+        *,
+        active: bool,
+        fetch: bool,
+        generation_guard=None,
+    ) -> UsageEntry:
+        """Gateway-only lease and cadence; OAuth's reserve/record are untouched."""
+        import hashlib
+        from claude_swap import gateway
+
+        guard = generation_guard or (lambda: nullcontext(True))
+        now = self.clock()
+        probe_config = {
+            name: record.get(name)
+            for name in ("baseUrl", "auth", "probeModel", "usageUrl")
+        }
+        fingerprint = hashlib.sha256(
+            (key + json.dumps(probe_config, sort_keys=True)).encode()
+        ).hexdigest()
+        config_fingerprint = hashlib.sha256(
+            json.dumps(probe_config, sort_keys=True).encode()
+        ).hexdigest()
+        claim = None
+        with guard() as valid, self._lock():
+            if not valid:
+                return UsageEntry()
+            rows = self._read_rows()
+            stored_row = rows.get(num)
+            row = dict(stored_row) if isinstance(stored_row, dict) else {}
+            if (
+                "gatewayConfigFingerprint" not in row
+                and row.get("gatewayFingerprint") == config_fingerprint
+                and isinstance(row.get("gateway"), dict)
+                and row["gateway"].get("errorType") == "credential_unavailable"
+            ):
+                # Older rows hashed an empty key as if it were a credential.
+                # Normalize that known absence without restarting the outage.
+                row["gatewayFingerprint"] = None
+            if (
+                not self._matches(row, identity)
+                or "gatewayFingerprint" not in row
+                or ("gatewayAuthGeneration" in row and row["gatewayAuthGeneration"] != record.get("authGeneration"))
+                or ("gatewayConfigFingerprint" in row and row["gatewayConfigFingerprint"] != config_fingerprint)
+                or (key and row.get("gatewayFingerprint") not in (None, fingerprint))
+            ):
+                row = self._fresh_row(identity)
+            # A failed credential read is not a replacement. Retain the last
+            # readable key's fingerprint and failure history until a readable
+            # key, explicit generation or probe configuration actually changes.
+            # With no prior readable key, the first read keeps the outage clock.
+            fingerprint = fingerprint if key else row.get("gatewayFingerprint")
+            row.update(
+                gatewayFingerprint=fingerprint,
+                gatewayAuthGeneration=record.get("authGeneration"),
+                gatewayConfigFingerprint=config_fingerprint,
+            )
+            prior = row.get("gateway", {})
+            due = row.get("nextPollAt", 0)
+            if (
+                active
+                and not row.get("gatewayActive")
+                and prior.get("probeStatus") in ("ok", "transient")
+            ):
+                due = min(due, prior["probedAt"] + gateway.ACTIVE_INTERVAL_S)
+                # The loop consumes the persisted deadline even when this
+                # read is too early to probe. Publish the promoted cadence.
+                row.update(nextPollAt=due, gatewayActive=True)
+            if (
+                fetch
+                and prior.get("probeStatus") != "unauthorized"
+                and now >= due
+                and now >= row.get("claimUntil", 0)
+            ):
+                claim = uuid.uuid4().hex
+                row.update(
+                    gatewayFingerprint=fingerprint,
+                    gatewayClaim=claim,
+                    claimUntil=now + CLAIM_TTL_S,
+                )
+            if row != rows.get(num):
+                rows[num] = row
+                self._write_rows(rows)
+        if claim:
+            if key:
+                verdict = gateway.probe(record, key, now=now, previous=prior)
+            else:
+                since = prior.get("failureSince", prior.get("transientSince", now))
+                verdict = {
+                    "probeStatus": "transient", "probedAt": now, "budget": None,
+                    "errorType": "credential_unavailable",
+                    "message": "Gateway credential is unavailable",
+                    "failureSince": since, "transientSince": since,
+                }
+            budget = gateway.usage(record, key) if key else None
+            if isinstance(budget, dict):
+                verdict["budget"] = budget
+            deadline = gateway.next_probe_at(verdict, active=active, now=now)
+            with guard() as valid, self._lock():
+                if not valid:
+                    return UsageEntry()
+                rows = self._read_rows()
+                row = rows.get(num, {})
+                if (
+                    row.get("gatewayClaim") == claim
+                    and row.get("gatewayFingerprint") == fingerprint
+                ):
+                    row.update(
+                        sentinel="gateway",
+                        gateway=verdict,
+                        gatewayActive=active,
+                        nextPollAt=deadline,
+                        fetchedAt=now,
+                        lastAttemptAt=now,
+                    )
+                    row.pop("gatewayClaim", None)
+                    row.pop("claimUntil", None)
+                    rows[num] = row
+                    self._write_rows(rows)
+        with guard() as valid:
+            if not valid:
+                return UsageEntry()
+            entry = self.entries({num: identity})[num]
+            # A changed key must never inherit the preceding key's healthy verdict.
+            if self._read_rows().get(num, {}).get("gatewayFingerprint") != fingerprint:
+                return UsageEntry(sentinel="gateway")
+            return replace(entry, sentinel="gateway")
 
     def _mutate(
         self,
@@ -1101,6 +1253,8 @@ class UsageStore:
         def apply(num: str, row: dict) -> None:
             accepted.add(num)
             rec = outcomes[num]
+            if rec.sentinel is None and rec.error is None:
+                self._reset_gateway_row(row, identities[num])
             row["claimId"] = None
             row["claimUntil"] = 0.0
             if rec.sentinel is not None:
@@ -1269,6 +1423,7 @@ class UsageStore:
             return
 
         def apply(_num: str, row: dict) -> None:
+            self._reset_gateway_row(row, identities[_num])
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0

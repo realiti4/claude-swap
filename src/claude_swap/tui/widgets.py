@@ -16,6 +16,7 @@ from textual.widgets import ListItem, Static
 
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
+from claude_swap import gateway
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.switcher import ERROR_NOTES
@@ -217,7 +218,10 @@ def account_card_text(
         text.append("\n    ")
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         marker = "·" if sentinel == USAGE_API_KEY else "⚠"
-        text.append(f"{marker} {data.sentinel_label(sentinel)}", style=style)
+        text.append(
+            f"{marker} {(gateway.usage_label(acc.usage.gateway) if sentinel == 'gateway' else data.sentinel_label(sentinel))}",
+            style=style,
+        )
         # Same supplementary line `cswap list` prints: the last good
         # measurement behind the sentinel (API-key accounts have no quota to
         # have "seen").
@@ -297,7 +301,14 @@ def mini_account_text(
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        text.append(data.sentinel_label(sentinel), style=style)
+        text.append(
+            (
+                gateway.usage_label(acc.usage.gateway)
+                if sentinel == "gateway"
+                else data.sentinel_label(sentinel)
+            ),
+            style=style,
+        )
         return text
 
     last_good = acc.usage.last_good

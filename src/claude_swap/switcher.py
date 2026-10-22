@@ -4,28 +4,31 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import logging
 import os
 import re
 import shutil
 import threading
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     LockError,
     SessionError,
+    StaleSwitchError,
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import gateway, oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -75,7 +78,6 @@ from claude_swap.printer import (
     bolded,
     dimmed,
     entrypoint_label,
-    error,
     format_age,
     ide_short_name,
     muted,
@@ -183,6 +185,7 @@ _DEMOTING_STASH_REASONS = (
     "consume-gate-persist-lock-failed",
     "consume-gate-unpersisted",
     "consume-gate-store-unreadable",
+    "consume-gate-account-replaced",
 )
 
 ERROR_NOTES = {
@@ -199,6 +202,9 @@ ERROR_NOTES = {
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+    "identity-conflict": (
+        "refreshed credential belongs to another account — re-login and re-add this slot"
     ),
 }
 
@@ -237,6 +243,8 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     with no measurement at all shows "usage unavailable" plus the last fetch
     error, so a failing endpoint is visible instead of a silent blank.
     """
+    if entry.sentinel == "gateway":
+        return [gateway.usage_label(entry.gateway)]
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
@@ -308,6 +316,40 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+
+
+def _token_identity_conflicts(record: dict, token_account: dict | None) -> bool:
+    """Compare endpoint identity without acquiring locks or changing the roster."""
+    if not isinstance(token_account, dict):
+        return False
+    uuid = token_account.get("uuid")
+    if not isinstance(uuid, str) or not uuid.strip():
+        return False
+    org = token_account.get("organizationUuid")
+    slot_org = record.get("organizationUuid")
+    slot_uuid = (record.get("uuid") or "").strip()
+    return bool(
+        (isinstance(org, str) and org and slot_org and org != slot_org)
+        or (slot_uuid and slot_uuid != uuid.strip())
+    )
+
+
+class _StashedIdentityConflict(Exception):
+    def __init__(self, token_account: dict):
+        super().__init__("stashed successor belongs to another account")
+        self.token_account = token_account
+
+
+class _AccountInfo(tuple):
+    """Seven-field compatibility tuple with the credential's local auth snapshot."""
+
+    def __new__(cls, values, record):
+        result = super().__new__(cls, values)
+        result.authentication = (
+            record.get("kind", "oauth"), record.get("email"),
+            record.get("organizationUuid") or "", record.get("authGeneration"),
+        )
+        return result
 
 
 class ClaudeAccountSwitcher:
@@ -810,7 +852,101 @@ class ClaudeAccountSwitcher:
             self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
+        if self._account_write_pending(account_num):
+            return ""
         return self._store._read_account_credentials(account_num, email)
+
+    def _account_write_marker(self, account_num: str) -> Path:
+        return self.backup_dir / f".account-write-{account_num}.pending"
+
+    def _account_write_pending(self, account_num: str) -> bool:
+        try:
+            self._account_write_marker(account_num).stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # Uncertain marker state must never license a key.
+        return True
+
+    def _refuse_pending_account_write(self, account_num: str) -> None:
+        if self._account_write_pending(account_num):
+            raise ConfigError(
+                f"Account-{account_num} replacement is incomplete; retry add-token with --slot {account_num} or import before using it"
+            )
+
+    @contextmanager
+    def _gateway_account_write(
+        self, slots, *, gateway_requested: bool = False,
+        explicit_replacement: bool = True,
+    ):
+        """Fail closed across multi-file replacement; caller holds roster lock.
+
+        The marker carries no credential. Ordinary store writes retain their
+        previous generation, while all authentication readers refuse this slot
+        until every write commits. A failed or interrupted write can be retried.
+        """
+        slots = sorted({str(num) for num in slots if num is not None})
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        gateway_active = gateway.active_slot(self._gateway_settings_path(), accounts) is not None
+        guarded = gateway_requested or explicit_replacement or any(
+            accounts.get(num, {}).get("kind") == "gateway" or self._account_write_pending(num)
+            for num in slots
+        )
+        if not guarded:
+            yield
+            return
+        retained_live = self._read_credentials() if gateway_active and explicit_replacement else ""
+        if retained_live is None:
+            raise CredentialReadError("Cannot replace an account while retained live credentials are unreadable")
+        try:
+            cleanup_slots = set(slots)
+            for num in slots:
+                try:
+                    prior = json.loads(self._account_write_marker(num).read_text())
+                except (FileNotFoundError, ValueError):
+                    continue
+                if isinstance(prior, dict):
+                    cleanup_slots.update(str(n) for n in prior.get("slots", []) if str(n).isdigit())
+            marker = json.dumps({"slots": sorted(cleanup_slots)}) + "\n"
+            for num in slots:
+                atomic_write_text(self._account_write_marker(num), marker)
+            yield
+            data = self._get_sequence_data() or {}
+            accounts = data.get("accounts", {})
+            if explicit_replacement:
+                for num in slots:
+                    if num in accounts:
+                        accounts[num]["authGeneration"] = uuid.uuid4().hex
+            if gateway_active and explicit_replacement:
+                # The live OAuth store is retained on gateway. An explicit
+                # import/replacement supersedes those bytes even when its
+                # expiry is earlier or absent. Publish intent before releasing
+                # the markers so a partial write cannot license the old live
+                # generation. Keeping it on the row follows moves and swaps.
+                for num in slots:
+                    if num in accounts and accounts[num].get("kind") != "gateway":
+                        replacement = self._store._read_account_credentials(num, accounts[num]["email"])
+                        live_oauth = oauth.extract_oauth_data(retained_live) or {}
+                        stored_oauth = oauth.extract_oauth_data(replacement) or {}
+                        same_generation = replacement == retained_live or (
+                            bool(live_oauth.get("accessToken"))
+                            and all(live_oauth.get(key) == stored_oauth.get(key) for key in ("accessToken", "refreshToken"))
+                        )
+                        if same_generation:
+                            accounts[num].pop("gatewayExplicitReplacement", None)
+                        else:
+                            accounts[num]["gatewayExplicitReplacement"] = True
+            if explicit_replacement:
+                self._write_json(self.sequence_file, data)
+            for num in cleanup_slots:
+                # A retry can finish a migration after its source row was
+                # already deleted. Never release another still-managed row.
+                if num in slots or num not in accounts:
+                    self._account_write_marker(num).unlink(missing_ok=True)
+        except (OSError, ClaudeSwitchError):
+            raise ConfigError(
+                "Account replacement is incomplete; retry add-token with the intended slot or import before using affected accounts"
+            ) from None
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -877,7 +1013,9 @@ class ClaudeAccountSwitcher:
         """Pre-commit clear that raises when the key still reads non-empty."""
         self._store.delete_account_credentials_strict(account_num, email)
 
-    def _delete_account_files(self, account_num: str, email: str) -> None:
+    def _delete_account_files(
+        self, account_num: str, email: str, *, before_delete=None
+    ) -> None:
         """Delete all backup files for an account (credentials + config).
 
         Single chokepoint for every path that removes or displaces a slot
@@ -890,6 +1028,8 @@ class ClaudeAccountSwitcher:
             SessionError: a live session-mode instance is using this account.
         """
         self._ensure_no_live_session(account_num, email, "the operation")
+        if before_delete is not None:
+            before_delete()
         self._delete_account_credentials(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
@@ -945,7 +1085,7 @@ class ClaudeAccountSwitcher:
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
-    def resolve_account(self, identifier: str) -> tuple[str, str, str]:
+    def resolve_account(self, identifier: str, *, locked: bool = False) -> tuple[str, str, str]:
         """Resolve NUM|EMAIL to (account_num, email, organizationUuid).
 
         Unlike switch_to/remove_account, ambiguity is a hard error rather
@@ -956,7 +1096,7 @@ class ClaudeAccountSwitcher:
             AccountNotFoundError: identifier doesn't match any account.
             ConfigError: email matches multiple accounts.
         """
-        self._get_sequence_data_migrated()
+        self._get_sequence_data_migrated(locked=locked)
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
             raise AccountNotFoundError(
@@ -966,6 +1106,7 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(account_num)
         if not record:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        self._refuse_pending_account_write(account_num)
         return (
             account_num,
             record.get("email", ""),
@@ -984,31 +1125,32 @@ class ClaudeAccountSwitcher:
             ValidationError: alias format is invalid.
             ConfigError: the normalized alias is already used by another account.
         """
-        self._refuse_session_shell()
-        try:
-            normalized = normalize_alias(alias)
-        except ValueError as e:
-            raise ValidationError(str(e)) from e
+        with FileLock(self.lock_file):
+            self._refuse_session_shell()
+            try:
+                normalized = normalize_alias(alias)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
 
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            self._get_sequence_data_migrated(locked=True)
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        conflict = self._alias_in_use(normalized, exclude_num=account_num)
-        if conflict is not None:
-            raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
+            conflict = self._alias_in_use(normalized, exclude_num=account_num)
+            if conflict is not None:
+                raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
 
-        record["alias"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        return account_num, normalized
+            record["alias"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            return account_num, normalized
 
     def unset_alias(self, identifier: str) -> str:
         """Clear the alias for the account matching identifier.
@@ -1020,23 +1162,24 @@ class ClaudeAccountSwitcher:
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
         """
-        self._refuse_session_shell()
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        with FileLock(self.lock_file):
+            self._refuse_session_shell()
+            self._get_sequence_data_migrated(locked=True)
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        if "alias" in record:
-            del record["alias"]
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
-        return account_num
+            if "alias" in record:
+                del record["alias"]
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+            return account_num
 
     def list_aliases(self) -> list[tuple[str, str, str]]:
         """Every set alias as ``(account_num, alias, email)``, slot-number order."""
@@ -1093,6 +1236,7 @@ class ClaudeAccountSwitcher:
         aborts here rather than committing a swap/move that silently drops
         the slot's live refresh token in favor of an empty destination.
         """
+        self._refuse_pending_account_write(account_num)
         creds, unreadable = self._read_account_credentials_ex(account_num, email)
         if unreadable:
             raise ConfigError(
@@ -1110,7 +1254,7 @@ class ClaudeAccountSwitcher:
         number resolved outside the lock could be renumbered by a concurrent
         swap/move and target the wrong account.
         """
-        self._get_sequence_data_migrated()
+        self._get_sequence_data_migrated(locked=True)
 
         num_a = self._resolve_account_identifier(first)
         if not num_a:
@@ -1128,6 +1272,7 @@ class ClaudeAccountSwitcher:
             raise AccountNotFoundError(f"Account-{num_a} does not exist")
         if not record_b:
             raise AccountNotFoundError(f"Account-{num_b} does not exist")
+        self._refuse_active_gateway_renumber(data, num_a, num_b)
 
         email_a = record_a.get("email", "")
         email_b = record_b.get("email", "")
@@ -1149,72 +1294,73 @@ class ClaudeAccountSwitcher:
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
 
-        staging: dict[str, Path] = {}
-        try:
-            if email_a == email_b:
-                # Same email: the two slots' backup keys fully overlap, so
-                # every write below overwrites the other account's material.
-                # Park durable copies first — a failure mid-write can then
-                # never leave a credential existing only in this process's
-                # memory. (Staging fails -> abort before anything changed.)
-                staging = self._stage_overlap_material(
-                    {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
+        with self._gateway_account_write([num_a, num_b], explicit_replacement=False):
+            staging: dict[str, Path] = {}
+            try:
+                if email_a == email_b:
+                    # Same email: the two slots' backup keys fully overlap, so
+                    # every write below overwrites the other account's material.
+                    # Park durable copies first — a failure mid-write can then
+                    # never leave a credential existing only in this process's
+                    # memory. (Staging fails -> abort before anything changed.)
+                    staging = self._stage_overlap_material(
+                        {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
+                    )
+
+                # Move each session profile to its owner's new slot key. When both
+                # accounts share an email the two paths swap directly, so stage the
+                # first through a temporary name.
+                self._swap_session_dirs(num_a, email_a, num_b, email_b)
+
+                # Set each destination key to its owner's exact state: write
+                # material that exists, actively clear what doesn't. An empty
+                # source must never leave the destination serving leftover
+                # material — the other account's (same-email overlap, where no
+                # separate old-key cleanup runs) or a stale file leaked by an
+                # earlier crash. The old keys are cleared only after the commit
+                # below, so the records never point at missing material.
+                if creds_a:
+                    self._write_account_credentials(num_b, email_a, creds_a)
+                else:
+                    self._delete_account_credentials_strict(num_b, email_a)
+                if config_a:
+                    self._write_account_config(num_b, email_a, config_a)
+                else:
+                    self._delete_config_backup(num_b, email_a)
+                if creds_b:
+                    self._write_account_credentials(num_a, email_b, creds_b)
+                else:
+                    self._delete_account_credentials_strict(num_a, email_b)
+                if config_b:
+                    self._write_account_config(num_a, email_b, config_b)
+                else:
+                    self._delete_config_backup(num_a, email_b)
+
+                data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
+                int_a, int_b = int(num_a), int(num_b)
+                # Renumber, then sort: sequence is kept sorted everywhere (add
+                # sorts on insert), so rotation and list order follow the new
+                # slot numbers instead of preserving the old visual positions.
+                data["sequence"] = [
+                    int_b if n == int_a else int_a if n == int_b else n
+                    for n in data.get("sequence", [])
+                ]
+                data["sequence"].sort()
+                active = data.get("activeAccountNumber")
+                if active == int_a:
+                    data["activeAccountNumber"] = int_b
+                elif active == int_b:
+                    data["activeAccountNumber"] = int_a
+                data["lastUpdated"] = get_timestamp()
+                # The commit point: _write_json's rename publishes the swap.
+                self._write_json(self.sequence_file, data)
+            except BaseException:
+                self._rollback_swap(
+                    num_a, email_a, creds_a, config_a,
+                    num_b, email_b, creds_b, config_b,
+                    staging,
                 )
-
-            # Move each session profile to its owner's new slot key. When both
-            # accounts share an email the two paths swap directly, so stage the
-            # first through a temporary name.
-            self._swap_session_dirs(num_a, email_a, num_b, email_b)
-
-            # Set each destination key to its owner's exact state: write
-            # material that exists, actively clear what doesn't. An empty
-            # source must never leave the destination serving leftover
-            # material — the other account's (same-email overlap, where no
-            # separate old-key cleanup runs) or a stale file leaked by an
-            # earlier crash. The old keys are cleared only after the commit
-            # below, so the records never point at missing material.
-            if creds_a:
-                self._write_account_credentials(num_b, email_a, creds_a)
-            else:
-                self._delete_account_credentials_strict(num_b, email_a)
-            if config_a:
-                self._write_account_config(num_b, email_a, config_a)
-            else:
-                self._delete_config_backup(num_b, email_a)
-            if creds_b:
-                self._write_account_credentials(num_a, email_b, creds_b)
-            else:
-                self._delete_account_credentials_strict(num_a, email_b)
-            if config_b:
-                self._write_account_config(num_a, email_b, config_b)
-            else:
-                self._delete_config_backup(num_a, email_b)
-
-            data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
-            int_a, int_b = int(num_a), int(num_b)
-            # Renumber, then sort: sequence is kept sorted everywhere (add
-            # sorts on insert), so rotation and list order follow the new
-            # slot numbers instead of preserving the old visual positions.
-            data["sequence"] = [
-                int_b if n == int_a else int_a if n == int_b else n
-                for n in data.get("sequence", [])
-            ]
-            data["sequence"].sort()
-            active = data.get("activeAccountNumber")
-            if active == int_a:
-                data["activeAccountNumber"] = int_b
-            elif active == int_b:
-                data["activeAccountNumber"] = int_a
-            data["lastUpdated"] = get_timestamp()
-            # The commit point: _write_json's rename publishes the swap.
-            self._write_json(self.sequence_file, data)
-        except BaseException:
-            self._rollback_swap(
-                num_a, email_a, creds_a, config_a,
-                num_b, email_b, creds_b, config_b,
-                staging,
-            )
-            raise
+                raise
 
         # Post-commit cleanup, all best-effort: the records already reference
         # the new keys only. A failure here leaks a stale file, never a wrong
@@ -1525,7 +1671,9 @@ class ClaudeAccountSwitcher:
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
         with FileLock(self.lock_file):
-            self._get_sequence_data_migrated()
+            self._get_sequence_data_migrated(locked=True)
+
+            self._refuse_pending_account_write(target)
 
             num_src = self._resolve_account_identifier(account)
             if not num_src:
@@ -1561,6 +1709,19 @@ class ClaudeAccountSwitcher:
             self._relocate_locked(num_src, target)
             return num_src, target, False
 
+    def _refuse_active_gateway_renumber(self, data: dict, *slots: str) -> None:
+        # Called under the account lock, before any relocation writes. The
+        # settings helper names a slot; leave changing it to switch's full
+        # settings transaction rather than risk serving the wrong key.
+        active = gateway.active_slot(
+            self._gateway_settings_path(), data.get("accounts", {})
+        )
+        if active in slots:
+            raise ValidationError(
+                f"Cannot renumber active gateway Account-{active}; switch away "
+                "from it before moving or swapping its slot"
+            )
+
     def _relocate_locked(self, num_src: str, target: str) -> None:
         """Move one account from ``num_src`` to the empty slot ``target``.
 
@@ -1579,6 +1740,7 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(num_src)
         if not record:
             raise AccountNotFoundError(f"Account-{num_src} does not exist")
+        self._refuse_active_gateway_renumber(data, num_src)
         if data.get("accounts", {}).get(target):
             raise ValidationError(
                 f"Slot {target} is already occupied — retry the move"
@@ -1746,8 +1908,8 @@ class ClaudeAccountSwitcher:
         """Public wrapper: account number → decision-grade usage value.
 
         Each value is a usage dict (last-good, trusted while ≤
-        ``usage_store.STALE_OK_S`` old), a sentinel string, or ``None``
-        (unknown).
+        ``usage_store.STALE_OK_S`` old), a gateway verdict under ``gateway``,
+        a sentinel string, or ``None`` (unknown).
         """
         return self._usage_by_account()
 
@@ -1784,6 +1946,8 @@ class ClaudeAccountSwitcher:
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
             n = str(num)
+            record = seq_data.get("accounts", {}).get(n, {})
+            kind = record.get("kind", "oauth")
             if is_active:
                 active_number = n
             accounts.append(
@@ -1793,12 +1957,17 @@ class ClaudeAccountSwitcher:
                     org_name=org_name,
                     org_uuid=org_uuid,
                     is_active=is_active,
-                    kind=self._account_kind(n),
+                    kind=kind,
                     switchable=self._account_is_switchable(n),
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
+                    gateway=(
+                        gateway.json_fields(record, entries[n].gateway)
+                        if kind == "gateway"
+                        else None
+                    ),
                 )
             )
         return AccountsSnapshot(
@@ -1952,7 +2121,7 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(data, str(num))
         ]
 
-    def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
+    def _resolve_for_policy_write(self, identifier: str, *, locked: bool = False) -> tuple[str, str, dict, dict]:
         """Resolve an identifier and fetch its record, ready for a policy write.
 
         Called by :meth:`set_account_threshold`. Every
@@ -1970,7 +2139,7 @@ class ClaudeAccountSwitcher:
             raise ConfigError("No accounts are managed yet")
 
         # resolve_account migrates org fields and hard-errors on ambiguity.
-        account_num, email, _ = self.resolve_account(identifier)
+        account_num, email, _ = self.resolve_account(identifier, locked=locked)
 
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(account_num)
@@ -2006,40 +2175,41 @@ class ClaudeAccountSwitcher:
         """
         # Validate first: a bad value must never reach the file. Resolution
         # order matters only in that both checks precede the single write.
-        normalized = None if threshold is None else normalize_account_threshold(threshold)
+        with FileLock(self.lock_file):
+            normalized = None if threshold is None else normalize_account_threshold(threshold)
 
-        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+            account_num, email, data, record = self._resolve_for_policy_write(identifier, locked=True)
 
-        current = record.get("threshold")
-        if normalized is None and "threshold" not in record:
-            print(dimmed(
-                f"Account-{account_num} ({email}) has no threshold override "
-                f"— already using the global default."
-            ))
-            return
-        if normalized is not None and current == normalized:
-            print(dimmed(
-                f"Account-{account_num} ({email}) is already at {normalized:g}%."
-            ))
-            return
+            current = record.get("threshold")
+            if normalized is None and "threshold" not in record:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) has no threshold override "
+                    f"— already using the global default."
+                ))
+                return
+            if normalized is not None and current == normalized:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) is already at {normalized:g}%."
+                ))
+                return
 
-        if normalized is None:
-            record.pop("threshold", None)
-        else:
-            record["threshold"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            if normalized is None:
+                record.pop("threshold", None)
+            else:
+                record["threshold"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
 
-        if normalized is None:
-            self._logger.info(f"Cleared threshold for account {account_num}: {email}")
-            print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
-                  f"— now using the global default.")
-        else:
-            self._logger.info(
-                f"Set threshold {normalized:g} for account {account_num}: {email}"
-            )
-            print(f"{accent('Set')} Account-{account_num} ({email}) "
-                  f"threshold to {normalized:g}%.")
+            if normalized is None:
+                self._logger.info(f"Cleared threshold for account {account_num}: {email}")
+                print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
+                      f"— now using the global default.")
+            else:
+                self._logger.info(
+                    f"Set threshold {normalized:g} for account {account_num}: {email}"
+                )
+                print(f"{accent('Set')} Account-{account_num} ({email}) "
+                      f"threshold to {normalized:g}%.")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.
@@ -2055,47 +2225,48 @@ class ClaudeAccountSwitcher:
             ConfigError: no accounts are managed yet, or the email is ambiguous.
             AccountNotFoundError: identifier doesn't match any account.
         """
-        if not self.sequence_file.exists():
-            raise ConfigError("No accounts are managed yet")
+        with FileLock(self.lock_file):
+            if not self.sequence_file.exists():
+                raise ConfigError("No accounts are managed yet")
 
-        # resolve_account migrates org fields and hard-errors on ambiguity.
-        account_num, email, _ = self.resolve_account(identifier)
+            # resolve_account migrates org fields and hard-errors on ambiguity.
+            account_num, email, _ = self.resolve_account(identifier, locked=True)
 
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        verb = "disabled" if disabled else "enabled"
-        if bool(record.get("disabled")) == disabled:
-            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
-            return
+            verb = "disabled" if disabled else "enabled"
+            if bool(record.get("disabled")) == disabled:
+                print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+                return
 
-        if disabled:
-            record["disabled"] = True
-        else:
-            record.pop("disabled", None)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
+            if disabled:
+                record["disabled"] = True
+            else:
+                record.pop("disabled", None)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
 
-        print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
+            print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
 
-        if disabled:
-            active = data.get("activeAccountNumber")
-            if str(active) == account_num:
-                print(dimmed(
-                    "  It is the active account — it stays live until you switch "
-                    "away; it just won't be an automatic switch target."
-                ))
-            if not self.switchable_account_numbers():
-                warning(
-                    "  No accounts remain in rotation — auto-switch and bare "
-                    "switch have nothing to pick. Re-enable one with "
-                    "cswap enable <num|email>."
-                )
-        else:
-            print(dimmed("  It is back in the rotation."))
+            if disabled:
+                active = data.get("activeAccountNumber")
+                if str(active) == account_num:
+                    print(dimmed(
+                        "  It is the active account — it stays live until you switch "
+                        "away; it just won't be an automatic switch target."
+                    ))
+                if not self.switchable_account_numbers():
+                    warning(
+                        "  No accounts remain in rotation — auto-switch and bare "
+                        "switch have nothing to pick. Re-enable one with "
+                        "cswap enable <num|email>."
+                    )
+            else:
+                print(dimmed("  It is back in the rotation."))
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -2121,7 +2292,7 @@ class ClaudeAccountSwitcher:
             return None
         data = self._get_sequence_data() or {}
         email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        return self._find_active_account_slot(data, email, org_uuid)
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
@@ -2290,6 +2461,12 @@ class ClaudeAccountSwitcher:
 
         try:
             with FileLock(self.lock_file):
+                expected_generation = self._oauth_write_generation(account_num, email)
+                if expected_generation is None:
+                    return oauth.RefreshOutcome(None, "transient")
+                expected_identity = dict(
+                    self._get_sequence_data()["accounts"][account_num]
+                )
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2310,6 +2487,11 @@ class ClaudeAccountSwitcher:
                 try:
                     adopted_creds = self._adopt_stashed_successor(
                         account_num, email, current
+                    )
+                except _StashedIdentityConflict as conflict:
+                    return oauth.RefreshOutcome(
+                        None, "identity-conflict", conflict.token_account,
+                        oauth.credential_fingerprint(current), stashed=True,
                     )
                 except CredentialReadError:
                     # The slot's only successor is unreadable. Deferring is
@@ -2479,6 +2661,10 @@ class ClaudeAccountSwitcher:
                     "fingerprint": oauth.credential_fingerprint(
                         result.credentials
                     ),
+                    "tokenAccount": {
+                        key: result.token_account.get(key)
+                        for key in ("uuid", "email", "organizationUuid")
+                    } if isinstance(result.token_account, dict) else None,
                 },
             )
             nonlocal stashed_reason
@@ -2486,13 +2672,28 @@ class ClaudeAccountSwitcher:
             self._logger.warning(note, account_num)
 
         outcome_creds = result.credentials
+        outcome_identity = result.token_account
+        identity_conflict = _token_identity_conflicts(expected_identity, outcome_identity)
         try:
             try:
                 with FileLock(self.lock_file):
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )
-                    if store_unreadable:
+                    generation_changed = self._oauth_write_generation(account_num, email) != expected_generation
+                    if not generation_changed:
+                        # UUID backfill does not change authGeneration. Honor
+                        # identity learned during the POST even if the backup
+                        # became unreadable and the successor must be stashed.
+                        identity_conflict = identity_conflict or _token_identity_conflicts(
+                            self._get_sequence_data()["accounts"][account_num], outcome_identity
+                        )
+                    if generation_changed and account_num in (self._get_sequence_data() or {}).get("accounts", {}):
+                        stash_successor(
+                            "consume-gate-account-replaced",
+                            "Account %s was replaced during a refresh POST; successor stashed, nothing rewritten.",
+                        )
+                    elif store_unreadable:
                         # The Keychain locked during the POST (macOS screen
                         # lock is ~1s away at any moment). The CAS cannot be
                         # evaluated: writing back could clobber a racing
@@ -2531,6 +2732,15 @@ class ClaudeAccountSwitcher:
                             "newer store credential.",
                         )
                         outcome_creds = store_now
+                        # The endpoint identity belongs to the stashed
+                        # successor, not the racing credential we adopted.
+                        outcome_identity = None
+                        identity_conflict = False
+                    elif identity_conflict:
+                        stash_successor(
+                            "consume-gate-identity-conflict",
+                            "Account %s's successor belongs to another account; stashed without adopting it.",
+                        )
                     else:
                         self._write_account_credentials(
                             account_num, email, result.credentials
@@ -2572,6 +2782,14 @@ class ClaudeAccountSwitcher:
                     "storage failure, then re-login and `cswap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
+        if identity_conflict:
+            # None of the consumers may use a known foreign token, even for
+            # one usage request. Keep its identity alongside the sole copy
+            # so a retry cannot silently adopt it as an ordinary successor.
+            return oauth.RefreshOutcome(
+                None, "identity-conflict", outcome_identity, consumed_fp,
+                stashed=bool(stashed_reason and stashed_reason != "consume-gate-unpersisted"),
+            )
         if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
             # generation whose grant we just spent. Callers read `error is
@@ -2597,14 +2815,14 @@ class ClaudeAccountSwitcher:
             # candidate (network?)" on every multi-surface race — the exact
             # contention this gate was built for, turned into a false alarm.
             return oauth.RefreshOutcome(
-                outcome_creds, "transient", result.token_account, consumed_fp,
+                outcome_creds, "transient", outcome_identity, consumed_fp,
                 # `consume-gate-unpersisted` is set precisely WHEN the stash
                 # write raised, so it is the one demoting reason that did not
                 # park anything. Every other one wrote the entry first.
                 stashed=stashed_reason != "consume-gate-unpersisted",
             )
         return oauth.RefreshOutcome(
-            outcome_creds, None, result.token_account, consumed_fp
+            outcome_creds, None, outcome_identity, consumed_fp
         )
 
     def _retire_stash_entry(self, entry_id: str, account_num: str) -> None:
@@ -2655,6 +2873,8 @@ class ClaudeAccountSwitcher:
         # it and keep scanning; only defer via CredentialReadError once no
         # row adopted.
         deferred_entry_id: str | None = None
+        conflicting_identity: dict | None = None
+        slot_identity = (self._get_sequence_data() or {}).get("accounts", {}).get(account_num, {})
         manifest, manifest_verdict = self._store._read_stash_manifest_ex()
         if manifest_verdict == "unreadable" or (
             manifest_verdict == "corrupt"
@@ -2735,6 +2955,9 @@ class ClaudeAccountSwitcher:
                 continue
             creds, unreadable = self._store._read_unclaimed_credential(entry_id)
             if unreadable:
+                if _token_identity_conflicts(slot_identity, meta.get("tokenAccount")):
+                    conflicting_identity = meta["tokenAccount"]
+                    continue
                 # This entry is the SOLE copy of a generation a prior gate
                 # pass already consumed and could not persist. Falling
                 # through here would make the caller POST the slot's
@@ -2760,6 +2983,11 @@ class ClaudeAccountSwitcher:
                     "generation is gone, so no pass could ever adopt it.",
                     account_num,
                 )
+                continue
+            if _token_identity_conflicts(slot_identity, meta.get("tokenAccount")):
+                # Preserve this entry, but still allow a healthy sibling on
+                # the same predecessor to recover the slot.
+                conflicting_identity = meta["tokenAccount"]
                 continue
             # The WRAPPER, not the store method plus a private repeat of its
             # tail: `_write_account_credentials` already contains the
@@ -2790,6 +3018,8 @@ class ClaudeAccountSwitcher:
                 "is unreadable; deferring adoption rather than discarding "
                 "its generation"
             )
+        if conflicting_identity is not None:
+            raise _StashedIdentityConflict(conflicting_identity)
         return None
 
     def _record_active_verdict(self, active) -> None:
@@ -2846,6 +3076,8 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials_ex(
         self, account_num: str, email: str
     ) -> tuple[str, bool]:
+        if self._account_write_pending(account_num):
+            return "", False
         return self._store._read_account_credentials_ex(account_num, email)
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
@@ -2870,7 +3102,7 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
-        if looks_like_api_key(creds):
+        if self._account_info_kind(account_info) == "gateway" or looks_like_api_key(creds):
             return []
         if is_active:
             line = _label_token_status("active profile", creds)
@@ -3056,7 +3288,10 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import profile_is_quiescent, read_session_identity
 
         session_dir = self._session_dir(account_num, email)
+        expected_generation = self._oauth_write_generation(account_num, email, org_uuid)
         with FileLock(self.lock_file):
+            if expected_generation is None or self._oauth_write_generation(account_num, email, org_uuid) != expected_generation:
+                return None
             if not profile_is_quiescent(session_dir):
                 return None
             profile = self._session_profile_ahead(account_num, email, org_uuid)
@@ -3114,8 +3349,11 @@ class ClaudeAccountSwitcher:
             f"Removed session profile for account {account_num} at {session_dir}"
         )
 
-    def _init_sequence_file(self) -> None:
+    def _init_sequence_file(self, *, locked: bool = False) -> None:
         """Initialize sequence.json if it doesn't exist."""
+        if not locked:
+            with FileLock(self.lock_file):
+                return self._init_sequence_file(locked=True)
         if not self.sequence_file.exists():
             init_data = {
                 "activeAccountNumber": None,
@@ -3161,6 +3399,12 @@ class ClaudeAccountSwitcher:
         Delegates so there is ONE reader: two copies of this drifted apart
         once already, over whether a null ``accountUuid`` normalises to "".
         """
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        slot = gateway.active_slot(self._gateway_settings_path(), accounts)
+        if slot is not None:
+            return accounts[slot]["email"], accounts[slot].get(
+                "organizationUuid", ""
+            ) or ""
         triple = self._get_current_identity_triple()
         return None if triple is None else triple[:2]
 
@@ -3294,6 +3538,17 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
+    def _find_active_account_slot(
+        self, data: dict, email: str, organization_uuid: str
+    ) -> str | None:
+        """A retained OAuth identity cannot establish gateway activation."""
+        slot = self._find_account_slot(data, email, organization_uuid)
+        accounts = data.get("accounts", {})
+        if slot is not None and accounts[slot].get("kind") == "gateway":
+            if gateway.active_slot(self._gateway_settings_path(), accounts) != slot:
+                return None
+        return slot
+
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
@@ -3311,7 +3566,8 @@ class ClaudeAccountSwitcher:
             return "oauth"
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num), {})
-        return "api_key" if record.get("kind") == "api_key" else "oauth"
+        kind = record.get("kind")
+        return kind if kind in ("api_key", "gateway") else "oauth"
 
     def _reject_identity_drift_since_verify(
         self, verified: tuple[str, str, str]
@@ -3514,7 +3770,9 @@ class ClaudeAccountSwitcher:
                 "'cswap add-token sk-ant-...' instead of 'cswap add'."
             )
 
-    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
+    def _reject_cross_kind_collision(
+        self, email: str, is_api_key: bool, *, kind: str | None = None
+    ) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
 
@@ -3532,10 +3790,11 @@ class ClaudeAccountSwitcher:
         if slot is None:
             return
         existing_kind = self._account_kind(slot)
-        new_kind = "api_key" if is_api_key else "oauth"
+        new_kind = kind or ("api_key" if is_api_key else "oauth")
         if existing_kind != new_kind:
-            existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
-            new_label = "API-key" if is_api_key else "OAuth"
+            labels = {"api_key": "API-key", "oauth": "OAuth", "gateway": "gateway"}
+            existing_label = labels[existing_kind]
+            new_label = labels[new_kind]
             raise ValidationError(
                 f"'{email}' already exists as an {existing_label} account "
                 f"(slot {slot}); cannot add it as an {new_label} account. "
@@ -3571,6 +3830,15 @@ class ClaudeAccountSwitcher:
         if num is not None and num == exclude_num:
             return None
         return num
+
+    def _validate_token_alias(self, email: str, alias: str | None) -> None:
+        """Check the requested alias; repeat under the token write lock."""
+        if alias is None:
+            return
+        existing_slot = self._find_account_slot(self._get_sequence_data() or {}, email, "")
+        conflict = self._alias_in_use(alias, exclude_num=existing_slot)
+        if conflict is not None:
+            raise ConfigError(f"Alias '{alias}' is already used by account {conflict}")
 
     def _resolve_account_identifier(self, identifier: str) -> str | None:
         """Resolve account identifier (number, alias, or email) to account number.
@@ -3610,7 +3878,7 @@ class ClaudeAccountSwitcher:
             f"Use account number instead (e.g., cswap --switch-to 1)."
         )
 
-    def _get_sequence_data_migrated(self) -> dict | None:
+    def _get_sequence_data_migrated(self, *, locked: bool = False) -> dict | None:
         """Get sequence data, ensuring org-field migration has run."""
         data = self._get_sequence_data()
         if not data:
@@ -3620,17 +3888,20 @@ class ClaudeAccountSwitcher:
             for acc in data.get("accounts", {}).values()
         )
         if needs_migration:
-            self._migrate_org_fields()
+            self._migrate_org_fields(locked=locked)
             data = self._get_sequence_data()  # Re-read after migration
         return data
 
-    def _migrate_org_fields(self) -> None:
+    def _migrate_org_fields(self, *, locked: bool = False) -> None:
         """Backfill organizationUuid/Name for accounts added before org support.
 
         For the currently active account, reads org info from the live config
         (which is authoritative). For inactive accounts, falls back to backup
         configs. Writes updated fields back to sequence.json.
         """
+        if not locked:
+            with FileLock(self.lock_file):
+                return self._migrate_org_fields(locked=True)
         data = self._get_sequence_data()
         if not data:
             return
@@ -3765,18 +4036,28 @@ class ClaudeAccountSwitcher:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
-            self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (current_email, current_org_uuid)}
-            )
+            expected_record = seq.get("accounts", {}).get(account_num)
+            with FileLock(self.lock_file):
+                self._validate_account_write_targets({account_num: expected_record})
+                seq = self._get_sequence_data()
+                self._refuse_active_gateway_replacement(seq, account_num)
+                if seq["accounts"][account_num].get("kind", "oauth") != "oauth":
+                    raise ValidationError(
+                        "Cannot refresh a gateway or API-key account from an OAuth login; use a distinct slot"
+                    )
+                with self._gateway_account_write([account_num], gateway_requested=False):
+                    self._write_account_credentials(account_num, current_email, current_creds)
+                    self._write_account_config(account_num, current_email, current_config)
+                    self._usage_store.clear_dead_token(
+                        [account_num], {account_num: (current_email, current_org_uuid)}
+                    )
 
-            if alias is not None:
-                seq["accounts"][account_num]["alias"] = alias
+                    if alias is not None:
+                        seq["accounts"][account_num]["alias"] = alias
 
-            seq["activeAccountNumber"] = int(account_num)
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
+                    seq["activeAccountNumber"] = int(account_num)
+                    seq["lastUpdated"] = get_timestamp()
+                    self._write_json(self.sequence_file, seq)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3887,52 +4168,67 @@ class ClaudeAccountSwitcher:
 
         self._reject_identity_drift_since_verify(identity)
 
-        # Now safe to perform destructive cleanup (new account data is in memory)
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
-        )
-
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
+        expected_records = {
+            account_num: data.get("accounts", {}).get(account_num) if slot is not None else None
         }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
+        if migrate_from:
+            expected_records[migrate_from] = data.get("accounts", {}).get(migrate_from)
+        with FileLock(self.lock_file):
+            self._validate_account_write_targets(expected_records)
+            self._refuse_active_gateway_replacement(
+                self._get_sequence_data() or {}, account_num, migrate_from
+            )
+            # Now safe to perform destructive cleanup (new account data is in memory)
+            if displace_slot:
+                self._ensure_no_live_session(displace_slot[0], displace_slot[1], "the operation")
+            if migrate_from:
+                self._ensure_no_live_session(migrate_from, expected_records[migrate_from]["email"], "the operation")
+            with self._gateway_account_write([account_num, migrate_from], gateway_requested=False):
+                if displace_slot:
+                    d_num, d_email, d_org = displace_slot
+                    self._delete_account_files(d_num, d_email)
+                    data = self._get_sequence_data()
+                    if int(d_num) in data["sequence"]:
+                        data["sequence"].remove(int(d_num))
+                    del data["accounts"][d_num]
+                    self._write_json(self.sequence_file, data)
+                    self._prune_mappings(d_email, d_org)
 
-        self._write_json(self.sequence_file, data)
+                if migrate_from:
+                    data = self._get_sequence_data()
+                    old_email = data["accounts"][migrate_from].get("email", "")
+                    self._delete_account_files(migrate_from, old_email)
+                    if int(migrate_from) in data["sequence"]:
+                        data["sequence"].remove(int(migrate_from))
+                    del data["accounts"][migrate_from]
+                    self._write_json(self.sequence_file, data)
+
+                # Store backups
+                self._write_account_credentials(account_num, current_email, current_creds)
+                self._write_account_config(account_num, current_email, current_config)
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (current_email, organization_uuid)}
+                )
+
+                # Update sequence.json
+                data = self._get_sequence_data()
+                data["accounts"][account_num] = {
+                    "email": current_email,
+                    "uuid": account_uuid,
+                    "organizationUuid": organization_uuid,
+                    "organizationName": organization_name,
+                    "added": get_timestamp(),
+                }
+                carried_alias = alias if alias is not None else existing_alias
+                if carried_alias:
+                    data["accounts"][account_num]["alias"] = carried_alias
+                if int(account_num) not in data["sequence"]:
+                    data["sequence"].append(int(account_num))
+                    data["sequence"].sort()
+                data["activeAccountNumber"] = int(account_num)
+                data["lastUpdated"] = get_timestamp()
+
+                self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -3945,6 +4241,13 @@ class ClaudeAccountSwitcher:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        *,
+        base_url: str | None = None,
+        auth: str = "bearer",
+        usage_url: str | None = None,
+        probe_model: str = gateway.DEFAULT_MODEL,
+        model_discovery: bool = False,
+        alias: str | None = None,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -3979,7 +4282,22 @@ class ClaudeAccountSwitcher:
         if not token:
             raise ValidationError("Token cannot be empty")
 
-        is_api_key = looks_like_api_key(token)
+        try:
+            gateway_fields = (
+                gateway.account_fields(
+                    base_url, auth, usage_url, probe_model, model_discovery
+                )
+                if base_url is not None
+                else {}
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from None
+        if alias is not None:
+            try:
+                alias = normalize_alias(alias)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from None
+        is_api_key = looks_like_api_key(token) or bool(gateway_fields)
 
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
@@ -3994,13 +4312,22 @@ class ClaudeAccountSwitcher:
         if not email:
             if slot is None:
                 slot = self._get_next_account_number()
-            label = "api-key" if is_api_key else "setup-token"
+            label = (
+                "gateway"
+                if gateway_fields
+                else "api-key"
+                if is_api_key
+                else "setup-token"
+            )
             email = f"{label}-{slot}@token.local"
 
         # Don't silently overwrite/convert an existing account of the other kind:
         # identity is matched on (email, org) only, so an api-key and an OAuth
         # account sharing an email would be indistinguishable at switch time.
-        self._reject_cross_kind_collision(email, is_api_key)
+        self._reject_cross_kind_collision(
+            email, is_api_key, kind="gateway" if gateway_fields else None
+        )
+        self._validate_token_alias(email, alias)
 
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
@@ -4031,18 +4358,34 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            self._write_account_credentials(account_num, email, credentials)
-            self._write_account_config(account_num, email, config)
-            # A refreshed credential invalidates any dead-token quarantine on this
-            # slot (mirrors ``add_account``); otherwise the stale strike row keeps
-            # the account stuck at "re-login needed" and it never fetches the new
-            # token. Token accounts are always personal, so org is "".
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (email, "")}
+            self._refuse_active_gateway_replacement(seq, account_num)
+            expected_record = seq.get("accounts", {}).get(account_num)
+            with FileLock(self.lock_file):
+                self._validate_account_write_targets({account_num: expected_record})
+                seq = self._get_sequence_data()
+                self._refuse_active_gateway_replacement(seq, account_num)
+                self._reject_cross_kind_collision(
+                    email, is_api_key, kind="gateway" if gateway_fields else None
+                )
+                self._validate_token_alias(email, alias)
+                with self._gateway_account_write([account_num], gateway_requested=bool(gateway_fields)):
+                    self._write_account_credentials(account_num, email, credentials)
+                    self._write_account_config(account_num, email, config)
+                    # A refreshed credential invalidates any dead-token quarantine on this
+                    # slot (mirrors ``add_account``); otherwise the stale strike row keeps
+                    # the account stuck at "re-login needed" and it never fetches the new
+                    # token. Token accounts are always personal, so org is "".
+                    self._usage_store.clear_dead_token(
+                        [account_num], {account_num: (email, "")}
+                    )
+                    seq["lastUpdated"] = get_timestamp()
+                    seq["accounts"][account_num].update(gateway_fields)
+                    if alias:
+                        seq["accounts"][account_num]["alias"] = alias
+                    self._write_json(self.sequence_file, seq)
+            kind_label = (
+                "gateway" if gateway_fields else "API key" if is_api_key else "token"
             )
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
-            kind_label = "API key" if is_api_key else "token"
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
@@ -4064,6 +4407,7 @@ class ClaudeAccountSwitcher:
                 if old_num and old_num != account_num:
                     migrate_from = old_num
 
+            self._refuse_active_gateway_replacement(data, account_num, migrate_from)
             if account_num in data.get("accounts", {}):
                 existing = data["accounts"][account_num]
                 existing_email = existing.get("email", "unknown")
@@ -4096,51 +4440,75 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        self._write_account_credentials(account_num, email, credentials)
-        self._write_account_config(account_num, email, config)
-        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
-        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (email, "")}
-        )
-
-        data = self._get_sequence_data()
-        record = {
-            "email": email,
-            "uuid": "",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": get_timestamp(),
+        expected_records = {
+            account_num: data.get("accounts", {}).get(account_num) if slot is not None else None
         }
-        if is_api_key:
-            record["kind"] = "api_key"
-        data["accounts"][account_num] = record
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
+        if migrate_from:
+            expected_records[migrate_from] = data.get("accounts", {}).get(migrate_from)
+        with FileLock(self.lock_file):
+            self._validate_account_write_targets(expected_records)
+            self._refuse_active_gateway_replacement(
+                self._get_sequence_data() or {}, account_num, migrate_from
+            )
+            self._reject_cross_kind_collision(
+                email, is_api_key, kind="gateway" if gateway_fields else None
+            )
+            self._validate_token_alias(email, alias)
+            if displace_slot:
+                self._ensure_no_live_session(displace_slot[0], displace_slot[1], "the operation")
+            if migrate_from:
+                self._ensure_no_live_session(migrate_from, expected_records[migrate_from]["email"], "the operation")
+            with self._gateway_account_write([account_num, migrate_from], gateway_requested=bool(gateway_fields)):
+                if displace_slot:
+                    d_num, d_email, d_org = displace_slot
+                    self._delete_account_files(d_num, d_email)
+                    data = self._get_sequence_data()
+                    if int(d_num) in data["sequence"]:
+                        data["sequence"].remove(int(d_num))
+                    del data["accounts"][d_num]
+                    self._write_json(self.sequence_file, data)
+                    self._prune_mappings(d_email, d_org)
 
-        self._write_json(self.sequence_file, data)
-        source_label = "API key" if is_api_key else "token"
+                if migrate_from:
+                    data = self._get_sequence_data()
+                    old_email = data["accounts"][migrate_from].get("email", "")
+                    self._delete_account_files(migrate_from, old_email)
+                    if int(migrate_from) in data["sequence"]:
+                        data["sequence"].remove(int(migrate_from))
+                    del data["accounts"][migrate_from]
+                    self._write_json(self.sequence_file, data)
+
+                self._write_account_credentials(account_num, email, credentials)
+                self._write_account_config(account_num, email, config)
+                # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+                # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (email, "")}
+                )
+
+                data = self._get_sequence_data()
+                record = {
+                    "email": email,
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": get_timestamp(),
+                }
+                if is_api_key:
+                    record["kind"] = "api_key"
+                record.update(gateway_fields)
+                if alias:
+                    record["alias"] = alias
+                data["accounts"][account_num] = record
+                if int(account_num) not in data["sequence"]:
+                    data["sequence"].append(int(account_num))
+                    data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+
+                self._write_json(self.sequence_file, data)
+        source_label = (
+            "gateway" if gateway_fields else "API key" if is_api_key else "token"
+        )
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
@@ -4148,6 +4516,17 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+
+    def _validate_account_write_targets(self, expected: dict) -> None:
+        """Validate pre-prompt/resolution records again under the roster lock."""
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        if any(accounts.get(num) != record for num, record in expected.items()):
+            raise ConfigError("Account changed while preparing replacement; retry")
+
+    def _refuse_active_gateway_replacement(self, data: dict, *slots: str | None) -> None:
+        active = gateway.active_slot(self._gateway_settings_path(), data.get("accounts", {}))
+        if active is not None and active in slots:
+            raise ConfigError("Switch away from the active gateway before replacing or moving its account")
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
@@ -4223,19 +4602,123 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
-        # Remove backup files
-        self._delete_account_files(account_num, email)
+        with (
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
+            data = self._get_sequence_data() or {}
+            latest = data.get("accounts", {}).get(account_num)
+            if latest is None or any(latest.get(k) != account_info.get(k) for k in ("email", "organizationUuid", "uuid")):
+                raise ConfigError("Account changed during confirmation; retry removal")
+            account_info = latest
+            if account_info.get("kind") == "gateway":
+                remaining = [
+                    n
+                    for n, r in data["accounts"].items()
+                    if n != account_num and r.get("kind") == "gateway"
+                ]
+                path = self._gateway_settings_path()
+                active_gateway = gateway.active_slot(path, data["accounts"])
+                if active_gateway == account_num:
+                    raise ConfigError(
+                        "Switch away from the active gateway before removing it"
+                    )
+                # The delete chokepoint rechecks live sessions; a session
+                # may have started since the pre-prompt check. Refuse before
+                # changing even the leftover first-party settings value.
+                def remove_gateway_settings():
+                    try:
+                        gateway.write_settings(path, None, remove_last=True)
+                    except (ValueError, OSError):
+                        raise ConfigError(
+                            f"Cannot update Claude settings file {path}; repair it before retrying removal"
+                        ) from None
 
-        # Update sequence.json
-        del data["accounts"][account_num]
-        data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-        data["lastUpdated"] = get_timestamp()
+                self._delete_account_files(
+                    account_num, email,
+                    before_delete=remove_gateway_settings if not remaining else None,
+                )
+            else:
+                self._delete_account_files(account_num, email)
 
-        self._write_json(self.sequence_file, data)
+            del data["accounts"][account_num]
+            data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            try:
+                self._account_write_marker(account_num).unlink(missing_ok=True)
+            except OSError:
+                raise ConfigError("Account removed but replacement marker cleanup failed; retry add-token with the intended slot before reuse") from None
+            if account_info.get("kind") == "gateway":
+                self._usage_store.forget(
+                    account_num, (email, account_info.get("organizationUuid", "") or "")
+                )
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+
+    def account_auth_snapshot(self, number: str, email: str, org_uuid: str | None = None):
+        """Read a gateway endpoint and its credential as one roster generation."""
+        with FileLock(self.lock_file):
+            record = (self._get_sequence_data() or {}).get("accounts", {}).get(number, {})
+            if record.get("email") != email or (
+                org_uuid is not None and (record.get("organizationUuid") or "") != org_uuid
+            ):
+                raise AccountNotFoundError("Account changed while preparing authentication; retry")
+            key = self._read_account_credentials(number, email) if record.get("kind") == "gateway" else ""
+            return dict(record), key or ""
+
+    def _oauth_write_generation(self, number: str, email: str, org_uuid: str | None = None):
+        """Local snapshot; persistence callers recheck while holding the roster lock."""
+        record = (self._get_sequence_data() or {}).get("accounts", {}).get(number, {})
+        org = record.get("organizationUuid") or ""
+        if (
+            not record or self._account_write_pending(number)
+            or record.get("kind", "oauth") != "oauth"
+            or record.get("email") != email
+            or (org_uuid is not None and org != org_uuid)
+        ):
+            return None
+        return email, org, record.get("authGeneration")
+
+    def _switch_target_snapshot(self, data: dict, number: str) -> dict | None:
+        record = data.get("accounts", {}).get(number)
+        if record is None or self._account_write_pending(number):
+            return None
+        result = {key: record.get(key) for key in (
+            "email", "organizationUuid", "authGeneration", "disabled", *gateway.RECORD_FIELDS,
+        )}
+        result["kind"] = record.get("kind", "oauth")
+        if result["kind"] == "gateway":
+            result["keyFingerprint"] = oauth.credential_fingerprint(
+                self._read_account_credentials(number, record["email"])
+            )
+        return result
+
+    def switch_target_snapshots(self) -> dict[str, dict | None]:
+        """Pin explicit replacements independently of automatic OAuth refresh."""
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            return {num: self._switch_target_snapshot(data, num) for num in data.get("accounts", {})}
+
+    @contextmanager
+    def _gateway_probe_generation(self, number: str, record: dict, key: str):
+        """Bind local probe claims/publication to the snapshot, never network I/O."""
+        with FileLock(self.lock_file):
+            current = (self._get_sequence_data() or {}).get("accounts", {}).get(number)
+            valid = (
+                current == record
+                and current.get("kind") == "gateway"
+                and (not self._account_write_pending(number) or not key)
+            )
+            if valid:
+                current_key = self._read_account_credentials(number, current["email"])
+                # A missing read does not invalidate evidence from this
+                # generation. Only two different readable keys prove rotation.
+                valid = not key or not current_key or current_key == key
+            yield valid
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
@@ -4245,14 +4728,18 @@ class ClaudeAccountSwitcher:
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
         """
-        data = self._get_sequence_data_migrated() or {}
+        with FileLock(self.lock_file):
+            return self._build_accounts_info_locked()
+
+    def _build_accounts_info_locked(self):
+        data = self._get_sequence_data_migrated(locked=True) or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
         active_num = None
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
-            active_num = self._find_account_slot(data, current_email, current_org_uuid)
+            active_num = self._find_active_account_slot(data, current_email, current_org_uuid)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
@@ -4267,18 +4754,32 @@ class ClaudeAccountSwitcher:
             alias = account.get("alias", "") or ""
             is_active = str(num) == active_num
 
-            if is_active:
+            if is_active and account.get("kind") != "gateway":
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
                 creds = self._read_account_credentials(str(num), email)
 
-            accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
+            accounts_info.append(_AccountInfo((num, email, org_name, org_uuid, is_active, creds, alias), account))
         return accounts_info
 
+    def _account_info_kind(self, info) -> str:
+        return info.authentication[0] if isinstance(info, _AccountInfo) else self._account_kind(str(info[0]))
+
+    def _account_info_current(self, info) -> bool:
+        if not isinstance(info, _AccountInfo):
+            return True
+        num = str(info[0])
+        record = (self._get_sequence_data() or {}).get("accounts", {}).get(num, {})
+        return not self._account_write_pending(num) and info.authentication == (
+            record.get("kind", "oauth"), record.get("email"),
+            record.get("organizationUuid") or "", record.get("authGeneration"),
+        )
+
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str, org_uuid: str = ""
+        self, account_num: str, email: str, creds: str, org_uuid: str = "",
+        *, expected_generation=None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -4317,6 +4818,10 @@ class ClaudeAccountSwitcher:
           the token endpoint rejects its reuse (verified: invalid_grant on
           re-presentation, siblings unaffected).
         """
+        current_generation = self._oauth_write_generation(account_num, email, org_uuid)
+        if expected_generation is not None and current_generation != expected_generation:
+            return FetchRecord(error="account-changed")
+        expected_generation = current_generation
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
@@ -4364,7 +4869,8 @@ class ClaudeAccountSwitcher:
                     # fine; writing waits for a non-degraded pass.
                     if not self._active_read_degraded:
                         self._resync_rotated_backup(
-                            account_num, email, org_uuid, creds
+                            account_num, email, org_uuid, creds,
+                            expected_generation=expected_generation,
                         )
                     if self._probe_verdicts and self._probe_verdicts.get(
                         self._lineage_key(
@@ -4487,6 +4993,8 @@ class ClaudeAccountSwitcher:
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
+                if expected_generation is None or self._oauth_write_generation(account_num, email, org_uuid) != expected_generation:
+                    return _defer(force_refresh)
                 live = self._read_credentials()
                 if live is None:
                     # Read ERROR (locked keychain, unreadable store) — not
@@ -4845,7 +5353,8 @@ class ClaudeAccountSwitcher:
         )
 
     def _resync_rotated_backup(
-        self, account_num: str, email: str, org_uuid: str, creds: str
+        self, account_num: str, email: str, org_uuid: str, creds: str,
+        *, expected_generation=None,
     ) -> None:
         """Resync the slot backup after a rotation that completed elsewhere.
 
@@ -4875,6 +5384,8 @@ class ClaudeAccountSwitcher:
         recovery branch consumes nothing it cannot attribute. Never raises.
         """
         try:
+            if expected_generation is None:
+                return
             creds_oauth = oauth.extract_oauth_data(creds)
             if not (
                 creds_oauth
@@ -4941,6 +5452,8 @@ class ClaudeAccountSwitcher:
             ):
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
+                if self._oauth_write_generation(account_num, email, org_uuid) != expected_generation:
+                    return
                 if not self._live_identity_matches(email, org_uuid):
                     return
                 # Verdict re-check under the lock: slot mutations hold this
@@ -4991,6 +5504,10 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        if self._account_info_kind(account_info) == "gateway":
+            return "gateway"
+        if not self._account_info_current(account_info):
+            return USAGE_NO_CREDENTIALS
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -5029,12 +5546,17 @@ class ClaudeAccountSwitcher:
         """One network fetch for one account. Never raises. ``rejected_fp``
         is the row's refused-credential stamp, if any."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
+        if self._account_info_kind(account_info) == "gateway":
+            return FetchRecord(sentinel="gateway")
+        if not self._account_info_current(account_info):
+            return FetchRecord(error="account-changed")
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds, org_uuid)
+            auth_args = {"expected_generation": account_info.authentication[1:]} if isinstance(account_info, _AccountInfo) else {}
+            return self._fetch_active_usage(str(num), email, creds, org_uuid, **auth_args)
 
         from claude_swap.session import (
             read_session_credentials,
@@ -5293,6 +5815,7 @@ class ClaudeAccountSwitcher:
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims], pre
             )
+            records = {num: record for num, record in records.items() if self._account_info_current(info_by_num[num])}
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
             accepted_records = {
@@ -5313,6 +5836,22 @@ class ClaudeAccountSwitcher:
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
+        for num, info in info_by_num.items():
+            if sentinels.get(num) == "gateway":
+                record, key = self.account_auth_snapshot(num, *identities[num])
+                if record.get("kind") != "gateway":
+                    sentinels.pop(num, None)
+                    entries[num] = UsageEntry()
+                    continue
+                entries[num] = store.collect_gateway(
+                    num,
+                    identities[num],
+                    record,
+                    key,
+                    active=info[4],
+                    fetch=fetch is None or num in fetch,
+                    generation_guard=lambda: self._gateway_probe_generation(num, record, key),
+                )
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
@@ -5338,6 +5877,8 @@ class ClaudeAccountSwitcher:
         # every real account carries a non-empty org, and the lookup would
         # return a blank entry whose token_dead() is always False.
         data = self._get_sequence_data() or {}
+        if data.get("accounts", {}).get(num, {}).get("kind") == "gateway":
+            return False
         org = (
             (data.get("accounts", {}).get(num) or {})
             .get("organizationUuid", "") or ""
@@ -5487,7 +6028,11 @@ class ClaudeAccountSwitcher:
         """Map account number → decision-grade usage value for managed accounts."""
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info)
-        return {num: entry.decision_value() for num, entry in entries.items()}
+        return {
+            num: {"gateway": entry.gateway or {}}
+            if entry.sentinel == "gateway" else entry.decision_value()
+            for num, entry in entries.items()
+        }
 
     def _warn_inert_models(
         self,
@@ -5620,8 +6165,11 @@ class ClaudeAccountSwitcher:
         by_fp: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
         out: list[str] = []
-        for num, email, _org_name, org_uuid, _is_active, creds, _alias in accounts_info:
+        for info in accounts_info:
+            num, email, _org_name, org_uuid, _is_active, creds, _alias = info
             snum = str(num)
+            if self._account_info_kind(info) == "gateway":
+                continue
             fp = oauth.credential_fingerprint(creds) if creds else None
             if fp:
                 other = by_fp.get(fp)
@@ -5713,7 +6261,9 @@ class ClaudeAccountSwitcher:
         accounts = []
         seq_data = self._get_sequence_data() or {}
         now = self._usage_store.clock()
-        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
+        for info in accounts_info:
+            num, email, org_name, org_uuid, is_active, creds, alias = info
+            record = seq_data.get("accounts", {}).get(str(num), {})
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -5723,7 +6273,11 @@ class ClaudeAccountSwitcher:
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
             accounts.append(
                 account_row(
-                    num, email, org_name, org_uuid, is_active,
+                    num,
+                    email,
+                    org_name,
+                    org_uuid,
+                    is_active,
                     entry.decision_value(),
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
@@ -5735,7 +6289,17 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
-                    login_expires_at=oauth.login_expires_at_iso(creds),
+                    login_expires_at=(
+                        None if self._account_info_kind(info) == "gateway"
+                        else oauth.login_expires_at_iso(creds)
+                    ),
+                    gateway_info=(
+                        gateway.json_fields(
+                            record, entry.gateway
+                        )
+                        if record.get("kind") == "gateway"
+                        else None
+                    ),
                 )
             )
         payload = {
@@ -5793,7 +6357,12 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
-            tag = self._get_display_tag(email, org_name, org_uuid)
+            record = seq_data.get("accounts", {}).get(str(num), {})
+            tag = (
+                gateway.tag(record)
+                if record.get("kind") == "gateway"
+                else self._get_display_tag(email, org_name, org_uuid)
+            )
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
             if is_active:
@@ -5866,10 +6435,22 @@ class ClaudeAccountSwitcher:
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
         """
-        active = self._read_active_credentials()
-        creds = active.value or ""
-        self._record_active_verdict(active)
-        info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
+        with FileLock(self.lock_file):
+            record = (self._get_sequence_data() or {}).get("accounts", {}).get(account_num, {})
+            if (
+                self.current_account_number() != account_num
+                or record.get("email") != current_email
+                or (record.get("organizationUuid") or "") != (org_uuid or "")
+            ):
+                return UsageEntry(sentinel=USAGE_NO_CREDENTIALS)
+            self._record_active_verdict(None)
+            if record.get("kind") == "gateway":
+                creds = self._read_account_credentials(account_num, current_email)
+            else:
+                active = self._read_active_credentials()
+                creds = active.value or ""
+                self._record_active_verdict(active)
+            info = _AccountInfo((int(account_num), current_email, "", org_uuid or "", True, creds, ""), record)
         return self._collect_usage_entries([info])[str(account_num)]
 
     def _build_status_payload(self) -> dict:
@@ -5886,7 +6467,7 @@ class ClaudeAccountSwitcher:
                 "active": {"email": current_email, "managed": False},
             }
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num = self._find_active_account_slot(data, current_email, current_org_uuid)
         if not account_num:
             return {
                 "schemaVersion": SCHEMA_VERSION,
@@ -5911,6 +6492,14 @@ class ClaudeAccountSwitcher:
             "usageStatus": status,
             "usage": usage,
         }
+        if acct.get("kind") == "gateway":
+            active.update(
+                kind="gateway",
+                usageStatus="gateway",
+                gateway=gateway.json_fields(
+                    data["accounts"][account_num], entry.gateway
+                ),
+            )
         if alias:
             active["alias"] = alias
         if usage is not None:
@@ -5948,13 +6537,18 @@ class ClaudeAccountSwitcher:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return None
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num = self._find_active_account_slot(data, current_email, current_org_uuid)
         org_name = ""
         if account_num is not None:
             org_name = data["accounts"][account_num].get("organizationName", "") or ""
 
         if account_num:
-            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
+            record = data["accounts"][account_num]
+            tag = (
+                gateway.tag(record)
+                if record.get("kind") == "gateway"
+                else self._get_display_tag(current_email, org_name, current_org_uuid)
+            )
             total = len(data.get("accounts", {}))
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
@@ -6156,7 +6750,9 @@ class ClaudeAccountSwitcher:
         current_email, current_org_uuid = identity
 
         # Check if current account is managed
-        if not self._account_exists(current_email, current_org_uuid):
+        if self._find_active_account_slot(
+            self._get_sequence_data() or {}, current_email, current_org_uuid
+        ) is None:
             # In JSON mode, don't silently auto-add (a surprising side effect in
             # automation) — report it as a structured no-op instead.
             if json_output:
@@ -6181,7 +6777,7 @@ class ClaudeAccountSwitcher:
 
         if len(sequence) < 2:
             if json_output:
-                num = self._find_account_slot(data, current_email, current_org_uuid)
+                num = self._find_active_account_slot(data, current_email, current_org_uuid)
                 return self._switch_noop(
                     strategy=strategy_label,
                     reason="only-one-account",
@@ -6195,7 +6791,7 @@ class ClaudeAccountSwitcher:
         # Where the user actually is right now (live identity), falling back to
         # the recorded active slot. Used so usage-aware switching never moves
         # them onto an account worse than their current one.
-        current_num = self._find_account_slot(data, current_email, current_org_uuid)
+        current_num = self._find_active_account_slot(data, current_email, current_org_uuid)
         if current_num is None:
             current_num = str(active_account) if active_account is not None else None
 
@@ -6323,6 +6919,7 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        skipped_gateway = False
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
@@ -6344,7 +6941,18 @@ class ClaudeAccountSwitcher:
                     )
                 continue
             if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate), models)
+                value = usage.get(candidate)
+                verdict = value.get("gateway", {}) if isinstance(value, dict) else {}
+                status = verdict.get("probeStatus")
+                if status in ("exhausted", "unauthorized"):
+                    skipped_exhausted.append(candidate)
+                    skipped_gateway = True
+                    if json_output:
+                        warnings.append(f"Skipped Account-{candidate} (gateway {status})")
+                    else:
+                        print(f"{accent('Skipping')} Account-{candidate} (gateway {status})")
+                    continue
+                headroom = oauth.account_headroom(value, models)
                 if headroom is not None and headroom <= 0:
                     skipped_exhausted.append(candidate)
                     label = "5h/7d"
@@ -6374,8 +6982,12 @@ class ClaudeAccountSwitcher:
         # account would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
             # With model limits in play the binding window may be a scoped
-            # one (the per-skip lines name it), so don't claim "5h/7d".
-            limits_label = "usage limits" if models else "5h/7d limit"
+            # one (the per-skip lines name it), so don't claim "5h/7d"; a
+            # failing gateway has no windows at all.
+            limits_label = (
+                "limits or unavailable" if skipped_gateway
+                else "usage limits" if models else "5h/7d limit"
+            )
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",
@@ -6440,7 +7052,9 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self, identifier: str, json_output: bool = False, force: bool = False,
+        *, expected_source: str | None = None, expected_target: dict | None = None,
+        expected_source_auth: dict | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
@@ -6512,8 +7126,13 @@ class ClaudeAccountSwitcher:
         if not force and data:
             identity = self._get_current_account()
             if identity is not None:
-                cur_slot = self._find_account_slot(data, identity[0], identity[1])
-                if cur_slot == target_account:
+                cur_slot = self._find_active_account_slot(data, identity[0], identity[1])
+                if (
+                    cur_slot == target_account
+                    and self._account_kind(target_account) == "gateway"
+                ):
+                    action = "noop"
+                elif cur_slot == target_account:
                     action, provenance = self._self_switch_action(
                         target_account, identity[0]
                     )
@@ -6545,6 +7164,9 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            expected_source=expected_source,
+            expected_target=expected_target,
+            expected_source_auth=expected_source_auth,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -6640,10 +7262,16 @@ class ClaudeAccountSwitcher:
         result["live"] = live
         if not live:
             return result
-        identity = self._get_current_account()
+        data = self._get_sequence_data() or {}
+        if gateway.active_slot(self._gateway_settings_path(), data.get("accounts", {})) is not None:
+            # Gateway settings mask the retained OAuth login. Its live bytes
+            # still need attribution before they can be overwritten on return.
+            triple = self._get_current_identity_triple()
+            identity = None if triple is None else triple[:2]
+        else:
+            identity = self._get_current_account()
         if identity is None:
             return result
-        data = self._get_sequence_data() or {}
         slot = self._find_account_slot(data, identity[0], identity[1])
         if slot is None:
             return result
@@ -6666,12 +7294,53 @@ class ClaudeAccountSwitcher:
         return result
 
     def _classify_outgoing_credential(
-        self,
-        current_account: str,
-        current_email: str,
-        original_creds: str,
-        provenance: dict,
-        data: dict,
+        self, current_account, current_email, original_creds, provenance, data,
+        *, gateway_return=False,
+    ) -> tuple[str, str | None]:
+        """Establish ownership before choosing which OAuth generation to keep."""
+        kind, foreign_slot = self._classify_outgoing_ownership(
+            current_account, current_email, original_creds, provenance, data,
+        )
+        if kind not in ("own-bytes", "own-family", "own-rotated", "unresolved"):
+            return kind, foreign_slot
+        backup = self._read_account_credentials(current_account, current_email)
+        if gateway_return and backup:
+            # Polling can rotate the OAuth backup while the gateway leaves
+            # the live login untouched. Identity alone cannot distinguish
+            # those generations: never copy the older live token back.
+            stored = oauth.extract_oauth_data(backup) or {}
+            live = oauth.extract_oauth_data(original_creds) or {}
+            nonrefreshable = (
+                data.get("accounts", {}).get(current_account, {}).get("kind") == "api_key"
+                or bool(stored.get("accessToken") and not stored.get("refreshToken"))
+            )
+            explicit_replacement = data.get("accounts", {}).get(current_account, {}).get("gatewayExplicitReplacement")
+            if (nonrefreshable or explicit_replacement) and backup != original_creds:
+                # API keys/setup tokens do not rotate; refreshable imports
+                # carry explicit replacement intent independently of expiry.
+                return ("stored-replacement", None)
+            try:
+                stored_newer = float(stored.get("expiresAt") or 0) > float(
+                    live.get("expiresAt") or 0
+                )
+            except (TypeError, ValueError):
+                stored_newer = False
+            if stored_newer and stored.get("accessToken"):
+                retained = data.get("gatewayRetainedLiveFp")
+                if kind == "unresolved" and not (
+                    retained and retained == oauth.credential_fingerprint(original_creds)
+                ):
+                    # Expiry orders generations, but cannot prove this live
+                    # login belongs to the slot: it changed since the entry
+                    # backup reconciled it, or no backup ran. Preserve its
+                    # only copy before activating the newer backup, as for
+                    # explicit replacement.
+                    return ("stored-replacement", None)
+                return ("stored-newer", None)
+        return kind, foreign_slot
+
+    def _classify_outgoing_ownership(
+        self, current_account, current_email, original_creds, provenance, data,
     ) -> tuple[str, str | None]:
         """Decide what the switch-time backup may do with the live credential.
 
@@ -6811,6 +7480,156 @@ class ClaudeAccountSwitcher:
             return ("foreign-synced", slot)
         return ("foreign", slot)
 
+    def _backup_outgoing_credential(
+        self, current_account, current_email, original_creds, original_config,
+        provenance, data, emit_output, warnings_out, *, gateway_return=False,
+    ):
+        """Preserve the outgoing generation with the same ownership rules on every switch."""
+        # Step 1: Backup current account. Position in ~/.claude.json
+        # says which slot is active; only the classification says who
+        # owns the live bytes (issue #117: an external write here
+        # used to destroy the outgoing slot's refresh token). The
+        # identity oracle is strictly advisory — "unresolved" falls
+        # back to the exact pre-fix backup, so endpoint state never
+        # decides whether a switch completes.
+        kind, foreign_slot = self._classify_outgoing_credential(
+            current_account, current_email, original_creds,
+            provenance, data,
+            gateway_return=gateway_return,
+        )
+        if kind in ("foreign", "alien", "known-foreign"):
+            # Positively not this slot's bytes: never into a slot;
+            # never silently destroyed. The safety copy (which raises
+            # on failure, aborting before the live store is
+            # overwritten) is the license to proceed.
+            self._stash_live_credential(
+                original_creds, kind, current_account,
+                provenance.get("resolved"),
+            )
+            if kind == "foreign":
+                msg = (
+                    "Credential ownership mismatch detected. The live "
+                    "credential was preserved and was not written "
+                    f"into Account-{current_account}. If Account-"
+                    f"{foreign_slot} later cannot authenticate, log "
+                    "in as it and run: cswap add --slot "
+                    f"{foreign_slot}"
+                )
+            elif kind == "known-foreign":
+                msg = (
+                    "The live credential was previously identified "
+                    "as another account's. It was preserved and not "
+                    f"written into Account-{current_account}. If the "
+                    "owning account later cannot authenticate, log "
+                    "in as it and run: cswap add"
+                )
+            else:
+                msg = (
+                    "The live login does not match a managed "
+                    "account. It was preserved and not written into "
+                    f"Account-{current_account}. If you need that "
+                    "account, log in as it and run: cswap add"
+                )
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+        elif kind == "foreign-synced":
+            # Another managed account's bytes, and that slot already
+            # holds this lineage — nothing needs preserving, nothing
+            # may be written.
+            msg = (
+                "Credential ownership mismatch detected. The live "
+                f"credential already matches Account-{foreign_slot}'s "
+                "stored backup, so nothing was written into "
+                f"Account-{current_account}."
+            )
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+        elif kind == "wiped":
+            # Claude Code emptied the live token fields in place
+            # (its invalid_grant reaction). The blob carries nothing
+            # to preserve and writing it would replace the slot's
+            # only surviving refresh token with empty strings — the
+            # exact destruction chain observed in the field. Config
+            # backup only; the slot's credential backup is the
+            # recovery path.
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            msg = (
+                "The live credential's tokens were wiped (Claude "
+                "Code clears them when a refresh is rejected). "
+                f"Account-{current_account}'s stored backup was "
+                "kept. If the account cannot authenticate after "
+                "switching back, log in with Claude Code and run: "
+                "cswap add"
+            )
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+        elif kind == "unresolved":
+            # Ownership could not be established (offline, endpoint
+            # failure, malformed response, non-OAuth blob). Fail
+            # open: exact pre-fix backup. Most such divergences are
+            # the account's own rotation — skipping the backup would
+            # leave the slot holding a consumed token — and the
+            # .prev retention inside the write gives even a wrong
+            # call a best-effort recovery cushion. Log only:
+            # indistinguishable from a legitimate rotation, so a
+            # warning would cry wolf.
+            self._write_account_credentials(
+                current_account, current_email, original_creds
+            )
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            self._logger.info(
+                f"Backed up account {current_account} (lineage "
+                "differs from the stored backup and ownership could "
+                "not be verified — pre-fix backup)"
+            )
+        elif kind in ("own-bytes", "stored-newer", "stored-replacement"):
+            if kind == "stored-replacement":
+                self._stash_live_credential(
+                    original_creds, "gateway-retained-live", current_account,
+                    provenance.get("resolved"),
+                )
+            # Untouched since cswap wrote it — the slot already holds
+            # these bytes. Refresh only the config backup. (Rare since
+            # #145: activation composes live shared MCP state into the
+            # written credential, so live bytes match the slot's only
+            # when nothing was composed in.) Also keep a backup
+            # refreshed while the gateway left this live copy idle.
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            self._logger.info(
+                f"Backed up account {current_account} (config only; "
+                "stored credentials kept)"
+            )
+        else:  # own-family / own-rotated
+            self._write_account_credentials(
+                current_account, current_email, original_creds
+            )
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            if kind == "own-rotated":
+                # The profile call proved the identity; backfill a
+                # missing slot uuid (add-token placeholder) while the
+                # sequence file is being rewritten anyway.
+                resolved = provenance.get("resolved") or {}
+                acct = data.get("accounts", {}).get(current_account, {})
+                if not acct.get("uuid") and resolved.get("uuid"):
+                    acct["uuid"] = resolved["uuid"]
+            self._logger.info(f"Backed up account {current_account}")
+        return kind
+
+
     def _stash_live_credential(
         self,
         original_creds: str,
@@ -6853,6 +7672,19 @@ class ClaudeAccountSwitcher:
                 "credentialsMtime": creds_mtime,
             },
         )
+        if reason == "gateway-retained-live":
+            # Changed since the gateway entry, never reconciled by a forced
+            # entry, or superseded by an explicit replacement: ownership
+            # unproven either way, so say what was done, not who wrote it.
+            self._logger.warning(
+                "The live login was not written into Account-%s, whose stored "
+                "credential replaces it on the gateway return: stashed as %s "
+                "(credentials mtime %s).",
+                current_account,
+                entry_id,
+                creds_mtime or "unknown",
+            )
+            return entry_id
         self._logger.warning(
             "Live credential does not belong to Account-%s (%s): stashed as %s "
             "(credentials mtime %s). Something outside cswap rewrote the live "
@@ -6875,6 +7707,7 @@ class ClaudeAccountSwitcher:
         which burns the stored grant of a slot whose backup is merely behind
         a locked Keychain. `session.py`'s `_bootstrap` carried a third copy.
         """
+        self._refuse_pending_account_write(account_num)
         creds, unreadable = self._read_account_credentials_ex(
             account_num, email
         )
@@ -6925,12 +7758,157 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _gateway_settings_path(self) -> Path:
+        from claude_swap.paths import get_claude_config_home
+
+        return get_claude_config_home() / "settings.json"
+
+    @staticmethod
+    def _clear_gateway_replacement_flags(data: dict) -> None:
+        """Drop gateway-episode state at each entry and each OAuth activation."""
+        for record in data.get("accounts", {}).values():
+            record.pop("gatewayExplicitReplacement", None)
+        data.pop("gatewayRetainedLiveFp", None)
+
+    @contextmanager
+    def _gateway_settings_transaction(
+        self, target: str, *, provenance: dict, emit_output: bool, warnings_out: list,
+        force_activate: bool,
+    ):
+        """Runs inside all three switch locks; undo the exact prior settings."""
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        target_record = accounts.get(target, {})
+        path = self._gateway_settings_path()
+        source = gateway.active_slot(path, accounts)
+        is_gateway = target_record.get("kind") == "gateway"
+        if source is None and not is_gateway:
+            yield None
+            return
+        identity = self._get_current_account()
+        source_num = self._find_active_account_slot(data, *identity) if identity else None
+        from_ref = (
+            account_ref(int(source_num) if source_num else None, identity[0])
+            if identity
+            else None
+        )
+        if is_gateway:
+            self._read_target_credentials(target, target_record["email"])
+        try:
+            parsed = gateway.read_settings(path)
+            if is_gateway:
+                gateway.refuse_auth_overrides(parsed, path)
+        except ValueError as exc:
+            raise SwitchError(str(exc)) from None
+        if (
+            parsed.get("apiKeyHelper") is not None
+            and gateway.owned_slot(parsed["apiKeyHelper"]) is None
+        ):
+            raise SwitchError(
+                "Claude settings.json has a foreign apiKeyHelper; refusing to replace it"
+            )
+        previous = path.read_bytes() if path.exists() else None
+        sequence_before = self.sequence_file.read_bytes()
+        transaction = SwitchTransaction(
+            "",
+            "",
+            source or "",
+            "",
+            self._get_claude_config_path(),
+            settings_path=path,
+            original_settings=previous,
+        )
+        transaction.record_step("settings_written")
+        try:
+            if is_gateway:
+                if source is None:
+                    self._clear_gateway_replacement_flags(data)
+                if (
+                    not force_activate
+                    and source is None
+                    and source_num is not None
+                    and accounts[source_num].get("kind", "oauth") == "oauth"
+                ):
+                    live = self._read_credentials()
+                    # A missing OAuth login is itself a reason to recover
+                    # onto the gateway; activation never replaces that store.
+                    if live:
+                        kind = self._backup_outgoing_credential(
+                            source_num, identity[0], live,
+                            self._get_claude_config_path().read_text(encoding="utf-8"),
+                            provenance, data, emit_output, warnings_out,
+                        )
+                        fingerprint = oauth.credential_fingerprint(live)
+                        if fingerprint and kind in (
+                            "own-bytes", "own-family", "own-rotated", "unresolved",
+                        ):
+                            # A managed slot now holds this retained login's
+                            # lineage. Remember it, outside the account rows,
+                            # so the return can tell that older login from
+                            # one written during the episode.
+                            data["gatewayRetainedLiveFp"] = fingerprint
+                # Existing OAuth sessions may still share settings via a
+                # symlink from before any gateway was added. Detach their
+                # auth settings before changing the default login, including
+                # profiles currently in use. Credential files stay untouched.
+                from claude_swap.session import SessionManager
+
+                manager = SessionManager(self)
+                for num, record in accounts.items():
+                    manager._isolate_auth_settings(
+                        self._session_dir(num, record["email"]),
+                        gateway_session=record.get("kind") == "gateway",
+                    )
+            gateway.write_settings(path, target if is_gateway else None, target_record)
+            yield {"from": from_ref, "data": data}
+        except Exception as exc:
+            restored = transaction.rollback(self)
+            try:
+                atomic_write_bytes(self.sequence_file, sequence_before)
+            except Exception:
+                restored = False
+            if not restored:
+                raise SwitchError(
+                    "Gateway switch failed and rollback was incomplete; "
+                    "check Claude settings and the active account before retrying"
+                ) from None
+            if isinstance(exc, SessionError):
+                raise SwitchError(
+                    f"Gateway switch failed; previous settings restored. {exc}"
+                ) from None
+            raise SwitchError(
+                "Gateway switch failed; previous settings restored"
+            ) from None
+
+    def gateway_credential(self, slot: str) -> str | None:
+        """The hidden helper has exactly one authorized credential source."""
+        self._refuse_session_shell()
+        with FileLock(self.lock_file):
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            if gateway.active_slot(self._gateway_settings_path(), accounts) != slot:
+                return None
+            return self._read_account_credentials(slot, accounts[slot]["email"]) or None
+
+    @contextmanager
+    def _check_expected_switch_source(self, expected_source: str | None, target: str, expected_target: dict | None, expected_source_auth: dict | None):
+        """Caller holds all switch locks; check before settings mutation."""
+        if expected_source is not None and self.current_account_number() != expected_source:
+            raise StaleSwitchError("Active account changed; automatic switch discarded")
+        if expected_source_auth is not None and self._switch_target_snapshot(self._get_sequence_data() or {}, expected_source) != expected_source_auth:
+            raise StaleSwitchError("Source authentication changed; automatic switch discarded")
+        if expected_target is not None and self._switch_target_snapshot(self._get_sequence_data() or {}, target) != expected_target:
+            raise StaleSwitchError("Target account changed; automatic switch discarded")
+        yield
+
     def _perform_switch(
         self,
         target_account: str,
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        expected_source: str | None = None,
+        expected_target: dict | None = None,
+        expected_source_auth: dict | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -6966,7 +7944,7 @@ class ClaudeAccountSwitcher:
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
-        if pre_email:
+        if pre_email and pre_account.get("kind") != "gateway":
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
                 self._session_dir(target_account, pre_email)
@@ -7048,8 +8026,33 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+            self._check_expected_switch_source(expected_source, target_account, expected_target, expected_source_auth),
+            self._gateway_settings_transaction(
+                target_account, provenance=provenance,
+                emit_output=emit_output, warnings_out=warnings_out,
+                force_activate=force_activate,
+            ) as gateway_switch,
+        ):
             data = self._get_sequence_data()
+            if data["accounts"][target_account].get("kind") == "gateway":
+                data = gateway_switch["data"]
+                data["activeAccountNumber"] = int(target_account)
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                target_email = data["accounts"][target_account]["email"]
+                if emit_output:
+                    print(
+                        f"{accent('Switched to')} Account-{target_account} ({target_email})"
+                    )
+                return {
+                    "from": gateway_switch["from"],
+                    "to": account_ref(int(target_account), target_email),
+                    "warnings": warnings_out,
+                }
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
@@ -7057,7 +8060,7 @@ class ClaudeAccountSwitcher:
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = self._find_account_slot(
+                current_account = self._find_active_account_slot(
                     data, current_email, current_org_uuid
                 )
 
@@ -7070,7 +8073,8 @@ class ClaudeAccountSwitcher:
             # live login from the stored backup. In all cases, skip the
             # back-up-current step: it would either write account-None-*
             # backups or (force) poison the stored backup with stale creds.
-            if force_activate or current_identity is None or current_account is None:
+            missing_gateway_login = gateway_switch is not None and self._read_credentials() == ""
+            if force_activate or current_identity is None or current_account is None or missing_gateway_login:
                 # Account left: None on a fresh machine (no live account at
                 # all); an unnumbered ref for an unmanaged live account (slot
                 # unknown to cswap); a numbered ref when --force ran with a
@@ -7213,6 +8217,7 @@ class ClaudeAccountSwitcher:
 
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
+                    self._clear_gateway_replacement_flags(data)
                     self._write_json(self.sequence_file, data)
                 except Exception:
                     if config_written and rollback_config_text is not None:
@@ -7255,7 +8260,11 @@ class ClaudeAccountSwitcher:
                     target_email,
                     data["accounts"][target_account].get("organizationUuid", ""),
                 )
-                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                return {
+                    "from": gateway_switch["from"] if gateway_switch else from_ref,
+                    "to": to_ref,
+                    "warnings": warnings_out,
+                }
 
             current_email, _ = current_identity
             from_ref = account_ref(int(current_account), current_email)
@@ -7290,141 +8299,11 @@ class ClaudeAccountSwitcher:
             )
 
             try:
-                # Step 1: Backup current account. Position in ~/.claude.json
-                # says which slot is active; only the classification says who
-                # owns the live bytes (issue #117: an external write here
-                # used to destroy the outgoing slot's refresh token). The
-                # identity oracle is strictly advisory — "unresolved" falls
-                # back to the exact pre-fix backup, so endpoint state never
-                # decides whether a switch completes.
-                kind, foreign_slot = self._classify_outgoing_credential(
-                    current_account, current_email, original_creds,
-                    provenance, data,
+                self._backup_outgoing_credential(
+                    current_account, current_email, original_creds, original_config,
+                    provenance, data, emit_output, warnings_out,
+                    gateway_return=gateway_switch is not None,
                 )
-                if kind in ("foreign", "alien", "known-foreign"):
-                    # Positively not this slot's bytes: never into a slot;
-                    # never silently destroyed. The safety copy (which raises
-                    # on failure, aborting before the live store is
-                    # overwritten) is the license to proceed.
-                    self._stash_live_credential(
-                        original_creds, kind, current_account,
-                        provenance.get("resolved"),
-                    )
-                    if kind == "foreign":
-                        msg = (
-                            "Credential ownership mismatch detected. The live "
-                            "credential was preserved and was not written "
-                            f"into Account-{current_account}. If Account-"
-                            f"{foreign_slot} later cannot authenticate, log "
-                            "in as it and run: cswap add --slot "
-                            f"{foreign_slot}"
-                        )
-                    elif kind == "known-foreign":
-                        msg = (
-                            "The live credential was previously identified "
-                            "as another account's. It was preserved and not "
-                            f"written into Account-{current_account}. If the "
-                            "owning account later cannot authenticate, log "
-                            "in as it and run: cswap add"
-                        )
-                    else:
-                        msg = (
-                            "The live login does not match a managed "
-                            "account. It was preserved and not written into "
-                            f"Account-{current_account}. If you need that "
-                            "account, log in as it and run: cswap add"
-                        )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
-                elif kind == "foreign-synced":
-                    # Another managed account's bytes, and that slot already
-                    # holds this lineage — nothing needs preserving, nothing
-                    # may be written.
-                    msg = (
-                        "Credential ownership mismatch detected. The live "
-                        f"credential already matches Account-{foreign_slot}'s "
-                        "stored backup, so nothing was written into "
-                        f"Account-{current_account}."
-                    )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
-                elif kind == "wiped":
-                    # Claude Code emptied the live token fields in place
-                    # (its invalid_grant reaction). The blob carries nothing
-                    # to preserve and writing it would replace the slot's
-                    # only surviving refresh token with empty strings — the
-                    # exact destruction chain observed in the field. Config
-                    # backup only; the slot's credential backup is the
-                    # recovery path.
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    msg = (
-                        "The live credential's tokens were wiped (Claude "
-                        "Code clears them when a refresh is rejected). "
-                        f"Account-{current_account}'s stored backup was "
-                        "kept. If the account cannot authenticate after "
-                        "switching back, log in with Claude Code and run: "
-                        "cswap add"
-                    )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
-                elif kind == "unresolved":
-                    # Ownership could not be established (offline, endpoint
-                    # failure, malformed response, non-OAuth blob). Fail
-                    # open: exact pre-fix backup. Most such divergences are
-                    # the account's own rotation — skipping the backup would
-                    # leave the slot holding a consumed token — and the
-                    # .prev retention inside the write gives even a wrong
-                    # call a best-effort recovery cushion. Log only:
-                    # indistinguishable from a legitimate rotation, so a
-                    # warning would cry wolf.
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
-                    )
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    self._logger.info(
-                        f"Backed up account {current_account} (lineage "
-                        "differs from the stored backup and ownership could "
-                        "not be verified — pre-fix backup)"
-                    )
-                elif kind == "own-bytes":
-                    # Untouched since cswap wrote it — the slot already holds
-                    # these bytes. Refresh only the config backup. (Rare since
-                    # #145: activation composes live shared MCP state into the
-                    # written credential, so live bytes match the slot's only
-                    # when nothing was composed in.)
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    self._logger.info(
-                        f"Backed up account {current_account} (config only; "
-                        "credentials unchanged)"
-                    )
-                else:  # own-family / own-rotated
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
-                    )
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    if kind == "own-rotated":
-                        # The profile call proved the identity; backfill a
-                        # missing slot uuid (add-token placeholder) while the
-                        # sequence file is being rewritten anyway.
-                        resolved = provenance.get("resolved") or {}
-                        acct = data.get("accounts", {}).get(current_account, {})
-                        if not acct.get("uuid") and resolved.get("uuid"):
-                            acct["uuid"] = resolved["uuid"]
-                    self._logger.info(f"Backed up account {current_account}")
 
                 # Step 2: Retrieve target account
                 target_creds = self._read_target_credentials(
@@ -7478,6 +8357,7 @@ class ClaudeAccountSwitcher:
                 # Step 5: Update sequence state
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
+                self._clear_gateway_replacement_flags(data)
                 self._write_json(self.sequence_file, data)
                 transaction.record_step("sequence_updated")
 
@@ -7521,7 +8401,11 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": gateway_switch["from"] if gateway_switch else from_ref,
+            "to": to_ref,
+            "warnings": warnings_out,
+        }
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
@@ -7559,6 +8443,9 @@ class ClaudeAccountSwitcher:
           before the XDG migration
         """
         self._refuse_session_shell()
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        if gateway.active_slot(self._gateway_settings_path(), accounts) is not None:
+            raise ConfigError("Switch away from the active gateway before purging")
         legacy = get_legacy_backup_root()
         legacy_distinct = legacy != self.backup_dir
 
@@ -7621,54 +8508,62 @@ class ClaudeAccountSwitcher:
 
         removed_items = []
 
-        # Remove credentials. On macOS backups may be in the Keychain and/or .enc
-        # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
-        data = self._get_sequence_data()
-        if data:
-            for account_num, account_info in data.get("accounts", {}).items():
-                email = account_info.get("email", "")
-                nums = [account_num]
-                if str(account_num) != "None":
-                    nums.append("None")
-                usernames = [f"account-{num}-{email}" for num in nums]
+        with FileLock(self.lock_file):
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            if gateway.active_slot(self._gateway_settings_path(), accounts) is not None:
+                raise ConfigError("Switch away from the active gateway before purging")
+            # Remove credentials. On macOS backups may be in the Keychain and/or .enc
+            # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
+            data = self._get_sequence_data()
+            if data:
+                for account_num, account_info in data.get("accounts", {}).items():
+                    email = account_info.get("email", "")
+                    nums = [account_num]
+                    if str(account_num) != "None":
+                        nums.append("None")
+                    usernames = [f"account-{num}-{email}" for num in nums]
 
-                # .enc files (Linux/WSL/Windows always; macOS fallback copies).
-                for num in nums:
-                    cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
-                    try:
-                        if cred_file.exists():
-                            cred_file.unlink()
-                            removed_items.append(f"Credential file: {cred_file.name}")
-                    except Exception:
-                        pass  # Ignore errors during purge
-
-                # macOS Keychain items via `security` (current macOS backend).
-                if self.platform == Platform.MACOS:
-                    for username in usernames:
+                    # .enc files (Linux/WSL/Windows always; macOS fallback copies).
+                    for num in nums:
+                        cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
                         try:
-                            macos_keychain.delete_password(SECURITY_SERVICE, username)
-                            removed_items.append(f"Credential: {username}")
+                            if cred_file.exists():
+                                cred_file.unlink()
+                                removed_items.append(f"Credential file: {cred_file.name}")
                         except Exception:
                             pass  # Ignore errors during purge
 
-                # Best-effort sweep of any pre-migration keyring / Credential
-                # Manager entries left behind by an incomplete keyring → files
-                # (Windows) or keyring → security (macOS) migration. Linux/WSL
-                # never used a keyring backend.
-                if self.platform in (Platform.MACOS, Platform.WINDOWS):
-                    _sweep_legacy_keyring(usernames, removed_items)
+                    # macOS Keychain items via `security` (current macOS backend).
+                    if self.platform == Platform.MACOS:
+                        for username in usernames:
+                            try:
+                                macos_keychain.delete_password(SECURITY_SERVICE, username)
+                                removed_items.append(f"Credential: {username}")
+                            except Exception:
+                                pass  # Ignore errors during purge
 
-        # Session-profile keychain entries must go BEFORE the backup dir:
-        # the hashed service names are derived from the dir paths and can't
-        # be recomputed once the directories are deleted.
-        if session_dirs:
-            from claude_swap.session import delete_macos_keychain_entry
+                    # Best-effort sweep of any pre-migration keyring / Credential
+                    # Manager entries left behind by an incomplete keyring → files
+                    # (Windows) or keyring → security (macOS) migration. Linux/WSL
+                    # never used a keyring backend.
+                    if self.platform in (Platform.MACOS, Platform.WINDOWS):
+                        _sweep_legacy_keyring(usernames, removed_items)
 
-            for d in session_dirs:
-                delete_macos_keychain_entry(d)
-            removed_items.append(
-                f"Session profiles: {', '.join(d.name for d in session_dirs)}"
-            )
+            # Session-profile keychain entries must go BEFORE the backup dir:
+            # the hashed service names are derived from the dir paths and can't
+            # be recomputed once the directories are deleted.
+            if session_dirs:
+                from claude_swap.session import delete_macos_keychain_entry
+
+                for d in session_dirs:
+                    delete_macos_keychain_entry(d)
+                removed_items.append(
+                    f"Session profiles: {', '.join(d.name for d in session_dirs)}"
+                )
+
+            # Retire the roster before releasing the lock, so a waiting
+            # switch cannot activate credentials that purge just deleted.
+            self.sequence_file.unlink(missing_ok=True)
 
         # Remove backup directory
         if self.backup_dir.exists():

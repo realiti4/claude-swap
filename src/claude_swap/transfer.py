@@ -15,14 +15,17 @@ from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
 from claude_swap.credentials import looks_like_api_key
+from claude_swap import gateway
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
     TransferError,
+    ValidationError,
 )
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -194,49 +197,53 @@ def export_accounts(
     else:
         target_nums = sorted(accounts_map.keys(), key=int)
 
-    # Identify the live active account (live vault has fresher tokens than backup)
-    current_identity = switcher._get_current_account()
-
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
-        record = accounts_map[num]
-        email = record.get("email", "")
-        org_uuid = record.get("organizationUuid", "") or ""
+        # Snapshot every kind together: a concurrent import may replace an
+        # OAuth/API-key record with a gateway as well as rotate a gateway key.
+        with FileLock(switcher.lock_file):
+            expected = accounts_map[num]
+            record = (switcher._get_sequence_data() or {}).get("accounts", {}).get(num)
+            if record is None or any(record.get(k) != expected.get(k) for k in ("email", "organizationUuid", "uuid")):
+                raise TransferError("Account changed while preparing export; retry")
+            email = record.get("email", "")
+            org_uuid = record.get("organizationUuid", "") or ""
+            current_identity = switcher._get_current_account()
 
-        is_active = (
-            current_identity is not None
-            and current_identity[0] == email
-            and current_identity[1] == org_uuid
-        )
+            is_active = (
+                current_identity is not None
+                and current_identity[0] == email
+                and current_identity[1] == org_uuid
+            )
 
-        if is_active:
-            creds_text = switcher._read_credentials()
-            if not creds_text:
-                raise CredentialReadError(
-                    f"failed to read live credentials for active account {email}"
-                )
-            config_path = switcher._get_claude_config_path()
-            if not config_path.exists():
-                raise ConfigError("Claude config file not found")
-            config_text = config_path.read_text(encoding="utf-8")
-        else:
-            creds_text = switcher._read_account_credentials(num, email)
-            config_text = switcher._read_account_config(num, email)
-            if not creds_text or not config_text:
-                if explicit_account:
-                    if not creds_text:
-                        raise CredentialReadError(
-                            f"no backup credentials found for account {num} ({email})"
-                        )
-                    raise ConfigError(
-                        f"no backup config found for account {num} ({email})"
+            if is_active and record.get("kind") != "gateway":
+                creds_text = switcher._read_credentials()
+                if not creds_text:
+                    raise CredentialReadError(
+                        f"failed to read live credentials for active account {email}"
                     )
-                _eprint(
-                    f"Skipping Account-{num} ({email}): no stored "
-                    f"credentials/config — re-add with: "
-                    f"cswap --add-account --slot {num}"
-                )
-                continue
+                config_path = switcher._get_claude_config_path()
+                if not config_path.exists():
+                    raise ConfigError("Claude config file not found")
+                config_text = config_path.read_text(encoding="utf-8")
+            else:
+                creds_text = switcher._read_account_credentials(num, email)
+                config_text = switcher._read_account_config(num, email)
+                if not creds_text or not config_text:
+                    if explicit_account:
+                        if not creds_text:
+                            raise CredentialReadError(
+                                f"no backup credentials found for account {num} ({email})"
+                            )
+                        raise ConfigError(
+                            f"no backup config found for account {num} ({email})"
+                        )
+                    _eprint(
+                        f"Skipping Account-{num} ({email}): no stored "
+                        f"credentials/config — re-add with: "
+                        f"cswap --add-account --slot {num}"
+                    )
+                    continue
 
         config_obj = _parse_payload(config_text, f"config for {email}")
         if not full:
@@ -245,7 +252,8 @@ def export_accounts(
         # API-key accounts store the credential as a raw ``sk-ant-…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
-        is_api_key = looks_like_api_key(creds_text)
+        is_gateway = record.get("kind") == "gateway"
+        is_api_key = looks_like_api_key(creds_text) or is_gateway
         if is_api_key:
             creds_payload: Any = creds_text.strip()
         else:
@@ -264,6 +272,11 @@ def export_accounts(
         }
         if is_api_key:
             entry["kind"] = "api_key"
+        if is_gateway:
+            entry.update(
+                kind="gateway",
+                **{k: record[k] for k in gateway.RECORD_FIELDS if k in record},
+            )
         if record.get("alias"):
             entry["alias"] = record["alias"]
         accounts_payload.append(entry)
@@ -324,6 +337,7 @@ def import_accounts(
     Raises:
         TransferError: malformed file, version mismatch, encrypted payload.
     """
+    switcher._refuse_session_shell()
     if source == "-":
         text = sys.stdin.read()
     else:
@@ -378,9 +392,31 @@ def import_accounts(
             raise TransferError(f"config for {email} must be a JSON object")
         # API-key accounts carry the credential as a raw string; OAuth accounts
         # carry a JSON object.
-        is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        is_gateway = raw.get("kind") == "gateway"
+        gateway_fields = {}
+        if is_gateway:
+            try:
+                gateway_fields = gateway.account_fields(
+                    raw.get("baseUrl"),
+                    raw.get("auth", "bearer"),
+                    raw.get("usageUrl"),
+                    raw.get("probeModel", gateway.DEFAULT_MODEL),
+                    raw.get("modelDiscovery", False),
+                )
+            except ValueError as exc:
+                raise TransferError(str(exc)) from None
+        is_api_key = (
+            raw.get("kind") == "api_key" or isinstance(creds_obj, str) or is_gateway
+        )
         if is_api_key:
-            if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
+            if not (
+                isinstance(creds_obj, str)
+                and (
+                    bool(creds_obj.strip())
+                    if is_gateway
+                    else looks_like_api_key(creds_obj)
+                )
+            ):
                 raise TransferError(
                     f"API-key credentials for {email} must be a raw sk-ant-… key "
                     "(not an OAuth token)"
@@ -423,7 +459,12 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
-                "kind": "api_key" if is_api_key else "oauth",
+                "kind": "gateway"
+                if is_gateway
+                else "api_key"
+                if is_api_key
+                else "oauth",
+                "gateway_fields": gateway_fields,
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
@@ -433,8 +474,21 @@ def import_accounts(
     # Pass 2: writes. Validation is complete; remaining failures (disk I/O,
     # keyring) are environmental and don't reflect on the file's integrity.
     switcher._setup_directories()
-    switcher._init_sequence_file()
+    with FileLock(switcher.lock_file):
+        switcher._init_sequence_file(locked=True)
+        _import_accounts_locked(switcher, envelope, normalized, force)
 
+
+def _import_accounts_locked(switcher, envelope, normalized, force):
+    """Keep replacement validation and all writes under the roster lock."""
+    data = switcher._get_sequence_data_migrated(locked=True) or {}
+    for entry in normalized:
+        slot = switcher._find_account_slot(data, entry["email"], entry["org_uuid"])
+        if slot is not None and (force or switcher._slot_token_dead(slot, entry["email"])):
+            try:
+                switcher._refuse_active_gateway_replacement(data, slot)
+            except ConfigError as exc:
+                raise ValidationError(str(exc)) from None
     imported = 0
     skipped = 0
     overwritten = 0
@@ -458,7 +512,7 @@ def import_accounts(
         )
 
         # Re-read sequence each iteration so per-account writes see prior updates
-        data = switcher._get_sequence_data_migrated() or {
+        data = switcher._get_sequence_data_migrated(locked=True) or {
             "activeAccountNumber": None,
             "lastUpdated": get_timestamp(),
             "sequence": [],
@@ -528,43 +582,52 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
-        switcher._write_account_config(
-            target_num, entry["email"], entry["config_text"]
-        )
-        # Every successful import write introduces credential material whose
-        # previous auth verdict is no longer authoritative, so lift any
-        # dead-token quarantine on this slot (mirrors add_account / the
-        # add-token paths). This clears for both "imported" and "overwrote":
-        # account removal doesn't prune usage.json, so re-importing a removed
-        # identity into the same slot would otherwise stay quarantined and
-        # never re-fetch to prove the imported token — issue #138.
-        switcher._usage_store.clear_dead_token(
-            [target_num], {target_num: (entry["email"], entry["org_uuid"])}
-        )
+        try:
+            switcher._refuse_active_gateway_replacement(data, target_num)
+        except ConfigError as exc:
+            raise ValidationError(str(exc)) from None
+        with switcher._gateway_account_write([target_num], gateway_requested=entry["kind"] == "gateway"):
+            switcher._write_account_credentials(
+                target_num, entry["email"], entry["creds_text"]
+            )
+            switcher._write_account_config(
+                target_num, entry["email"], entry["config_text"]
+            )
+            # Every successful import write introduces credential material whose
+            # previous auth verdict is no longer authoritative, so lift any
+            # dead-token quarantine on this slot (mirrors add_account / the
+            # add-token paths). This clears for both "imported" and "overwrote":
+            # account removal doesn't prune usage.json, so re-importing a removed
+            # identity into the same slot would otherwise stay quarantined and
+            # never re-fetch to prove the imported token — issue #138.
+            switcher._usage_store.clear_dead_token(
+                [target_num], {target_num: (entry["email"], entry["org_uuid"])}
+            )
 
-        data.setdefault("accounts", {})
-        data.setdefault("sequence", [])
-        new_record = {
-            "email": entry["email"],
-            "uuid": entry["uuid"],
-            "organizationUuid": entry["org_uuid"],
-            "organizationName": entry["org_name"],
-            "added": entry["added"],
-        }
-        if entry["kind"] == "api_key":
-            new_record["kind"] = "api_key"
-        if entry.get("alias"):
-            new_record["alias"] = entry["alias"]
-        data["accounts"][target_num] = new_record
-        if int(target_num) not in data["sequence"]:
-            data["sequence"].append(int(target_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-        switcher._write_json(switcher.sequence_file, data)
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            new_record = {
+                "email": entry["email"],
+                "uuid": entry["uuid"],
+                "organizationUuid": entry["org_uuid"],
+                "organizationName": entry["org_name"],
+                "added": entry["added"],
+            }
+            if entry["kind"] == "api_key":
+                new_record["kind"] = "api_key"
+            if entry["kind"] == "gateway":
+                new_record.update(entry["gateway_fields"])
+            if entry.get("alias"):
+                new_record["alias"] = entry["alias"]
+            data["accounts"][target_num] = new_record
+            if int(target_num) not in data["sequence"]:
+                data["sequence"].append(int(target_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+            switcher._write_json(switcher.sequence_file, data)
 
+        # Carry locally published generations into the next batch write.
+        data = switcher._get_sequence_data()
         if is_envelope_active:
             resolved_active_slot = target_num
         written_slots.add(target_num)

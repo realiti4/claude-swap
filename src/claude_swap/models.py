@@ -213,18 +213,23 @@ class AccountSnapshot:
     org_name: str
     org_uuid: str
     is_active: bool
-    kind: str  # "oauth" | "api_key"
+    kind: str  # "oauth" | "api_key" | "gateway"
     switchable: bool
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
-    #: Per-account auto-switch overrides. Appended last and defaulted, so every
+    #: Per-account auto-switch overrides. Appended and defaulted, so every
     #: pre-existing construction site keeps working and yields the default.
     policy: AccountPolicy = AccountPolicy()
+    gateway: dict | None = None
 
     @property
     def display_tag(self) -> str:
         """Org tag for display: the org name, or 'personal'."""
+        if self.gateway is not None:
+            from claude_swap.gateway import tag
+
+            return tag(self.gateway)
         return self.org_name if self.org_name else "personal"
 
 
@@ -252,6 +257,8 @@ class SwitchTransaction:
     original_email: str
     config_path: Path
     completed_steps: list[str] = field(default_factory=list)
+    settings_path: Path | None = None
+    original_settings: bytes | None = None
 
     def record_step(self, step: str) -> None:
         """Record a completed step."""
@@ -266,7 +273,11 @@ class SwitchTransaction:
         success = True
         for step in reversed(self.completed_steps):
             try:
-                if step == "credentials_written":
+                if step == "settings_written":
+                    from claude_swap import gateway
+
+                    gateway.restore_settings(self.settings_path, self.original_settings)
+                elif step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
                     # By rename, never in place (#419): see atomic_write_text.
@@ -279,7 +290,12 @@ class SwitchTransaction:
                         switcher._write_json(switcher.sequence_file, data)
                 switcher._logger.info(f"Rolled back step: {step}")
             except Exception as e:
-                switcher._logger.error(f"Failed to rollback step {step}: {e}")
+                if step == "settings_written":
+                    switcher._logger.error(
+                        "Failed to restore Claude settings during gateway rollback"
+                    )
+                else:
+                    switcher._logger.error(f"Failed to rollback step {step}: {e}")
                 success = False
         return success
 

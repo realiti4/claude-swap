@@ -752,6 +752,16 @@ class TestFetchAccountUsageSessionProfile:
     def _info(self, backup_creds: str) -> tuple:
         return (2, "test@example.com", "Org", "org-uuid", False, backup_creds, "")
 
+    @pytest.fixture(autouse=True)
+    def _managed_slot(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "sequence": [2], "accounts": {"2": {
+                "email": "test@example.com", "organizationUuid": "org-uuid",
+            }},
+        })
+
     def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
         """Profile creds are used with is_active=True (no refresh, no persist)."""
         switcher = ClaudeAccountSwitcher()
@@ -1249,6 +1259,11 @@ class TestAdoptSessionCredential:
     def _switcher(self, backup: str) -> ClaudeAccountSwitcher:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "sequence": [2], "accounts": {"2": {
+                "email": self.EMAIL, "organizationUuid": "org-uuid",
+            }},
+        })
         switcher._write_account_credentials("2", self.EMAIL, backup)
         return switcher
 
@@ -4363,17 +4378,32 @@ class TestSwitchToSelfSlotAndForce:
         assert data["activeAccountNumber"] == 1
         assert "Activated" in capsys.readouterr().out
 
+    @pytest.mark.parametrize("target_kind", ["oauth", "gateway"])
     def test_force_cross_slot_skips_backup_of_current(
         self,
         temp_home: Path,
         mock_claude_config: Path,
         sample_sequence_data: dict,
+        monkeypatch,
+        target_kind,
     ):
         """--switch-to 2 --force lands on account 2 without writing the stale
         live creds into slot 1's freshly imported backup."""
         switcher, creds, configs, live = self._post_import_state(
             temp_home, sample_sequence_data,
         )
+        if target_kind == "gateway":
+            from claude_swap import gateway
+            from tests.test_gateway_accounts import KEY
+
+            monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+            data = switcher._get_sequence_data()
+            data["accounts"]["2"].update(
+                kind="gateway", baseUrl="https://gateway.example", auth="bearer",
+                probeModel=gateway.DEFAULT_MODEL,
+            )
+            switcher._write_json(switcher.sequence_file, data)
+            creds[("2", "account2@example.com")] = KEY
         patches = self._install_store_patches(switcher, creds, configs, live)
         try:
             switcher.switch_to("2", force=True)
@@ -4382,7 +4412,13 @@ class TestSwitchToSelfSlotAndForce:
                 p.stop()
 
         assert creds[("1", "test@example.com")] == self.IMPORTED_1
-        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-2"
+        if target_kind == "gateway":
+            assert live["creds"] == self.LIVE_1
+            assert gateway.active_slot(
+                switcher._gateway_settings_path(), switcher._get_sequence_data()["accounts"],
+            ) == "2"
+        else:
+            assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-2"
         data = switcher._get_sequence_data()
         assert data["activeAccountNumber"] == 2
 
@@ -5379,7 +5415,7 @@ class TestAddAccountFromToken:
     def test_basic_add_stores_account(self, temp_home, capsys):
         """A valid token + email should store the account and print 'Added'."""
         switcher = self._make_switcher(temp_home)
-        with patch.object(switcher, "_write_account_credentials") as mock_creds, \
+        with patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_write_account_config"):
             switcher.add_account_from_token("sk-ant-oat01-abc", "user@example.com")
 
@@ -8888,6 +8924,7 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
+            expected_source=None, expected_target=None, expected_source_auth=None,
         )
 
     def test_switch_to_unknown_alias_raises_account_not_found_not_validation(
@@ -9427,7 +9464,7 @@ class TestDegradedReadProvenance:
                  switcher, "_read_account_credentials", return_value=stale
              ), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
-             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
             result = switcher._fetch_active_usage(
                 "1", "test@example.com", stale
             )
@@ -9667,7 +9704,7 @@ class TestBackupUnreadableDisplay:
         sample_sequence_data: dict,
     ):
         from claude_swap.json_output import (
-            USAGE_KEYCHAIN_UNAVAILABLE, USAGE_NO_CREDENTIALS,
+            USAGE_KEYCHAIN_UNAVAILABLE,
         )
         s = ClaudeAccountSwitcher()
         s.platform = Platform.MACOS
@@ -10486,6 +10523,7 @@ class TestStoreResolutionParity:
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
         monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         s = ClaudeAccountSwitcher()
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
@@ -10630,8 +10668,6 @@ class TestConsumeGateLockFailures:
         from claude_swap.exceptions import LockError as LE
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
-
-        from claude_swap.locking import FileLock as real_lock
 
         class FailingLock:
             def __init__(self, *a, **k): pass

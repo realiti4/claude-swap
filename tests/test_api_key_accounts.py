@@ -287,9 +287,8 @@ class TestUsageDisplay:
     @pytest.mark.parametrize("key", [API_KEY, PERSONAL_KEY])
     def test_active_account_usage_short_circuits(self, temp_home: Path, key):
         s = _linux_switcher()
-        get_global_config_path().write_text(
-            json.dumps({"primaryApiKey": key}), encoding="utf-8"
-        )
+        s.add_account_from_token(key, slot=2)
+        s.switch_to("2", json_output=True)
         entry = s._active_account_usage("2", "api-key-2@token.local", "")
         assert entry.sentinel == USAGE_API_KEY
         assert entry.decision_value() == USAGE_API_KEY

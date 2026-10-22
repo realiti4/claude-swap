@@ -231,6 +231,8 @@ def usage_fields(
         return "token_expired", None
     if entry == USAGE_API_KEY:
         return "api_key", None
+    if entry == "gateway":
+        return "gateway", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:
@@ -320,6 +322,7 @@ def account_row(
     disabled: bool = False,
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
+    gateway_info: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -334,6 +337,8 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if gateway_info is not None:
+        row.update(kind="gateway", usageStatus="gateway", gateway=gateway_info)
     if alias:
         row["alias"] = alias
     # Additive field: present only when the slot is held out of rotation, so

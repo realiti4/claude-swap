@@ -17,9 +17,14 @@ mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
-them into the session profile — symlinks on macOS/Linux (Claude's settings writer
-detects symlinks and writes through to the target, so in-session ``/config``
-changes land in ``~/.claude``), copies re-synced on every launch on Windows.
+them into the session profile — symlinks on macOS/Linux, copies re-synced on
+every launch on Windows. On macOS/Linux, in-session ``/config`` edits follow
+the ``settings.json`` symlink to ``~/.claude`` until gateway auth isolation
+makes it a managed copy.
+Once a gateway account has existed, a session's managed settings copy merges
+local edits with default changes at each launch. It stays a copy after the last
+gateway is removed, and in-session settings edits stay in the session.
+Other shared copies are refreshed.
 A manifest records what cswap created so removal never touches user data.
 
 History sharing (``--share-history``, opt-in): additionally links
@@ -44,6 +49,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -55,6 +61,7 @@ from claude_swap.exceptions import (
     SessionError,
 )
 from claude_swap.fsutil import atomic_write_text
+from claude_swap.gateway import AUTH_OVERRIDE_ENV_VARS
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
@@ -92,6 +99,9 @@ HISTORY_ITEMS = (
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
 SHARE_MANIFEST = ".cswap-shared.json"
+
+# Last shared settings, without credentials, for merging managed copies.
+SETTINGS_BASE = ".cswap-settings-base.json"
 
 # Deferred-invalidation marker: backup credentials changed while a session was
 # live (we never pull credentials out from under a running claude), so the
@@ -189,13 +199,6 @@ def mark_session_stale(session_dir: Path) -> bool:
 # warning: `cswap run N` is an explicit request for account N, so letting an
 # exported API key silently hijack the session would defeat the command. The
 # same-account fast path (plain claude, untouched env) does not scrub.
-AUTH_OVERRIDE_ENV_VARS = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-)
 
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
 _AUTH_STATUS_TIMEOUT = 10.0
@@ -541,11 +544,25 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
-def _probe_env(session_dir: Path) -> dict[str, str]:
+def _scrub_gateway_overrides(env: dict[str, str], gateway_urls) -> dict[str, str]:
+    from claude_swap import gateway
+
+    url = env.get("ANTHROPIC_BASE_URL")
+    try:
+        url = gateway.validate_url(url, base=True) if url else None
+    except ValueError:
+        pass
+    if url in gateway_urls:
+        for name in (*AUTH_OVERRIDE_ENV_VARS, "ANTHROPIC_BASE_URL", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"):
+            env.pop(name, None)
+    return env
+
+
+def _probe_env(session_dir: Path, gateway_urls=()) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped."""
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-    return env
+    return _scrub_gateway_overrides(env, gateway_urls)
 
 
 class SessionManager:
@@ -587,6 +604,7 @@ class SessionManager:
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        prepared_kind = self.switcher._account_kind(account_num)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
@@ -600,7 +618,7 @@ class SessionManager:
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-        else:
+        elif self.switcher._account_kind(account_num) != "gateway":
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
@@ -622,7 +640,7 @@ class SessionManager:
                         "default login — launching claude directly."
                     )
                 )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                self._exec(claude_bin, claude_args, env=_scrub_gateway_overrides(dict(os.environ), self._gateway_urls()))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -632,7 +650,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, share_history, expected_kind=prepared_kind
         )
 
         print(
@@ -643,6 +661,23 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        record, key = self.switcher.account_auth_snapshot(account_num, email, org_uuid)
+        if record.get("kind", "oauth") != prepared_kind:
+            raise SessionError("Account kind changed during session preparation; retry")
+        if record.get("kind") == "gateway":
+            if not key:
+                raise SessionError("Gateway account has no stored credential")
+            env["ANTHROPIC_BASE_URL"] = record["baseUrl"]
+            env[
+                "ANTHROPIC_AUTH_TOKEN"
+                if record.get("auth", "bearer") == "bearer"
+                else "ANTHROPIC_API_KEY"
+            ] = key
+            env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
+            if record.get("modelDiscovery"):
+                env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+        else:
+            _scrub_gateway_overrides(env, self._gateway_urls())
         self._exec(claude_bin, claude_args, env=env)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
@@ -696,13 +731,30 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self, identifier: str, share: bool, share_history: bool = False,
+        *, expected_kind: str | None = None,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        prepared_kind = self.switcher._account_kind(account_num)
+        if expected_kind is not None and prepared_kind != expected_kind:
+            raise SessionError("Account kind changed during session preparation; retry")
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        if prepared_kind == "gateway":
+            _mkdir_private(session_dir)
+            self._init_gateway_config(session_dir)
+            self._sync_sharing(session_dir, share, share_history, gateway_session=True)
+            with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+                self._isolate_auth_settings(session_dir, gateway_session=True, merge_shared=share)
+            return session_dir, account_num, email
+
+        if self._has_gateway_accounts():
+            # Repair old shared profiles before even the local auth probe:
+            # its result must describe this OAuth account, not the default.
+            with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+                self._isolate_auth_settings(session_dir, merge_shared=share)
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -730,6 +782,10 @@ class SessionManager:
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
+            if outcome.error == "identity-conflict":
+                raise SessionError(
+                    "Refreshed credential belongs to another account; re-login and re-add this slot."
+                )
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
                 # and safe to activate" signal, and it is NOT implied by
@@ -785,6 +841,12 @@ class SessionManager:
                 )
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            record = (self.switcher._get_sequence_data() or {}).get("accounts", {}).get(account_num, {})
+            if (record.get("kind", "oauth") != prepared_kind
+                    or record.get("email") != email
+                    or (record.get("organizationUuid", "") or "") != org_uuid):
+                raise SessionError("Account changed during session preparation; retry")
+            self.switcher._refuse_pending_account_write(account_num)
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
@@ -815,11 +877,11 @@ class SessionManager:
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
-                self._sync_sharing(session_dir, share, share_history)
+                self._sync_sharing(session_dir, share, share_history, locked=True)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            self._sync_sharing(session_dir, share, share_history, locked=True)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
@@ -948,6 +1010,36 @@ class SessionManager:
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
         )
 
+    def _init_gateway_config(self, session_dir: Path) -> None:
+        """Seed a new gateway profile's .claude.json without any login.
+
+        The OAuth bootstrap writes this file with the account identity. A
+        gateway profile authenticates through the launch environment, so it
+        gets only the onboarding keys. Without the file, the MCP mirror has
+        nothing to splice into on the first launch. An existing file belongs
+        to the profile (or a claude running in it) and is left alone.
+        """
+        config_path = session_dir / ".claude.json"
+        if config_path.exists() or config_path.is_symlink():
+            return
+        default = self._load_json_object(get_default_global_config_path()) or {}
+        theme = default.get("theme")
+        lock_dir = config_path.parent / (config_path.name + ".lock")
+        try:
+            with proper_lockfile(lock_dir):
+                if config_path.exists() or config_path.is_symlink():
+                    return
+                atomic_write_text(config_path, json.dumps({
+                    "hasCompletedOnboarding": True,
+                    "theme": theme if isinstance(theme, str) and theme else "dark",
+                }, indent=2))
+        except (ClaudeCodeLockTimeout, OSError) as e:
+            # Claude creates its own config on first start; only the shared
+            # MCP servers wait for the next launch.
+            self._logger.warning(
+                f"Could not initialize {config_path} ({e}) — continuing."
+            )
+
     @staticmethod
     def _has_refresh_token(creds: str) -> bool:
         try:
@@ -1000,7 +1092,7 @@ class SessionManager:
         try:
             result = subprocess.run(
                 [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(session_dir),
+                env=_probe_env(session_dir, self._gateway_urls()),
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
@@ -1068,8 +1160,191 @@ class SessionManager:
 
     # -- sharing ---------------------------------------------------------
 
+    def _has_gateway_accounts(self) -> bool:
+        return any(
+            record.get("kind") == "gateway"
+            for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
+        )
+
+    def _gateway_urls(self) -> set[str]:
+        return {
+            record["baseUrl"]
+            for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
+            if record.get("kind") == "gateway" and isinstance(record.get("baseUrl"), str)
+        }
+
+    def _isolate_auth_settings(
+        self, session_dir: Path, *, gateway_session: bool = False,
+        source: Path | None = None, merge_shared: bool = True,
+    ) -> None:
+        """Isolate auth under the roster lock; no-share sanitizes only the copy."""
+        from claude_swap import gateway
+
+        path = session_dir / "settings.json"
+        if not merge_shared and path.is_symlink():
+            # Disabling sharing must not follow a link into default settings.
+            path.unlink()
+            return
+        managed = path.is_symlink() or "settings.json" in self._read_manifest(session_dir / SHARE_MANIFEST)
+        if not merge_shared:
+            if managed:
+                # Discard our copy before parsing; only surviving local
+                # settings need sanitizing when sharing is disabled.
+                self._remove_managed(path)
+            source = path
+        elif managed and (source is None or source == path):
+            default = Path.home() / ".claude" / "settings.json"
+            if default.exists():
+                source = default
+        source = source or path
+        if not source.exists():
+            if path.is_symlink():
+                path.unlink()
+            return
+        if source != path:
+            self._sync_settings_copy(path, source, gateway_session=gateway_session)
+            return
+        settings = self._read_settings(source)
+        if not self._normalize_auth_settings(
+            settings, source, gateway_session=gateway_session, managed=managed,
+        ):
+            return
+        if path.is_symlink():
+            path.unlink()
+        gateway.atomic_bytes(path, (json.dumps(settings, indent=2) + "\n").encode())
+
+    @staticmethod
+    def _read_settings(path: Path) -> dict:
+        from claude_swap import gateway
+
+        try:
+            return gateway.read_settings(path)
+        except ValueError:
+            raise SessionError(
+                f"Cannot read Claude settings file {path}; repair it before retrying"
+            ) from None
+
+    @staticmethod
+    def _merge_settings(base: dict, ours: dict, theirs: dict) -> dict:
+        """Apply local changes over the default, one level into env only.
+
+        Other nested objects, including values below env, are replaced whole.
+        An empty base adopts a legacy copy without treating absent keys as
+        deletions: existing non-auth local keys win, new default keys flow in.
+        Auth keys always come from the current default, never from local edits
+        or baseline comparisons; any session auth normalization runs afterward.
+        """
+        missing = object()
+
+        def merge(old: dict, local: dict, shared: dict, excluded: set[str]) -> dict:
+            result = shared.copy()
+            for key in (old.keys() | local.keys()) - excluded:
+                if local.get(key, missing) != old.get(key, missing):
+                    if key in local:
+                        result[key] = local[key]
+                    else:
+                        result.pop(key, None)
+            return result
+
+        # env is compared only per key below, with its auth keys excluded too.
+        result = merge(base, ours, theirs, {"apiKeyHelper", "env"})
+        env = merge(base.get("env", {}), ours.get("env", {}), theirs.get("env", {}), {
+            *AUTH_OVERRIDE_ENV_VARS, "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+        })
+        if env:
+            result["env"] = env
+        else:
+            result.pop("env", None)
+        return result
+
+    def _sync_settings_copy(
+        self, path: Path, source: Path, *, gateway_session: bool | None = None,
+    ) -> None:
+        """Merge a managed copy and advance its private, credential-free base.
+
+        None keeps non-isolated sharing's auth behavior. For isolated
+        copies, normalize the baseline like the output so generated auth
+        values are never mistaken for local edits. The caller holds the
+        roster lock across reading, merging and publishing both files.
+        """
+        from claude_swap import gateway
+
+        theirs = self._read_settings(source)
+        snapshot = deepcopy(theirs)
+        if gateway_session is not None:
+            self._normalize_auth_settings(
+                snapshot, source, gateway_session=gateway_session, managed=True,
+            )
+        # Foreign helpers can embed credentials too. Never persist a helper
+        # or a credential-bearing env override in the merge baseline.
+        snapshot.pop("apiKeyHelper", None)
+        for name in AUTH_OVERRIDE_ENV_VARS:
+            snapshot.get("env", {}).pop(name, None)
+        if not snapshot.get("env"):
+            snapshot.pop("env", None)
+        base_path = path.parent / SETTINGS_BASE
+        settings = theirs
+        if path.is_file() and not path.is_symlink():
+            settings = self._merge_settings(
+                self._read_settings(base_path), self._read_settings(path), theirs,
+            )
+        if gateway_session is not None:
+            self._normalize_auth_settings(
+                settings, path, gateway_session=gateway_session, managed=True,
+            )
+        if path.is_symlink():
+            path.unlink()
+        # These atomic writes are not a transaction: a crash between them can
+        # make this sync's non-auth default changes look local at the next sync.
+        gateway.atomic_bytes(path, (json.dumps(settings, indent=2) + "\n").encode())
+        gateway.atomic_bytes(base_path, (json.dumps(snapshot, indent=2) + "\n").encode())
+
+    def _normalize_auth_settings(
+        self, settings: dict, source: Path, *, gateway_session: bool, managed: bool,
+    ) -> bool:
+        """Apply the session auth rules in place; leave private customizations alone."""
+        from claude_swap import gateway
+
+        owned_helper = gateway.owned_slot(settings.get("apiKeyHelper")) is not None
+        gateway_urls = self._gateway_urls()
+        base_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL")
+        if base_url is not None and not isinstance(base_url, str):
+            raise SessionError(
+                f"Cannot read Claude settings file {source}; ANTHROPIC_BASE_URL must be a string"
+            )
+        gateway_url = base_url in gateway_urls
+        if not gateway_session and not managed and not owned_helper and not gateway_url:
+            return False  # A profile-local customization belongs to its user.
+        if gateway_session or owned_helper:
+            settings.pop("apiKeyHelper", None)
+        env = settings.setdefault("env", {})
+        for name in AUTH_OVERRIDE_ENV_VARS:
+            env.pop(name, None)
+        if gateway_session or owned_helper or gateway_url:
+            env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
+        if gateway_session:
+            env.pop("ANTHROPIC_BASE_URL", None)
+        elif gateway_url or (managed and "ANTHROPIC_BASE_URL" not in env):
+            env["ANTHROPIC_BASE_URL"] = gateway.FIRST_PARTY_URL
+        if not env:
+            settings.pop("env", None)
+        return True
+
     def _sync_sharing(
-        self, session_dir: Path, share: bool, share_history: bool = False
+        self, session_dir: Path, share: bool, share_history: bool = False,
+        *, gateway_session: bool = False, locked: bool = False,
+    ) -> None:
+        """Serialize sharing decisions and publication with gateway activation."""
+        if not locked:
+            with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+                self._sync_sharing_locked(session_dir, share, share_history, gateway_session=gateway_session)
+            return
+        self._sync_sharing_locked(session_dir, share, share_history, gateway_session=gateway_session)
+
+    def _sync_sharing_locked(
+        self, session_dir: Path, share: bool, share_history: bool = False,
+        *, gateway_session: bool = False,
     ) -> None:
         """Mirror shared items from ~/.claude into the profile (or undo it).
 
@@ -1081,10 +1356,10 @@ class SessionManager:
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
-        is set in the invoking environment. File/dir sharing is lock-free on
-        the reuse path — concurrent runs with different flags are last-writer-
-        wins and self-heal on the next launch; only the MCP mirror takes
-        Claude's config lock, and only when it needs to write.
+        is set in the invoking environment. The caller holds the roster lock
+        through settings isolation decisions and publication so activation
+        cannot be undone by a stale sharing decision. The MCP mirror also
+        takes Claude's config lock when it needs to write, in that order.
         """
         if not session_dir.is_dir():
             return
@@ -1099,6 +1374,11 @@ class SessionManager:
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
+        isolate_settings = gateway_session or self._has_gateway_accounts()
+        if not share and isolate_settings:
+            self._isolate_auth_settings(
+                session_dir, gateway_session=gateway_session, merge_shared=False,
+            )
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
@@ -1121,6 +1401,39 @@ class SessionManager:
         for name in active_items:
             src = source_root / name
             dest = session_dir / name
+
+            if name == "settings.json" and (
+                isolate_settings
+                or (name in managed and dest.is_file() and not dest.is_symlink())
+                or (not use_symlinks and (
+                    name in managed or not dest.exists() or dest.is_symlink()
+                ))
+            ):
+                if not src.exists():
+                    if name in managed:
+                        self._remove_managed(dest)
+                        # Keep ownership while the source is absent, so a
+                        # later launch can restore the managed copy.
+                        new_managed.append(name)
+                    else:
+                        if dest.is_symlink():
+                            dest.unlink()
+                        if gateway_session and not dest.exists():
+                            # Retain sharing intent while the source is absent.
+                            new_managed.append(name)
+                    continue
+                # Keep shared customizations as a copy. Linking would let a
+                # later default gateway switch change this session's auth.
+                source = src if name in managed or not dest.exists() or dest.is_symlink() else dest
+                if isolate_settings:
+                    self._isolate_auth_settings(
+                        session_dir, gateway_session=gateway_session, source=source
+                    )
+                else:
+                    self._sync_settings_copy(dest, source)
+                if source == src and src.exists():
+                    new_managed.append(name)
+                continue
 
             if name in HISTORY_ITEMS and not self._prepare_history_share(
                 src, dest, session_dir
@@ -1502,6 +1815,8 @@ class SessionManager:
         """Remove a cswap-created share entry (link or copy), never user data
         beyond it — callers guarantee `dest` is manifest-listed or a symlink."""
         try:
+            if dest.name == "settings.json":
+                (dest.parent / SETTINGS_BASE).unlink(missing_ok=True)
             if dest.is_symlink() or dest.is_file():
                 dest.unlink(missing_ok=True)
             elif dest.is_dir():

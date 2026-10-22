@@ -2501,8 +2501,8 @@ class TestTokenIdentity:
 
     def test_conflicting_token_identity_returns_identity_conflict(self, harness):
         """A slot whose credential authenticates as a different account is not
-        a viable target — but the rotated generation is still persisted (the
-        grant consumed its predecessor)."""
+        a viable target — preserve the rotated generation in the stash without
+        installing a known foreign credential."""
         harness.switcher._write_account_credentials(
             "2", "b@example.com",
             json.dumps({"claudeAiOauth": {
@@ -2513,6 +2513,7 @@ class TestTokenIdentity:
             "accessToken": "sk-2f", "refreshToken": "rt-2f",
             "expiresAt": 99_999_999_999_000,
         }})
+        predecessor = harness.switcher.read_account_credentials("2", "b@example.com")
         with patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(
@@ -2523,10 +2524,14 @@ class TestTokenIdentity:
         ):
             status = harness.engine._freshen_target("2", "b@example.com")
         assert status == "identity-conflict"
-        # The consumed generation's successor was persisted regardless.
+        # The sole successor survives without becoming the slot credential.
         assert harness.switcher.read_account_credentials(
             "2", "b@example.com"
-        ) == fresh
+        ) == predecessor
+        assert any(
+            harness.switcher._store._read_unclaimed_credential(i) == (fresh, False)
+            for i in harness.switcher.list_unclaimed_credentials()
+        )
 
     def test_identity_conflict_quarantines_instead_of_activating(self, harness):
         """Tick path: the conflicted slot is quarantined (wrong-account switch
@@ -2688,6 +2693,7 @@ class TestTokenIdentity:
             "accessToken": "sk-2f", "refreshToken": "rt-2f",
             "expiresAt": 99_999_999_999_000,
         }})
+        predecessor = harness.switcher.read_account_credentials("2", "b@example.com")
         with patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(
@@ -2700,10 +2706,14 @@ class TestTokenIdentity:
         assert status == "identity-conflict"
         # The foreign uuid was NOT backfilled onto the slot.
         assert harness.switcher._get_sequence_data()["accounts"]["2"]["uuid"] == ""
-        # The successor generation was still persisted (grant consumed it).
+        # Preserve the foreign successor without installing or backfilling it.
         assert harness.switcher.read_account_credentials(
             "2", "b@example.com"
-        ) == fresh
+        ) == predecessor
+        assert any(
+            harness.switcher._store._read_unclaimed_credential(i) == (fresh, False)
+            for i in harness.switcher.list_unclaimed_credentials()
+        )
 
 
 def _model_usage(five_h: float, fable: float) -> dict:
@@ -3747,7 +3757,7 @@ class TestRecoveryHorizon:
     def test_a_days_away_reset_does_not_buy_headroom(self, harness):
         """The measured live shape. Every reset is days out, so ranking falls
         back to headroom and the account with 9 points left keeps the work."""
-        outcome = harness.tick_with_usage({
+        harness.tick_with_usage({
             "1": _usage(91, self._at(harness, 109 * 3600)),  # active, 9 left
             "2": _usage(94, self._at(harness, 80 * 3600)),
             "3": _usage(98, self._at(harness, 50 * 3600)),   # 2 left, soonest

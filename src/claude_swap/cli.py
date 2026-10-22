@@ -9,7 +9,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, SwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
 from claude_swap.printer import (
@@ -1105,9 +1105,30 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
+    argv = sys.argv[1:]
+    if argv and argv[0] == "gateway-credential":
+        # Helpers must emit exactly the credential, with no CLI/theme/log chatter.
+        import contextlib
+        import io
+
+        key = None
+        try:
+            if len(argv) == 2 and argv[1].isdigit() and int(argv[1]) > 0:
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    key = ClaudeAccountSwitcher().gateway_credential(str(int(argv[1])))
+        except SwitchError:
+            sys.stderr.write("Gateway credentials are unavailable inside a cswap run session profile.\n")
+        except Exception:
+            pass
+        if key is None:
+            sys.exit(1)
+        sys.stdout.write(key)
+        return
     force_utf8_output()
     _use_native_tls()
-    argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -1433,7 +1454,21 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
 
+    parser.add_argument("--base-url", help="Gateway base URL (with add-token)")
+    parser.add_argument("--auth", choices=("bearer", "x-api-key"), default="bearer")
+    parser.add_argument("--usage-url", help="Optional gateway budget endpoint")
+    parser.add_argument("--probe-model", default="claude-haiku-4-5")
+    parser.add_argument("--model-discovery", action="store_true")
     args = parser.parse_args(argv)
+    if args.base_url is not None and args.add_token is None:
+        parser.error("--base-url can only be used with add-token")
+    if args.base_url is None and (
+        args.usage_url
+        or args.model_discovery
+        or args.auth != "bearer"
+        or args.probe_model != "claude-haiku-4-5"
+    ):
+        parser.error("Gateway options require --base-url")
 
     # No action selected: emit a clean, subcommand-oriented message rather than
     # the raw argparse "one of the arguments ... is required" (which would list
@@ -1491,8 +1526,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
 
-    if args.alias is not None and not args.add_account:
-        parser.error("--alias can only be used with 'add'")
+    if args.alias is not None and not args.add_account and args.add_token is None:
+        parser.error("--alias can only be used with 'add' or 'add-token'")
 
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
@@ -1544,10 +1579,22 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         if args.add_account:
             switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
+            gateway_options = {}
+            if args.base_url is not None:
+                gateway_options.update(
+                    base_url=args.base_url,
+                    auth=args.auth,
+                    usage_url=args.usage_url,
+                    probe_model=args.probe_model,
+                    model_discovery=args.model_discovery,
+                )
+            if args.alias is not None:
+                gateway_options["alias"] = args.alias
             switcher.add_account_from_token(
                 token=args.add_token,
                 email=args.email,
                 slot=args.slot,
+                **gateway_options,
             )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)

@@ -194,14 +194,14 @@ class TestAccountSnapshotPolicyField:
         policy = AccountPolicy(threshold=85.0)
         assert _snapshot(policy=policy).policy == policy
 
-    def test_policy_is_last_so_positional_callers_are_unaffected(self):
+    def test_policy_stays_after_disabled_for_positional_callers(self):
         """The field is appended after `disabled`, not inserted.
 
         Inserting it ahead of `alias`/`disabled` would silently rebind every
         positional construction in the repo.
         """
         names = [f.name for f in dataclasses.fields(AccountSnapshot)]
-        assert names[-1] == "policy"
+        assert names[names.index("disabled") + 1] == "policy"
         assert names.index("policy") > names.index("disabled")
 
     def test_snapshot_is_still_frozen_and_still_has_display_tag(self):

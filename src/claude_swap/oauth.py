@@ -37,6 +37,8 @@ def extract_oauth_data(credentials: str) -> dict | None:
         data = json.loads(credentials)
     except json.JSONDecodeError:
         return None
+    if not isinstance(data, dict):
+        return None
     oauth = data.get("claudeAiOauth")
     return oauth if isinstance(oauth, dict) else None
 
@@ -640,6 +642,7 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "identity-conflict",
 )
 
 

@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, StaleSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
@@ -547,6 +547,15 @@ class TickOutcome(enum.Enum):
     BLOCKED = 3  # wanted to switch but no viable target / all exhausted
 
 
+class _FreshenFailure(str):
+    """A status string bound to the exact token generation that failed."""
+
+    def __new__(cls, status: str, fingerprint: str | None):
+        result = super().__new__(cls, status)
+        result.fingerprint = fingerprint
+        return result
+
+
 # Quarantine state persisted fingerprints from a local refresh-token-only
 # helper; oauth.credential_fingerprint is identical for refresh-token creds.
 # Setup-token quarantines stored None where the shared helper now yields a
@@ -804,19 +813,28 @@ class AutoSwitchEngine:
 
     # -- quarantine -----------------------------------------------------------
 
-    def _quarantine(self, number: str, email: str, reason: str) -> None:
-        creds = self.switcher.read_account_credentials(number, email)
-        fingerprint = _refresh_fingerprint(creds) if creds else None
-
-        def add(state: dict) -> None:
+    def _quarantine(self, number: str, email: str, reason: str, *, expected_auth: dict | None = None, expected_fingerprint: str | None = None) -> None:
+        # Match switch commit order: state, then roster. Publication and the
+        # credential fingerprint must refer to the generation that failed.
+        with self._state_lock(), FileLock(self.switcher.lock_file):
+            auth = self.switcher._switch_target_snapshot(self.switcher._get_sequence_data() or {}, number)
+            if expected_auth is not None and auth != expected_auth:
+                return
+            creds = self.switcher.read_account_credentials(number, email)
+            fingerprint = _refresh_fingerprint(creds) if creds else None
+            if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+                return
+            state = self._read_state()
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
             state.setdefault("quarantine", {})[number] = {
                 "email": email,
                 "reason": reason,
                 "at": _now_iso(),
                 "refreshTokenFingerprint": fingerprint,
+                "authGeneration": (auth or {}).get("authGeneration"),
+                "kind": (auth or {}).get("kind"),
             }
-
-        self._mutate_state(add)
+            atomic_write_json(self.state_path, state)
         self._emit(QuarantineEvent(number=number, email=email, reason=reason))
 
     def _release_recovered_quarantines(self, state: dict) -> dict:
@@ -830,12 +848,19 @@ class AutoSwitchEngine:
         if not isinstance(quarantine, dict) or not quarantine:
             return state
         to_release: list[tuple[str, str, str]] = []
+        auth = self.switcher.switch_target_snapshots()
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
                 to_release.append(
                     (number, entry.get("email", ""), "account-replaced")
                 )
+                continue
+            current_auth = auth.get(number) or {}
+            if "authGeneration" in entry and any(
+                current_auth.get(key) != entry.get(key) for key in ("authGeneration", "kind")
+            ):
+                to_release.append((number, email_now, "account-replaced"))
                 continue
             creds = self.switcher.read_account_credentials(number, email_now)
             fingerprint = _refresh_fingerprint(creds) if creds else None
@@ -848,7 +873,8 @@ class AutoSwitchEngine:
             q = s.get("quarantine")
             if isinstance(q, dict):
                 for number, _, _ in to_release:
-                    q.pop(number, None)
+                    if q.get(number) == quarantine.get(number):
+                        q.pop(number, None)
 
         state = self._mutate_state(drop)
         for number, email, reason in to_release:
@@ -868,7 +894,7 @@ class AutoSwitchEngine:
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
-        if self.switcher.account_kind_for(number) == "api_key":
+        if self.switcher.account_kind_for(number) in ("api_key", "gateway"):
             return "ok"  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
@@ -883,7 +909,7 @@ class AutoSwitchEngine:
             return "transient"
         data = oauth.extract_oauth_data(creds)
         if not data:
-            return "invalid_grant"
+            return _FreshenFailure("invalid_grant", _refresh_fingerprint(creds))
         expires_at = data.get("expiresAt")
         now_ms = self.clock() * 1000
         near_expiry = (
@@ -909,10 +935,12 @@ class AutoSwitchEngine:
                 # account with every gauge reading normal. Not a viable
                 # target; the caller quarantines it (released automatically
                 # once the credential is replaced by a re-add).
-                return "identity-conflict"
+                return _FreshenFailure("identity-conflict", _refresh_fingerprint(outcome.credentials))
             return "ok"
+        if outcome.error == "identity-conflict":
+            return _FreshenFailure("identity-conflict", outcome.consumed_fp or _refresh_fingerprint(creds))
         if outcome.error in ("invalid_grant", "no_refresh_token"):
-            return "invalid_grant"
+            return _FreshenFailure("invalid_grant", outcome.consumed_fp or _refresh_fingerprint(creds))
         if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
             # refuses identically and keeps refusing until something outside
@@ -1025,6 +1053,7 @@ class AutoSwitchEngine:
         values = [
             thresholds[num]
             for num in self.switcher.switchable_account_numbers()
+            if self.switcher.account_kind_for(num) != "gateway"
         ]
         return min(values) if values else self.settings.threshold
 
@@ -1181,6 +1210,13 @@ class AutoSwitchEngine:
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
+        target_snapshots = self.switcher.switch_target_snapshots()
+        if self.switcher.account_kind_for(current) == "gateway":
+            # A previous OAuth idle hold must not suppress candidate polls
+            # for the gateway, whose own probe now controls departure.
+            self._idle_hold_since = None
+            self._idle_hold_slow = False
+            self._unhealthy_ticks = 0
         entries, usage, headroom = self._collect_scheduled_usage(
             current,
             quarantined,
@@ -1225,6 +1261,19 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
+
+        if self.switcher.account_kind_for(current) == "gateway":
+            return self._tick_active_gateway(
+                current,
+                entries,
+                usage,
+                headroom,
+                thresholds,
+                settings,
+                state,
+                quarantined,
+                target_snapshots,
+            )
 
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
@@ -1313,7 +1362,11 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in (
+            "proactive",
+            "consume-first",
+            "gateway-return",
+        ) and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1324,7 +1377,7 @@ class AutoSwitchEngine:
             if num != current and num not in quarantined
         ]
         oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+            n for n in candidates if self.switcher.account_kind_for(n) == "oauth"
         ]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
@@ -1335,6 +1388,17 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
+        gateway_candidates = (
+            [
+                n
+                for n in candidates
+                if self.switcher.account_kind_for(n) == "gateway"
+                and self._gateway_eligible(entries.get(n), thresholds[n])
+            ]
+            if settings.include_gateway_accounts
+            else []
+        )
+        api_key_candidates += gateway_candidates
         if (
             trigger == "consume-first"
             and not oauth_candidates
@@ -1469,7 +1533,7 @@ class AutoSwitchEngine:
             # threshold: a still-qualifying sooner target switches anyway,
             # and otherwise the next tick escalates normally and escapes.
             entries = self.switcher.usage_entries_by_account(
-                fetch={current, *candidates}
+                fetch={current, *oauth_candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
@@ -1488,11 +1552,24 @@ class AutoSwitchEngine:
                 thresholds=thresholds,
             )
 
+        if gateway_candidates and trigger != "consume-first":
+            # A healthy gateway is the fallback once OAuth seats reach their
+            # own lines; do not choose a nearly-spent OAuth recovery fallback.
+            ordered = [
+                n
+                for n in ordered
+                if self._gateway_oauth_eligible(usage.get(n), thresholds[n], settings)
+            ]
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
+        elif api_key_candidates and trigger != "consume-first":
+            # Ranked OAuth seats may still be unusable (a live session,
+            # refresh failure, or identity conflict). Exhaust those choices
+            # before trying opted-in API keys, then healthy gateways.
+            ordered = [*ordered, *api_key_candidates]
 
         if not ordered:
             if not any_known:
@@ -1613,17 +1690,9 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
-            status = self._freshen_target(num, email)
-            if status == "identity-conflict":
-                # The slot's credential is alive but belongs to a different
-                # account — switching onto it would silently run the wrong
-                # account. Quarantine (auto-released once a re-add replaces
-                # the credential).
-                self._quarantine(num, email, "identity-conflict")
-                continue
-            if status == "invalid_grant":
-                self._quarantine(num, email, "invalid_grant")
+                return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
+            status = self._prepare_target(num, email)
+            if status in ("identity-conflict", "invalid_grant"):
                 continue
             if status == "transient":
                 transient_failure = True
@@ -1644,7 +1713,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
 
         if systemic or transient_failure:
             self._emit(
@@ -1658,6 +1727,172 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _prepare_target(self, number: str, email: str) -> str:
+        """Persist quarantine for a failed freshen on every rotation path."""
+        expected_auth = self.switcher.switch_target_snapshots().get(number) or {}
+        status = self._freshen_target(number, email)
+        if status in ("identity-conflict", "invalid_grant"):
+            # Freshening may already have persisted a foreign successor.
+            # Fingerprint that generation so it stays excluded next tick.
+            self._quarantine(number, email, str(status), expected_auth=expected_auth,
+                             expected_fingerprint=getattr(status, "fingerprint", None))
+        return status
+
+    @staticmethod
+    def _gateway_eligible(entry, threshold: float) -> bool:
+        verdict = entry.gateway if entry is not None else None
+        if not verdict or verdict.get("probeStatus") != "ok":
+            return False
+        budget = verdict.get("budget")
+        return budget is None or budget["pct"] < threshold
+
+    def _gateway_oauth_eligible(self, value, threshold, settings, margin=0.0) -> bool:
+        windows = oauth.relevant_windows(
+            value if isinstance(value, dict) else None, self._models
+        )
+        return bool(windows) and all(
+            pct < window_line(label, threshold, settings.weekly_threshold)
+            and pct <= window_line(label, threshold, settings.weekly_threshold) - margin
+            for label, pct, _ in windows
+        )
+
+    def _tick_active_gateway(
+        self,
+        current,
+        entries,
+        usage,
+        headroom,
+        thresholds,
+        settings,
+        state,
+        quarantined,
+        target_snapshots,
+    ):
+        from claude_swap import gateway
+
+        verdict = entries[current].gateway or {}
+        status = verdict.get("probeStatus")
+        failure = None
+        if status in ("exhausted", "unauthorized"):
+            failure = "gateway-" + status
+        elif (
+            status == "cooling"
+            and self.clock() - verdict.get("coolingSince", self.clock())
+            >= gateway.COOLING_MAX_S
+        ):
+            failure = "gateway-cooling"
+        elif (
+            status == "transient"
+            and self.clock() - verdict.get("transientSince", self.clock())
+            >= gateway.TRANSIENT_MAX_S
+        ):
+            failure = "gateway-transient"
+        elif verdict.get("budget") and verdict["budget"]["pct"] >= thresholds[current]:
+            failure = "gateway-exhausted"
+        if not failure:
+            self._emit(NoSwitchEvent(reason="gateway-hold"))
+            return TickOutcome.NO_ACTION
+        candidates = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n != current and n not in quarantined
+        ]
+        oauth_candidates = [
+            n
+            for n in candidates
+            if self.switcher.account_kind_for(n) == "oauth"
+            and self._gateway_oauth_eligible(
+                usage.get(n),
+                thresholds[n],
+                settings,
+            )
+        ]
+        ordered, _, _ = self._rank_candidates(
+            trigger="at-limit",
+            consume_first=settings.strategy == "consume-first",
+            oauth_candidates=oauth_candidates,
+            no_return=None,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=None,
+            settings=settings,
+            now=self.clock(),
+            thresholds=thresholds,
+        )
+        # A failed gateway must yield to any OAuth seat under its own lines.
+        # Prefer seats clearing the margin, retaining strategy order within
+        # each group and the inside-band fallbacks if freshening fails.
+        ordered.sort(key=lambda n: not self._gateway_oauth_eligible(
+            usage.get(n), thresholds[n], settings, margin=settings.hysteresis_pct,
+        ))
+        trigger = failure
+        if settings.include_api_key_accounts:
+            ordered += [
+                n for n in candidates
+                if self.switcher.account_kind_for(n) == "api_key"
+            ]
+        if settings.include_gateway_accounts:
+            ordered += [
+                n
+                for n in candidates
+                if self.switcher.account_kind_for(n) == "gateway"
+                and self._gateway_eligible(entries.get(n), thresholds[n])
+            ]
+        transient_failure = False
+        systemic = ""
+        for num in ordered:
+            email = self.switcher.account_email(num)
+            if self.dry_run:
+                return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
+            status = self._prepare_target(num, email)
+            if status in ("identity-conflict", "invalid_grant", "skip-live-session"):
+                continue
+            if status == "transient":
+                transient_failure = True
+                continue
+            if status in _SYSTEMIC_STATUSES:
+                if not systemic or _SYSTEMIC_STATUSES.index(status) < _SYSTEMIC_STATUSES.index(systemic):
+                    systemic = status
+                continue
+            return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
+        if systemic or transient_failure:
+            self._emit(ErrorEvent(
+                message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
+                if systemic else "could not freshen any candidate (network?)",
+                transient=True,
+            ))
+            return TickOutcome.ERROR
+        self._emit(
+            NoSwitchEvent(
+                reason=failure or "gateway-hold",
+                detail="no eligible fallback account; holding gateway",
+            )
+        )
+        oauth_peers = [
+            n for n in candidates if self.switcher.account_kind_for(n) == "oauth"
+        ]
+        if (
+            failure
+            and oauth_peers
+            and all(
+                headroom.get(n) is not None and headroom[n] <= 0 for n in oauth_peers
+            )
+        ):
+            earliest = self._earliest_recovery(usage)
+            self._emit(
+                AllExhaustedEvent(
+                    earliest_reset_at=(
+                        earliest.isoformat().replace("+00:00", "Z")
+                        if earliest
+                        else None
+                    )
+                )
+            )
+            # Keep ticking: gateway cooling/retry cadence must not be parked
+            # until an OAuth reset hours away.
+        return TickOutcome.BLOCKED if failure else TickOutcome.NO_ACTION
 
     def _no_return_account(
         self,
@@ -2374,11 +2609,23 @@ class AutoSwitchEngine:
         candidates = [
             n
             for n in self.switcher.switchable_account_numbers()
-            if n != current and n not in quarantined
+            if n != current
+            and n not in quarantined
+            and self.switcher.account_kind_for(n) != "gateway"
         ]
+        gateway_slots = {
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if self.switcher.account_kind_for(n) == "gateway"
+            and self.settings.include_gateway_accounts
+            and n not in quarantined
+        }
+        active_gateway = self.switcher.account_kind_for(current) == "gateway"
+        if active_gateway:
+            gateway_slots.add(current)
 
         pre = self.switcher.usage_entries_by_account(fetch=set())
-        plan: set[str] = set()
+        plan: set[str] = set(gateway_slots)
         active_pre = pre.get(current)
         # The active account is nominated when never fetched, poll-due per its
         # persisted plan, or (no plan yet) past the normal cadence floor. The
@@ -2449,9 +2696,13 @@ class AutoSwitchEngine:
                 active_value if isinstance(active_value, dict) else None, self._models
             )
         )
-        escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
-            or (active_headroom is not None and near_a_line)
+        escalate = (
+            not active_gateway
+            and bool(candidates)
+            and (
+                (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+                or (active_headroom is not None and near_a_line)
+            )
         )
         if escalate:
             escalation_fetch = {current, *candidates}
@@ -2489,6 +2740,9 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        *, expected_source: str | None = None,
+        expected_target: dict | None = None,
+        expected_source_auth: dict | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2511,11 +2765,24 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in (
+                "proactive",
+                "consume-first",
+                "gateway-return",
+            ) and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            try:
+                source_args = {"expected_source": expected_source} if expected_source is not None else {}
+                if expected_target is not None:
+                    source_args["expected_target"] = expected_target
+                if expected_source_auth is not None:
+                    source_args["expected_source_auth"] = expected_source_auth
+                result = self.switcher.switch_to(number, json_output=True, **source_args)
+            except StaleSwitchError:
+                self._emit(NoSwitchEvent(reason="active-account-changed"))
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -2603,7 +2870,7 @@ class AutoSwitchEngine:
             n
             for n in self.switcher.switchable_account_numbers()
             if n not in quarantined
-            and self.switcher.account_kind_for(n) != "api_key"
+            and self.switcher.account_kind_for(n) == "oauth"
         ]
         values = [usage.get(n) for n in relevant]
         readable = [v for v in values if isinstance(v, dict)]
@@ -2699,10 +2966,10 @@ class AutoSwitchEngine:
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
                 delay = self._sleep_until_ts - self.clock()
-                return min(max(delay, interval), MAX_SLEEP_S)
+                return self._respect_gateway_poll_plan(min(max(delay, interval), MAX_SLEEP_S))
             if self._blocked_wait_long:
                 # Truly exhausted with no reset time known / no candidates.
-                return max(interval, NO_RESET_FALLBACK_S)
+                return self._respect_gateway_poll_plan(max(interval, NO_RESET_FALLBACK_S))
             # Blocked on something that can resolve any tick (hysteresis,
             # unreadable usage) — keep the normal cadence so the at-limit
             # escape isn't missed.
@@ -2710,9 +2977,40 @@ class AutoSwitchEngine:
             # Idle-hold: Claude is idle on an expired token — nothing changes
             # until the user comes back, so crawl. Worst case protection
             # resumes one slow tick after they do.
-            return max(interval, NO_RESET_FALLBACK_S)
+            return self._respect_gateway_poll_plan(max(interval, NO_RESET_FALLBACK_S))
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        return self._respect_gateway_poll_plan(
+            self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        )
+
+    def _respect_gateway_poll_plan(self, delay: float) -> float:
+        """Keep enabled gateway recovery deadlines even during OAuth waits."""
+        try:
+            current = self.switcher.current_account_number()
+            if current is None:
+                return delay
+            quarantine = self._read_state().get("quarantine", {})
+            quarantined = set(quarantine) if isinstance(quarantine, dict) else set()
+            slots = {
+                num for num in self.switcher.switchable_account_numbers()
+                if self.settings.include_gateway_accounts
+                and num not in quarantined
+                and self.switcher.account_kind_for(num) == "gateway"
+            }
+            if self.switcher.account_kind_for(current) == "gateway":
+                slots.add(current)
+            if not slots:
+                return delay
+            entries = self.switcher.usage_entries_by_account(fetch=set())
+            now = self.clock()
+            for num in slots:
+                entry = entries.get(num)
+                if (entry is not None and entry.next_poll_at is not None
+                        and (entry.gateway or {}).get("probeStatus") != "unauthorized"):
+                    delay = min(delay, max(entry.next_poll_at - now, 1.0))
+            return delay
+        except Exception:
+            return delay
 
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.

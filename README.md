@@ -391,6 +391,59 @@ service-account keys scoped to a single workspace: a multi-workspace key needs a
 `anthropic-workspace-id` header on every request, which Claude Code does not add for
 a stored key.
 
+### Gateway accounts
+
+Register an Anthropic-compatible gateway as its own account kind. The key can
+have any prefix; `--base-url` distinguishes it from an OAuth token or a Console
+API key. Prefer stdin so the key stays out of shell history:
+
+```bash
+cswap add-token - --base-url https://gateway.example --alias gateway
+cswap config set autoswitch.includeGatewayAccounts true
+cswap switch gateway
+cswap run gateway
+```
+
+`--auth bearer` (the default) or `--auth x-api-key` selects the probe and
+`cswap run` header. Optional flags are `--slot`, `--probe-model` (default
+`claude-haiku-4-5`), `--model-discovery`, and `--usage-url`. URLs require HTTPS,
+except HTTP on `localhost` or `127.0.0.1`; trailing `/` and `/v1` are normalized.
+Budget usage is currently **unconfigured**: the optional usage adapter awaits a
+verified provider payload. A gateway's spend limit is therefore detected by its
+probe response, not by Anthropic's OAuth usage endpoint.
+
+Automatic gateway selection is off by default. When enabled, healthy gateways
+are fallback candidates after qualifying OAuth accounts, never consume-first
+nudges. An active gateway is probed about every two minutes; inactive candidates
+about every ten minutes. A 429 marks exhaustion, 503/529 marks cooling, and
+401/403 quarantines the credential until it is replaced with `add-token`.
+The loop stays on the gateway until it reports exhaustion or unauthorized
+credentials, or cooling/transient failure lasts ten minutes. OAuth accounts
+keep being polled while it holds. On departure, OAuth accounts below their own
+thresholds by the hysteresis margin are preferred, then any OAuth account under
+its own threshold. Recovery alone never triggers a return. If no eligible
+alternative exists, it holds the current seat.
+
+Switching writes only a cswap `apiKeyHelper` command and gateway environment
+settings to Claude Code's `settings.json`. The key remains in cswap's credential
+store; the saved OAuth login stays in place. A foreign `apiKeyHelper` makes the
+switch refuse. Returning to a regular account removes cswap's helper and sets
+`ANTHROPIC_BASE_URL` explicitly to `https://api.anthropic.com`: deleting a
+settings environment variable does not unset it in an already-running session.
+Switch away before removing an active gateway. Removing the last gateway cleans
+up that first-party setting. Remove gateway seats before downgrading below this
+build; older versions interpret unknown kinds as OAuth accounts.
+
+The live-reload drill on Claude Code 2.1.303 used a scratch profile and two local
+401-only gateways with dummy credentials. The same interactive session picked
+up both the changed base URL and helper credential, recognized the explicit
+first-party URL, and stopped authenticated requests after helper removal.
+`claude doctor` accepted the settings. Bare print/stream-json mode with
+`--settings` did not reload them during the same process; that mode requires a
+new launch. cswap never restarts or signals a running Claude Code session.
+`cswap run` supplies the gateway URL and credential only in its isolated launch
+environment, without OAuth credential seeding or an auth-status probe.
+
 ## Uninstall
 
 Remove all data:

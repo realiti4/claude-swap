@@ -1472,6 +1472,23 @@ class TestConsumeBusyIsDeterministic:
     spending a request per pass to learn nothing.
     """
 
+    @pytest.mark.parametrize("expired", [True, False])
+    def test_identity_conflict_never_retries_usage_or_refresh(self, expired):
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "predecessor-access", "refreshToken": "predecessor-refresh",
+            "expiresAt": 1 if expired else 9999999999999,
+        }})
+        gate = MagicMock(return_value=oauth.RefreshOutcome(None, "identity-conflict", stashed=True))
+        unauthorized = urllib.error.HTTPError("https://usage.example", 401, "Unauthorized", {}, None)
+        with patch("claude_swap.oauth.request_usage_data", side_effect=unauthorized) as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False, refresh_via=gate,
+            )
+        assert out.error == "identity-conflict"
+        assert out.usage is None
+        assert gate.call_count == 1
+        assert usage.call_count == (0 if expired else 1)
+
     def test_a_busy_gate_does_not_spend_a_doomed_request(self):
         creds = json.dumps({
             "claudeAiOauth": {

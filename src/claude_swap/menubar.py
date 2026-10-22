@@ -397,6 +397,10 @@ def _account_display_usage(entry) -> dict | str | None:
     keychain unavailable), otherwise the last-good measurement dict, otherwise
     ``None``.
     """
+    if entry.sentinel == "gateway":
+        from claude_swap.gateway import usage_label
+
+        return usage_label(entry.gateway)
     if entry.sentinel:
         return SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
     return entry.last_good

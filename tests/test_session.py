@@ -933,7 +933,7 @@ class TestSharingWindowsMode:
 
         mgr._sync_sharing(session_dir, share=True)
 
-        assert (session_dir / "settings.json").read_text() == '{"changed": true}'
+        assert json.loads((session_dir / "settings.json").read_text()) == {"changed": True}
 
     def test_no_share_removes_copies(self, windows_mgr):
         source, session_dir, mgr = windows_mgr
@@ -1290,6 +1290,40 @@ def capture_exec(monkeypatch):
 
 
 class TestRun:
+    @pytest.mark.parametrize("existing", [False, pytest.param(
+        True, marks=pytest.mark.skipif(sys.platform == "win32", reason="legacy symlink profile is POSIX-only")
+    )])
+    def test_oauth_session_isolated_from_default_gateway(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, temp_home, existing,
+    ):
+        from claude_swap import gateway
+        from tests.test_gateway_accounts import KEY
+
+        monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+        settings = temp_home / ".claude" / "settings.json"
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(json.dumps({"theme": "dark", "env": {"KEEP": "yes"}}))
+        profile = session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        if existing:
+            manager.setup_session("2", share=True)
+            assert (profile / "settings.json").is_symlink()
+        manager.switcher.add_account_from_token(
+            KEY, base_url="https://gateway.example", slot=7, model_discovery=True
+        )
+        manager.switcher.switch_to("7", json_output=True)
+        if existing:
+            # An already-running OAuth profile must be insulated immediately.
+            assert not (profile / "settings.json").is_symlink()
+            assert "apiKeyHelper" not in json.loads((profile / "settings.json").read_text())
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+        data = json.loads((profile / "settings.json").read_text())
+        assert "apiKeyHelper" not in data
+        assert data["env"] == {"KEEP": "yes", "ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL}
+        assert data["theme"] == "dark"
+        assert json.loads(settings.read_text())["apiKeyHelper"] == gateway.helper("7")
+
     def test_claude_not_on_path(self, manager, monkeypatch):
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):
@@ -1393,6 +1427,51 @@ class TestRun:
         assert "ANTHROPIC_API_KEY" not in exc.value.env
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
+
+    @pytest.mark.parametrize("auth", ["bearer", "x-api-key"])
+    def test_gateway_exec_env_without_oauth_bootstrap(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth,
+        capsys,
+    ):
+        key = "gateway-session-dummy-secret"
+        manager.switcher.add_account_from_token(
+            key,
+            base_url="https://gateway.example",
+            auth=auth,
+            slot=7,
+            model_discovery=True,
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-key")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "unrelated-token")
+        monkeypatch.setenv("UNRELATED_VAR", "kept")
+        monkeypatch.setattr(
+            manager, "_bootstrap", lambda *a, **kw: pytest.fail("OAuth bootstrap")
+        )
+        monkeypatch.setattr(
+            manager,
+            "_is_session_valid",
+            lambda *a, **kw: pytest.fail("OAuth auth-status probe"),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("7", ["--model", "dummy"])
+        env = exc.value.env
+        chosen = "ANTHROPIC_AUTH_TOKEN" if auth == "bearer" else "ANTHROPIC_API_KEY"
+        other = "ANTHROPIC_API_KEY" if auth == "bearer" else "ANTHROPIC_AUTH_TOKEN"
+        assert env[chosen] == key and other not in env
+        assert env["ANTHROPIC_BASE_URL"] == "https://gateway.example"
+        assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert env["UNRELATED_VAR"] == "kept"
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        assert not (profile / ".credentials.json").exists()
+        settings = profile / "settings.json"
+        assert not settings.exists() or key not in settings.read_text()
+        out = capsys.readouterr().out
+        assert "Ignoring ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN" in out
+        assert key not in out
 
     def test_fast_path_keeps_env_untouched(
         self, manager, capture_exec, monkeypatch
@@ -2720,10 +2799,6 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
     def test_the_early_return_leaves_the_profile_on_the_rotated_generation(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
     ):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
-
         # The gate rotates the backup, exactly as the real one does.
         def fake_gate(self, num, email, snapshot):
             self._write_account_credentials(num, email, ROTATED_CREDS)
@@ -2773,10 +2848,6 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         VALID, which IS the live case, so it needed the guard most and had
         nothing pinning it.
         """
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
-
         def fake_gate(self, num, email, snapshot):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
@@ -2865,6 +2936,28 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             manager.setup_session(ACCOUNT_NUM, share=False)
 
         assert not session_dir.exists()
+
+    def test_identity_conflict_never_bootstraps_or_reposts_on_retry(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        from unittest.mock import Mock
+
+        post = Mock(return_value=oauth.RefreshOutcome(
+            ROTATED_CREDS, None, {"uuid": "foreign-account", "organizationUuid": "foreign-org"}
+        ))
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", post)
+        bootstrap = Mock(side_effect=AssertionError("must not bootstrap a conflicting identity"))
+        monkeypatch.setattr(manager, "_bootstrap", bootstrap)
+        for _ in range(2):
+            with pytest.raises(SessionError, match="belongs to another account"):
+                manager.setup_session(ACCOUNT_NUM, share=False)
+        assert post.call_count == 1
+        bootstrap.assert_not_called()
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == CREDS
+        assert any(
+            seeded_switcher._store._read_unclaimed_credential(i) == (ROTATED_CREDS, False)
+            for i in seeded_switcher.list_unclaimed_credentials()
+        )
 
     def test_a_failed_persist_does_not_seed_the_profile_from_a_spent_grant(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
@@ -2974,3 +3067,830 @@ def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypat
     with pytest.raises(KeyboardInterrupt):
         mgr._write_manifest(tmp_path / ".cswap-shared.json", ["a"])
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_gateway_activation_cannot_relink_reused_oauth_session(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed, refresh_rotates,
+):
+    import threading
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"kept"}')
+    profile, _, _ = manager.setup_session("2", share=True)
+    credential_before = oauth.credential_fingerprint(session_mod.read_session_credentials(profile))
+    assert (profile / "settings.json").is_symlink()
+    finished = threading.Event()
+    errors, threads, calls = [], [], []
+    def activate():
+        try:
+            s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+            s.switch_to("7", json_output=True)
+        except BaseException as exc:
+            errors.append(type(exc).__name__)
+        finally:
+            finished.set()
+    has_gateway = manager._has_gateway_accounts
+    def race():
+        result = has_gateway()
+        calls.append(True)
+        if len(calls) == 2:
+            worker = threading.Thread(target=activate)
+            threads.append(worker)
+            worker.start()
+            # Old sharing allows activation to finish here, then publishes
+            # its stale symlink decision. Locked sharing makes it wait.
+            finished.wait(0.5)
+        return result
+    monkeypatch.setattr(manager, "_has_gateway_accounts", race)
+    try:
+        with pytest.raises(_ExecCalled) as launched:
+            manager.run("2", [], share=True)
+    finally:
+        for worker in threads:
+            worker.join(timeout=5)
+    assert threads and finished.is_set()
+    assert errors == []
+    assert s.current_account_number() == "7"
+    assert gateway.owned_slot(json.loads(source.read_text()).get("apiKeyHelper")) == "7"
+    assert launched.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert oauth.credential_fingerprint(session_mod.read_session_credentials(profile)) == credential_before
+    assert not (profile / "settings.json").is_symlink()
+    settings = json.loads((profile / "settings.json").read_text())
+    assert settings["theme"] == "kept"
+    assert "apiKeyHelper" not in settings
+    assert settings.get("env", {}).get("ANTHROPIC_BASE_URL") != "https://gateway.example"
+
+
+def test_gateway_deleted_shared_settings_remain_managed(share_setup):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    manager._sync_sharing(profile, share=True)
+    (source / "settings.json").unlink()
+    manager._sync_sharing(profile, share=True)
+    assert "settings.json" in manager._read_manifest(profile / SHARE_MANIFEST)
+    assert not (profile / "settings.json").exists()
+    (source / "settings.json").write_text('{"theme": "new-theme"}')
+    manager._sync_sharing(profile, share=True)
+    assert json.loads((profile / "settings.json").read_text())["theme"] == "new-theme"
+    manager._sync_sharing(profile, share=False)
+    assert not (profile / "settings.json").exists()
+
+
+@pytest.mark.parametrize("operation", ["oauth-run", "gateway-activation"])
+def test_gateway_malformed_settings_report_file_without_traceback(
+    manager, monkeypatch, temp_home, auth_status_tracks_seed, refresh_rotates, capsys, operation,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    if operation == "oauth-run":
+        path = temp_home / ".claude" / "settings.json"
+        argv = ["cswap", "run", "2"]
+    else:
+        profile = session_dir_for(s.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        profile.mkdir(parents=True, exist_ok=True)
+        path = profile / "settings.json"
+        argv = ["cswap", "switch", "7"]
+    path.write_text("{broken")
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: s)
+    monkeypatch.setattr(sys, "argv", argv)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert str(path) in output.out + output.err
+    assert "Traceback" not in output.out + output.err
+    assert path.read_text() == "{broken"
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_gateway_isolation_preserves_user_proxy_across_launch_and_switch(
+    manager, temp_home, monkeypatch, auth_status_tracks_seed, refresh_rotates, managed,
+):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    source = temp_home / ".claude" / "settings.json"
+    private = '{"theme":"private","env":{"ANTHROPIC_BASE_URL":"https://proxy.example","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1"}}'
+    source.write_text(private if managed else '{}')
+    profile = session_dir_for(s.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    manager.setup_session("2", share=True)
+    if not managed:
+        (profile / "settings.json").unlink()
+        (profile / "settings.json").write_text(private)
+        manager._write_manifest(profile / SHARE_MANIFEST, [])
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    manager.setup_session("2", share=True)
+    expected = json.loads(private)
+    assert json.loads((profile / "settings.json").read_text()) == expected
+    s.switch_to("7", json_output=True)
+    assert json.loads((profile / "settings.json").read_text()) == expected
+    s.switch_to("2", json_output=True)
+    assert json.loads((profile / "settings.json").read_text()) == expected
+    if not managed:
+        manager.setup_session("2", share=True)
+        assert (profile / "settings.json").read_text() == private
+
+
+def test_gateway_isolation_removes_registered_gateway_url(share_setup):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    path = profile / "settings.json"
+    path.write_text(json.dumps({"env": {
+        "ANTHROPIC_BASE_URL": "https://gateway.example",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "KEEP": "yes",
+    }}))
+    manager._isolate_auth_settings(profile)
+    assert json.loads(path.read_text())["env"] == {
+        "ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL, "KEEP": "yes",
+    }
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="legacy symlink profile is POSIX-only")
+def test_gateway_activation_prunes_dangling_oauth_settings_link(manager, temp_home, monkeypatch):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.unlink(missing_ok=True)
+    profile = session_dir_for(s.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    profile.mkdir(parents=True, exist_ok=True)
+    path = profile / "settings.json"
+    path.symlink_to(source)
+    s.switch_to("7", json_output=True)
+    assert not path.is_symlink()
+    settings = json.loads(path.read_text()) if path.exists() else {}
+    assert "apiKeyHelper" not in settings
+    assert settings.get("env", {}).get("ANTHROPIC_BASE_URL") != "https://gateway.example"
+    assert json.loads(source.read_text())["apiKeyHelper"] == gateway.helper("7")
+
+
+@pytest.mark.parametrize("value", [[], {}])
+def test_gateway_malformed_base_url_names_settings_file(share_setup, value):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    path = source / "settings.json"
+    path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": value}}))
+    with pytest.raises(SessionError, match=str(path)):
+        manager._sync_sharing(profile, share=True)
+
+
+@pytest.mark.parametrize("initial_kind,final_kind,phase", [
+    ("gateway", "oauth", "prepared"),
+    ("gateway", "api_key", "prepared"),
+    ("oauth", "gateway", "prepared"),
+    ("oauth", "gateway", "bootstrap"),
+])
+def test_gateway_session_refuses_kind_change_during_preparation(
+    manager, capture_exec, temp_home, monkeypatch,
+    initial_kind, final_kind, phase,
+):
+    from claude_swap import gateway
+    from claude_swap.transfer import export_accounts, import_accounts
+    from tests.test_gateway_accounts import KEY
+
+    def auth_status(cmd, env=None, **kwargs):
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        payload = {"loggedIn": (profile / ".credentials.json").exists(),
+                   "authMethod": "claude.ai", "email": "race@example.com", "orgId": ""}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+    monkeypatch.setattr(session_mod.subprocess, "run", auth_status)
+    s = manager.switcher
+    s.add_account_from_token(KEY if initial_kind == "gateway" else "sk-ant-oat01-dummy",
+                             slot=7, email="race@example.com",
+                             base_url="https://gateway.example" if initial_kind == "gateway" else None)
+    path = temp_home / "kind-replacement.json"
+    export_accounts(s, str(path))
+    envelope = json.loads(path.read_text())
+    row = next(r for r in envelope["accounts"] if r["email"] == "race@example.com")
+    envelope["accounts"] = [row]
+    for name in gateway.RECORD_FIELDS:
+        row.pop(name, None)
+    row["kind"] = final_kind
+    row["credentials"] = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-replacement"}} if final_kind == "oauth" else KEY
+    if final_kind == "api_key":
+        row["credentials"] = "sk-ant-api03-" + KEY
+    if final_kind == "gateway":
+        row.update(gateway.account_fields("https://new.example"))
+    path.write_text(json.dumps(envelope))
+    replaced = []
+    def replace_kind():
+        if not replaced:
+            replaced.append(True)
+            import_accounts(s, str(path), force=True)
+    if phase == "prepared":
+        setup = manager.setup_session
+        def prepare(*args, **kwargs):
+            result = setup(*args, **kwargs)
+            replace_kind()
+            return result
+        monkeypatch.setattr(manager, "setup_session", prepare)
+    else:
+        def invalid(*args):
+            replace_kind()
+            return False
+        monkeypatch.setattr(manager, "_is_session_valid", invalid)
+    with pytest.raises(SessionError, match="changed.*retry"):
+        manager.run("7", [])
+    assert replaced
+    if final_kind == "gateway":
+        assert s._read_account_credentials("7", "race@example.com") == KEY
+
+
+def test_gateway_launch_snapshots_endpoint_and_key_together(manager, capture_exec, monkeypatch):
+    from claude_swap.locking import FileLock
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=7)
+    read = s._read_account_credentials
+    attempted = []
+    def racing_read(num, email):
+        if num == "7":
+            lock = FileLock(s.lock_file)
+            acquired = lock.acquire(timeout=0)
+            attempted.append(acquired)
+            if acquired:
+                try:
+                    data = s._get_sequence_data()
+                    data["accounts"]["7"]["baseUrl"] = "https://new.example"
+                    s._write_json(s.sequence_file, data)
+                    s._write_account_credentials(num, email, KEY + "-replacement")
+                finally:
+                    lock.release()
+        return read(num, email)
+    monkeypatch.setattr(s, "_read_account_credentials", racing_read)
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run("7", [])
+    assert attempted
+    pair = (exc.value.env["ANTHROPIC_BASE_URL"], exc.value.env["ANTHROPIC_AUTH_TOKEN"])
+    assert pair in [("https://old.example", KEY), ("https://new.example", KEY + "-replacement")]
+
+
+@pytest.mark.parametrize("url", ["https://gateway.example", "https://proxy.example"])
+@pytest.mark.parametrize("same_account", [False, True])
+def test_oauth_launch_scrubs_registered_gateway_environment(
+    manager, capture_exec, auth_status_tracks_seed, refresh_rotates, monkeypatch, url, same_account,
+):
+    from tests.test_gateway_accounts import KEY
+    s = manager.switcher
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    if same_account:
+        monkeypatch.setattr(s, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", url)
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run("2", [], share=False)
+    envs = [exc.value.env, *auth_status_tracks_seed]
+    for env in envs:
+        if url == "https://gateway.example":
+            assert "ANTHROPIC_BASE_URL" not in env
+            assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in env
+        else:
+            assert env["ANTHROPIC_BASE_URL"] == url
+            assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
+
+def test_gateway_generated_settings_adopt_later_shared_source(manager, temp_home):
+    from tests.test_gateway_accounts import KEY
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.unlink(missing_ok=True)
+    profile, _, _ = manager.setup_session("7", share=True)
+    assert "settings.json" in manager._read_manifest(profile / SHARE_MANIFEST)
+    source.write_text('{"theme":"later"}')
+    manager.setup_session("7", share=True)
+    assert json.loads((profile / "settings.json").read_text())["theme"] == "later"
+    manager.setup_session("7", share=False)
+    assert not (profile / "settings.json").exists()
+    assert not (profile / SHARE_MANIFEST).exists()
+
+
+@pytest.mark.parametrize("share", [False, True])
+def test_fresh_gateway_session_mirrors_default_mcp_servers(
+    manager, temp_home, capture_exec, share,
+):
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    (temp_home / ".claude.json").write_text(
+        json.dumps({"theme": "light", "mcpServers": {"github": GITHUB_MCP}})
+    )
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run("7", [], share=share)
+    profile = Path(exc.value.env["CLAUDE_CONFIG_DIR"])
+    config = _session_config(profile)
+    # The first launch, not a later one: the mirror needs a config to splice.
+    assert config.get("mcpServers") == ({"github": GITHUB_MCP} if share else None)
+    assert (profile / MCP_MIRROR_MARKER).exists() == share
+    assert config["hasCompletedOnboarding"] is True
+    assert config["theme"] == "light"
+    assert "oauthAccount" not in config
+    assert KEY not in (profile / ".claude.json").read_text()
+    profile_config = {**config, "projects": {"/w": {"allowedTools": []}}}
+    (profile / ".claude.json").write_text(json.dumps(profile_config))
+    with pytest.raises(_ExecCalled):
+        manager.run("7", [], share=share)
+    assert _session_config(profile) == profile_config
+
+
+@pytest.mark.parametrize("initial_share", [False, True])
+def test_gateway_settings_resume_sharing_after_no_share(manager, temp_home, initial_share):
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"original"}')
+    manager.setup_session("7", share=initial_share)
+    manager.setup_session("7", share=False)
+    source.write_text('{"theme":"resumed"}')
+    profile, _, _ = manager.setup_session("7", share=True)
+    assert json.loads((profile / "settings.json").read_text())["theme"] == "resumed"
+    assert "settings.json" in manager._read_manifest(profile / SHARE_MANIFEST)
+
+
+@pytest.mark.parametrize("auth", ["bearer", "x-api-key"])
+@pytest.mark.parametrize("shared", [False, True])
+def test_gateway_session_scrubs_settings_auth_overrides(manager, temp_home, auth, shared):
+    from claude_swap.session import AUTH_OVERRIDE_ENV_VARS
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", auth=auth, slot=7)
+    profile, _, _ = manager.setup_session("7", share=False)
+    source = temp_home / ".claude" / "settings.json" if shared else profile / "settings.json"
+    contents = json.dumps({"theme": "kept", "env": {name: KEY for name in AUTH_OVERRIDE_ENV_VARS}})
+    source.write_text(contents)
+    manager.setup_session("7", share=shared)
+    settings = json.loads((profile / "settings.json").read_text())
+    assert settings["theme"] == "kept"
+    assert not any(name in settings.get("env", {}) for name in AUTH_OVERRIDE_ENV_VARS)
+    assert KEY not in (profile / "settings.json").read_text()
+    if shared:
+        assert source.read_text() == contents
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_managed_settings_merge_preserves_edits_across_launch_and_switch(
+    manager, temp_home, monkeypatch, auth_status_tracks_seed, refresh_rotates,
+    identifier,
+):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    original = {
+        "theme": "light", "shared": "original", "removed": True,
+        "permissions": {"allow": ["Read"], "deny": ["Write"]},
+        "env": {"SHARED": "original", "REMOVED": "original", "NESTED": {"a": 1}},
+    }
+    source.write_text(json.dumps(original))
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    assert not path.is_symlink()
+    local = json.loads(path.read_text())
+    local.update(theme="dark", model="session-model", permissions={"allow": ["Bash"]})
+    local.pop("removed")
+    local["env"].update(LOCAL="session", NESTED={"local": True})
+    local["env"].pop("REMOVED")
+    path.write_text(json.dumps(local))
+    default = {
+        **original, "theme": "concurrent", "shared": "updated", "added": True,
+        "removed": "concurrent", "permissions": {"allow": ["Edit"], "extra": True},
+        "env": {"SHARED": "updated", "REMOVED": "concurrent", "ADDED": "new",
+                "NESTED": {"default": True}},
+    }
+    source.write_text(json.dumps(default))
+
+    def assert_merged():
+        settings = json.loads(path.read_text())
+        assert settings["theme"] == "dark"
+        assert settings["model"] == "session-model"
+        assert settings["shared"] == "updated"
+        assert settings["added"] is True
+        assert "removed" not in settings
+        assert settings["permissions"] == {"allow": ["Bash"]}
+        assert settings["env"]["LOCAL"] == "session"
+        assert settings["env"]["SHARED"] == "updated"
+        assert settings["env"]["ADDED"] == "new"
+        assert settings["env"]["NESTED"] == {"local": True}
+        assert "REMOVED" not in settings["env"]
+
+    # The no-source callers must merge too, before a later sharing pass.
+    manager._isolate_auth_settings(profile, gateway_session=identifier == "7")
+    assert_merged()
+    manager.setup_session(identifier, share=True)
+    assert_merged()
+    s.switch_to("7", json_output=True)
+    assert_merged()
+    s.switch_to("2", json_output=True)
+    manager.setup_session(identifier, share=True)
+    assert_merged()
+    assert json.loads(source.read_text())["theme"] == "concurrent"
+    snapshot = profile / ".cswap-settings-base.json"
+    assert json.loads(snapshot.read_text())["theme"] == "concurrent"
+    if sys.platform != "win32":
+        assert snapshot.stat().st_mode & 0o777 == 0o600
+    # A second shared-only update follows the advanced baseline.
+    default["shared"] = "next"
+    default["env"]["SHARED"] = "next"
+    source.write_text(json.dumps(default))
+    manager.setup_session(identifier, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["shared"] == settings["env"]["SHARED"] == "next"
+    assert settings["theme"] == "dark"
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_managed_settings_merge_adopts_legacy_copy(
+    manager, temp_home, auth_status_tracks_seed, refresh_rotates, identifier,
+):
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text(json.dumps({"theme": "default", "added": True,
+                                  "env": {"DEFAULT": "new", "BOTH": "default"}}))
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    snapshot = profile / ".cswap-settings-base.json"
+    snapshot.unlink(missing_ok=True)  # A managed copy written by round 6.
+    path = profile / "settings.json"
+    path.write_text(json.dumps({"theme": "legacy", "nullable": None,
+                                "env": {"BOTH": "legacy", "LOCAL": "kept"}}))
+    manager.setup_session(identifier, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["theme"] == "legacy"
+    assert settings["added"] is True
+    assert "nullable" in settings and settings["nullable"] is None
+    assert settings["env"]["DEFAULT"] == "new"
+    assert settings["env"]["BOTH"] == "legacy"
+    assert settings["env"]["LOCAL"] == "kept"
+    assert json.loads(snapshot.read_text())["theme"] == "default"
+
+
+@pytest.mark.parametrize("auth", ["bearer", "x-api-key"])
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_managed_settings_merge_scrubs_auth_and_snapshot(
+    manager, temp_home, monkeypatch, auth_status_tracks_seed, refresh_rotates, auth, identifier,
+):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", auth=auth, slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    payload = {
+        "theme": "default", "apiKeyHelper": gateway.helper("7"),
+        "env": {**dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+                "ANTHROPIC_BASE_URL": "https://gateway.example",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "KEEP": "yes"},
+    }
+    source.write_text(json.dumps(payload))
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    payload["theme"] = "local"
+    path.write_text(json.dumps(payload))
+    manager.setup_session(identifier, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["theme"] == "local"
+    assert "apiKeyHelper" not in settings
+    assert settings["env"]["KEEP"] == "yes"
+    assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in settings["env"]
+    assert not any(key in settings["env"] for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+    assert settings["env"].get("ANTHROPIC_BASE_URL") == (
+        None if identifier == "7" else gateway.FIRST_PARTY_URL
+    )
+    snapshot = profile / ".cswap-settings-base.json"
+    assert KEY not in path.read_text() + snapshot.read_text()
+    base = json.loads(snapshot.read_text())
+    assert "apiKeyHelper" not in base
+    assert not any(key in base.get("env", {}) for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+    assert base["theme"] == "default"
+
+
+def test_gateway_managed_settings_merge_cleans_snapshot_with_copy(share_setup):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    manager._sync_sharing(profile, share=True)
+    snapshot = profile / ".cswap-settings-base.json"
+    assert snapshot.exists()
+    (source / "settings.json").unlink()
+    manager._sync_sharing(profile, share=True)
+    assert not snapshot.exists()
+    (source / "settings.json").write_text('{"theme":"new"}')
+    manager._sync_sharing(profile, share=True)
+    assert json.loads(snapshot.read_text())["theme"] == "new"
+    manager._sync_sharing(profile, share=False)
+    assert not snapshot.exists()
+    assert not (profile / SHARE_MANIFEST).exists()
+
+
+def test_windows_managed_settings_merge_without_gateway(share_setup):
+    source, profile, manager = share_setup
+    manager.switcher.platform = Platform.WINDOWS
+    default = source / "settings.json"
+    default.write_text('{"theme":"light","env":{"REMOVED":"old"}}')
+    manager._sync_sharing(profile, share=True)
+    path = profile / "settings.json"
+    path.write_text('{"theme":"dark"}')  # Removing env removes its old keys.
+    (profile / "CLAUDE.md").write_text("local memory")
+    default.write_text('{"theme":"concurrent","added":true,"env":{"REMOVED":"new","ADDED":"yes"}}')
+    (source / "CLAUDE.md").write_text("updated shared memory")
+    manager._sync_sharing(profile, share=True)
+    assert json.loads(path.read_text()) == {
+        "theme": "dark", "added": True, "env": {"ADDED": "yes"},
+    }
+    assert (profile / "CLAUDE.md").read_text() == "updated shared memory"
+
+
+@pytest.mark.parametrize("platform", [Platform.MACOS, Platform.LINUX, Platform.WINDOWS])
+def test_gateway_managed_settings_merge_on_every_platform(share_setup, monkeypatch, platform):
+    source, profile, manager = share_setup
+    manager.switcher.platform = platform
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: True)
+    default = source / "settings.json"
+    default.write_text('{"theme":"light","defaultOnly":true,"env":{"SHARED":"old","REMOVE":"old","DEFAULT_ONLY":"old"}}')
+    manager._sync_sharing(profile, share=True)
+    path = profile / "settings.json"
+    local = json.loads(path.read_text())
+    local["theme"] = "dark"
+    local["env"]["LOCAL"] = "kept"
+    local["env"].pop("REMOVE")
+    path.write_text(json.dumps(local))
+    default.write_text('{"theme":"concurrent","env":{"SHARED":"new","REMOVE":"new"}}')
+    manager._sync_sharing(profile, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["theme"] == "dark"
+    assert settings["env"]["SHARED"] == "new"
+    assert settings["env"]["LOCAL"] == "kept"
+    assert "REMOVE" not in settings["env"]
+    assert "defaultOnly" not in settings
+    assert "DEFAULT_ONLY" not in settings["env"]
+    # Removing the last gateway must not turn the copy back into a symlink
+    # and discard the session's accumulated edits.
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: False)
+    manager._sync_sharing(profile, share=True)
+    assert not path.is_symlink()
+    assert json.loads(path.read_text())["theme"] == "dark"
+
+
+@pytest.mark.parametrize("isolate", [False, True])
+def test_gateway_managed_settings_merge_snapshot_omits_foreign_helper(
+    share_setup, monkeypatch, isolate,
+):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.platform = Platform.WINDOWS
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: isolate)
+    default = source / "settings.json"
+    default.write_text(json.dumps({
+        "apiKeyHelper": "printf " + KEY, "theme": "kept",
+        "env": dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+    }))
+    manager._sync_sharing(profile, share=True)
+    snapshot = profile / ".cswap-settings-base.json"
+    assert KEY not in snapshot.read_text()
+    base = json.loads(snapshot.read_text())
+    assert base["theme"] == "kept"
+    assert "apiKeyHelper" not in base
+    assert not any(key in base.get("env", {}) for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+
+
+@pytest.mark.parametrize("broken", ["settings.json", ".cswap-settings-base.json"])
+def test_gateway_managed_settings_merge_refuses_malformed_inputs(share_setup, monkeypatch, broken):
+    source, profile, manager = share_setup
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: True)
+    manager._sync_sharing(profile, share=True)
+    (profile / broken).write_text("{broken")
+    before = {name: (profile / name).read_bytes() for name in (
+        "settings.json", ".cswap-settings-base.json",
+    )}
+    (source / "settings.json").write_text('{"theme":"new"}')
+    with pytest.raises(SessionError, match=str(profile / broken)):
+        manager._sync_sharing(profile, share=True)
+    assert {name: (profile / name).read_bytes() for name in before} == before
+
+
+@pytest.mark.parametrize("platform,isolate,gateway_session", [
+    (Platform.WINDOWS, False, False),
+    *[(platform, True, gateway_session)
+      for platform in (Platform.MACOS, Platform.LINUX, Platform.WINDOWS)
+      for gateway_session in (False, True)],
+])
+@pytest.mark.parametrize("auth_key", [
+    "apiKeyHelper", *session_mod.AUTH_OVERRIDE_ENV_VARS,
+    "ANTHROPIC_BASE_URL", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+])
+def test_gateway_managed_auth_follows_default_across_syncs(
+    share_setup, monkeypatch, platform, isolate, gateway_session, auth_key,
+):
+    from claude_swap import gateway
+
+    source, profile, manager = share_setup
+    manager.switcher.platform = platform
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: isolate)
+    default = source / "settings.json"
+    path = profile / "settings.json"
+
+    def payload(value, theme):
+        settings = {"theme": theme, "env": {"SHARED": theme}}
+        if value is not None:
+            target = settings if auth_key == "apiKeyHelper" else settings["env"]
+            target[auth_key] = value
+        return settings
+
+    def expected(value):
+        if not isolate:
+            return value
+        if auth_key in session_mod.AUTH_OVERRIDE_ENV_VARS:
+            return None
+        if gateway_session:
+            return None
+        if auth_key == "ANTHROPIC_BASE_URL" and value is None:
+            return gateway.FIRST_PARTY_URL
+        return value
+
+    values = ("https://proxy-a.example", "https://proxy-b.example") if (
+        auth_key == "ANTHROPIC_BASE_URL"
+    ) else ("helper-a", "helper-b") if auth_key == "apiKeyHelper" else ("value-a", "value-b")
+    default.write_text(json.dumps(payload(values[0], "original")))
+    manager._sync_sharing(profile, share=True, gateway_session=gateway_session)
+    local = json.loads(path.read_text())
+    local["theme"] = "local"
+    local["env"]["LOCAL"] = "kept"
+    path.write_text(json.dumps(local))
+
+    # An inherited value must rotate, then disappear at the next sync.
+    # A later explicit auth edit in the copy must also lose to the default.
+    for value in (values[1], None, values[0]):
+        if value == values[0]:
+            local = json.loads(path.read_text())
+            target = local if auth_key == "apiKeyHelper" else local.setdefault("env", {})
+            target[auth_key] = values[1]
+            path.write_text(json.dumps(local))
+        shared = payload(value, "updated")
+        default.write_text(json.dumps(shared))
+        manager._sync_sharing(profile, share=True, gateway_session=gateway_session)
+        settings = json.loads(path.read_text())
+        target = settings if auth_key == "apiKeyHelper" else settings.get("env", {})
+        assert target.get(auth_key) == expected(value)
+        assert settings["theme"] == "local"
+        assert settings["env"]["LOCAL"] == "kept"
+        assert settings["env"]["SHARED"] == "updated"
+        assert json.loads(default.read_text()) == shared
+        baseline = json.loads((profile / session_mod.SETTINGS_BASE).read_text())
+        assert "apiKeyHelper" not in baseline
+        assert not any(key in baseline.get("env", {}) for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_gateway_managed_auth_local_deletions_do_not_override_default(
+    share_setup, monkeypatch, legacy,
+):
+    source, profile, manager = share_setup
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: True)
+    default = source / "settings.json"
+    shared = {"theme": "default", "apiKeyHelper": "helper-a", "env": {
+        "ANTHROPIC_BASE_URL": "https://proxy.example",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    }}
+    default.write_text(json.dumps(shared))
+    manager._sync_sharing(profile, share=True)
+    if legacy:
+        (profile / session_mod.SETTINGS_BASE).unlink()
+    (profile / "settings.json").write_text('{"theme":"local"}')
+    manager._sync_sharing(profile, share=True)
+    assert json.loads((profile / "settings.json").read_text()) == {**shared, "theme": "local"}
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+@pytest.mark.parametrize("share", [False, True])
+def test_gateway_no_share_ignores_malformed_default_settings(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed,
+    refresh_rotates, identifier, share,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"default"}')
+    (source.parent / "CLAUDE.md").write_text("shared memory")
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    path.write_text(json.dumps({"theme": "local", "apiKeyHelper": gateway.helper("7"), "env": {
+        **dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+        "ANTHROPIC_BASE_URL": "https://gateway.example",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    }}))
+    source.write_text("{broken")
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: manager.switcher)
+    monkeypatch.setattr(sys, "argv", ["cswap", "run", identifier, *([] if share else ["--no-share"])])
+    if share:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+        assert path.exists()
+    else:
+        with pytest.raises(_ExecCalled) as exc:
+            cli.main()
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+        assert not path.exists()
+        assert not (profile / "CLAUDE.md").exists()
+        assert not (profile / session_mod.SETTINGS_BASE).exists()
+        assert not (profile / SHARE_MANIFEST).exists()
+    assert source.read_text() == "{broken"
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_no_share_removes_malformed_managed_settings(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed,
+    refresh_rotates, identifier,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"default"}')
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    assert not path.is_symlink()
+    assert "settings.json" in json.loads((profile / SHARE_MANIFEST).read_text())["items"]
+    assert (profile / session_mod.SETTINGS_BASE).exists()
+    path.write_text("{broken")
+
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: manager.switcher)
+    monkeypatch.setattr(sys, "argv", ["cswap", "run", identifier, "--no-share"])
+    with pytest.raises(_ExecCalled) as exc:
+        cli.main()
+
+    assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert not path.exists()
+    assert not (profile / session_mod.SETTINGS_BASE).exists()
+    assert not (profile / SHARE_MANIFEST).exists()
+    assert source.read_text() == '{"theme":"default"}'
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+@pytest.mark.parametrize("malformed", [False, True])
+def test_gateway_no_share_preserves_profile_local_settings(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed,
+    refresh_rotates, identifier, malformed,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    profile, _, _ = manager.setup_session(identifier, share=False)
+    path = profile / "settings.json"
+    path.write_text("{broken" if malformed else json.dumps({
+        "theme": "local", "apiKeyHelper": gateway.helper("7"), "env": {
+            **dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+            "ANTHROPIC_BASE_URL": "https://gateway.example",
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "KEEP": "yes",
+        },
+    }))
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: manager.switcher)
+    monkeypatch.setattr(sys, "argv", ["cswap", "run", identifier, "--no-share"])
+    if malformed:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+        assert path.read_text() == "{broken"
+    else:
+        with pytest.raises(_ExecCalled) as exc:
+            cli.main()
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+        assert json.loads(path.read_text()) == {"theme": "local", "env": {
+            "KEEP": "yes",
+            **({"ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL} if identifier == "2" else {}),
+        }}

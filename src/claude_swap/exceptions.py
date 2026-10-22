@@ -37,6 +37,10 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class StaleSwitchError(SwitchError):
+    """The active account changed after an automatic switch was selected."""
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 
