@@ -421,6 +421,26 @@ class CredentialStore:
             self._keychain_disabled_until = 0.0
         return self._keychain_usable_cache is not False
 
+    def _active_write_misses_read_store(self) -> bool:
+        """Whether a write of the active credential lands outside the store it
+        was read from.
+
+        On macOS the read follows ``CLAUDE_CONFIG_DIR`` to that profile's hashed
+        Keychain item (:func:`_active_oauth_keychain_services`), while
+        :meth:`_write_oauth_credentials` always writes the unsuffixed item of
+        the default profile (#206). With the variable naming another profile —
+        a ``cswap run`` session shell is the common case — a credential
+        refreshed from the read would be persisted into the default login and
+        never reach the profile it came from.
+
+        ``False`` off macOS and in file mode: both sides follow the variable
+        there and land in the same profile.
+        """
+        return (
+            self._use_keychain()
+            and CLAUDE_CODE_KEYCHAIN_SERVICE not in _active_oauth_keychain_services()
+        )
+
     def _pin_file_mode(self, *, residual_cleared: bool) -> None:
         """Pin file mode for the rest of the process — no Keychain re-probe.
 

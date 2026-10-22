@@ -271,3 +271,47 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestActiveWriteMissesReadStore:
+    """``_write_oauth_credentials`` writes the default profile's Keychain item
+    whatever ``CLAUDE_CONFIG_DIR`` says (#206). A caller about to refresh the
+    credential it just read has to know when the result cannot go back to
+    where the read came from."""
+
+    def test_another_profiles_keychain_item_is_out_of_reach(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+
+        assert store._active_write_misses_read_store()
+
+    def test_default_profile_is_within_reach(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+
+        assert not store._active_write_misses_read_store()
+
+    def test_file_backend_follows_the_variable_on_both_sides(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Off macOS the read and the write both resolve through
+        ``CLAUDE_CONFIG_DIR``, so a refresh lands in the profile it was read
+        from and must stay allowed."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        host = _Host(tmp_path / "backups")
+        host.platform = Platform.LINUX
+
+        assert not CredentialStore(host)._active_write_misses_read_store()
