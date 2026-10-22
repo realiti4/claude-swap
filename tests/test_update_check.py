@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from claude_swap.update_check import (
     CACHE_TTL,
     _detect_install_method,
+    _installed_tool_version,
+    _uv_pin_specifier,
     check_for_update,
     run_self_upgrade,
 )
@@ -28,16 +29,22 @@ def _make_pypi_response(version: str) -> MagicMock:
 def _write_cache(path, version, timestamp=None):
     """Write a cache file in the shared cache format."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "timestamp": timestamp if timestamp is not None else time.time(),
-        "data": version,
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": timestamp if timestamp is not None else time.time(),
+                "data": version,
+            }
+        )
+    )
 
 
 class TestCheckForUpdate:
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_newer_version_available(self, mock_urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.4.0")
 
         result = check_for_update("0.3.2")
@@ -48,15 +55,22 @@ class TestCheckForUpdate:
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_already_on_latest(self, mock_urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.3.2")
 
         result = check_for_update("0.3.2")
 
         assert result is None
 
-    @patch("claude_swap.update_check.urllib.request.urlopen", side_effect=OSError("network error"))
-    def test_network_error_returns_none_and_caches(self, mock_urlopen, tmp_path, monkeypatch):
+    @patch(
+        "claude_swap.update_check.urllib.request.urlopen",
+        side_effect=OSError("network error"),
+    )
+    def test_network_error_returns_none_and_caches(
+        self, mock_urlopen, tmp_path, monkeypatch
+    ):
         cache_path = tmp_path / "cache.json"
         monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", cache_path)
 
@@ -109,8 +123,12 @@ class TestCheckForUpdatePrereleases:
     cli.main hands to check_for_update is routinely something like 0.27.0b1."""
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    def test_prerelease_is_told_about_later_release(self, mock_urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+    def test_prerelease_is_told_about_later_release(
+        self, mock_urlopen, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.28.0")
 
         result = check_for_update("0.27.0b1")
@@ -123,7 +141,9 @@ class TestCheckForUpdatePrereleases:
     def test_prerelease_is_told_about_its_own_final_release(
         self, mock_urlopen, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.27.0")
 
         result = check_for_update("0.27.0b1")
@@ -132,8 +152,12 @@ class TestCheckForUpdatePrereleases:
         assert "0.27.0" in result
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    def test_prerelease_is_told_about_later_prerelease(self, mock_urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+    def test_prerelease_is_told_about_later_prerelease(
+        self, mock_urlopen, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.27.0rc1")
 
         result = check_for_update("0.27.0b2")
@@ -145,14 +169,20 @@ class TestCheckForUpdatePrereleases:
     def test_final_release_is_not_pushed_onto_a_prerelease(
         self, mock_urlopen, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.28.0b1")
 
         assert check_for_update("0.27.0") is None
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    def test_unparseable_version_stays_silent(self, mock_urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+    def test_unparseable_version_stays_silent(
+        self, mock_urlopen, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.28.0")
 
         assert check_for_update("main") is None
@@ -203,7 +233,8 @@ class TestDetectInstallMethod:
         custom_root = tmp_path / "uv-tools"
         # Prefix lives somewhere else entirely — env var alone must not trigger.
         monkeypatch.setattr(
-            "claude_swap.update_check.sys.prefix", str(tmp_path / "some-project" / ".venv")
+            "claude_swap.update_check.sys.prefix",
+            str(tmp_path / "some-project" / ".venv"),
         )
         monkeypatch.setenv("UV_TOOL_DIR", str(custom_root))
         monkeypatch.delenv("PIPX_HOME", raising=False)
@@ -225,8 +256,12 @@ class TestCheckForUpdateMessage:
         self, mock_urlopen, tmp_path, monkeypatch
     ):
         # uv/pipx on macOS/Linux: cswap upgrade actually upgrades, so advertise it.
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
-        monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "uv")
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
+        monkeypatch.setattr(
+            "claude_swap.update_check._detect_install_method", lambda: "uv"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.4.0")
 
         result = check_for_update("0.3.2")
@@ -241,8 +276,12 @@ class TestCheckForUpdateMessage:
         self, mock_urlopen, tmp_path, monkeypatch
     ):
         # Windows: cswap upgrade only prints, so point at the real command.
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
-        monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "pipx")
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
+        monkeypatch.setattr(
+            "claude_swap.update_check._detect_install_method", lambda: "pipx"
+        )
         mock_urlopen.return_value = _make_pypi_response("0.4.0")
 
         result = check_for_update("0.3.2")
@@ -256,8 +295,12 @@ class TestCheckForUpdateMessage:
         self, mock_urlopen, tmp_path, monkeypatch
     ):
         # Unknown install method: cswap upgrade can only show instructions.
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
-        monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: None)
+        monkeypatch.setattr(
+            "claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json"
+        )
+        monkeypatch.setattr(
+            "claude_swap.update_check._detect_install_method", lambda: None
+        )
         mock_urlopen.return_value = _make_pypi_response("0.4.0")
 
         result = check_for_update("0.3.2")
@@ -273,27 +316,39 @@ class TestRunSelfUpgrade:
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_uv_invokes_uv_tool_upgrade(self, mock_detect, mock_run):
-        mock_run.return_value = MagicMock(returncode=0)
+        # First call: the upgrade itself. Second call: the post-upgrade
+        # version verification via `uv tool list`.
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="claude-swap v0.26.0\n"),
+        ]
 
         assert run_self_upgrade() == 0
-        mock_run.assert_called_once_with(
-            ["uv", "tool", "upgrade", "claude-swap"], check=False
-        )
+        upgrade_call = mock_run.call_args_list[0]
+        assert upgrade_call.args[0] == ["uv", "tool", "upgrade", "claude-swap"]
+        assert upgrade_call.kwargs["check"] is False
+        assert upgrade_call.kwargs["capture_output"] is True
+        assert upgrade_call.kwargs["text"] is True
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
     def test_pipx_invokes_pipx_upgrade(self, mock_detect, mock_run):
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="claude-swap 0.26.0\n"),
+        ]
 
         assert run_self_upgrade() == 0
-        mock_run.assert_called_once_with(
-            ["pipx", "upgrade", "claude-swap"], check=False
-        )
+        upgrade_call = mock_run.call_args_list[0]
+        assert upgrade_call.args[0] == ["pipx", "upgrade", "claude-swap"]
+        assert upgrade_call.kwargs["check"] is False
+        assert upgrade_call.kwargs["capture_output"] is True
+        assert upgrade_call.kwargs["text"] is True
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_propagates_nonzero_exit_code(self, mock_detect, mock_run):
-        mock_run.return_value = MagicMock(returncode=2)
+        mock_run.return_value = MagicMock(returncode=2, stdout="", stderr="")
 
         assert run_self_upgrade() == 2
 
@@ -309,9 +364,7 @@ class TestRunSelfUpgrade:
         assert "pipx upgrade claude-swap" in err
         assert "pip install --upgrade claude-swap" in err
 
-    @patch(
-        "claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError
-    )
+    @patch("claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError)
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_filenotfound_returns_1(self, mock_detect, mock_run, capsys):
         assert run_self_upgrade() == 1
@@ -349,3 +402,113 @@ class TestRunSelfUpgradeWindows:
         assert "uv tool upgrade claude-swap" in err
         assert "pipx upgrade claude-swap" in err
         assert "pip install --upgrade claude-swap" in err
+
+
+class TestUvPinSpecifier:
+    """uv-receipt.toml records the exact pin; that pin is what makes
+    `uv tool upgrade` a silent no-op (#491)."""
+
+    def _write_receipt(self, tmp_path, specifier):
+        receipt = tmp_path / "uv-receipt.toml"
+        receipt.write_text(
+            "[tool]\n"
+            f'requirements = [{{ name = "claude-swap", specifier = "{specifier}" }}]\n'
+        )
+        return receipt
+
+    def test_detects_exact_pin(self, tmp_path, monkeypatch):
+        self._write_receipt(tmp_path, "==0.26.0")
+        monkeypatch.setattr(sys, "prefix", str(tmp_path))
+        assert _uv_pin_specifier() == "0.26.0"
+
+    def test_returns_none_for_unpinned_install(self, tmp_path, monkeypatch):
+        self._write_receipt(tmp_path, ">=0.26.0")
+        monkeypatch.setattr(sys, "prefix", str(tmp_path))
+        assert _uv_pin_specifier() is None
+
+    def test_returns_none_without_receipt(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "prefix", str(tmp_path))
+        assert _uv_pin_specifier() is None
+
+
+class TestInstalledToolVersion:
+    @patch(
+        "claude_swap.update_check.subprocess.run",
+        return_value=MagicMock(
+            returncode=0, stdout="claude-swap v0.27.2\n- cswap\n- claude-swap\n"
+        ),
+    )
+    def test_parses_uv_tool_list(self, mock_run):
+        assert _installed_tool_version("uv") == "0.27.2"
+
+    @patch(
+        "claude_swap.update_check.subprocess.run",
+        return_value=MagicMock(returncode=0, stdout="claude-swap 0.27.2\n"),
+    )
+    def test_parses_pipx_short_list(self, mock_run):
+        assert _installed_tool_version("pipx") == "0.27.2"
+
+    @patch("claude_swap.update_check.subprocess.run", side_effect=OSError("no uv"))
+    def test_returns_none_on_oserror(self, mock_run):
+        assert _installed_tool_version("uv") is None
+
+
+@patch("claude_swap.update_check.sys.platform", "darwin")
+class TestRunSelfUpgradePin:
+    """A pinned install makes `uv tool upgrade` a silent no-op; cswap must
+    explain that instead of forwarding uv's misleading wording (#491)."""
+
+    @patch("claude_swap.update_check._uv_pin_specifier", return_value="0.26.0")
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_pinned_install_explains_and_does_not_upgrade(
+        self, mock_detect, mock_run, mock_pin, capsys
+    ):
+        assert run_self_upgrade() == 1
+        mock_run.assert_not_called()
+        out = capsys.readouterr().out
+        assert "pinned to 0.26.0" in out
+        assert "uv tool install --reinstall claude-swap@latest" in out
+
+    @patch("claude_swap.update_check._uv_pin_specifier", return_value=None)
+    @patch(
+        "claude_swap.update_check.subprocess.run",
+        return_value=MagicMock(
+            returncode=0, stdout="Updated claude-swap v0.26.0 -> v0.27.2\n", stderr=""
+        ),
+    )
+    @patch("claude_swap.update_check._installed_tool_version", return_value="0.27.2")
+    @patch("claude_swap.update_check._running_version", return_value="0.26.0")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_reports_old_to_new_on_success(
+        self, mock_detect, mock_running, mock_installed, mock_run, mock_pin, capsys
+    ):
+        assert run_self_upgrade() == 0
+        out = capsys.readouterr().out
+        assert "claude-swap upgraded: 0.26.0 -> 0.27.2" in out
+
+    @patch("claude_swap.update_check._uv_pin_specifier", return_value=None)
+    @patch(
+        "claude_swap.update_check.subprocess.run",
+        return_value=MagicMock(returncode=0, stdout="Nothing to upgrade\n", stderr=""),
+    )
+    @patch("claude_swap.update_check._installed_tool_version", return_value="0.26.0")
+    @patch("claude_swap.update_check._running_version", return_value="0.26.0")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_reports_honest_noop_when_version_unchanged(
+        self, mock_detect, mock_running, mock_installed, mock_run, mock_pin, capsys
+    ):
+        assert run_self_upgrade() == 0
+        out = capsys.readouterr().out
+        assert "is still at 0.26.0" in out
+
+    @patch("claude_swap.update_check._uv_pin_specifier", return_value=None)
+    @patch(
+        "claude_swap.update_check.subprocess.run",
+        return_value=MagicMock(returncode=1, stdout="", stderr="boom"),
+    )
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_nonzero_exit_code_passes_through(
+        self, mock_detect, mock_run, mock_pin, capsys
+    ):
+        assert run_self_upgrade() == 1
