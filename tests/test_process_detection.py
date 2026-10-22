@@ -26,6 +26,7 @@ from claude_swap.process_detection import (
     process_is_claude,
     process_start_ticks,
     process_started_at,
+    scan_sessions,
 )
 from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 
@@ -479,6 +480,71 @@ class TestListSessions:
         assert s.started_at == 1700000000000
         assert s.kind == "bg"
         assert s.entrypoint == "claude-desktop"
+
+
+# --- scan_sessions ---
+
+
+class TestScanSessions:
+    """The guard-shaped view, where "0 live" and "0 readable" must not
+    collapse into the same answer."""
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_an_unlistable_sessions_dir_counts_as_unreadable(self, tmp_path):
+        """A directory whose listing fails hides live records exactly the way
+        an unparseable record does, so it must not answer "0 unreadable": the
+        callers read that as "nobody there" and re-bootstrap the profile under
+        a running claude.
+
+        The REAL state, not a patched scan. `Path.glob` SUPPRESSES the
+        listing's own OSError and answers an empty list, so a test that fakes
+        the raise cannot see that the raise never happens.
+        """
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, os.getpid())
+        assert scan_sessions(tmp_path) != ([], 0), "test premise"
+
+        os.chmod(sessions_dir, 0o300)  # searchable and writable, not listable
+        try:
+            sessions, unreadable = scan_sessions(tmp_path)
+        finally:
+            os.chmod(sessions_dir, 0o700)
+
+        assert sessions == []
+        assert unreadable > 0
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_an_unreachable_sessions_dir_counts_as_unreadable(self, tmp_path):
+        """The same conflation one level up: `Path.is_dir()` answers False
+        when the stat FAILS, not only when the directory is absent, so a
+        profile root that cannot be traversed reads as a profile that never
+        ran."""
+        profile = tmp_path / "profile"
+        sessions_dir = profile / "sessions"
+        sessions_dir.mkdir(parents=True)
+        _write_session(sessions_dir, os.getpid())
+
+        os.chmod(profile, 0o600)  # readable, not searchable: the stat fails
+        try:
+            sessions, unreadable = scan_sessions(profile)
+        finally:
+            os.chmod(profile, 0o700)
+
+        assert sessions == []
+        assert unreadable > 0
+
+    def test_a_missing_sessions_dir_is_provably_no_records(self, tmp_path):
+        """The one scan failure that stays at 0: a profile that has never been
+        run has no sessions directory, and refusing on that would block every
+        destructive step on it permanently."""
+        assert scan_sessions(tmp_path) == ([], 0)
 
 
 # --- list_ide_instances ---
