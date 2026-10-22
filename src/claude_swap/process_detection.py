@@ -190,6 +190,87 @@ def process_is_claude(pid: int) -> bool | None:
     return "claude" in text.lower()
 
 
+def process_config_dir(pid: int) -> Path | None:
+    """The config dir the claude at ``pid`` runs against, or None when unknowable.
+
+    Read from the process's own environment: ``CLAUDE_CONFIG_DIR`` when set,
+    else the default ``~/.claude``. Linux reads ``/proc/<pid>/environ``, macOS
+    the ``KERN_PROCARGS2`` sysctl; both only answer for processes of the same
+    user. Windows and every failure answer None.
+    """
+    if sys.platform.startswith("linux"):
+        environ = _linux_environ(pid)
+    elif sys.platform == "darwin":
+        environ = _darwin_environ(pid)
+    else:
+        return None
+    if environ is None:
+        return None
+    configured = environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def _linux_environ(pid: int) -> dict[str, str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    return _parse_environ(raw.split(b"\0"))
+
+
+def _darwin_environ(pid: int) -> dict[str, str] | None:
+    """Environment of ``pid`` from ``sysctl({CTL_KERN, KERN_PROCARGS2, pid})``.
+
+    The buffer is ``argc`` (a C int), the exec path, NUL padding, ``argc``
+    NUL-terminated arguments, then the NUL-terminated environment. ``ps -E``
+    prints the same data but joined by spaces, which cannot be split back
+    when a path contains one.
+    """
+    import ctypes
+    import ctypes.util
+
+    ctl_kern, kern_argmax, kern_procargs2 = 1, 8, 49
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        argmax = ctypes.c_int()
+        size = ctypes.c_size_t(ctypes.sizeof(argmax))
+        mib = (ctypes.c_int * 2)(ctl_kern, kern_argmax)
+        if libc.sysctl(mib, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
+            return None
+        buffer = ctypes.create_string_buffer(argmax.value)
+        size = ctypes.c_size_t(argmax.value)
+        mib = (ctypes.c_int * 3)(ctl_kern, kern_procargs2, pid)
+        if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+    except (OSError, AttributeError, ValueError):
+        return None
+    return _parse_procargs2(buffer.raw[:size.value])
+
+
+def _parse_procargs2(raw: bytes) -> dict[str, str] | None:
+    if len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    exec_path_end = raw.find(b"\0", 4)
+    if exec_path_end < 0:
+        return None
+    fields = raw[exec_path_end:].lstrip(b"\0").split(b"\0")
+    if len(fields) < argc:
+        return None
+    return _parse_environ(fields[argc:])
+
+
+def _parse_environ(entries: list[bytes]) -> dict[str, str]:
+    environ: dict[str, str] = {}
+    for entry in entries:
+        if not entry:
+            break  # the environment ends at the first empty string
+        name, separator, value = entry.decode("utf-8", errors="surrogateescape").partition("=")
+        if separator:
+            environ.setdefault(name, value)
+    return environ
+
+
 def pid_matches_record(pid: int, proc_start: str | None) -> bool:
     """Is the live process at ``pid`` the one that wrote a record stamped
     ``proc_start``, claude's reading of its own start?

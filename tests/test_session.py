@@ -248,6 +248,42 @@ class TestHelpers:
         assert [s.pid for s in sessions] == [os.getpid()]
         assert unreadable == 0
 
+    def _profiles_sharing_one_registry(self, tmp_path):
+        shared = tmp_path / "shared-sessions"
+        make_live(shared.parent / "shared-root")  # writes our own pid record
+        (tmp_path / "shared-root" / "sessions").rename(shared)
+        owner, other = tmp_path / "1-owner", tmp_path / "2-other"
+        for profile in (owner, other):
+            profile.mkdir()
+            (profile / "sessions").symlink_to(shared)
+        return owner, other
+
+    def test_shared_registry_counts_a_session_only_for_its_own_profile(
+        self, tmp_path, monkeypatch
+    ):
+        owner, other = self._profiles_sharing_one_registry(tmp_path)
+        monkeypatch.setattr(session_mod, "process_config_dir", lambda _pid: owner)
+
+        assert [s.pid for s in scan_live_sessions(owner)[0]] == [os.getpid()]
+        assert scan_live_sessions(other) == ([], 0)
+
+    def test_shared_registry_keeps_a_session_whose_owner_is_unknowable(
+        self, tmp_path, monkeypatch
+    ):
+        _, other = self._profiles_sharing_one_registry(tmp_path)
+        monkeypatch.setattr(session_mod, "process_config_dir", lambda _pid: None)
+
+        assert [s.pid for s in scan_live_sessions(other)[0]] == [os.getpid()]
+
+    def test_own_registry_is_not_filtered_by_owner(self, tmp_path, monkeypatch):
+        make_live(tmp_path)
+        monkeypatch.setattr(
+            session_mod, "process_config_dir",
+            lambda _pid: pytest.fail("a profile's own registry needs no owner check"),
+        )
+
+        assert [s.pid for s in scan_live_sessions(tmp_path)[0]] == [os.getpid()]
+
     def test_unreadable_record_is_not_quiescent(self, tmp_path):
         """A dead PID and an unreadable record both yield zero live sessions.
         Only the first is evidence that nothing is running."""
