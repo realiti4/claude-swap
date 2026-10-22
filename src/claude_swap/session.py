@@ -25,8 +25,10 @@ A manifest records what cswap created so removal never touches user data.
 History sharing (``--share-history``, opt-in): additionally links
 ``projects/`` (conversation transcripts — what ``claude --resume`` lists) and
 ``history.jsonl`` (prompt history) from ``~/.claude``, so all accounts see one
-unified conversation history. POSIX-only: Windows shares by re-synced copy,
-which would fork history rather than share it. If the profile already
+unified conversation history. On Windows ``projects/`` is a directory
+junction (no elevation needed, unlike a symlink) and ``history.jsonl`` stays
+per-account: a file cannot be junctioned, and a re-synced copy would fork the
+history rather than share it. If the profile already
 accumulated its own history, it is merged into ``~/.claude`` first so nothing
 disappears from ``--resume``.
 
@@ -57,9 +59,16 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.paths import get_default_global_config_path
+from claude_swap.paths import (
+    get_default_claude_config_home,
+    get_default_global_config_path,
+)
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, scan_sessions
+from claude_swap.process_detection import (
+    ClaudeSession,
+    list_ide_instances,
+    scan_sessions,
+)
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -83,11 +92,62 @@ SHARED_ITEMS = (
 )
 
 # Conversation-history items linked additionally under --share-history.
-# POSIX symlinks only: Windows copy-mode would fork history, not share it.
 HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
 )
+# The subset Windows can link: projects/ as a directory junction. A file
+# cannot be junctioned, and a re-synced copy would fork history, not share it.
+WINDOWS_HISTORY_ITEMS = ("projects",)
+
+
+def _is_link(path: Path) -> bool:
+    """A symlink, or a Windows directory junction (how history is linked there).
+
+    Everything that must never treat a link as real history -- or delete
+    through one -- asks this rather than ``is_symlink``, which is False for a
+    junction. ``rglob`` walks into a junction, so mistaking one for a real
+    directory would merge ``~/.claude/projects`` into itself.
+    """
+    return path.is_symlink() or path.is_junction()
+
+
+def _walk_no_links(root: Path):
+    """Every file and folder under ``root``, children before their parent.
+
+    Refuses (OSError) to go through a symlink or junction rather than
+    following it, so nothing outside ``root`` is ever visited.
+    """
+    with os.scandir(root) as entries:
+        children = list(entries)
+    for entry in children:
+        p = Path(entry.path)
+        if _is_link(p):
+            raise OSError(f"refusing to merge through link {p}")
+        if entry.is_dir(follow_symlinks=False):
+            yield from _walk_no_links(p)
+        yield p
+
+
+def _unlink_link(path: Path) -> None:
+    """Remove a link itself, never what it points at."""
+    if path.is_junction():
+        os.rmdir(path)  # removes the junction only
+    else:
+        path.unlink()
+
+
+def _link_target(path: Path) -> Path:
+    """Where a symlink or junction points, without Windows' ``\\\\?\\`` prefix."""
+    target = os.readlink(path)
+    return Path(target.removeprefix("\\\\?\\"))
+
+
+def _make_junction(target: Path, link: Path) -> None:
+    """Create directory junction ``link`` -> ``target`` (Windows, no elevation)."""
+    import _winapi  # Windows-only CPython module; CreateJunction since 3.5
+
+    _winapi.CreateJunction(str(target), str(link))
 
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
@@ -511,7 +571,54 @@ def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
     """
     if not session_dir.exists():
         return [], 0
-    return scan_sessions(claude_dir=session_dir)
+    sessions, unreadable = scan_sessions(claude_dir=session_dir)
+    # An editor window opened with `cswap code` keeps the profile in use for
+    # as long as it is open, even while no claude process runs in it (the
+    # extension starts one per conversation): its next conversation picks
+    # the profile's credential up again. Its IDE lockfile is the record, so
+    # count it as live -- otherwise an idle window reads as quiescent and the
+    # profile's credential can be adopted, invalidated or re-seeded under it.
+    # The lockfile's pid is the editor's, shared by all its windows, so only
+    # a lockfile whose port still answers is a window that is still open.
+    seen = {s.pid for s in sessions}
+    for ide in list_ide_instances(session_dir, require_listening=True):
+        if ide.pid in seen:
+            continue
+        seen.add(ide.pid)
+        sessions.append(ClaudeSession(
+            pid=ide.pid,
+            session_id=f"ide-{ide.port}",
+            cwd=ide.workspace_folders[0] if ide.workspace_folders else "",
+            started_at=0,
+            kind="ide-window",
+            entrypoint="claude-vscode",
+        ))
+    return sessions, unreadable
+
+
+def describe_live(sessions: list[ClaudeSession]) -> str:
+    """Name what is running against a profile, for refusal messages.
+
+    An editor window's record carries the editor's pid, which is no use to
+    someone looking for a claude process to exit.
+    """
+    pids = [str(s.pid) for s in sessions if s.kind != "ide-window"]
+    windows = sum(1 for s in sessions if s.kind == "ide-window")
+    parts = []
+    if pids:
+        parts.append(f"a live session-mode Claude instance (PID {', '.join(pids)})")
+    if windows:
+        parts.append(
+            "an open editor window on this account (`cswap code`)"
+            if windows == 1
+            else f"{windows} open editor windows on this account (`cswap code`)"
+        )
+    return " and ".join(parts)
+
+
+def profile_label(session_dir: Path) -> str:
+    """``Account-N`` for a profile directory named by :func:`session_dir_for`."""
+    return f"Account-{session_dir.name.split('-', 1)[0]}"
 
 
 def profile_is_quiescent(session_dir: Path) -> bool:
@@ -579,13 +686,6 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        if share_history and self.switcher.platform == Platform.WINDOWS:
-            raise SessionError(
-                "--share-history is not supported on Windows yet: sharing uses "
-                "re-synced copies there, which would fork the history instead "
-                "of sharing it."
-            )
-
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
@@ -643,6 +743,9 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        # Started from a `cswap code` window's terminal: this session is a
+        # `cswap run` session, not that window, so it must not carry the mark.
+        env.pop("CSWAP_EDITOR_WINDOW", None)
         self._exec(claude_bin, claude_args, env=env)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
@@ -660,6 +763,164 @@ class SessionManager:
                 "'claude' was not found on PATH. Install Claude Code first."
             )
         self._exec(claude_bin, claude_args, env=dict(os.environ))
+
+    def open_editor(
+        self,
+        identifier: str | None,
+        folder: Path,
+        editor: str | None = None,
+        share: bool = True,
+        share_history: bool = True,
+    ) -> None:
+        """Open ``folder`` in an editor window whose Claude extension runs as an account.
+
+        ``identifier=None`` means the default login. Run from the integrated
+        terminal of the window that has ``folder`` open, that window itself
+        is reopened on the account; otherwise a new window opens. See
+        :mod:`claude_swap.editor` for the mechanism and its limits.
+
+        History is shared by default, unlike ``run``: the window's Claude
+        panel is where its past conversations are listed, and a window that
+        switched account would otherwise show none of them.
+        """
+        from claude_swap import editor as ed
+        from claude_swap.mappings import normalize_path
+
+        if not folder.is_dir():
+            raise SessionError(f"Not a directory: {folder}")
+
+        windows = ed.editor_windows(self.sessions_dir)
+        here = ed.current_window(windows, cwd=Path.cwd())
+        launcher = ed.resolve_launcher(editor, here)
+
+        # Work out which profile the window should end up on before touching
+        # it: setup_session refreshes the account's token and syncs the
+        # profile, which is wasted -- or unwanted -- when it turns out there
+        # is nothing to switch.
+        session_dir: Path | None = None
+        label = "the default account"
+        if identifier is not None:
+            account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+            self._ensure_not_api_key(account_num, email)
+            label = f"Account-{account_num} ({email})"
+            if self.switcher._get_current_account() == (email, org_uuid):
+                # Same-account fast path, as in run(): never seed a second
+                # copy of the default login's credential (one copy goes stale
+                # when the server rotates the refresh token).
+                print(
+                    dimmed(
+                        f"{label} is the active default login — opening the "
+                        "window on the default login."
+                    )
+                )
+            else:
+                session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+
+        default_home = normalize_path(get_default_claude_config_home())
+        target_dir = normalize_path(session_dir) if session_dir else default_home
+        wanted = normalize_path(folder)
+
+        def shows_folder(w: ed.EditorWindow) -> bool:
+            return w.folders == [wanted]
+
+        def on_target(w: ed.EditorWindow) -> bool:
+            return shows_folder(w) and normalize_path(w.config_dir) == target_dir
+
+        def prepare() -> tuple[str | None, tuple[str, ...]]:
+            """Set the profile up; returns the CLAUDE_CONFIG_DIR value and scrub list."""
+            if session_dir is None:
+                return None, ()
+            scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
+            if scrubbed:
+                warning(
+                    f"Ignoring {', '.join(scrubbed)} for this window — it "
+                    "would override the selected account inside Claude Code."
+                )
+            ready, _, _ = self.setup_session(identifier, share, share_history)
+            return str(ready), AUTH_OVERRIDE_ENV_VARS
+
+        if here is not None and on_target(here):
+            print(dimmed(f"This window is already on {label}."))
+            return
+
+        if here is not None and shows_folder(here):
+            config_value, scrub = prepare()
+            print(
+                f"{accent('Reopening')} this window on {label} "
+                f"{muted('[editor mode]')}",
+                flush=True,
+            )
+            # Pinned explicitly even for the default login: the window keeps
+            # the env it was opened with across a reopen, so leaving the
+            # variable out would keep the old account. The empty value is
+            # unset to the extension; a `claude` typed in this window's
+            # terminal reads it as a path, so that terminal is logged out
+            # until the window is opened afresh (README).
+            env = ed.launch_env("" if config_value is None else config_value, scrub)
+            placeholder = ed.placeholder_workspace(
+                self.switcher.backup_dir, here.instance.port
+            )
+            ed.spawn_reopen(
+                launcher, folder, here.instance.port, self.sessions_dir, placeholder, env
+            )
+            ed.begin_reopen(launcher, folder, placeholder, env)
+            return
+
+        # Not typed in a window showing the folder: a new window opens for
+        # it, unless one already shows it -- the editor would only focus
+        # that one, and it can be switched only from its own terminal.
+        elsewhere = next(
+            (w for w in windows if shows_folder(w)
+             and (here is None or w.instance.port != here.instance.port)),
+            None,
+        )
+        if elsewhere is not None:
+            if on_target(elsewhere):
+                print(dimmed(f"{folder} is already open on {label} — switching to it."))
+                ed.launch(launcher, [str(folder)], ed.launch_env(None))
+                return
+            theirs = (
+                "the default account"
+                if normalize_path(elsewhere.config_dir) == default_home
+                else profile_label(elsewhere.config_dir)
+            )
+            raise SessionError(
+                f"{folder} is already open in another window (on {theirs}), "
+                "and VS Code keeps one window per folder. Run this command in "
+                "that window's terminal to switch it."
+            )
+
+        config_value, scrub = prepare()
+        if session_dir is not None:
+            # A cold editor would adopt this launch's env as its own, and
+            # every window opened later from its UI would inherit the
+            # account. Start it plain first, so only this window gets it.
+            ide_names = ed.ide_names_for(launcher)
+            if ide_names and not any(w.instance.ide_name in ide_names for w in windows):
+                print(dimmed(f"Starting {Path(launcher).stem} first..."), flush=True)
+                ed.launch(launcher, [], ed.launch_env(None))
+                ed.wait_for(
+                    lambda: any(
+                        w.instance.ide_name in ide_names
+                        for w in ed.editor_windows(self.sessions_dir)
+                    ),
+                    ed.EDITOR_START_TIMEOUT,
+                )
+
+        print(f"{accent('Opening')} {folder} on {label} {muted('[editor mode]')}", flush=True)
+        ed.launch(launcher, ["-n", str(folder)], ed.launch_env(config_value, scrub))
+        if session_dir is None:
+            return
+        confirmed = ed.wait_for(
+            lambda: any(on_target(w) for w in ed.editor_windows(self.sessions_dir)),
+            ed.WINDOW_CONFIRM_TIMEOUT,
+        )
+        if not confirmed:
+            warning(
+                f"The new window has not reported in on {label} yet. Claude "
+                "only runs once the folder is trusted: if the window shows "
+                "Restricted Mode, trust the folder from its banner."
+            )
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
@@ -1089,12 +1350,10 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
-        if self.switcher.platform == Platform.WINDOWS:
-            share_history = False
+        windows = self.switcher.platform == Platform.WINDOWS
+        history_items = WINDOWS_HISTORY_ITEMS if windows else HISTORY_ITEMS
         active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
+            history_items if share_history else ()
         )
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
@@ -1108,7 +1367,7 @@ class SessionManager:
         for name in managed:
             if name not in active_items:
                 dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                if name in HISTORY_ITEMS and dest.exists() and not _is_link(dest):
                     continue
                 self._remove_managed(dest)
         if not active_items:
@@ -1140,21 +1399,29 @@ class SessionManager:
             # link, silently replacing it with a regular file
             # (anthropics/claude-code#78162).
             link_target = src.resolve() if src.is_symlink() else src
+            # On Windows history is linked by junction; everything else there
+            # is a re-synced copy.
+            junction = windows and name in HISTORY_ITEMS
 
-            if dest.is_symlink():
+            # Windows copy mode never links shared items, so a junction there
+            # is the user's own; only history items are cswap's junctions.
+            if dest.is_symlink() or (junction and dest.is_junction()):
                 if name not in managed:
                     managed = [*managed, name]  # adopt: only cswap links here
-                if use_symlinks:
+                if use_symlinks or junction:
                     try:
-                        if dest.readlink() != link_target:
-                            dest.unlink()
-                            dest.symlink_to(link_target)
+                        if os.path.normcase(_link_target(dest)) != os.path.normcase(link_target):
+                            _unlink_link(dest)
+                            if junction:
+                                _make_junction(link_target, dest)
+                            else:
+                                dest.symlink_to(link_target)
                     except OSError:
                         continue
                     new_managed.append(name)
                     continue
                 # Platform moved POSIX → Windows: replace link with a copy.
-                dest.unlink()
+                _unlink_link(dest)
             elif dest.exists() and name not in managed:
                 # Pre-existing user data in the profile — never touch it.
                 print(
@@ -1170,6 +1437,10 @@ class SessionManager:
                     if dest.exists():
                         self._remove_managed(dest)
                     dest.symlink_to(link_target)
+                elif junction:
+                    if dest.exists():
+                        self._remove_managed(dest)
+                    _make_junction(link_target, dest)
                 else:
                     if dest.exists():
                         self._remove_managed(dest)
@@ -1390,7 +1661,7 @@ class SessionManager:
         even when the manifest claims the entry is managed: a stale manifest
         (lock-free launches race) must never let the generic loop delete it.
         """
-        if dest.exists() and not dest.is_symlink():
+        if dest.exists() and not _is_link(dest):
             # Real per-account history accumulated before the flag existed.
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
@@ -1444,19 +1715,25 @@ class SessionManager:
 
         Directories merge file-by-file (transcript filenames are UUIDs, so
         collisions mean identical sessions — first writer wins and the
-        duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        duplicate is dropped). ``history.jsonl`` merges by appending lines not
+        already present. ``dest`` is removed once empty; any failure raises
+        OSError and leaves remaining files in place for the next try.
+
+        The walk never enters a link: ``rglob`` follows Windows junctions,
+        and a junction inside ``dest`` pointing into ``src`` would make a
+        transcript its own "duplicate" -- deleted as such. A link anywhere
+        under ``dest`` stops the merge instead.
         """
         if dest.is_dir():
             _mkdir_private(src)
-            for path in sorted(dest.rglob("*"), reverse=True):
-                rel = path.relative_to(dest)
-                target = src / rel
+            for path in list(_walk_no_links(dest)):  # children before parents
+                target = src / path.relative_to(dest)
                 if path.is_dir():
-                    path.rmdir()  # children already moved (reverse walk)
+                    path.rmdir()  # children already moved
                     continue
                 if target.exists():
+                    if os.path.samefile(path, target):
+                        raise OSError(f"{path} and {target} are the same file")
                     path.unlink()
                     continue
                 _mkdir_private(target.parent)
@@ -1502,7 +1779,9 @@ class SessionManager:
         """Remove a cswap-created share entry (link or copy), never user data
         beyond it — callers guarantee `dest` is manifest-listed or a symlink."""
         try:
-            if dest.is_symlink() or dest.is_file():
+            if _is_link(dest):
+                _unlink_link(dest)  # never rmtree through a junction
+            elif dest.is_file():
                 dest.unlink(missing_ok=True)
             elif dest.is_dir():
                 shutil.rmtree(dest, ignore_errors=True)

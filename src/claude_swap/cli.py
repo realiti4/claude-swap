@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+from pathlib import Path
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
@@ -163,7 +164,8 @@ Examples:
             "~/.claude into the session profile, so every account sees one "
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "per-account history (the default). On Windows only projects/ "
+            "is shared (prompt history stays per-account)."
         ),
     )
     parser.add_argument(
@@ -224,6 +226,179 @@ Examples:
                 )
             )
         manager.exec_default(tail)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _looks_like_account(arg: str) -> bool:
+    """Whether a lone `cswap code` argument is an account rather than a folder.
+
+    Slot numbers and emails always are. Anything spelled like a path (a
+    separator, or a leading ``.`` or ``~``) is a folder, so a typo in one is
+    reported as a missing directory rather than an unknown account. A bare
+    word is a folder when such a folder exists, and an alias otherwise;
+    `./3` names a folder called 3.
+    """
+    if arg.isdigit() or "@" in arg:
+        return True
+    if arg.startswith((".", "~")) or "/" in arg or "\\" in arg:
+        return False
+    return not os.path.isdir(arg)
+
+
+def _drop_session_profile_env(require_editor_mark: bool) -> None:
+    """Forget an inherited CLAUDE_CONFIG_DIR that points into a session profile.
+
+    A terminal of a window that `cswap code` opened inherits the window's
+    profile, and cswap would otherwise treat the terminal as a `cswap run`
+    session shell: every command reading the profile as the live store, and
+    the roster commands refusing. Such a window marks its terminals (see
+    claude_swap.editor.EDITOR_WINDOW_MARK), so for them the variable goes,
+    and cswap works there as in any terminal. `cswap code` itself always
+    drops it: it is about the default store and some window's account, never
+    about operating inside a profile.
+    """
+    from claude_swap.editor import EDITOR_WINDOW_MARK
+
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not config_dir:
+        return
+    if require_editor_mark:
+        # The mark holds the profile its window was opened on; it vouches
+        # for that CLAUDE_CONFIG_DIR only, not for whatever else is set later.
+        mark = os.environ.get(EDITOR_WINDOW_MARK, "")
+        if not mark or os.path.normcase(os.path.abspath(mark)) != os.path.normcase(
+            os.path.abspath(config_dir)
+        ):
+            return
+    try:
+        Path(config_dir).resolve().relative_to(
+            (paths.get_backup_root() / "sessions").resolve()
+        )
+    except ValueError:
+        return
+    del os.environ["CLAUDE_CONFIG_DIR"]
+
+
+def _code_command(argv: list[str]) -> None:
+    """Handle `cswap code [NUM|EMAIL] [PATH] [--editor NAME] [--no-share]`.
+
+    Pre-dispatched like `run`. Opens PATH (default: the current directory)
+    in a VS Code-family window whose Claude extension runs as the account;
+    run from the window that has PATH open, it reopens that window instead.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} code",
+        description=(
+            "[EXPERIMENTAL] Open a folder in VS Code (or Cursor, Windsurf, ...) "
+            "with the Claude extension running as a stored account, in that "
+            "window only. Run it in the terminal of the window that has the "
+            "folder open to switch that window."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap code 2                    # this folder (or this window) on account 2
+  cswap code user@example.com
+  cswap code 2 ~/work/api         # open another folder on account 2
+  cswap code                      # the folder's mapped account (see `cswap map`)
+  cswap code 2 --editor cursor
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to open (number, email or alias). Omit to use the "
+        "folder's mapping, or the default login when it has none.",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        metavar="PATH",
+        help="Folder to open (default: the current directory)",
+    )
+    parser.add_argument(
+        "--editor",
+        metavar="NAME",
+        help="Editor command to use, e.g. code, code-insiders, cursor, "
+        "windsurf (default: the editor this terminal runs in, else code)",
+    )
+    parser.add_argument(
+        "--no-share",
+        action="store_true",
+        help=(
+            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
+            "from ~/.claude into the session profile (and remove previously "
+            "shared items)"
+        ),
+    )
+    parser.add_argument(
+        "--share-history",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Share conversation history with the default login, so the "
+            "window's Claude panel keeps listing its past conversations "
+            "(the default; see `cswap run --share-history`). "
+            "--no-share-history keeps this account's history separate."
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    args = parser.parse_args(argv)
+
+    account, path = args.account, args.path
+    if account is not None and path is None and not _looks_like_account(account):
+        account, path = None, account
+    _drop_session_profile_env(require_editor_mark=False)
+
+    try:
+        if path is not None:
+            folder = Path(path).expanduser().resolve()
+        else:
+            from claude_swap.editor import default_folder
+
+            folder = default_folder(
+                paths.get_backup_root() / "sessions", Path(os.getcwd()).resolve()
+            )
+
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap.session import SessionManager
+
+        if account is None:
+            slot, email = switcher.slot_for_directory(folder)
+            if slot is not None:
+                account = slot
+            elif email is not None:
+                warning(
+                    f"Mapped account {email} no longer exists — "
+                    "opening on the default account."
+                )
+            else:
+                print(
+                    dimmed(
+                        f"No account given or mapped for {folder} — "
+                        "using the default account."
+                    )
+                )
+
+        SessionManager(switcher).open_editor(
+            account,
+            folder,
+            editor=args.editor,
+            share=not args.no_share,
+            share_history=args.share_history,
+        )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -1107,6 +1282,7 @@ def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
     _use_native_tls()
+    _drop_session_profile_env(require_editor_mark=True)
     argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
@@ -1123,6 +1299,9 @@ def main() -> None:
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "code":
+        _code_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -1183,6 +1362,7 @@ Commands:
   %(prog)s threshold                  list the global default and overrides
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s code <num|email> [path]    open VS Code as an account, that window only
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

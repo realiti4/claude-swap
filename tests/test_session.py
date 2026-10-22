@@ -2046,25 +2046,58 @@ class TestShareHistoryPosix:
         assert (proj / "bbb.jsonl").read_text() == "profile-b\n"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
 class TestShareHistoryWindows:
-    def test_sync_never_links_history_in_copy_mode(self, history_setup):
+    """Windows links projects/ by directory junction; prompt history stays per-account."""
+
+    def test_projects_linked_by_junction(self, history_setup):
         source, session_dir, mgr = history_setup
         mgr.switcher.platform = Platform.WINDOWS
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
-        assert not (session_dir / "projects").exists()
+        projects = session_dir / "projects"
+        assert projects.is_junction()
+        assert (projects / "-home-user-app" / "aaa.jsonl").read_text() == "main-a\n"
+        assert not (session_dir / "history.jsonl").exists()
         manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
-        assert "projects" not in manifest["items"]
+        assert "projects" in manifest["items"]
+        assert "history.jsonl" not in manifest["items"]
 
-    def test_run_rejects_flag(self, history_setup, monkeypatch):
+    def test_resync_keeps_junction(self, history_setup):
         source, session_dir, mgr = history_setup
         mgr.switcher.platform = Platform.WINDOWS
-        monkeypatch.setattr(
-            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
-        )
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        assert (session_dir / "projects").is_junction()
 
-        with pytest.raises(SessionError, match="Windows"):
-            mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+    def test_turning_off_removes_only_the_junction(self, history_setup):
+        """Never deletes through the junction into ~/.claude/projects."""
+        source, session_dir, mgr = history_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        mgr._sync_sharing(session_dir, share=True, share_history=False)
+
+        assert not (session_dir / "projects").exists()
+        assert (source / "projects" / "-home-user-app" / "aaa.jsonl").exists()
+
+    def test_profile_history_merged_before_linking(self, history_setup):
+        source, session_dir, mgr = history_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        own = session_dir / "projects" / "-home-user-app"
+        own.mkdir(parents=True)
+        (own / "bbb.jsonl").write_text("profile-b\n")
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "projects").is_junction()
+        assert (source / "projects" / "-home-user-app" / "bbb.jsonl").read_text() == "profile-b\n"
+        assert (source / "projects" / "-home-user-app" / "aaa.jsonl").exists()
+
+    def test_deleting_the_profile_spares_shared_history(self, history_setup):
+        source, session_dir, mgr = history_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        shutil.rmtree(session_dir)
+        assert (source / "projects" / "-home-user-app" / "aaa.jsonl").exists()
 
 
 class TestReadSessionCredentials:
@@ -2974,3 +3007,17 @@ def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypat
     with pytest.raises(KeyboardInterrupt):
         mgr._write_manifest(tmp_path / ".cswap-shared.json", ["a"])
     assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+def test_merge_never_deletes_through_a_junction(history_setup):
+    """A junction inside the profile's own projects/ that points into the
+    shared history must not turn each transcript into its own "duplicate"."""
+    source, session_dir, mgr = history_setup
+    mgr.switcher.platform = Platform.WINDOWS
+    (session_dir / "projects").mkdir()
+    session_mod._make_junction(
+        source / "projects" / "-home-user-app", session_dir / "projects" / "-home-user-app"
+    )
+    mgr._sync_sharing(session_dir, share=True, share_history=True)
+    assert (source / "projects" / "-home-user-app" / "aaa.jsonl").read_text() == "main-a\n"

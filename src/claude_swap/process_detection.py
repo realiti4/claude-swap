@@ -11,6 +11,7 @@ import calendar
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -41,7 +42,7 @@ class ClaudeSession:
     session_id: str
     cwd: str
     started_at: int  # epoch milliseconds
-    kind: str  # "interactive", "bg", "daemon", "daemon-worker"
+    kind: str  # "interactive", "bg", "daemon", "daemon-worker", "ide-window"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
     status: str | None = None  # "busy", "idle", "waiting"
 
@@ -303,8 +304,30 @@ def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
     return scan_sessions(claude_dir)[0]
 
 
-def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
-    """Read IDE lockfiles and return only those with alive processes."""
+def is_ide_listening(port: int, timeout: float = 0.2) -> bool:
+    """Whether an IDE lockfile's port still accepts a local connection.
+
+    The extension serves on ``127.0.0.1:<port>`` for as long as its window
+    is open. The lockfile's pid is the editor's own, shared by every window,
+    so a lockfile left behind by a window that went away uncleanly keeps a
+    live pid until the whole editor quits; the port does not.
+    """
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=timeout).close()
+    except OSError:
+        return False
+    return True
+
+
+def list_ide_instances(
+    claude_dir: Path | None = None, *, require_listening: bool = False
+) -> list[IdeInstance]:
+    """Read IDE lockfiles and return only those with alive processes.
+
+    ``require_listening`` also drops lockfiles whose port no longer answers
+    (see :func:`is_ide_listening`): callers that treat a window as using a
+    profile need the window, not just its editor, to be there.
+    """
     ide_dir = (claude_dir or get_claude_dir()) / "ide"
     if not ide_dir.is_dir():
         return []
@@ -317,6 +340,8 @@ def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
             if pid is None or not is_pid_alive(pid):
                 continue
             port = int(path.stem)
+            if require_listening and not is_ide_listening(port):
+                continue
             instances.append(IdeInstance(
                 port=port,
                 pid=pid,

@@ -121,13 +121,13 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 ### Run multiple accounts at the same time (session mode)
 
-Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
+Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel. To give a VS Code window its own account, see [editor mode](#one-account-per-vs-code-window-editor-mode).
 
 ```bash
 cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
-cswap run 2 --share-history     # share your chat history with this account too
+cswap run 2 --share-history     # share your chat history with this account too (Windows: transcripts only)
 cswap run 2 --require-session   # refuse rather than run plain claude if 2 is the default login
 ```
 
@@ -165,6 +165,28 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### One account per VS Code window (editor mode)
+
+All VS Code windows use your default account. `cswap code` puts one window on a different account.
+
+```bash
+cswap code 4                # in a window's terminal: this window → account 4
+cswap code 4 ~/work/api     # open a folder in a new window on account 4
+```
+
+The window reloads with the same folder, tabs and chat history. Your default account and the other windows don't change. `cswap list` shows the window separately:
+
+```
+Editor windows on other accounts:
+  ● VS Code   ~/work/api  → Account-4 (you@example.com)
+```
+
+Notes:
+- Reloading closes the window's terminals. VS Code asks about unsaved files first.
+- After restarting VS Code, run `cswap code N` in the window again.
+- To switch a window back, run `cswap code` with your default account's number. Its Claude panel switches at once; `claude` in its terminal works again after you reopen the window.
+- Also works with Cursor and Windsurf (`--editor cursor`). Needs Claude Code 2.1.284 or newer.
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -185,6 +207,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap code 2                    # Put this VS Code window on account 2 (editor mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times

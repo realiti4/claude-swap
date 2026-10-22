@@ -1877,3 +1877,141 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+class TestCodeCommand:
+    """`cswap code` pre-dispatch: argument shapes and dispatch to open_editor."""
+
+    def _dispatch(self, argv, mapping=(None, None), cwd_folder=None):
+        calls = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def open_editor(self, identifier, folder, editor=None, share=True,
+                            share_history=False):
+                calls.append((identifier, folder, editor, share, share_history))
+
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.editor.default_folder",
+                   side_effect=lambda sessions, cwd: cwd_folder or cwd), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "code", *argv]):
+            switcher_cls.return_value.slot_for_directory.return_value = mapping
+            cli.main()
+        return calls
+
+    def test_account_only_uses_current_folder(self):
+        (call,) = self._dispatch(["2"])
+        assert call == ("2", Path(os.getcwd()).resolve(), None, True, True)
+
+    def test_account_and_path(self, tmp_path):
+        (call,) = self._dispatch(["user@example.com", str(tmp_path)])
+        assert call[:2] == ("user@example.com", tmp_path.resolve())
+
+    def test_lone_existing_folder_is_a_path(self, tmp_path):
+        (call,) = self._dispatch([str(tmp_path)])
+        assert call[:2] == (None, tmp_path.resolve())
+
+    def test_lone_number_is_an_account_even_if_a_folder(self, tmp_path, monkeypatch):
+        (tmp_path / "3").mkdir()
+        monkeypatch.chdir(tmp_path)
+        (call,) = self._dispatch(["3"])
+        assert call[0] == "3"
+
+    def test_no_account_uses_mapping(self, tmp_path):
+        (call,) = self._dispatch([str(tmp_path)], mapping=("4", "m@example.com"))
+        assert call[0] == "4"
+
+    def test_unmapped_is_default_login(self, tmp_path):
+        (call,) = self._dispatch([str(tmp_path)])
+        assert call[0] is None
+
+    def test_folder_defaults_to_this_window(self, tmp_path):
+        (call,) = self._dispatch(["2"], cwd_folder=tmp_path)
+        assert call[1] == tmp_path
+
+    def test_flags(self, tmp_path):
+        (call,) = self._dispatch(
+            ["2", str(tmp_path), "--editor", "cursor", "--no-share", "--no-share-history"]
+        )
+        assert call[2:] == ("cursor", False, False)
+
+    def test_inherited_session_profile_is_dropped(self, tmp_path, monkeypatch):
+        """Typed in a `cswap code` window: cswap must see the default store."""
+        backup = tmp_path / "backup"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(backup / "sessions" / "2-a"))
+        with patch("claude_swap.paths.get_backup_root", return_value=backup):
+            self._dispatch(["2", str(tmp_path)])
+        assert "CLAUDE_CONFIG_DIR" not in os.environ
+
+    def test_user_config_dir_is_kept(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "my-claude"))
+        with patch("claude_swap.paths.get_backup_root", return_value=tmp_path / "backup"):
+            self._dispatch(["2", str(tmp_path)])
+        assert os.environ["CLAUDE_CONFIG_DIR"] == str(tmp_path / "my-claude")
+
+    def test_code_help(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "code", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        assert "--editor" in capsys.readouterr().out
+
+    def test_main_help_mentions_code(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "code <num|email> [path]" in result.stdout
+
+    def test_session_error_exits_cleanly(self, capsys, tmp_path):
+        class FailingSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def open_editor(self, *args, **kwargs):
+                from claude_swap.exceptions import SessionError
+
+                raise SessionError("boom")
+
+        with patch("claude_swap.session.SessionManager", FailingSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "code", "2", str(tmp_path)]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 1
+        assert "boom" in capsys.readouterr().err
+
+
+class TestEditorWindowMark:
+    """A `cswap code` window's terminal may drop CLAUDE_CONFIG_DIR -- its own only."""
+
+    def _run(self, tmp_path, monkeypatch, config_dir, mark):
+        backup = tmp_path / "backup"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+        if mark is None:
+            monkeypatch.delenv("CSWAP_EDITOR_WINDOW", raising=False)
+        else:
+            monkeypatch.setenv("CSWAP_EDITOR_WINDOW", str(mark))
+        with patch("claude_swap.paths.get_backup_root", return_value=backup):
+            cli._drop_session_profile_env(require_editor_mark=True)
+        return os.environ.get("CLAUDE_CONFIG_DIR")
+
+    def test_matching_mark_drops_it(self, tmp_path, monkeypatch):
+        profile = tmp_path / "backup" / "sessions" / "2-a"
+        assert self._run(tmp_path, monkeypatch, profile, profile) is None
+
+    def test_mark_for_another_profile_keeps_it(self, tmp_path, monkeypatch):
+        profile = tmp_path / "backup" / "sessions" / "3-b"
+        other = tmp_path / "backup" / "sessions" / "2-a"
+        assert self._run(tmp_path, monkeypatch, profile, other) == str(profile)
+
+    def test_no_mark_keeps_it(self, tmp_path, monkeypatch):
+        profile = tmp_path / "backup" / "sessions" / "2-a"
+        assert self._run(tmp_path, monkeypatch, profile, None) == str(profile)

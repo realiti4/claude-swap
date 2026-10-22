@@ -434,6 +434,101 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
 sys.addaudithook(_real_store_audit_hook)
 
 
+class DestructiveOpBlocked(Exception):
+    """A test tried to delete, move or link something outside the temp dir.
+
+    The real-store guard above only knows the account store's paths, so a
+    bug that deletes anything else -- a drive root, say, from code that
+    removes ``Path("/ph").parent`` -- sailed past it. This one allows such
+    operations only under the temp dir that tmp_path lives in. Deliberately
+    not an OSError: ``ignore_errors=True`` and ``except OSError`` must not
+    swallow it.
+    """
+
+
+def _canon(p: str) -> str:
+    # Windows' extended form (\\?\C:\...) is the same path; compare without it.
+    return os.path.normcase(os.path.realpath(p)).removeprefix("\\\\?\\")
+
+
+def _canon_entry(p) -> str:
+    """Resolve the parent only: removing a link acts on the link, not its target."""
+    a = os.path.abspath(os.fsdecode(p))  # "/" -> the current drive's root
+    head, tail = os.path.split(a)
+    if not tail:
+        return _canon(a)
+    return os.path.normcase(os.path.join(_canon(head), tail))
+
+
+_SAFE_UNDER = [_canon(tempfile.gettempdir())]  # tmp_path / tmp_path_factory live here
+_SAFE_AT_OR_UNDER: list[str] = []  # --basetemp, which pytest cleans itself
+_REPO = _canon(str(Path(__file__).resolve().parent.parent))
+_DESTRUCTIVE = frozenset({
+    "os.remove", "os.rmdir", "shutil.rmtree", "os.rename", "shutil.move",
+    "_winapi.CreateJunction",
+})
+_in_destructive_guard = False
+
+
+def _under(p: str, root: str, inclusive: bool = False) -> bool:
+    return (inclusive and p == root) or p.startswith(root.rstrip("\\/") + os.sep)
+
+
+def _destructive_allowed(p: str) -> bool:
+    if any(_under(p, r) for r in _SAFE_UNDER):  # strictly below: never the temp root
+        return True
+    if any(_under(p, r, inclusive=True) for r in _SAFE_AT_OR_UNDER):
+        return True
+    if _under(p, os.path.join(_REPO, ".pytest_cache"), inclusive=True):
+        return True
+    # pytest's cache provider builds .pytest_cache in a pytest-cache-files-*
+    # folder next to it, then renames it into place (or removes it).
+    rel = os.path.relpath(p, _REPO) if _under(p, _REPO) else ""
+    if rel.split(os.sep)[0].startswith("pytest-cache-files-"):
+        return True
+    if "__pycache__" in p.split(os.sep):
+        return True  # importlib's atomic .pyc writes
+    if os.path.dirname(p) == _REPO and os.path.basename(p).startswith(".coverage"):
+        return True
+    return os.path.basename(p) == _GUARD_PROBE_MARKER  # the real-store guard's own probe
+
+
+def _destructive_audit_hook(event: str, args: tuple) -> None:
+    global _in_destructive_guard
+    if event not in _DESTRUCTIVE or _in_destructive_guard:
+        return
+    if event in ("os.remove", "os.rmdir", "shutil.rmtree"):
+        path, dir_fd = args
+        if dir_fd is not None or isinstance(path, int):
+            return  # a dir_fd-relative child of an rmtree whose top was checked
+        candidates = (path,)
+    elif event == "os.rename":
+        src, dst, src_fd, dst_fd = args
+        candidates = tuple(p for p, fd in ((src, src_fd), (dst, dst_fd)) if fd is None)
+    else:  # shutil.move (src, dst) / _winapi.CreateJunction (target, link)
+        candidates = args[:2]
+    _in_destructive_guard = True
+    try:
+        for c in candidates:
+            p = _canon_entry(c)
+            if not _destructive_allowed(p):
+                raise DestructiveOpBlocked(
+                    f"{event} refused: {p} is outside the test temp dir. Tests "
+                    "may only delete, move or link inside tmp_path."
+                )
+    finally:
+        _in_destructive_guard = False
+
+
+sys.addaudithook(_destructive_audit_hook)
+
+
+def pytest_configure(config):
+    basetemp = getattr(config.option, "basetemp", None)
+    if basetemp:
+        _SAFE_AT_OR_UNDER.append(_canon(str(basetemp)))
+
+
 class _KeychainStore:
     """In-memory ``(service, account) -> secret`` map standing in for the real
     macOS Keychain so unit tests never shell out to ``security`` or ``keyring``."""

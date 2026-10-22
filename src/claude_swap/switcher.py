@@ -2916,17 +2916,15 @@ class ClaudeAccountSwitcher:
         ``.credentials.json`` overwritten) and slot removal, so treating an
         unreadable record as an absent one runs them under a live instance.
         """
-        from claude_swap.session import scan_live_sessions
+        from claude_swap.session import describe_live, scan_live_sessions
 
-        pids = self._live_session_pids(account_num, email)
-        if pids:
-            raise SessionError(
-                f"Account-{account_num} ({email}) has a live session-mode Claude "
-                f"instance (PID {', '.join(map(str, pids))}). "
-                f"Exit it first, then retry {action}."
-            )
         session_dir = self._session_dir(account_num, email)
-        _, unreadable = scan_live_sessions(session_dir)
+        sessions, unreadable = scan_live_sessions(session_dir)
+        if sessions:
+            raise SessionError(
+                f"Account-{account_num} ({email}) has {describe_live(sessions)}. "
+                f"Exit or close it first, then retry {action}."
+            )
         if unreadable:
             raise SessionError(
                 f"Account-{account_num} ({email}) has {unreadable} session "
@@ -5856,6 +5854,36 @@ class ClaudeAccountSwitcher:
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
+        try:
+            self._print_editor_windows()
+        except Exception:
+            self._logger.debug("Failed to list editor windows", exc_info=True)
+
+    def _print_editor_windows(self) -> None:
+        """List the editor windows `cswap code` put on a non-default account.
+
+        The account list marks the default login only, which these windows
+        do not follow -- without this they would be invisible in `cswap list`.
+        """
+        from claude_swap.editor import editor_windows
+        from claude_swap.session import profile_label
+
+        sessions_dir = self.backup_dir / "sessions"
+        others = [w for w in editor_windows(sessions_dir) if w.config_dir.parent == sessions_dir]
+        if not others:
+            return
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        print()
+        print(bolded("Editor windows on other accounts:"))
+        for w in others:
+            label = profile_label(w.config_dir)
+            email = accounts.get(label.removeprefix("Account-"), {}).get("email", "")
+            who = f"{label} ({email})" if email else label
+            folders = w.instance.workspace_folders
+            folder = abbreviate_path(folders[0]) if folders else "(no folder)"
+            print(f"  {dimmed('●')} {muted(ide_short_name(w.instance.ide_name))}   "
+                  f"{muted(folder)}  {dimmed('→')} {accent(who)}")
+
     def _active_account_usage(
         self, account_num: str, current_email: str, org_uuid: str
     ) -> UsageEntry:
@@ -6949,7 +6977,7 @@ class ClaudeAccountSwitcher:
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
-        from claude_swap.session import scan_live_sessions
+        from claude_swap.session import describe_live, scan_live_sessions
 
         self._refuse_session_shell()
         warnings_out: list[str] = []
@@ -6975,8 +7003,7 @@ class ClaudeAccountSwitcher:
             if pids or unreadable:
                 if self._session_profile_ahead(target_account, pre_email, pre_org):
                     who = (
-                        "a live session-mode Claude instance "
-                        f"(PID {', '.join(map(str, pids))})"
+                        describe_live(sessions)
                         if pids
                         else f"{unreadable} session record(s) that could not be read"
                     )
@@ -6991,9 +7018,8 @@ class ClaudeAccountSwitcher:
                     )
                 if pids:
                     msg = (
-                        f"Account-{target_account} ({pre_email}) has a live "
-                        "session-mode Claude instance "
-                        f"(PID {', '.join(map(str, pids))}). Running the same "
+                        f"Account-{target_account} ({pre_email}) has "
+                        f"{describe_live(sessions)}. Running the same "
                         "account as both the default login and a session can make "
                         "one copy's token go stale if the server rotates it. If the "
                         "session later fails to authenticate, exit it and re-run "
@@ -7570,20 +7596,20 @@ class ClaudeAccountSwitcher:
             if sessions_root.is_dir()
             else []
         )
-        from claude_swap.session import scan_live_sessions
+        from claude_swap.session import describe_live, scan_live_sessions
 
         live = {}
         unreadable = {}
         for d in session_dirs:
             sessions, bad = scan_live_sessions(d)
             if sessions:
-                live[d.name] = [s.pid for s in sessions]
+                live[d.name] = sessions
             elif bad:
                 unreadable[d.name] = bad
         if live:
             details = "; ".join(
-                f"{name} (PID {', '.join(map(str, pids))})"
-                for name, pids in live.items()
+                f"{name} ({describe_live(sessions)})"
+                for name, sessions in live.items()
             )
             raise SessionError(
                 f"Live session-mode Claude instance(s) found: {details}. "
