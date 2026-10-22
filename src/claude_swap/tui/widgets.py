@@ -187,6 +187,7 @@ def account_card_text(
     weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    show_tag: bool = True,
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
@@ -201,7 +202,8 @@ def account_card_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -271,7 +273,11 @@ def account_card_text(
 
 
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
+    show_tag: bool = True,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -287,7 +293,8 @@ def mini_account_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
@@ -373,11 +380,15 @@ class AccountsPanel(Static):
                     account_card_text(
                         acc, width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
-                        palette=palette,
+                        palette=palette, show_tag=app.show_org_tag,
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(
+                    mini_account_text(
+                        acc, now, palette=palette, show_tag=app.show_org_tag
+                    )
+                )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
@@ -408,6 +419,7 @@ class AccountCard(Static):
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
+            show_tag=self.app.tag_shown(self._acc),
         )
 
 
