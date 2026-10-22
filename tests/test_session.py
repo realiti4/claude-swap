@@ -6,7 +6,9 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
+import textwrap
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
@@ -1296,7 +1298,7 @@ class TestRun:
             manager.run("2", [])
 
     def test_exec_env_and_forwarded_args(
-        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, capsys
     ):
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", ["--resume", "--model", "x"])
@@ -1308,6 +1310,10 @@ class TestRun:
             manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         assert call.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert f"Launching Account-{ACCOUNT_NUM} ({ACCOUNT_EMAIL})" in captured.err
+        assert "[session mode]" in captured.err
 
     def test_fast_path_for_active_account(
         self, manager, capture_exec, monkeypatch, capsys
@@ -1321,7 +1327,68 @@ class TestRun:
             manager.run("2", [])
 
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        assert "already the active default login" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "already the active default login" in captured.err
+
+    @pytest.mark.parametrize("active_account", [False, True], ids=["session", "fast-path"])
+    def test_unbuffered_launch_preserves_piped_json(
+        self, tmp_path, monkeypatch, active_account
+    ):
+        """A real handoff must not prefix Claude's JSON with a launch notice."""
+        fake_claude = tmp_path / "claude.py"
+        fake_claude.write_text(
+            'import json, sys\nprint(json.dumps({"args": sys.argv[1:]}))\n'
+        )
+        script = textwrap.dedent("""\
+            import sys
+            from pathlib import Path
+            from types import SimpleNamespace
+            from unittest.mock import patch
+
+            from claude_swap.models import Platform
+            from claude_swap.session import SessionManager
+
+            identity = ("account2@example.com", "org-uuid-2")
+            switcher = SimpleNamespace(
+                backup_dir=Path.cwd(),
+                _logger=None,
+                platform=Platform.detect(),
+                resolve_account=lambda _: ("2", *identity),
+                _account_kind=lambda _: "oauth",
+                _get_current_account=lambda: identity if sys.argv[2] == "True" else None,
+            )
+            manager = SessionManager(switcher)
+            manager.setup_session = lambda *args: (Path.cwd() / "session", "2", identity[0])
+            # Python stands in for Claude; _exec still performs the real handoff.
+            with patch("claude_swap.session.shutil.which", return_value=sys.executable):
+                manager.run("2", [sys.argv[1], "--output-format", "stream-json"])
+        """)
+        for name in session_mod.AUTH_OVERRIDE_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        env = dict(os.environ)
+        env.update(
+            PYTHONPATH=str(Path(session_mod.__file__).resolve().parents[1]),
+            PYTHONUNBUFFERED="1",
+            PYTHONIOENCODING="utf-8",
+            NO_COLOR="1",
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(fake_claude), str(active_account)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert [json.loads(line) for line in result.stdout.splitlines()] == [
+            {"args": ["--output-format", "stream-json"]}
+        ]
+        notice = "already the active default login" if active_account else "[session mode]"
+        assert notice in result.stderr
 
     def test_require_session_refuses_fast_path(
         self, manager, capture_exec, monkeypatch

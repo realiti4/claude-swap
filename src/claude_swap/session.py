@@ -620,7 +620,8 @@ class SessionManager:
                     dimmed(
                         f"Account-{account_num} ({email}) is already the active "
                         "default login — launching claude directly."
-                    )
+                    ),
+                    file=sys.stderr,
                 )
                 self._exec(claude_bin, claude_args, env=dict(os.environ))
 
@@ -637,7 +638,8 @@ class SessionManager:
 
         print(
             f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
+            f"{muted('[session mode]')}",
+            file=sys.stderr,
         )
         env = {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
