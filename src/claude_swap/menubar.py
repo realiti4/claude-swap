@@ -442,6 +442,40 @@ def _adapt_snapshot(snap) -> dict:
     }
 
 
+def switch_notification(payload: dict | None = None) -> tuple[str, str]:
+    """``(title, body)`` for the notification a completed switch posts.
+
+    A ``needsLogin`` landing is a switch onto a slot with no stored login, so
+    the machine is now logged out: the propagation note below would tell the
+    user to wait for an account that never arrives.
+    """
+    if (payload or {}).get("needsLogin"):
+        return (
+            "Logged out",
+            (payload or {}).get("message")
+            or "That slot has no stored login — run /login in Claude Code.",
+        )
+    return (
+        "Account switched",
+        "Switch takes effect within ~30s — restart Claude Code to apply "
+        "immediately.",
+    )
+
+
+def exhausted_notification(event) -> tuple[str, str]:
+    """``(title, body)`` for the notification an ``all-exhausted`` event posts.
+
+    One kind carries two states. A deliberate wait is entered BECAUSE every
+    candidate was READ and one still holds quota, so "All accounts exhausted"
+    is the one thing it is not -- and the notification is a surface
+    `AllExhaustedEvent`'s own enumeration ("the panel, the JSON and the log")
+    does not count.
+    """
+    if getattr(event, "deliberate_wait", False):
+        return "Waiting for a reset", event.human()
+    return "All accounts exhausted", event.human()
+
+
 # macOS 26 stopped drawing status items for processes launched through an
 # exec trampoline, and a CPython *framework* build is exactly that: its
 # ``bin/python3.x`` is a stub that posix_spawns into ``Python.app``
@@ -701,15 +735,15 @@ def run(switcher) -> int:
             except Exception:
                 self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
 
-        def _stop_engine(self):
+        def _stop_engine(self, reason):
             if self._engine is not None:
-                self._engine.stop()
+                self._engine.stop(reason)
                 self._engine = None
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
             if self._engine is not None:
-                self._stop_engine()
+                self._stop_engine("restart")
                 self._start_engine()
 
         def _on_engine_event(self, event):
@@ -728,7 +762,7 @@ def run(switcher) -> int:
                 elif ev.kind == "account-quarantined":
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                    rumps.notification("claude-swap", *exhausted_notification(ev))
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
@@ -907,17 +941,16 @@ def run(switcher) -> int:
                 rumps.alert(title="claude-swap", message=str(e))
                 return False
 
-        def _notify_switched(self):
-            rumps.notification(
-                "claude-swap",
-                "Account switched",
-                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
-            )
+        def _notify_switched(self, payload: dict | None = None):
+            rumps.notification("claude-swap", *switch_notification(payload))
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self._notify_switched()
+                payload: dict = {}
+                if self._guard(lambda: payload.update(
+                    self.switcher.switch_to(str(num), json_output=True) or {}
+                )):
+                    self._notify_switched(payload)
                     self.refresh_async()
             return cb
 
@@ -1014,7 +1047,7 @@ def run(switcher) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
-            self._stop_engine()
+            self._stop_engine("quit")
             rumps.quit_application()
 
         def on_toggle_name(self, _sender):
@@ -1049,7 +1082,7 @@ def run(switcher) -> int:
             if self.settings.auto_switch_enabled:
                 self._start_engine()
             else:
-                self._stop_engine()
+                self._stop_engine("turned off")
             self.rebuild_menu()
 
         def _make_threshold(self, pct):

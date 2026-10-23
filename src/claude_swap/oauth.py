@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -18,6 +19,13 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Claude Code's own organization_type -> subscriptionType mapping.
+_SUBSCRIPTION_BY_ORG_TYPE = {
+    "claude_max": "max",
+    "claude_pro": "pro",
+    "claude_team": "team",
+    "claude_enterprise": "enterprise",
+}
 
 _logger = logging.getLogger("claude-swap")
 
@@ -92,13 +100,34 @@ def login_expires_at_iso(credentials: str) -> str | None:
     )
 
 
-def is_oauth_token_expired(expires_at: object) -> bool:
+def is_oauth_token_expired(expires_at: object, *, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(expires_at, (int, float)) or (
+        isinstance(expires_at, float) and not math.isfinite(expires_at)
+    ):
         return False
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+    return now_ms + buffer_ms >= int(expires_at)
+
+
+def refresh_token_spent(credentials: str, *, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
+    """Has this credential's own refresh token expired?
+
+    Unknown is not expired — no field, a non-numeric one, JSON carrying no
+    ``claudeAiOauth``, and non-JSON all answer False. The one predicate for
+    "these bytes can mint nothing", so no caller can disagree about a
+    credential.
+
+    It RAISES on JSON that is not an object (``AttributeError``) and on
+    ``None`` (``TypeError``), both out of ``extract_oauth_data``, so a caller
+    that cannot afford a raise must sit behind one that already parsed these
+    bytes.
+    """
+    return is_oauth_token_expired(
+        (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt"),
+        buffer_ms=buffer_ms,
+    )
 
 
 @dataclass(frozen=True)
@@ -143,13 +172,17 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = 10.0, slot: str | None = None
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
+
+    ``slot`` is logging only (an account number, when the caller has one) —
+    this used to log nothing on success and only at DEBUG on failure, so no
+    refresh POST was ever dateable from the log at all.
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -186,14 +219,49 @@ def try_refresh_oauth_credentials(
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        oauth["accessToken"] = resp_data["access_token"]
-        oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
-        if resp_data.get("refresh_token"):
-            oauth["refreshToken"] = resp_data["refresh_token"]
-        if resp_data.get("scope"):
-            oauth["scopes"] = resp_data["scope"].split()
+        if not isinstance(resp_data, dict):
+            resp_data = {}
+        # The grant is consumed the instant the server answers 200, whatever
+        # the body's shape — read `refresh_token` FIRST and apply it
+        # unconditionally, so a malformed `access_token`/`expires_in` below
+        # can never discard a rotation the server already committed. A
+        # caller that got "transient" here would retry with the refresh
+        # token the server just spent, and the very next response
+        # invalid_grants a live account.
+        new_rt = resp_data.get("refresh_token")
+        if isinstance(new_rt, str) and new_rt:
+            oauth["refreshToken"] = new_rt
+        access_token = resp_data.get("access_token")
+        expires_in = resp_data.get("expires_in")
+        # A valid access_token is kept even when expires_in is missing or
+        # bad: the server DID issue it, and discarding a good token because
+        # a sibling field is malformed loses it for nothing (the caller
+        # would keep serving the OLD, possibly-revoked access token).
+        if isinstance(access_token, str) and access_token:
+            oauth["accessToken"] = access_token
+        if (
+            isinstance(expires_in, (int, float))
+            and not isinstance(expires_in, bool)
+            and math.isfinite(expires_in)
+        ):
+            oauth["expiresAt"] = now_ms + int(expires_in) * 1000
+        else:
+            # Missing, mistyped, or non-finite (Infinity/NaN, which would
+            # otherwise raise out of ``int()`` and into the generic
+            # ``except Exception`` below, reporting a spent grant as
+            # "transient" and making the caller re-POST it) — either way
+            # the grant is spent, so force this generation to read as
+            # already-expired: the next use refreshes again, this time
+            # with whatever refresh token was captured above rather than
+            # the one just consumed.
+            oauth["expiresAt"] = 0
+        scope = resp_data.get("scope")
+        if isinstance(scope, str) and scope:
+            oauth["scopes"] = scope.split()
 
+        # Keep the tier: CC refills it only in its own refresh, which this one pre-empts.
         data["claudeAiOauth"] = oauth
+        _logger.info("Refresh POST for account %s: ok", slot)
         return RefreshOutcome(
             json.dumps(data), None, _parse_token_account(resp_data)
         )
@@ -221,10 +289,13 @@ def try_refresh_oauth_credentials(
             # (client_id rotated/blocked), no evidence about any slot, so it
             # keeps its own kind and lands no strike.
             if err in ("invalid_grant", "invalid_client"):
+                _logger.info("Refresh POST for account %s: failed (%s)", slot, err)
                 return RefreshOutcome(None, err)
+        _logger.info("Refresh POST for account %s: failed (transient)", slot)
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
+        _logger.info("Refresh POST for account %s: failed (transient)", slot)
         return RefreshOutcome(None, "transient")
 
 
@@ -257,9 +328,63 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
+def carry_tier(credentials: str, *donors: str) -> str:
+    """Give a blob with no ``subscriptionType`` the tier of the first donor blob that has one.
+
+    The donor's source and verifiedAt travel with its tier, so a Claude Code sourced donor keeps its source.
+    Pure, no request, never raises: it runs under the credential locks and
+    right after a grant POST, where a failure must not cost the successor.
+    """
+    try:
+        data = json.loads(credentials)
+        blob = data["claudeAiOauth"]
+        if blob.get("subscriptionType") is None:
+            for donor in donors:
+                tier = extract_oauth_data(donor) or {}
+                if tier.get("subscriptionType") is not None:
+                    keys = ("subscriptionType", "rateLimitTier", "subscriptionTypeSource", "subscriptionTypeVerifiedAt")
+                    blob.update({k: tier[k] for k in keys if k in tier})
+                    return json.dumps(data)
+    except Exception as e:
+        _logger.debug("Tier carry skipped: %r", e)
+    return credentials
+
+
+def fill_missing_tier(credentials: str) -> str:
+    """Fill a blob's tier from the slot's own profile and stamp it ``sign_in``.
+
+    Claude Code fills the tier only from ``GET /api/oauth/profile`` inside its
+    own token refresh, which cswap's refreshes pre-empt; without it it shows
+    "Claude API" and can hide /remote-control. It also fetches that profile for
+    a blob with a ``subscriptionType`` and no source, and through the pin the
+    profile is the PINNED account's: the stamp keeps that tier off the slot. A
+    blob with a source and a ``rateLimitTier`` is returned as is, with no
+    request, and so is any failure or an organization type with no
+    ``subscriptionType`` mapping. One network request: never call it between
+    a grant POST and the successor's persist, or under a lock.
+    """
+    try:
+        data = json.loads(credentials)
+        blob = data["claudeAiOauth"]
+        if blob.get("subscriptionTypeSource") and blob.get("rateLimitTier") is not None:
+            return credentials
+        profile = fetch_oauth_profile(blob["accessToken"]) or {}
+        if "subscriptionType" not in profile:
+            return credentials
+        blob.update({k: profile[k] for k in ("subscriptionType", "rateLimitTier") if k in profile})
+        # No verifiedAt: CC's own sign_in writer stores none and its save helpers drop it.
+        blob["subscriptionTypeSource"] = "sign_in"
+        return json.dumps(data)
+    except Exception as e:
+        _logger.debug("Tier fill skipped: %r", e)
+        return credentials
+
+
+def refresh_oauth_credentials(
+    credentials: str, slot: str | None = None
+) -> str | None:
     """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
-    return try_refresh_oauth_credentials(credentials).credentials
+    return try_refresh_oauth_credentials(credentials, slot=slot).credentials
 
 
 def fetch_oauth_profile(access_token: str) -> dict | None:
@@ -267,7 +392,8 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
 
     ``GET /api/oauth/profile`` answers the one question the credential bytes
     can't: *whose* token is this. Returns ``{"uuid", "email",
-    "organizationUuid"}`` or None on any failure — callers treat None as
+    "organizationUuid"}`` (plus ``"subscriptionType"`` / ``"rateLimitTier"``
+    when the response names them) or None on any failure — callers treat None as
     "unresolvable", never as an error. The identity oracle is strictly
     advisory (a switch proceeds pre-fix on None), so the boundary is strict
     the other way: a response counts as resolved only when it carries a
@@ -297,8 +423,8 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
             # expired on an idle machine). Log-file only — the caller falls
             # back to pre-fix behavior and the user sees nothing.
             _logger.warning(
-                "OAuth profile returned 401 while resolving credential "
-                "ownership; proceeding without identity (pre-fix behavior)."
+                "OAuth profile returned 401; the caller proceeds without it "
+                "(pre-fix behavior)."
             )
         else:
             _logger.debug("OAuth profile fetch failed: %r", e)
@@ -317,12 +443,53 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     email = account.get("email")
     organization = data.get("organization")
     org_uuid = organization.get("uuid") if isinstance(organization, dict) else None
-    return {
+    profile = {
         "uuid": uuid.strip(),
         "email": email if isinstance(email, str) else None,
         "organizationUuid": org_uuid if isinstance(org_uuid, str) else None,
     }
+    # Optional, present only when the response names them: the blob's tier fields.
+    if isinstance(organization, dict):
+        subscription = _SUBSCRIPTION_BY_ORG_TYPE.get(str(organization.get("organization_type")))
+        if subscription:
+            profile["subscriptionType"] = subscription
+        tier = organization.get("rate_limit_tier")
+        if isinstance(tier, str) and tier:
+            profile["rateLimitTier"] = tier
+    return profile
 
+
+def probe_oauth_profile_live(access_token: str, timeout_s: float = 5.0) -> bool | None:
+    """Is this access token still accepted by the API, right now?
+
+    Same endpoint as ``fetch_oauth_profile``, but that oracle deliberately
+    collapses every failure to ``None`` ("unresolvable, proceed as before") —
+    exactly wrong for a caller who needs to tell "this credential is dead"
+    (401: the server itself rejected it) from "no answer either way"
+    (timeout, connection error, 5xx). Returns ``True`` (live), ``False``
+    (dead — a 401), or ``None`` (transport failure — no verdict). Must not be
+    called while any credential/config lock is held (network under locks is
+    forbidden).
+    """
+    url = "https://api.anthropic.com/api/oauth/profile"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            resp.read()
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False
+        _logger.debug("OAuth profile liveness probe failed: %r", e)
+        return None
+    except Exception as e:
+        _logger.debug("OAuth profile liveness probe failed: %r", e)
+        return None
 
 
 def build_token_status(credentials: str) -> str | None:
@@ -601,6 +768,41 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
+def binding_window_label(
+    usage: dict | None, models: Sequence[str] = ()
+) -> str | None:
+    """Label of the window this account is closest to hitting, or ``None``.
+
+    The companion to :func:`account_headroom`, which returns the binding
+    window's headroom and throws away WHICH window it was. An escape needs the
+    label: a 5-hour limit and a weekly limit want different targets, and a
+    ranking that cannot tell them apart optimises the wrong axis for one of
+    them.
+    """
+    windows = relevant_windows(usage, models)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: w[1])[0]
+
+
+def headroom_on_window(
+    usage: dict | None, label: str, models: Sequence[str] = ()
+) -> float | None:
+    """Headroom on ONE named window, or ``None`` when it is not reported.
+
+    Deliberately NOT a floor on the others, and NOT a usability test: a high
+    number here says only that one window is clear. An account can score 50
+    on it and hold a single point overall. Callers must therefore rank with
+    it and decide usability with :func:`account_headroom` — the engine's
+    escape key tiers on that first, because ordering by this number alone
+    lands on an account that stops answering on the next request.
+    """
+    for name, pct, _ in relevant_windows(usage, models):
+        if name == label:
+            return 100.0 - pct
+    return None
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.
@@ -640,6 +842,8 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "stash-write-failed", "identity-unreadable", "lineage-condemned",
+    "live-store-unreadable", "live-store-current",
 )
 
 
@@ -673,10 +877,26 @@ def try_fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
+        # A grant already past its own expiry (not just inside the refresh
+        # buffer) cannot be revived by a POST — the server will only say
+        # invalid_grant. Skip straight to that outcome.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            _logger.info(
+                "Account %s: refresh-token grant already past its own "
+                "expiry — decided locally from the stored expiry, no "
+                "request made. Reporting invalid_grant without a POST.",
+                account_num,
+            )
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(
+                working_credentials, slot=account_num,
+            )
         if refresh.credentials:
             working_credentials = refresh.credentials
             if refresh_via is None:
@@ -728,10 +948,25 @@ def try_fetch_usage_for_account(
         # is permanently dead — surface it distinctly (not the generic
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            _log_usage_failure(context, e, kind)
+            _logger.info(
+                "Account %s: refresh-token grant already past its own "
+                "expiry — decided locally from the stored expiry, no "
+                "retry request made. Reporting invalid_grant without a "
+                "POST.",
+                account_num,
+            )
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(
+                working_credentials, slot=account_num,
+            )
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error in ("invalid_grant", "no_refresh_token")

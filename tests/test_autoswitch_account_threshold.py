@@ -56,6 +56,8 @@ GLOBAL = AutoSwitchSettings().threshold  # 90.0
 
 def _fleet(temp_home, **settings_kwargs) -> EngineHarness:
     """Three seeded OAuth accounts, account 1 live and active."""
+    # This branch defaults to consume-first; these tests pin the `best` ranking.
+    settings_kwargs.setdefault("strategy", "best")
     h = EngineHarness(temp_home, **settings_kwargs)
     h.seed(1, "a@example.com")
     h.seed(2, "b@example.com")
@@ -544,8 +546,8 @@ class TestRankCandidatesStaysPure:
             if monkey is not None:
                 setattr(h.switcher, name, _boom)
 
-        ordered_a, _, _ = h.engine._rank_candidates(**kwargs)
-        ordered_b, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_a, *_ = h.engine._rank_candidates(**kwargs)
+        ordered_b, *_ = h.engine._rank_candidates(**kwargs)
         assert ordered_a == ordered_b
 
     def test_two_calls_on_different_snapshots_use_the_passed_map(self, temp_home):
@@ -553,7 +555,7 @@ class TestRankCandidatesStaysPure:
         h = _fleet(temp_home)
         thresholds = ThresholdMap({"2": 45.0, "3": 95.0}, GLOBAL)
         phase1 = self._kwargs(h, thresholds)
-        ordered1, _, _ = h.engine._rank_candidates(**phase1)
+        ordered1, *_ = h.engine._rank_candidates(**phase1)
         # 2 is at 50 utilization, over its own 45 line -> not a landing spot.
         assert "2" not in ordered1
         assert ordered1 == ["3"]
@@ -561,7 +563,7 @@ class TestRankCandidatesStaysPure:
         phase2 = dict(phase1)
         phase2["usage"] = {"1": _usage(99.0), "2": _usage(20.0), "3": _usage(60.0)}
         phase2["headroom"] = {"1": 1.0, "2": 80.0, "3": 40.0}
-        ordered2, _, _ = h.engine._rank_candidates(**phase2)
+        ordered2, *_ = h.engine._rank_candidates(**phase2)
         # Same map, fresher snapshot: 2 is now at 20, under its own line.
         assert ordered2[0] == "2"
 
@@ -1293,9 +1295,7 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
         # crossed here at 60%.
         live.switcher.set_account_threshold("1", 50.0)
         live.engine = live._make_engine()
-        with patch.object(
-            live.switcher, "live_session_pids_for", return_value=[4242]
-        ):
+        with patch("claude_swap.session.scan_live_sessions", return_value=([4242], 0)):
             outcome, _ = _tick(live, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.BLOCKED
         assert "no-viable-target" in _reasons(live)
