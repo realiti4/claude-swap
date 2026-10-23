@@ -2195,6 +2195,10 @@ class AutoSwitchEngine:
             # any of them is reached; raw `h` / the single line when it
             # reports no window (a readable headroom rules that out).
             lh = binding.line_headroom if binding is not None else h
+            # Points left before the candidate reaches its own binding line:
+            # line headroom sits at exactly `100 - threshold` on the line
+            # (lines.line_headroom), whatever the account's own line is.
+            room = lh - (100.0 - settings.threshold)
             over = (
                 binding.over
                 if binding is not None
@@ -2279,6 +2283,14 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                    # ...and only with room to spend it: at least the hysteresis
+                    # margin under every one of its lines. The move is
+                    # opportunistic, and the cooldown it starts would hold auto on
+                    # a target a few points short of its line while it crosses it
+                    # and runs out (measured: 5h 85% under a 90 line, landed on,
+                    # 92/93/99% held by cooldown, the session limit hit at 100%).
+                    if trigger == "consume-first" and room < settings.hysteresis_pct:
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
@@ -2315,10 +2327,20 @@ class AutoSwitchEngine:
                 )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
-                # policy headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+                # policy headroom breaks ties, then sequence order. A forced
+                # (proactive) move first prefers targets with the hysteresis
+                # margin of room: one a few points under its line would need
+                # leaving again within the cooldown it is about to start.
+                tight = trigger == "proactive" and room < settings.hysteresis_pct
+                key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 key = (-lh,)
+            if trigger in ("at-limit", "failover"):
+                # Escapes skip the landing gate on purpose (any account with
+                # real headroom beats a dead one) but must still prefer a target
+                # below its lines: ranking by weekly reset alone escaped onto an
+                # account at 7d 91% of a 90 line while one at 16% / 2% was free.
+                key = (over, *key)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
