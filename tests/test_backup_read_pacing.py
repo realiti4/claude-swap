@@ -425,9 +425,9 @@ class TestStrikeBindingReadsFresh:
         calls: list = []
         real = s._usage_store.clear_dead_token
 
-        def spy(nums, identities):
+        def spy(nums, identities, **kwargs):
             calls.append(list(nums))
-            return real(nums, identities)
+            return real(nums, identities, **kwargs)
 
         monkeypatch.setattr(s._usage_store, "clear_dead_token", spy)
         return calls
