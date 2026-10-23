@@ -34,11 +34,16 @@ from claude_swap.autoswitch import (
     TickOutcome,
     _binding_recovery_ts,
     _every_account_above_threshold,
+    _headroom_by_account,
+    _model_window_binds_everywhere,
     _parse_reset_ts,
     pct_label,
 )
+from claude_swap.lines import binding_window
 from claude_swap.settings import AutoSwitchSettings
 
+# The module, not its Test class: a class imported by name is collected here too.
+import tests.test_autoswitch as test_autoswitch
 from tests.test_autoswitch import (
     _R_LATEST,
     _R_SOON,
@@ -56,6 +61,8 @@ GLOBAL = AutoSwitchSettings().threshold  # 90.0
 
 def _fleet(temp_home, **settings_kwargs) -> EngineHarness:
     """Three seeded OAuth accounts, account 1 live and active."""
+    # The suite reasons in `best` terms; the fork defaults to consume-first.
+    settings_kwargs.setdefault("strategy", "best")
     h = EngineHarness(temp_home, **settings_kwargs)
     h.seed(1, "a@example.com")
     h.seed(2, "b@example.com")
@@ -544,8 +551,8 @@ class TestRankCandidatesStaysPure:
             if monkey is not None:
                 setattr(h.switcher, name, _boom)
 
-        ordered_a, _, _ = h.engine._rank_candidates(**kwargs)
-        ordered_b, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_a, _, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_b, _, _, _ = h.engine._rank_candidates(**kwargs)
         assert ordered_a == ordered_b
 
     def test_two_calls_on_different_snapshots_use_the_passed_map(self, temp_home):
@@ -553,7 +560,7 @@ class TestRankCandidatesStaysPure:
         h = _fleet(temp_home)
         thresholds = ThresholdMap({"2": 45.0, "3": 95.0}, GLOBAL)
         phase1 = self._kwargs(h, thresholds)
-        ordered1, _, _ = h.engine._rank_candidates(**phase1)
+        ordered1, _, _, _ = h.engine._rank_candidates(**phase1)
         # 2 is at 50 utilization, over its own 45 line -> not a landing spot.
         assert "2" not in ordered1
         assert ordered1 == ["3"]
@@ -561,7 +568,7 @@ class TestRankCandidatesStaysPure:
         phase2 = dict(phase1)
         phase2["usage"] = {"1": _usage(99.0), "2": _usage(20.0), "3": _usage(60.0)}
         phase2["headroom"] = {"1": 1.0, "2": 80.0, "3": 40.0}
-        ordered2, _, _ = h.engine._rank_candidates(**phase2)
+        ordered2, _, _, _ = h.engine._rank_candidates(**phase2)
         # Same map, fresher snapshot: 2 is now at 20, under its own line.
         assert ordered2[0] == "2"
 
@@ -1233,6 +1240,169 @@ class TestRecoveryUsesTheRankingsScale:
         )
         assert recovery == _parse_reset_ts(binding.resets_at)
         assert recovery == _parse_reset_ts(_R_SOON)
+
+
+class TestTheWalledEscapeSortsOnTheRankingsScale:
+    """The dynamic-healthy walled escape orders its candidates by
+    `_binding_recovery_ts`, which must read each one's own line and the
+    ruler the ranking scores on, like every other recovery site.
+
+    Global 90, weekly 95, dynamic (ruler 97). Account 2 carries a 98 line and
+    sits at 5h 93% (resets in an hour) and 7d 96% (resets in 5 days). On the
+    global line both windows are over, and the 5h one binds (headroom 7 < 8);
+    on its own line only the 7d one is. Account 3 is blocked on its 7d too and
+    comes back in 2 days, so the order is 2 then 3 on the wrong reading and
+    3 then 2 on the right one. Every account is blocked, which is what makes
+    the active's Fable wall read `dynamic-healthy` and reach the escape.
+    """
+
+    def test_an_escapee_with_its_own_line_is_sorted_on_the_window_that_binds_it(
+        self, temp_home
+    ):
+        u = test_autoswitch.TestBoundedWalledEscapeUnderDynamicHealthy._u
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, weekly_threshold=95.0,
+            strategy="dynamic",
+        )
+        for num in (1, 2, 3):
+            h.seed(num, f"a{num}@example.invalid")
+        h.make_live("a1@example.invalid", 1)
+        h.switcher.set_account_threshold("2", 98.0)
+        h.engine = h._make_engine()
+        fleet = {
+            "1": u(18, 20, 100, days_out=4),                      # Fable-walled
+            "2": u(93, 96, 0, days_out=5, five_h_resets=3600),
+            "3": u(10, 96, 0, days_out=2),
+        }
+        windows = list(oauth.relevant_windows(fleet["2"], ("Fable",)))
+        peer = _parse_reset_ts(fleet["3"]["seven_day"]["resets_at"])
+        wrong = binding_window(windows, 90.0, 95.0)
+        right = binding_window(windows, 98.0, 95.0, scale=97.0)
+        assert _parse_reset_ts(wrong.resets_at) < peer < _parse_reset_ts(right.resets_at)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 3
+
+
+class TestTheModelWindowPredicateReadsEachAccountsOwnLine:
+    """`_model_window_binds_everywhere` decides whether the model window is a
+    fleet-wide wall (and so whether dynamic may drop it). It must judge an
+    account against the line the ranking lands it on, not the global one: with
+    per-account lines it was wrong both ways. Global 90, model "Fable"; the
+    5h/7d windows are open throughout, so only the Fable window can block.
+    """
+
+    @staticmethod
+    def _fable(pct, five_hour=10.0):
+        return {
+            "five_hour": {"pct": five_hour},
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": pct}],
+        }
+
+    def _binds(self, usage, overrides=None):
+        return _model_window_binds_everywhere(
+            usage, ("Fable",), GLOBAL, lines=ThresholdMap(overrides or {}, GLOBAL)
+        )
+
+    def test_a_lower_own_line_blocks_what_the_global_line_lets_through(self):
+        usage = {"1": self._fable(95.0), "2": self._fable(85.0)}
+        assert self._binds(usage) is False         # 2 is open at 90
+        assert self._binds(usage, {"2": 80.0}) is True   # 85 >= its own 80
+
+    def test_a_higher_own_line_opens_what_the_global_line_blocks(self):
+        usage = {"1": self._fable(95.0), "2": self._fable(92.0)}
+        assert self._binds(usage) is True          # both blocked at 90
+        assert self._binds(usage, {"2": 98.0}) is False  # 92 < its own 98
+
+    def test_the_ranking_retries_on_5h_7d_when_every_account_is_blocked_on_its_own_line(
+        self, temp_home
+    ):
+        """Landing gate and predicate agree: candidates 2 and 3 are refused at
+        their own 80 line (Fable 85), so the model-gated pass is empty, and the
+        fleet-wide wall is what lets the ranking drop the model set."""
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic"
+        )
+        usage = {
+            "1": self._fable(95.0, five_hour=80.0),   # active: little 5h room too
+            "2": self._fable(85.0),
+            "3": self._fable(85.0),
+        }
+        ordered, _, _, _ = h.engine._rank_candidates(
+            trigger="proactive",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage=usage,
+            headroom=_headroom_by_account(usage, h.engine._models),
+            current="1",
+            active_headroom=5.0,
+            settings=h.settings,
+            now=h.clock.now,
+            thresholds=ThresholdMap({"2": 80.0, "3": 80.0}, GLOBAL),
+        )
+        assert ordered, "the model window binds everywhere: the retry must fire"
+
+
+class TestTheActiveAndTheEscapeTierReadTheirOwnLine:
+    """Two dynamic checks that kept the global line after the merge."""
+
+    def test_a_reset_ordered_departure_releases_once_the_active_reaches_its_own_line(
+        self, temp_home
+    ):
+        """`active_at_threshold` lifts the reset-ordering skip of the dominance
+        leg. Active at 85% (headroom 15) is at its own 80 line (<= 20) but not
+        at the global 90 (> 10); the peer clears the dominance margin."""
+        h = _fleet(temp_home, strategy="dynamic")
+        state = {
+            "lastSwitchFrom": 2,
+            "lastSwitchTo": "1",
+            "leftHeadroom": 100.0,
+            "leftRecoveryAt": None,
+            "leftTrigger": "consume-first",
+        }
+        common = dict(
+            usage={"1": _usage(85.0), "2": _usage(10.0)},
+            headroom={"1": 15.0, "2": 90.0},
+            active_headroom=15.0,
+            settings=h.settings,
+            now=h.clock.now,
+            current="1",
+        )
+        assert h.engine._left_account_recovered(
+            dict(state), thresholds=ThresholdMap({"1": 80.0}, GLOBAL), **common
+        ) is True
+        assert h.engine._left_account_recovered(
+            dict(state), thresholds=ThresholdMap({}, GLOBAL), **common
+        ) is False
+
+    def test_a_candidate_under_its_own_line_is_not_self_walled_at_the_global_one(
+        self, temp_home
+    ):
+        """At-limit on 7d. Account 2 (own line 99) sits at 5h 93%: under its
+        own line, so it lands untiered with 95 points on the blocked window.
+        Account 3 holds 40 there. Judged on the global 90 account 2 reads
+        self-walled and drops a tier behind 3."""
+        h = _fleet(temp_home, strategy="dynamic")
+        usage = {
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 100.0}},
+            "2": _usage(93.0),
+            "3": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 60.0}},
+        }
+        ordered, _, _, _ = h.engine._rank_candidates(
+            trigger="at-limit",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage=usage,
+            headroom=_headroom_by_account(usage, h.engine._models),
+            current="1",
+            active_headroom=0.0,
+            settings=h.settings,
+            now=h.clock.now,
+            thresholds=ThresholdMap({"2": 99.0}, GLOBAL),
+        )
+        assert ordered == ["2", "3"]
 
 
 def _tick(h: EngineHarness, snapshots: list[dict]):
