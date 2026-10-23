@@ -19,14 +19,21 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
+import time
 
 import pytest
 
-from claude_swap.models import AccountPolicy
+from claude_swap.models import AccountPolicy, AccountsSnapshot
+from claude_swap.settings import AutoSwitchSettings
+from claude_swap.tui import data as tui_data
 from claude_swap.tui.widgets import account_card_text, mini_account_text
+from claude_swap.usage_store import UsageEntry
 
 from tests.test_tui import (
     FakeSwitcher,
+    _autoview_order,
+    _iso_in,
     fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
     make_account,
     make_app,
@@ -34,27 +41,25 @@ from tests.test_tui import (
     settle,
 )
 
-# Goldens captured from the unmodified engine at
+# Goldens captured from the unmodified engine (the mini row's window chips and
+# their ``:`` separator are the fork's; see ``mini``) at
 # 4f6c6ac6f303bd910d51bf5bf2fb36d553f4f37f60a50e438291d4feb5cadfbe, rendered
 # through the same ``make_account`` fixture used below.  Only the header row and
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
 # instead (see ``test_the_card_bar_rows_are_untouched``).
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h 25% · 7d 10%"
+GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h:25% · 7d:10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h 25% · 7d 10%"
+GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h:25% · 7d:10%"
 
 NOW = 1000.0
 
 
 def with_policy(acc, **kwargs):
-    """Attach an ``AccountPolicy`` to a snapshot from ``tests.test_tui``.
-
-    ``make_account`` predates the policy field and takes no ``policy=``
-    argument; ``test_tui.py`` is upstream's and stays byte-unchanged, so the
-    snapshot is rebuilt here instead of the helper being widened.
-    """
+    """Attach an ``AccountPolicy(**kwargs)`` to a snapshot from
+    ``tests.test_tui``: ``make_account(policy=...)`` for an account already
+    built."""
     return dataclasses.replace(acc, policy=AccountPolicy(**kwargs))
 
 
@@ -63,7 +68,10 @@ def card(acc) -> str:
 
 
 def mini(acc) -> str:
-    return mini_account_text(acc, NOW).plain
+    # The fork's mini row draws each window as a chip with its reset countdown,
+    # measured against ``NOW`` and so against the wall clock: drop the countdown
+    # so the goldens stay a statement about the policy token alone.
+    return re.sub(r"\(⟳[^)]*\)", "", mini_account_text(acc, NOW).plain)
 
 
 class TestThresholdBadge:
@@ -166,11 +174,11 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
     def _fleet(self, tmp_path):
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
-            "autoswitch": {"threshold": 90},
+            "autoswitch": {"threshold": 90, "strategy": "best"},
         }))
         return FakeSwitcher(
             [
-                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
                 with_policy(
                     make_account(2, entry=make_entry(50.0, 10.0)), threshold=60.0
                 ),
@@ -196,7 +204,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
             assert "(line" not in self._row(plain, "user3@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
@@ -217,4 +225,91 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
+
+    async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
+        self, tmp_path, fake_engine
+    ):
+        """Under dynamic the panel ranks on 5h/7d alone once no candidate is
+        open on the model axis, as the engine's retry does. Candidates 2 and 3
+        sit under the dynamic bar (97) but over their own 80 line on Fable, so
+        neither is open and the ranking drops the model: 2's real 5h (20%)
+        beats 3's (60%). Judged on the bar, both read open, the model gate
+        stays, nobody is admitted, and both fall to the waiting tail, whose
+        order here coincides with the right one: so the ranking itself is
+        asserted, empty without the per-account lines."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(
+                        2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 85.0)])
+                    ),
+                    threshold=80.0,
+                ),
+                with_policy(
+                    make_account(
+                        3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 84.0)])
+                    ),
+                    threshold=80.0,
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            ordered, *_ = tui_data.rank_switch_candidates(
+                fake.accounts_snapshot(), app.screen._settings, time.time(), "1"
+            )
+            assert ordered == ["2", "3"]
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+
+
+class TestWaitingTailReadsEachAccountsOwnLine:
+    """Both screens order the refused candidates by the soonest binding
+    recovery, read on each account's own line as the engine reads it: "3" sits
+    over its own 60% five-hour line, so the 5h binds and recovers in 2h. Read
+    on the global 90 it would bind on the 7d and recover in 3 days, behind "2",
+    which is over the weekly line and recovers in 1."""
+
+    @staticmethod
+    def _entry(five_hour, five_hour_resets, seven_day, seven_day_resets):
+        return UsageEntry(
+            last_good={
+                "five_hour": {"pct": five_hour, "resets_at": _iso_in(five_hour_resets)},
+                "seven_day": {"pct": seven_day, "resets_at": _iso_in(seven_day_resets)},
+            },
+            fetched_at=time.time(),
+            age_s=0.0,
+        )
+
+    def test_the_tail_orders_by_recovery_on_the_accounts_own_line(self):
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=self._entry(95.0, 600, 20.0, 86400)),
+                make_account(2, entry=self._entry(10.0, 7200, 98.0, 86400)),
+                with_policy(
+                    make_account(3, entry=self._entry(70.0, 7200, 90.0, 86400 * 3)),
+                    threshold=60.0,
+                ),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(
+            strategy="best", threshold=90.0, weekly_threshold=97.0
+        )
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "3", "2"]
+        assert order[1:] == _autoview_order(snap, "1", settings)
