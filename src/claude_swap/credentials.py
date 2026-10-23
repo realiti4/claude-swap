@@ -325,7 +325,7 @@ class _StoreHost(Protocol):
 
     platform: Platform
     credentials_dir: Path
-    # The account registry (``sequence.json``): its mtime is the "did the
+    # The account registry (``sequence.json``): its stat is the "did the
     # account set change?" signal the backup read cache is keyed on.
     sequence_file: Path
     _logger: logging.Logger
@@ -379,12 +379,12 @@ class CredentialStore:
         # Per-slot cache for DISPLAY reads of backup Keychain items (see
         # `_kc_read_backup`): (num, email) -> (value or "", monotonic read_at).
         # The lock guards dict and epoch; the epoch voids fills that raced a
-        # drop; the generation is sequence.json's mtime_ns the entries were
-        # read under.
+        # drop; the generation is sequence.json's (inode, mtime_ns, size) the
+        # entries were read under.
         self._backup_read_cache: dict[tuple[str, str], tuple[str, float]] = {}
         self._backup_read_cache_lock = threading.Lock()
         self._backup_read_cache_epoch = 0
-        self._backup_read_cache_gen: int | None = None
+        self._backup_read_cache_gen: tuple[int, int, int] | None = None
         # The cooldown deadline already announced in the log (see
         # KeychainBackedOff): one line per cooldown, not one per skipped read.
         self._backoff_announced_until: float = 0.0
@@ -1085,16 +1085,20 @@ class CredentialStore:
     def _backup_username(self, account_num: str, email: str) -> str:
         return f"account-{account_num}-{email}"
 
-    def _registry_generation(self) -> int | None:
-        """``sequence.json``'s mtime_ns, or ``None`` when it cannot be stat'ed.
+    def _registry_generation(self) -> tuple[int, int, int] | None:
+        """``sequence.json``'s (inode, mtime_ns, size), or ``None`` when it
+        cannot be stat'ed.
 
         The cheap "did the account set change?" signal: every registry write
         (add/remove/swap/move/switch/import, from any process) replaces the
         file. The display read cache is keyed on it — the same device as the
-        switcher's ``_poll_policy_inputs`` settings stat.
+        switcher's ``_poll_policy_inputs`` settings stat. The mtime alone can
+        repeat across two writes in one coarse timestamp tick; the atomic
+        write's new inode and the size tell those apart.
         """
         try:
-            return self._host.sequence_file.stat().st_mtime_ns
+            st = self._host.sequence_file.stat()
+            return st.st_ino, st.st_mtime_ns, st.st_size
         except OSError:
             return None
 
