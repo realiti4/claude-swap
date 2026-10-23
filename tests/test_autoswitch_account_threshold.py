@@ -1056,18 +1056,20 @@ class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
         assert self._switches(h) == []
 
     def test_room_replaces_raw_headroom_rather_than_relaxing_it(self, temp_home):
-        """1 at 95% on a 95 line, 2 at 80% on an 85 line.
+        """1 at 93% on a 93 line, 2 at 80% on an 85 line.
 
-        Raw margin `20 - 5 = 15` would accept; room on the 90 scale is `10`
+        Raw margin `20 - 7 = 13` would accept; room on the 90 scale is `10`
         for 1 (exactly on its line) and `10 + 90 * 5 / 85 = 15.29` for 2, a
         margin of `5.29` that refuses. A gate that takes the looser of the
-        two still switches here.
+        two still switches here. (93 rather than 95: at 95% the active has
+        PREEMPT_HEADROOM_PCT left and the near-limit escape takes over, which
+        is a different question from the room arithmetic asked here.)
         """
         h = _fleet(temp_home)
-        h.switcher.set_account_threshold("1", 95.0)
+        h.switcher.set_account_threshold("1", 93.0)
         h.switcher.set_account_threshold("2", 85.0)
         h.engine = h._make_engine()
-        outcome = self._tick(h, 95.0, 80.0)
+        outcome = self._tick(h, 93.0, 80.0)
         assert outcome is not TickOutcome.SWITCHED
         assert h.active_number() == 1
         assert self._switches(h) == []

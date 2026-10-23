@@ -157,6 +157,18 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# An active account with this much raw headroom or less is about to stop serving requests,
+# so the tick is a `near-limit` escape: ranked like at-limit (below-line targets first, no
+# cooldown) onto any target with more real headroom than this. Five points is about three
+# ticks at the burn a fleet of agents was measured at (1-2 points a minute); waiting for 0
+# meant the sessions hit the limit a tick before the escape. A proactive move never lands
+# on an account this close to empty, or it would escape straight back.
+PREEMPT_HEADROOM_PCT = 5.0
+# ...unless that account's own binding window comes back within this long: waiting a few
+# minutes for a reset is the #202 choice, and the escape does not override it. The same
+# bound lets a proactive move land on a nearly spent peer only when it is back that soon.
+PREEMPT_WAIT_S = 15 * 60.0
+
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
@@ -404,7 +416,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "near-limit" | "at-limit" | "failover" | "consume-first"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1313,9 +1325,22 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
+        # Over the line AND about to run out: if the ordinary ranking has nothing
+        # (or the cooldown holds it), the tick escapes as near-limit rather than
+        # waiting for zero, when the sessions would already have hit the limit.
+        # Decided against the ranking's own `now` below, so this tick reads the
+        # clock no more often than before.
+        running_out = (
+            trigger == "proactive"
+            and active_headroom is not None
+            and active_headroom <= PREEMPT_HEADROOM_PCT
+        )
+        held_by_cooldown = False
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
-            self._emit(NoSwitchEvent(reason="cooldown"))
-            return TickOutcome.NO_ACTION
+            if not running_out:
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+            held_by_cooldown = True
 
         # -- candidate selection ------------------------------------------
         candidates = [
@@ -1443,6 +1468,16 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
+        near_limit = running_out and (
+            self._recovery_ts(usage.get(current), settings, thresholds[current], decided_now)
+            - decided_now
+            > PREEMPT_WAIT_S
+        )
+        if held_by_cooldown:
+            if not near_limit:
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+            trigger = "near-limit"
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
@@ -1455,6 +1490,23 @@ class AutoSwitchEngine:
             now=decided_now,
             thresholds=thresholds,
         )
+        if not ordered and near_limit and trigger == "proactive":
+            # Nothing qualifies by the lines (typically every peer is over one,
+            # and the all-above ranking prefers waiting for the active's reset),
+            # but a peer may still have real quota: escape onto the best of it.
+            trigger = "near-limit"
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+                thresholds=thresholds,
+            )
 
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -2188,6 +2240,23 @@ class AutoSwitchEngine:
             any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
+            if trigger == "near-limit" and (
+                h <= PREEMPT_HEADROOM_PCT
+                or h < (active_headroom or 0.0) + PREEMPT_HEADROOM_PCT
+            ):
+                # Itself about to run out, or not enough more to be worth a switch.
+                continue
+            if (
+                trigger in ("proactive", "consume-first")
+                and h <= PREEMPT_HEADROOM_PCT
+                and (active_headroom or 0.0) > PREEMPT_HEADROOM_PCT
+                and self._recovery_ts(usage.get(num), settings, thresholds[num], now) - now
+                > PREEMPT_WAIT_S
+            ):
+                # Leaving an account that still has room for one about to run
+                # out, and not back soon, makes the next tick a near-limit
+                # escape straight back.
+                continue
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             binding = bindings[num]
@@ -2195,6 +2264,10 @@ class AutoSwitchEngine:
             # any of them is reached; raw `h` / the single line when it
             # reports no window (a readable headroom rules that out).
             lh = binding.line_headroom if binding is not None else h
+            # Points left before the candidate reaches its own binding line:
+            # line headroom sits at exactly `100 - threshold` on the line
+            # (lines.line_headroom), whatever the account's own line is.
+            room = lh - (100.0 - settings.threshold)
             over = (
                 binding.over
                 if binding is not None
@@ -2279,6 +2352,14 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                    # ...and only with room to spend it: at least the hysteresis
+                    # margin under every one of its lines. The move is
+                    # opportunistic, and the cooldown it starts would hold auto on
+                    # a target a few points short of its line while it crosses it
+                    # and runs out (measured: 5h 85% under a 90 line, landed on,
+                    # 92/93/99% held by cooldown, the session limit hit at 100%).
+                    if trigger == "consume-first" and room < settings.hysteresis_pct:
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
@@ -2315,10 +2396,20 @@ class AutoSwitchEngine:
                 )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
-                # policy headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+                # policy headroom breaks ties, then sequence order. A forced
+                # (proactive) move first prefers targets with the hysteresis
+                # margin of room: one a few points under its line would need
+                # leaving again within the cooldown it is about to start.
+                tight = trigger == "proactive" and room < settings.hysteresis_pct
+                key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 key = (-lh,)
+            if trigger in ("at-limit", "near-limit", "failover"):
+                # Escapes skip the landing gate on purpose (any account with
+                # real headroom beats a dead one) but must still prefer a target
+                # below its lines: ranking by weekly reset alone escaped onto an
+                # account at 7d 91% of a 90 line while one at 16% / 2% was free.
+                key = (over, *key)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
@@ -2575,6 +2666,19 @@ class AutoSwitchEngine:
             ),
             line,
             settings.weekly_threshold,
+            scale=settings.threshold,
+        )
+
+    def _recovery_ts(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float, now: float
+    ) -> float:
+        """When this account's binding window comes back (``inf`` if unknown)."""
+        return _binding_recovery_ts(
+            value if isinstance(value, dict) else None,
+            self._models,
+            now,
+            threshold=line,
+            weekly_threshold=settings.weekly_threshold,
             scale=settings.threshold,
         )
 

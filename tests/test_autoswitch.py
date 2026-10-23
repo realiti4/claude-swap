@@ -335,12 +335,14 @@ class TestDecisionTable:
 
     def test_hysteresis_margin_blocks_marginal_candidates(self, harness):
         # threshold 90, hysteresis 10 → a candidate must beat the active
-        # account's utilization by >= 10 points; 95→86 is only 9 better.
+        # account's utilization by >= 10 points; 92→83 is only 9 better.
         # Failing the margin is NOT exhaustion: no all-exhausted event, no
         # reset-sleep — the next tick must stay at normal cadence so the
-        # at-limit escape isn't missed when the active account tops out.
+        # near-limit / at-limit escape isn't missed when the active account
+        # tops out. (92, not 95: with 5 points left the near-limit escape
+        # takes a peer with 14 more, which is the point of that escape.)
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(86), "3": _usage(88),
+            "1": _usage(92), "2": _usage(83), "3": _usage(85),
         })
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
@@ -455,11 +457,14 @@ class TestDecisionTable:
         assert exhausted.earliest_reset_at == reset
 
     def test_cooldown_suppresses_proactive(self, harness):
+        # 92%, not 95%: with PREEMPT_HEADROOM_PCT or less left the tick is a
+        # near-limit escape, which the cooldown does not hold (see
+        # tests/test_autoswitch_near_limit.py).
         harness.engine._mutate_state(
             lambda s: s.update(lastSwitchAt=harness.clock() - 10)
         )
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(10), "3": _usage(10),
+            "1": _usage(92), "2": _usage(10), "3": _usage(10),
         })
         assert outcome is TickOutcome.NO_ACTION
         assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
@@ -7250,9 +7255,11 @@ class TestWeeklyThreshold:
         # full refetch: a candidate that crossed its weekly line since the
         # snapshot must not be landed on.
         h = self._harness(temp_home, accounts=(1, 2, 3), strategy="consume-first")
+        # 7d 80% stored: room enough under the 97 line for consume-first to
+        # pick it on the snapshot, so the refetch is what must reject it.
         stored = {
             "1": _usage7(5, 50, _R_LATER),
-            "2": _usage7(5, 90, _R_SOON),
+            "2": _usage7(5, 80, _R_SOON),
             "3": _usage7(5, 50, _R_LATEST),
         }
         fresh = {**stored, "2": _usage7(5, 97, _R_SOON)}
