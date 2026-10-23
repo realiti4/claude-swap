@@ -57,7 +57,10 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    strategy: str = "best"  # "best" (most headroom), "consume-first" (soonest weekly reset) or "pace" (least weekly deficit)
+    # Days per week, from Monday, that count toward the weekly pace the `pace`
+    # strategy ranks by. 7 is the plain linear week; 6 leaves Sunday out.
+    work_days: int = 7
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -147,8 +150,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "pace"),
             help="How auto-switch picks the target account",
+        ),
+        SettingSpec(
+            "autoswitch", "workDays", "work_days", "int", 2, 7,
+            help="Days per week (from Monday) that count toward weekly pace",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
