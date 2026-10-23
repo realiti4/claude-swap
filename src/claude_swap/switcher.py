@@ -237,6 +237,7 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     with no measurement at all shows "usage unavailable" plus the last fetch
     error, so a failing endpoint is visible instead of a silent blank.
     """
+    entry = entry.for_display()
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
@@ -252,6 +253,8 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
             and entry.fetched_at is not None
         ):
             lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+        if lines and entry.shows_live:
+            lines[-1] += " · live"
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
@@ -1800,7 +1803,7 @@ class ClaudeAccountSwitcher:
                     is_active=is_active,
                     kind=self._account_kind(n),
                     switchable=self._account_is_switchable(n),
-                    usage=entries[n],
+                    usage=entries[n].for_display(),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
@@ -1823,8 +1826,9 @@ class ClaudeAccountSwitcher:
             for num, info in data.get("accounts", {}).items()
         }
         # No models needed: only fetched_at is read, never scoped-window trust.
+        # Display stamps: a live reading from ``cswap proxy`` counts as a refresh.
         return {
-            num: entry.fetched_at
+            num: entry.for_display().fetched_at
             for num, entry in self._usage_store.entries(identities).items()
         }
 

@@ -1045,6 +1045,89 @@ def _use_native_tls() -> None:
         pass
 
 
+def _proxy_command(argv: list[str]) -> None:
+    """Handle `cswap proxy [--host H] [--port N]`.
+
+    Pre-dispatched like `auto`: a long-running foreground process with its
+    own options. Exits 0 on Ctrl-C/SIGTERM, 1 when it cannot listen.
+    """
+    import signal
+
+    from claude_swap import proxy
+
+    parser = argparse.ArgumentParser(
+        prog="cswap proxy",
+        description=(
+            "Relay Claude Code's API traffic to api.anthropic.com unchanged and "
+            "read each reply's rate-limit headers, so 'auto' and 'list' see the "
+            "active account's 5h/7d usage as of its last request instead of the "
+            "last /api/oauth/usage poll."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Point Claude Code at it (every session, e.g. in your shell profile):
+  export ANTHROPIC_BASE_URL=http://127.0.0.1:{proxy.DEFAULT_PORT}
+  export ENABLE_TOOL_SEARCH=true
+
+The second line matters: with a base URL that is not Anthropic's own,
+Claude Code turns off deferred tool loading and sends every MCP tool
+definition with every request (measured: 5.5x the prompt tokens for the
+same request). The proxy forwards tool-search requests unchanged.
+
+It listens on loopback only, forwards only to api.anthropic.com, and never
+stores or logs a token or a request/reply body. While it is not running,
+sessions using ANTHROPIC_BASE_URL cannot reach the API: run it under a
+supervisor (launchd, systemd, a container entrypoint) next to 'cswap auto'.
+        """,
+    )
+    parser.add_argument(
+        "--host",
+        default=proxy.DEFAULT_HOST,
+        help=f"Loopback address to listen on (default {proxy.DEFAULT_HOST})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=proxy.DEFAULT_PORT,
+        help=f"Port to listen on (default {proxy.DEFAULT_PORT})",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        def announce(host: str, port: int) -> None:
+            print(f"cswap proxy listening on {host}:{port} - Ctrl-C to stop", flush=True)
+            print(
+                dimmed(
+                    f"Start Claude Code with ANTHROPIC_BASE_URL=http://{host}:{port} "
+                    "ENABLE_TOOL_SEARCH=true"
+                ),
+                flush=True,
+            )
+
+        def stop(*_: object) -> None:
+            raise KeyboardInterrupt
+
+        # SIGTERM (a supervisor's stop) ends it the same way Ctrl-C does.
+        signal.signal(signal.SIGTERM, stop)
+        sys.exit(proxy.run_proxy(args.host, args.port, switcher, on_listening=announce))
+    except ValueError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except OSError as e:
+        error(f"Error: cannot listen on {args.host}:{args.port}: {e.strerror or e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _menubar_service(args) -> int:
     """Handle ``menubar --install-service|--uninstall-service|--service-status``.
 
@@ -1126,6 +1209,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "proxy":
+        _proxy_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1197,7 +1283,8 @@ Commands:
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)
-  %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
+  %(prog)s proxy                      read live usage off Claude Code's own API replies
+  %(prog)s tui                       interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
