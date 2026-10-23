@@ -108,7 +108,7 @@ cswap auto --dry-run           # log what it would do, never switch
 | `weekly-first` | same as `best` | the account whose weekly window resets soonest |
 | `consume-first` | at the threshold, and earlier whenever an account that resets sooner has room | the account whose weekly window resets soonest |
 | `priority-consume-first` | whenever a higher-tier account is usable | your highest tier (`cswap priority`), then the soonest weekly reset |
-| `pace` | at the threshold, and earlier whenever an account is 10 points further behind its weekly pace | the account with the least weekly deficit |
+| `pace` | at the threshold, and earlier whenever an account is 10 points further behind its weekly pace and has 25 points of 5h room | the account with the least weekly deficit |
 
 The weekly ones exist because weekly quota left unused at its reset is lost.
 

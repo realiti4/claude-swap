@@ -153,6 +153,15 @@ SPENT_HEADROOM_PCT = 3.0
 # real change. The same number as the default hysteresis, on the pace axis.
 PACE_MARGIN_PCT = 10.0
 
+# How much room (in points) a candidate's 5h window needs under its line for a
+# `pace` move to land there. A move below the threshold is optional, so it
+# must not land on an account that reaches its 5h line minutes later and
+# forces a second move: every switch drops the prompt cache of every running
+# session. At the threshold these accounts rank after every other one, so a
+# forced move still has somewhere to go. 5h only: room near a WEEKLY line on
+# an account that resets soon is exactly the quota pace exists to spend.
+PACE_LANDING_5H_ROOM_PCT = 25.0
+
 # Strategies that may move BELOW the threshold with the strategy name as the
 # trigger, and share the plumbing a voluntary move needs: the cooldown, the
 # healthy-landing gate, the phase-2 refetch before switching, and holding
@@ -520,6 +529,15 @@ def _window_pcts(
 _limiting_reset_ts = poll_policy.limiting_reset_ts
 _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
+
+
+def _five_hour_room(usage: dict | str | None, line: float) -> float | None:
+    """Points left under ``line`` in an account's 5h window, or None when it
+    reports no 5h window."""
+    for label, pct, _resets_at in oauth.relevant_windows(usage):
+        if label == oauth.FIVE_HOUR_LABEL:
+            return line - pct
+    return None
 
 
 def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
@@ -1508,7 +1526,8 @@ class AutoSwitchEngine:
                         reason="on-best-pace",
                         detail=(
                             f"no account is {PACE_MARGIN_PCT:.0f} points "
-                            "further behind its weekly pace"
+                            "further behind its weekly pace with "
+                            f"{PACE_LANDING_5H_ROOM_PCT:.0f} points of 5h room"
                         ),
                     )
                 )
@@ -2284,6 +2303,13 @@ class AutoSwitchEngine:
                 if by_pace
                 else None
             )
+            five_hour_room = (
+                _five_hour_room(usage.get(num), thresholds[num]) if by_pace else None
+            )
+            cramped = (
+                five_hour_room is not None
+                and five_hour_room < PACE_LANDING_5H_ROOM_PCT
+            )
             if trigger in ("proactive", *_NUDGE_TRIGGERS):
                 # Landing must be healthy: an account at/over any of its own
                 # lines would re-trigger on the very next tick. At-limit and
@@ -2316,12 +2342,14 @@ class AutoSwitchEngine:
                         continue
                 elif trigger == "pace":
                     # Only accounts measurably further behind their weekly
-                    # schedule than the active one. An unknown deficit on
-                    # either side cannot prove that, so it never qualifies.
-                    # Above the threshold the trigger is `proactive` and the
-                    # `best` hysteresis below applies instead.
+                    # schedule than the active one, with room to work in their
+                    # 5h window. An unknown deficit on either side cannot prove
+                    # that, so it never qualifies. Above the threshold the
+                    # trigger is `proactive` and the `best` hysteresis below
+                    # applies instead.
                     if (
-                        deficit is None
+                        cramped
+                        or deficit is None
                         or active_deficit is None
                         or deficit > active_deficit - PACE_MARGIN_PCT
                     ):
@@ -2360,10 +2388,12 @@ class AutoSwitchEngine:
                 # reset or more raw headroom does not beat an account that is
                 # behind its schedule. Accounts over a line sort after every
                 # account under one (at-limit and failover skip the landing
-                # gate), unknown deficits after known ones, and policy
+                # gate), then accounts short of PACE_LANDING_5H_ROOM_PCT after
+                # the rest, unknown deficits after known ones, and policy
                 # headroom breaks ties.
                 key = (
                     over,
+                    cramped,
                     deficit if deficit is not None else float("inf"),
                     -lh,
                 )

@@ -7484,6 +7484,36 @@ class TestPaceStrategy:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
+    def test_holds_when_the_target_5h_window_is_nearly_full(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 3, 69, 3),
+            "2": self._usage(h, 70, 0, 6),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["on-best-pace"]
+
+    def test_at_the_threshold_a_nearly_full_5h_window_ranks_last(self, temp_home):
+        h = self._harness(temp_home, accounts=3)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 95, 50, 3.5),
+            "2": self._usage(h, 70, 10, 3),
+            "3": self._usage(h, 0, 40, 6),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_at_the_threshold_a_nearly_full_5h_window_is_still_a_landing(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 95, 50, 3.5),
+            "2": self._usage(h, 70, 10, 3),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_at_the_threshold_least_deficit_beats_most_headroom(self, temp_home):
         h = self._harness(temp_home, accounts=3)
         outcome = h.tick_with_usage({
