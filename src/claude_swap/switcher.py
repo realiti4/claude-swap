@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -80,6 +80,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -226,6 +227,24 @@ def last_seen_note(entry: UsageEntry) -> str | None:
         f"last seen {100 - headroom:.0f}% used · "
         f"{format_age(int(entry.fetched_at * 1000))}"
     )
+
+
+def _plan_marker(record: dict | None, now: float) -> str:
+    """`` · Max 20x`` after a slot's header, plus ``(expired)`` when lapsed.
+
+    A plan that has not refreshed in two TTLs carries its age, so a label kept
+    alive by a slot whose profile calls keep failing reads as old rather than
+    current — the stuck-label case the independent pacing exists to avoid.
+    """
+    if not record:
+        return ""
+    plan = record["plan"]
+    marker = f" {muted('· ' + subscription.plan_label(plan))}"
+    if now - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
+        marker += f" {dimmed('(' + format_age(int(record['fetchedAt'] * 1000)) + ')')}"
+    if subscription.is_expired(plan):
+        marker += f" {yellowed('(expired)')}"
+    return marker
 
 
 def _usage_entry_lines(entry: UsageEntry) -> list[str]:
@@ -1771,6 +1790,53 @@ class ClaudeAccountSwitcher:
             accounts_info, fetch=fetch, scheduled=scheduled
         )
 
+    def _collect_subscription_plans(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+    ) -> dict[str, dict]:
+        """Per-slot subscription plan record, refreshed on its own clock (#350).
+
+        Independent of the usage collector by construction: its own file, its
+        own TTL, and attempted whether or not that slot's usage call just
+        succeeded — a slot in usage backoff is exactly the slot whose plan may
+        have changed. Only an already-valid access token is used; a due slot
+        without one keeps its last record and is retried on the next pass.
+
+        Network happens here with no lock held. Returns only slots that have a
+        usable record, so a slot never fetched is simply absent.
+        """
+        store = subscription.PlanStore(
+            self.backup_dir / "cache" / subscription.PLAN_FILENAME,
+            clock=self._usage_store.clock,
+        )
+        records = store.load()
+        now = store.clock()
+        updates: dict[str, dict] = {}
+        plans: dict[str, dict] = {}
+        for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
+            key = subscription.identity_key(email, org_uuid)
+            record = records.get(key)
+            if subscription.is_due(record, now):
+                token = subscription.usable_access_token(creds)
+                if token is None and not is_active:
+                    # accounts_info was read before the usage pass, which may
+                    # have refreshed and persisted this slot's token since.
+                    token = subscription.usable_access_token(
+                        self._read_account_credentials(str(num), email)
+                    )
+                if token is not None:
+                    fetched = subscription.fetch_plan(token)
+                    if fetched is not None:
+                        record = {"plan": fetched, "fetchedAt": now}
+                        updates[key] = record
+            if subscription.valid_record(record):
+                plans[str(num)] = record
+        if updates:
+            try:
+                store.save(updates)
+            except OSError as e:
+                self._logger.debug("Could not save subscription plans: %r", e)
+        return plans
+
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 
@@ -1784,6 +1850,7 @@ class ClaudeAccountSwitcher:
         """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        plans = self._collect_subscription_plans(accounts_info)
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -1804,6 +1871,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
+                    subscription_plan=plans.get(n),
                 )
             )
         return AccountsSnapshot(
@@ -5728,6 +5796,7 @@ class ClaudeAccountSwitcher:
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry],
+        plans: dict[str, dict] | None = None,
     ) -> dict:
         """Build the ``--list --json`` payload from gathered account + usage data."""
         active_num: int | None = None
@@ -5757,6 +5826,7 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    subscription_plan=(plans or {}).get(str(num)),
                 )
             )
         payload = {
@@ -5807,9 +5877,10 @@ class ClaudeAccountSwitcher:
 
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        plans = self._collect_subscription_plans(accounts_info)
 
         if json_output:
-            return self._build_list_payload(accounts_info, entries)
+            return self._build_list_payload(accounts_info, entries, plans)
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
@@ -5821,6 +5892,7 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
