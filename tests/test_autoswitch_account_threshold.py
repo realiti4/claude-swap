@@ -40,6 +40,7 @@ from claude_swap.autoswitch import (
 from claude_swap.settings import AutoSwitchSettings
 
 from tests.test_autoswitch import (
+    _R_LATER,
     _R_LATEST,
     _R_SOON,
     EngineHarness,
@@ -56,6 +57,9 @@ GLOBAL = AutoSwitchSettings().threshold  # 90.0
 
 def _fleet(temp_home, **settings_kwargs) -> EngineHarness:
     """Three seeded OAuth accounts, account 1 live and active."""
+    # These gates are the `best` strategy's; this branch's default is
+    # consume-first, which idles a tick whose active reset time is unknown.
+    settings_kwargs.setdefault("strategy", "best")
     h = EngineHarness(temp_home, **settings_kwargs)
     h.seed(1, "a@example.com")
     h.seed(2, "b@example.com")
@@ -544,8 +548,8 @@ class TestRankCandidatesStaysPure:
             if monkey is not None:
                 setattr(h.switcher, name, _boom)
 
-        ordered_a, _, _ = h.engine._rank_candidates(**kwargs)
-        ordered_b, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_a, *_ = h.engine._rank_candidates(**kwargs)
+        ordered_b, *_ = h.engine._rank_candidates(**kwargs)
         assert ordered_a == ordered_b
 
     def test_two_calls_on_different_snapshots_use_the_passed_map(self, temp_home):
@@ -553,7 +557,7 @@ class TestRankCandidatesStaysPure:
         h = _fleet(temp_home)
         thresholds = ThresholdMap({"2": 45.0, "3": 95.0}, GLOBAL)
         phase1 = self._kwargs(h, thresholds)
-        ordered1, _, _ = h.engine._rank_candidates(**phase1)
+        ordered1, *_ = h.engine._rank_candidates(**phase1)
         # 2 is at 50 utilization, over its own 45 line -> not a landing spot.
         assert "2" not in ordered1
         assert ordered1 == ["3"]
@@ -561,7 +565,7 @@ class TestRankCandidatesStaysPure:
         phase2 = dict(phase1)
         phase2["usage"] = {"1": _usage(99.0), "2": _usage(20.0), "3": _usage(60.0)}
         phase2["headroom"] = {"1": 1.0, "2": 80.0, "3": 40.0}
-        ordered2, _, _ = h.engine._rank_candidates(**phase2)
+        ordered2, *_ = h.engine._rank_candidates(**phase2)
         # Same map, fresher snapshot: 2 is now at 20, under its own line.
         assert ordered2[0] == "2"
 
@@ -764,6 +768,31 @@ class TestPollEventCarriesTheActiveThreshold:
         rendered = _polls(h)[0].threshold
         assert rendered == pytest.approx(95.0)
         assert f"< {pct_label(rendered)}%" in _details(h)[0]
+
+
+class TestPollEventLabelsEachCandidateOnItsOwnLine:
+    """`(X full)` for a candidate is judged against that candidate's own line,
+    not the active account's (`PollEvent.threshold`)."""
+
+    def test_a_plain_candidate_is_not_judged_on_the_actives_override(
+        self, temp_home
+    ):
+        """Active on a 60 line; 2 at 75% is under the global 90 it lands on."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.engine = h._make_engine()
+        h.tick_with_usage({"1": _usage(40.0), "2": _usage(75.0), "3": _usage(10.0)})
+        assert "full" not in _polls(h)[0]._describe("2")
+
+    def test_an_override_candidate_is_judged_on_its_own_line(self, temp_home):
+        """2 at 92% under its own 95 line is open; 3 at 92% on the 90 is full."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("2", 95.0)
+        h.engine = h._make_engine()
+        h.tick_with_usage({"1": _usage(40.0), "2": _usage(92.0), "3": _usage(92.0)})
+        poll = _polls(h)[0]
+        assert "full" not in poll._describe("2")
+        assert "(5h full)" in poll._describe("3")
 
 
 class TestDepartureGateDetailString:
@@ -1313,3 +1342,48 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
             outcome, _ = _tick(h, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.ERROR
         assert any(isinstance(e, ErrorEvent) for e in h.events)
+
+
+class TestConsumeFirstRanksOnEachAccountsOwnLine:
+    """The consume-first key's landing-health tier and `-lh` tie-break are read
+    against the candidate's own line, on the global ruler. Passing the global
+    line for every candidate makes an override's 'over' wrong both ways."""
+
+    def test_an_override_account_under_its_own_line_keeps_the_soonest_reset(
+        self, temp_home
+    ):
+        """2 sits at 92% on a 95 line: under it, so its sooner weekly reset
+        wins. On the global 90 it read as over and fell behind 3."""
+        h = _fleet(temp_home, strategy="consume-first")
+        h.switcher.set_account_threshold("2", 95.0)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.0, 0.0, _R_LATEST),
+            "2": _usage7(92.0, 0.0, _R_SOON),
+            "3": _usage7(50.0, 0.0, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+
+    def test_an_escape_does_not_land_on_an_account_over_its_own_line(
+        self, temp_home
+    ):
+        """`failover` skips the landing gate, so the key's tier is all that
+        keeps 2 (85% on an 80 line, under the global 90) behind 3."""
+        h = _fleet(temp_home, strategy="consume-first")
+        thresholds = ThresholdMap({"2": 80.0}, GLOBAL)
+        ordered, *_ = h.engine._rank_candidates(
+            trigger="failover",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage={"1": None, "2": _usage7(85.0, 0.0, _R_SOON),
+                   "3": _usage7(60.0, 0.0, _R_LATER)},
+            headroom={"1": None, "2": 15.0, "3": 40.0},
+            current="1",
+            active_headroom=None,
+            settings=h.settings,
+            now=h.clock.now,
+            thresholds=thresholds,
+        )
+        assert ordered[0] == "3"

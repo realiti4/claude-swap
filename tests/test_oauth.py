@@ -30,6 +30,22 @@ class TestExtractAccessToken:
         assert oauth.extract_access_token("") is None
 
 
+class TestIsOauthTokenExpired:
+    """A non-finite numeric stamp must answer like a missing one, not raise."""
+
+    def test_infinity_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(float("inf")) is False
+
+    def test_negative_infinity_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(float("-inf")) is False
+
+    def test_nan_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(float("nan")) is False
+
+    def test_oversized_int_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(10**400) is False
+
+
 class TestAccountHeadroom:
     """Test account_headroom."""
 
