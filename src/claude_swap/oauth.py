@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -115,6 +117,10 @@ class RefreshOutcome:
       token is dead and re-login is required
     - ``"no_refresh_token"`` — the stored credential carries no usable refresh
       token (also permanent for retry purposes)
+    - ``"foreign-lineage"`` — the caller's own ``condemned`` check confirmed
+      these bytes are a different slot's grant; refused before any network
+      call. Not a strike-worthy verdict about THIS slot's credential — the
+      next pass re-reads and, if the slot's own bytes changed, may proceed.
     - ``"transient"`` — network/server error; the token may still be valid
 
     ``token_account`` is the account identity the token endpoint optionally
@@ -143,13 +149,27 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = 10.0,
+    *, condemned: "Callable[[str], bool] | None" = None,
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
+
+    ``condemned``, when given, is consulted with ``credentials``'
+    ``credential_fingerprint`` right before the POST: a confirmed
+    ``True`` refuses without sending a single byte over the wire
+    (``"foreign-lineage"``, no strike). This is the ONE place every
+    in-tree caller's refresh POST passes through, so a caller that wants
+    the "never POST another slot's grant" guarantee holds it here rather
+    than re-implementing its own pre-POST check — a second call site that
+    forgot to would otherwise reopen exactly this hole. Never refuses on
+    ``condemned`` returning False OR on no ``condemned`` at all: absence of
+    evidence is not a mismatch (see the module's ``_probe_verdicts``
+    convention), and refusing a refresh this codebase cannot prove is
+    foreign is the very re-login this guard exists to prevent.
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -165,6 +185,9 @@ def try_refresh_oauth_credentials(
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
+
+    if condemned is not None and condemned(credential_fingerprint(credentials)):
+        return RefreshOutcome(None, "foreign-lineage")
 
     try:
         body = json.dumps({
@@ -287,7 +310,9 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(
+            req, timeout=5, context=_pin_aware_ssl_context()
+        ) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -403,7 +428,9 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with urllib.request.urlopen(
+        req, timeout=5, context=_pin_aware_ssl_context()
+    ) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -411,10 +438,10 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
-    exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
-    HTTP-date form is rare enough to ignore).
+    (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
+    ``"bad-response"``, or the exception type name as a fallback).
+    ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
+    one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
@@ -430,6 +457,16 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
+        # A TLS handshake the SERVER answered and we refused is not a
+        # transport failure, and calling it one sends you to DNS while the
+        # repair is a CA bundle. Measured: a TLS-terminating proxy
+        # presented a CA urllib does not trust, every poll raised
+        # URLError(SSLCertVerificationError), all of it stored as "network",
+        # and one account sat unpolled for ten days with that one word as the
+        # whole record. The remedy is platform-dependent and lives in
+        # ERROR_NOTES["tls-cert"], where the operator actually reads it.
+        if isinstance(e.reason, ssl.SSLCertVerificationError):
+            return "tls-cert", None
         return "network", None
     if isinstance(e, json.JSONDecodeError):
         return "bad-response", None
@@ -640,6 +677,7 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "foreign-lineage",
 )
 
 
@@ -811,3 +849,138 @@ def _persist(
             f"If the next refresh fails, re-run `cswap --add-account` after logging in.",
             file=sys.stderr,
         )
+
+
+_POLICY_LIMITS_URL = "https://api.anthropic.com/api/claude_code/policy_limits"
+
+
+def fetch_policy_limits(access_token: str,
+                        timeout_s: float = 10.0) -> dict | None:
+    """The org-policy document the SERVER returns for this credential.
+
+    Claude Code caches this at `<config home>/policy-limits.json` and reads it
+    once per process into a session cache; every gate check — `/remote-control`
+    among them — resolves against that copy. The fetch carries whichever
+    account is ACTIVE and the file is machine-wide, so the answer has to be
+    re-asked when the active account changes or one account's restrictions go
+    on gating every session on the machine.
+
+    ``None`` when it could not be asked, which the caller must keep distinct
+    from an empty document: ABSENT IS DENIED on the reader's side
+    (`Ms()` returns false for a gated capability when no document is present),
+    so writing nothing is never the safe default.
+    """
+    req = urllib.request.Request(_POLICY_LIMITS_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-client-platform": "cli",
+    })
+    try:
+        with urllib.request.urlopen(
+            req, timeout=timeout_s, context=_pin_aware_ssl_context()
+        ) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — a switch must not fail on this
+        _logger.debug("policy_limits fetch failed: %r", e)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# One slot, not a dict, keyed on the CA's path and mtime. A dict grew
+# monotonically across re-pins, each dead entry holding a full parsed copy of
+# the system trust store; a single slot has the same hit rate, because the key
+# changes only when the CA does and the old context is dead when it does.
+_PIN_CTX_SLOT: "tuple | None" = None
+
+
+def _pin_ca_fingerprint():
+    """What the cached context was built FOR -- path and mtime, or None.
+
+    A regenerated CA must not keep the old context, which is the only way a
+    cache here can be wrong: `cswap pin` can mint a new CA at the same path,
+    and a context still trusting the old one fails every call afterwards.
+    mtime answers that without reading the file.
+
+    None when there is no pin at all -- a real key, not an error.
+    """
+    # THROUGH THE SEAM. `pin.ca_path_for_trust` already returns None for
+    # "cannot ask", so the guard that used to live here is the seam's now.
+    from claude_swap import pin as _pin
+
+    ca = _pin.ca_path_for_trust()
+    if not ca:
+        return None
+    # A CA naming a path we cannot stat is not the same state as no pin at
+    # all; collapsing the two hands the no-pin caller a context built for a
+    # pin. Distinct key, so each caches its own.
+    try:
+        stamp = os.stat(ca).st_mtime_ns
+    except OSError:
+        stamp = None
+    return (str(ca), stamp)
+
+
+def _pin_aware_ssl_context():
+    """A verifying context that ALSO trusts the pin's CA, if there is one.
+
+    Named for the property, not the caller: three sites in this module have
+    the identical problem -- profile, usage and policy limits.
+
+    TOKEN REFRESH IS NOT ONE OF THEM. The helper is only needed where the pin
+    RE-SIGNS the host: it MITMs `UPSTREAM_HOST` and blind-tunnels everything
+    else, and `OAUTH_TOKEN_URL` is on a different host, so that call is
+    verified against the real certificate by an ordinary default context. A
+    test pins that relationship, because it holds between two packages.
+
+    These calls are plain urllib through whatever proxy the session was wired
+    to. When that is the pin it MITMs api.anthropic.com, so a default context
+    cannot verify it and every call dies CERTIFICATE_VERIFY_FAILED, which
+    the callers log at debug.
+
+    ADD, NEVER REPLACE. `SSL_CERT_FILE` REPLACES OpenSSL's file, so it is safe
+    only where the bundle subsumes the store it displaces -- measured by
+    certificate SET across three machines, two were missing 27 and 128 roots
+    respectively, so the writer that sets it correctly refuses on both.
+    Loading our CA into a default context keeps every ambient root and needs
+    no environment variable.
+
+    NEVER RAISES and never returns None: with no pin installed, or an
+    unreadable CA, the caller still gets an ordinary verifying context.
+
+    INSIDE THE PIN DAEMON the egress is a re-signing hop, not the pin, so this
+    context fails on it; the pin's own `_verifying_context` trusts what that
+    hop presents and is returned instead, uncached.
+    """
+    from claude_swap import pin as _pin
+
+    ctx = _pin.daemon_ssl_context()
+    if ctx is not None:
+        return ctx
+
+    # Built once per CA, not per call: `create_default_context()` loads the
+    # whole system trust store and this sits on the polling path. Nothing in
+    # the result changes unless the pin's CA file does, so the cache is keyed
+    # on that file's path and mtime.
+    global _PIN_CTX_SLOT
+
+    key = _pin_ca_fingerprint()
+    if _PIN_CTX_SLOT is not None and _PIN_CTX_SLOT[0] == key:
+        return _PIN_CTX_SLOT[1]
+
+    # The key CARRIES the path, so the file loaded and the key it is cached
+    # under are one read. Asking the seam again let the two disagree:
+    # `ca_path_for_trust` collapses every failure to None, so a None on the
+    # second read cached a context with no CA under a key that named one.
+    ctx = ssl.create_default_context()
+    try:
+        if key:
+            ctx.load_verify_locations(cafile=key[0])
+    except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
+        # NOT CACHED: the key is the CA's path and mtime and neither moves
+        # because a load failed, so caching this would freeze it for the life
+        # of the process. Uncached, the next call retries.
+        _logger.debug("pin-aware ssl context: pin CA not added: %r", e)
+        return ctx
+    _PIN_CTX_SLOT = (key, ctx)
+    return ctx

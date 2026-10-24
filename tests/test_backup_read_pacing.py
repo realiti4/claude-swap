@@ -241,7 +241,9 @@ class TestBackupReadCache:
         assert store._read_account_credentials("2", _email(2), cached=True) == (
             _cred("backup2")
         )
-        store._write_account_credentials("2", _email(2), _cred("rotated"))
+        store._write_account_credentials(
+            "2", _email(2), _cred("rotated"), attributed=True
+        )
         before = keychain.backup_calls(2)
         assert store._read_account_credentials("2", _email(2), cached=True) == (
             _cred("rotated")

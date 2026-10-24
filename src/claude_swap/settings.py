@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch``, ``ui`` and ``updates`` sections; other sections can be added additively.
+``autoswitch``, ``ui``, ``updates`` and ``pin`` sections; other sections can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -86,10 +86,20 @@ class UpdateSettings:
     check: bool = True
 
 
+@dataclass(frozen=True)
+class PinSettings:
+    """Cloud-pin switches (``pin`` section): ``desktop_follows`` lets the Claude
+    Desktop app's inference follow the account swap. cswap-pin reads it through
+    ``load_pin_settings(backup_dir)``, not by opening the settings files."""
+
+    desktop_follows: bool = False
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "updates": UpdateSettings,
+    "pin": PinSettings,
 }
 
 
@@ -102,7 +112,7 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui", "updates")
+    section: str  # top-level JSON section ("autoswitch", "ui", "updates", "pin")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
     kind: str  # "float" | "int" | "bool" | "choice"
@@ -170,6 +180,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "updates", "check", "check", "bool",
             help="Check PyPI once a day and print a hint when a newer release exists",
         ),
+        SettingSpec(
+            "pin", "desktopFollows", "desktop_follows", "bool",
+            help="Let the Claude Desktop app's inference follow the account swap (needs the cloud pin)",
+        ),
     )
 }
 
@@ -182,6 +196,18 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
 
 def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
+
+
+def pin_cleared_path(backup_root: Path) -> Path:
+    """This host's "cleared the pin" marker, beside settings.json.
+
+    A settings.json symlinked from a repository shared across machines holds
+    ONE pin record for every host that links it, so a one-host ``cswap pin
+    --clear`` records itself here instead of dropping that record. Its
+    existence is the whole fact, and the cswap-pin package keys its use of the
+    marker on this function being present.
+    """
+    return backup_root / "pin-cleared"
 
 
 def parse_model_names(value: str | None) -> tuple[str, ...]:
@@ -305,6 +331,23 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
     return UpdateSettings(check=check)
 
 
+def load_pin_settings(backup_root: Path) -> PinSettings:
+    """Load the pin section; missing/corrupt file or non-boolean → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("pin")
+    default = PinSettings()
+    if not isinstance(section, dict):
+        return default
+    desktop_follows = section.get("desktopFollows", default.desktop_follows)
+    if not isinstance(desktop_follows, bool):
+        _logger.warning(
+            "settings.json: pin.desktopFollows %r is not true or false; using %r",
+            desktop_follows, default.desktop_follows,
+        )
+        return default
+    return PinSettings(desktop_follows=desktop_follows)
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
@@ -331,8 +374,8 @@ def setting_spec(dotted_key: str) -> SettingSpec:
 
 
 _BOOL_WORDS = {
-    "true": True, "1": True, "yes": True,
-    "false": False, "0": False, "no": False,
+    "true": True, "1": True, "yes": True, "on": True,
+    "false": False, "0": False, "no": False, "off": False,
 }
 
 
@@ -348,7 +391,7 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
         parsed = _BOOL_WORDS.get(raw_value.strip().lower())
         if parsed is None:
             raise ConfigError(
-                f"{spec.dotted} expects true or false (or 1/0, yes/no), "
+                f"{spec.dotted} expects true or false (or 1/0, yes/no, on/off), "
                 f"got '{raw_value}'"
             )
         return parsed
@@ -477,6 +520,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
         "updates": load_update_settings(backup_root),
+        "pin": load_pin_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
