@@ -1323,6 +1323,21 @@ class AutoSwitchEngine:
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
+        # -- work/personal barrier (contexts.json) -------------------------
+        # Never hand a live session's directory to an account its context
+        # forbids (e.g. a work repo onto a personal account).
+        barred = self._context_barred(candidates)
+        if barred:
+            candidates = [n for n in candidates if n not in barred]
+            if not candidates:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="context-barrier",
+                        detail="no account is allowed in "
+                        + ", ".join(sorted({d for ds in barred.values() for d in ds})),
+                    )
+                )
+                return TickOutcome.BLOCKED
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
@@ -2577,6 +2592,38 @@ class AutoSwitchEngine:
             settings.weekly_threshold,
             scale=settings.threshold,
         )
+
+    def _context_barred(self, candidates: Sequence[str]) -> dict[str, list[str]]:
+        """Candidates the work/personal barrier forbids, with the directories why.
+
+        Judged against the working directories of the live Claude sessions on
+        this profile: those are the sessions a switch would move. Empty when
+        no contexts are configured, the mode is ``open``, or the sessions
+        cannot be read (the Claude Code hook still guards each prompt then).
+        """
+        from claude_swap.contexts import MODE_OPEN, ContextStore
+        from claude_swap.process_detection import scan_sessions
+
+        store = ContextStore(self.switcher.backup_dir)
+        if not store.path.exists() or store.mode() == MODE_OPEN:
+            return {}
+        try:
+            sessions, _ = scan_sessions()
+        except Exception as e:  # noqa: BLE001 - never stall the engine on this
+            _logger.debug("context barrier: cannot read sessions: %s", e)
+            return {}
+        cwds = sorted({s.cwd for s in sessions if s.cwd})
+        if not cwds:
+            return {}
+        barred: dict[str, list[str]] = {}
+        for num in candidates:
+            ident = self.switcher.account_identity(num)
+            blocked = store.blocked_directories(
+                cwds, ident["email"], ident["organizationUuid"]
+            )
+            if blocked:
+                barred[num] = blocked
+        return barred
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

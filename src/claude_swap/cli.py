@@ -191,6 +191,7 @@ Examples:
         manager = SessionManager(switcher)
 
         if args.account is not None:
+            _refuse_if_context_barred(switcher, args.account)
             manager.run(
                 args.account,
                 tail,
@@ -203,6 +204,7 @@ Examples:
         # No account given: resolve from the current directory's mapping.
         slot, email = switcher.slot_for_directory(os.getcwd())
         if slot is not None:
+            _refuse_if_context_barred(switcher, slot)
             manager.run(
                 slot,
                 tail,
@@ -230,6 +232,24 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _refuse_if_context_barred(switcher: ClaudeAccountSwitcher, identifier: str) -> None:
+    """Exit 1 when the work/personal barrier forbids the account in this directory."""
+    from claude_swap.contexts import ContextStore
+
+    store = ContextStore(switcher.backup_dir)
+    if not store.path.exists():
+        return
+    num, email, org = switcher.resolve_account(identifier)
+    resolution, _, verdict = store.verdict(os.getcwd(), email, org)
+    if not verdict.allowed:
+        error(
+            f"Error: Account-{num} ({email}) is not allowed here: {verdict.reason} "
+            f"[{resolution.context}, {resolution.describe()}]. "
+            "See `cswap context`."
+        )
+        sys.exit(1)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -311,6 +331,221 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _hook_command_string() -> str:
+    """Absolute ``cswap hook`` command for settings.json (PATH may differ in Claude)."""
+    import shutil
+
+    exe = shutil.which("cswap") or shutil.which("claude-swap")
+    # normpath: a PATH entry like ~/.local/share/../bin would leak into settings.json.
+    return f"{os.path.normpath(exe)} hook" if exe else "cswap hook"
+
+
+def _context_command(argv: list[str]) -> None:
+    """Handle `cswap context ...` — work / personal barrier between accounts."""
+    from claude_swap import contexts as ctx
+    from claude_swap import hook
+
+    parser = argparse.ArgumentParser(
+        prog="cswap context",
+        description=(
+            "Tag directories and accounts as work or personal, and choose how "
+            "strictly they are kept apart. Enforced by the Claude Code hook "
+            "(see install-hooks) and by auto-switch."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  open        any account anywhere; contexts are labels only
+  asymmetric  work directories run on work accounts only (default)
+  strict      work dirs on work accounts, personal dirs on personal accounts
+
+Examples:
+  cswap context                         # rules + verdict for this directory
+  cswap context set work ~/work         # everything under ~/work is work
+  cswap context set shared              # this directory accepts any account
+  cswap context account 2 work          # account 2 is the work licence
+  cswap context remote github.com/acme work   # repos of that org are work
+  cswap context mode strict
+  cswap context install-hooks           # enforce it inside Claude Code
+  echo work > .claude-context           # per-repo marker, also honoured
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(dest="action")
+
+    p_show = sub.add_parser("show", help="Show rules and this directory's verdict (default)")
+    p_show.add_argument("path", nargs="?", metavar="PATH")
+    p_show.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_set = sub.add_parser("set", help="Set a directory's context")
+    p_set.add_argument("context", choices=ctx.DIRECTORY_CONTEXTS)
+    p_set.add_argument("path", nargs="?", metavar="PATH", help="Default: current directory")
+
+    p_unset = sub.add_parser("unset", help="Remove a directory rule")
+    p_unset.add_argument("path", nargs="?", metavar="PATH", help="Default: current directory")
+
+    p_acct = sub.add_parser("account", help="Tag an account work or personal")
+    p_acct.add_argument("account", metavar="NUM|EMAIL")
+    p_acct.add_argument("context", nargs="?", choices=ctx.ACCOUNT_CONTEXTS)
+    p_acct.add_argument("--unset", action="store_true", help="Remove the tag")
+
+    p_mode = sub.add_parser("mode", help="Show or set the barrier mode")
+    p_mode.add_argument("mode", nargs="?", choices=ctx.MODES)
+
+    p_default = sub.add_parser("default", help="Context of directories no rule covers")
+    p_default.add_argument("context", nargs="?", choices=ctx.DIRECTORY_CONTEXTS)
+
+    p_remote = sub.add_parser(
+        "remote", help="Map a git remote prefix (host[/org]) to a context"
+    )
+    p_remote.add_argument("pattern", nargs="?", metavar="PATTERN")
+    p_remote.add_argument("context", nargs="?", choices=ctx.DIRECTORY_CONTEXTS)
+    p_remote.add_argument("--unset", action="store_true", help="Remove the hint")
+
+    p_install = sub.add_parser(
+        "install-hooks", help="Add the enforcing hook to ~/.claude/settings.json"
+    )
+    p_install.add_argument("--uninstall", action="store_true", help="Remove it instead")
+
+    args = parser.parse_args(argv)
+    action = args.action or "show"
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        store = ctx.ContextStore(switcher.backup_dir)
+
+        if action == "set":
+            key = store.set_path(args.path or os.getcwd(), args.context)
+            print(f"{accent('Context')} {key} → {args.context}")
+        elif action == "unset":
+            target = args.path or os.getcwd()
+            if store.unset_path(target):
+                print(f"{accent('Removed')} rule for {target}")
+            else:
+                print(dimmed(f"No rule for {target}"))
+        elif action == "account":
+            if args.unset == (args.context is not None):
+                parser.error("account takes a context or --unset (exactly one)")
+            num, email, org = switcher.resolve_account(args.account)
+            store.set_account_context(email, org, None if args.unset else args.context)
+            shown = "untagged (counts as personal)" if args.unset else args.context
+            print(f"{accent('Account')}-{num} ({email}) → {shown}")
+        elif action == "mode":
+            if args.mode:
+                store.set_mode(args.mode)
+            print(store.mode())
+        elif action == "default":
+            if args.context:
+                store.set_default_context(args.context)
+            print(store.default_context())
+        elif action == "remote":
+            if args.pattern is None:
+                remotes = store.load()["remotes"]
+                if not remotes:
+                    print(dimmed("No remote hints."))
+                for pattern in sorted(remotes):
+                    print(f"  {pattern} {dimmed('→')} {remotes[pattern]}")
+            elif args.unset == (args.context is not None):
+                parser.error("remote PATTERN takes a context or --unset (exactly one)")
+            else:
+                store.set_remote(args.pattern, None if args.unset else args.context)
+                print(f"{accent('Remote')} {args.pattern.lower()} → "
+                      f"{'removed' if args.unset else args.context}")
+        elif action == "install-hooks":
+            settings_file = paths.get_default_claude_config_home() / "settings.json"
+            command = _hook_command_string()
+            changed = hook.install(settings_file, command, uninstall=args.uninstall)
+            verb = "Removed" if args.uninstall else "Installed"
+            if changed:
+                print(f"{accent(verb)} `{command}` in {settings_file}")
+            else:
+                print(dimmed(f"Nothing to do ({settings_file} already up to date)"))
+        else:
+            # Bare `cswap context` never ran the `show` subparser, so its
+            # arguments are absent from the namespace.
+            _context_show(
+                switcher,
+                store,
+                getattr(args, "path", None) or os.getcwd(),
+                getattr(args, "json", False),
+            )
+    except ValueError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _context_show(switcher, store, path: str, as_json: bool) -> None:
+    """Print the rules and the verdict for ``path`` (``cswap context``)."""
+    from claude_swap import hook
+
+    data = store.load()
+    resolution = store.resolve(path, data)
+    seq = switcher._get_sequence_data() or {}
+    accounts = []
+    for num in seq.get("sequence", []):
+        ident = switcher.account_identity(str(num))
+        tag = store.account_context(ident["email"], ident["organizationUuid"])
+        accounts.append({"num": str(num), "email": ident["email"], "context": tag})
+
+    live = hook.current_identity()
+    verdict = None
+    if live:
+        _, _, verdict = store.verdict(path, *live)
+
+    if as_json:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "mode": data["mode"],
+            "default": data["default"],
+            "directory": {
+                "path": path,
+                "context": resolution.context,
+                "source": resolution.source,
+                "detail": resolution.detail,
+            },
+            "activeAccount": (
+                {"email": live[0], "allowed": verdict.allowed, "reason": verdict.reason}
+                if live and verdict else None
+            ),
+            "accounts": accounts,
+            "paths": data["paths"],
+            "remotes": data["remotes"],
+        }, indent=2))
+        return
+
+    print(f"{bolded('Mode:')} {data['mode']}   {bolded('Default:')} {data['default']}")
+    print(f"{bolded('Here:')} {path} → {accent(resolution.context)} "
+          f"{muted('(' + resolution.describe() + ')')}")
+    if live and verdict:
+        status = (
+            accent("allowed")
+            if verdict.allowed
+            else printer.yellowed(f"blocked: {verdict.reason}")
+        )
+        print(f"{bolded('Active account:')} {live[0]} — {status}")
+    print(bolded("Accounts:"))
+    if not accounts:
+        print(dimmed("  none managed yet"))
+    for a in accounts:
+        tag = a["context"] or muted("untagged (counts as personal)")
+        print(f"  {a['num']}: {a['email']} {dimmed('→')} {tag}")
+    if data["paths"]:
+        print(bolded("Directory rules:"))
+        for p in sorted(data["paths"]):
+            print(f"  {p} {dimmed('→')} {data['paths'][p]}")
+    if data["remotes"]:
+        print(bolded("Remote hints:"))
+        for p in sorted(data["remotes"]):
+            print(f"  {p} {dimmed('→')} {data['remotes'][p]}")
 
 
 def _unmap_command(argv: list[str]) -> None:
@@ -1105,9 +1340,15 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
+    argv = sys.argv[1:]
+    if argv[:1] == ["hook"]:
+        # Claude Code hook: stdin/stdout are JSON pipes. Dispatch before the
+        # theme probe and TLS setup, which this path never needs.
+        from claude_swap import hook
+
+        sys.exit(hook.run())
     force_utf8_output()
     _use_native_tls()
-    argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -1120,6 +1361,9 @@ def main() -> None:
         pass  # theme is cosmetic; never block the CLI on it
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
+    if argv and argv[0] == "context":
+        _context_command(argv[1:])
+        return
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
@@ -1186,6 +1430,7 @@ Commands:
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping
+  %(prog)s context                    work/personal barrier (see: context -h)
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases

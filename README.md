@@ -165,6 +165,43 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Keep work and personal apart (contexts)
+
+Tag directories and accounts as `work` or `personal`, then pick how strictly
+they are kept apart:
+
+| Mode | Work directory | Personal directory |
+|---|---|---|
+| `open` | any account (labels only) | any account |
+| `asymmetric` (default) | work accounts only | any account |
+| `strict` | work accounts only | personal accounts only |
+
+`shared` directories accept any account in every mode. Untagged accounts count
+as personal.
+
+```bash
+cswap context account 2 work              # account 2 is the work licence
+cswap context set work ~/work             # everything under ~/work is work
+cswap context remote github.com/acme work  # repos of that org (SSH or HTTPS) are work
+echo shared > .claude-context             # per-repo marker
+cswap context mode strict                 # or open / asymmetric
+cswap context install-hooks               # enforce inside Claude Code
+cswap context                             # rules + verdict for this directory
+```
+
+A directory's context comes from the nearest path rule or `.claude-context`
+marker, then a git-remote hint, then the default (`cswap context default`).
+
+The rules are enforced in three places:
+
+- **Claude Code hook** (`install-hooks` adds `cswap hook` to
+  `~/.claude/settings.json`): at session start Claude is told the context and
+  the active account; a prompt is blocked when the active account is not
+  allowed in the directory. The hook fails open if it cannot run.
+- **Auto-switch** never picks an account that the context of a running
+  session's directory forbids (event reason `context-barrier`).
+- **`cswap run`** refuses to launch a forbidden account in the current directory.
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
