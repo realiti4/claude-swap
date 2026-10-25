@@ -685,6 +685,33 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
         print(f"  Account-{num}  {value:g}%")
 
 
+def _artifact_owner_command(argv: list[str]) -> None:
+    """Handle `cswap artifact-owner ...` by handing over to the claude-artifact-owner package.
+
+    claude-artifact-owner is a pair of Claude Code hooks that keep sessions working
+    on their artifacts after a switch: an Artifact call on an artifact
+    another stored account owns runs as that account, in a short headless
+    helper session (`cswap run <owner> -- -p ...`). It is a companion package
+    with releases of its own, installed by the 'artifact-owner' extra, so
+    this only checks that it is there and passes the arguments on: `hook`,
+    `hooks`, `refresh` and the rest are its own commands. Pre-dispatched like
+    `run`/`auto`, with the same limitation: `artifact-owner` must be the
+    first argument.
+    """
+    try:
+        import claude_artifact_owner  # lazy: optional dependency
+    except ImportError as e:
+        if e.name != "claude_artifact_owner":  # installed, but it can't load here (it runs on Linux)
+            error(f"Error: cswap artifact-owner: {e}")
+            sys.exit(1)
+        error(
+            "Error: cswap artifact-owner needs the 'artifact-owner' extra. Install with:\n"
+            "  uv tool install 'claude-swap[artifact-owner]'"
+        )
+        sys.exit(1)
+    sys.exit(claude_artifact_owner.main(argv, prog=f"{_prog_name()} artifact-owner"))
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1126,6 +1153,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "artifact-owner":
+        _artifact_owner_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1192,6 +1222,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s artifact-owner hooks       reach your other accounts' artifacts (extra)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

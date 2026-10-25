@@ -268,6 +268,25 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 
 </details>
 
+## Artifacts after a switch
+
+<details>
+<summary>Optional: keep sessions working on the artifacts they published before a switch</summary>
+
+An artifact belongs to the account that published it, so after a switch the artifacts a running session published look deleted to it ("artifact not found — it may have been deleted, or it has not been shared with you"), and the session may publish a copy under a new link. The `artifact-owner` extra adds Claude Code hooks that record which of your accounts owns each artifact, and run an Artifact call on another account's artifact as that account, in a short headless helper session (`cswap run <owner>`, Haiku, safe mode, only the Artifact tools and Read). The session gets the call's result back.
+
+```bash
+uv tool install 'claude-swap[artifact-owner]'   # or: pipx install 'claude-swap[artifact-owner]'
+cswap artifact-owner refresh                    # record who owns your existing artifacts (one helper per account)
+cswap artifact-owner hooks                      # print the hook entries for ~/.claude/settings.json
+```
+
+Add the two printed entries to the `hooks` in `~/.claude/settings.json`. A routed call takes about 6–40 s and a fraction of a cent at list prices, on the owner account's usage. Artifact deletes are never routed.
+
+It's a separate package with its own releases and documentation: [claude-artifact-owner](https://github.com/cskiraly/claude-artifact-owner), which also has a line for `~/.claude/CLAUDE.md` so sessions trust the result the hook hands back. Experimental, like `cswap run`, which it relies on.
+
+</details>
+
 ## Advanced
 
 ### Configuration

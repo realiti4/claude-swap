@@ -33,6 +33,9 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# `cswap artifact-owner` hands over to it: Claude Code hooks that run an
+# Artifact call on another account's artifact as that account (cswap run).
+artifact-owner = ["claude-artifact-owner>=0.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
