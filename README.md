@@ -268,6 +268,25 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 
 </details>
 
+## Remote Control after a switch (Linux, tmux)
+
+<details>
+<summary>Optional: turn Remote Control back on in your sessions after a switch</summary>
+
+A Remote Control session belongs to the account that started it, so a switch stops it in every Claude Code session that has it ("signed-in claude.ai account or organization changed on this machine — run /remote-control …"), and you have to run `/remote-control` in each one again. The `rc-revive` extra does that for you, in sessions running in tmux on Linux:
+
+```bash
+uv tool install 'claude-swap[rc-revive]'   # or: pipx install 'claude-swap[rc-revive]'
+cswap rc-revive install-service            # a systemd user service that watches your sessions
+cswap rc-revive status                     # each session's Remote Control state
+```
+
+In each session that lost Remote Control to a switch, it types `/remote-control <session name>` into the session's tmux pane once that's safe: the input box is showing (no dialog, menu or permission prompt), nobody has typed in that tmux session for 15 s, and a draft on the input line goes to Claude Code's stash and comes back. The new Remote Control session is titled with the session's name in the Claude app. Remote Control you turned off yourself stays off, and it doesn't matter how the account changed (`cswap switch`, `cswap auto`, `/login`).
+
+It's a separate package with its own releases and documentation: [claude-rc-revive](https://github.com/cskiraly/claude-rc-revive). Experimental: it reads Claude Code's screen, so a Claude Code update can break it; it then waits or fails, logged, rather than typing blind.
+
+</details>
+
 ## Advanced
 
 ### Configuration

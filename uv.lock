@@ -3,6 +3,15 @@ revision = 5
 requires-python = ">=3.12"
 
 [[package]]
+name = "claude-rc-revive"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0d/3a/3bbee11b2800444a9ad80fa6cf34ebb727f8df92441f07d59e918684a1c0/claude_rc_revive-0.1.0.tar.gz", hash = "sha256:ffb740fe7e1e0889376f69d6407517207e56a3d78c2e3f4442437f74f1d28e57", size = 33662, upload-time = "2026-10-25T21:31:00.375Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1b/61/3cb36e80c6ad4f1f2338ffacb11449865e339185db4a487b521e7a5a42d0/claude_rc_revive-0.1.0-py3-none-any.whl", hash = "sha256:545db6710bf2e990a328297517d5f4f9d9f1bd350bee57598dc981b88fa9ca25", size = 16041, upload-time = "2026-10-25T21:31:01.498Z" },
+]
+
+[[package]]
 name = "claude-swap"
 version = "0.29.0b1"
 source = { editable = "." }
@@ -16,6 +25,9 @@ dependencies = [
 menubar = [
     { name = "rumps" },
 ]
+rc-revive = [
+    { name = "claude-rc-revive" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -26,12 +38,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "claude-rc-revive", marker = "extra == 'rc-revive'", specifier = ">=0.1.0" },
     { name = "keyring", marker = "sys_platform == 'win32'", specifier = ">=25.0.0" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
     { name = "textual", specifier = ">=8.2.8,<9" },
     { name = "truststore", specifier = ">=0.10.4" },
 ]
-provides-extras = ["menubar"]
+provides-extras = ["menubar", "rc-revive"]
 
 [package.metadata.requires-dev]
 dev = [

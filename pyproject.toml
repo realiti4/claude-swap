@@ -33,6 +33,9 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# `cswap rc-revive` hands over to it: turns Remote Control back on in the
+# Claude Code sessions a switch disconnected (Linux, sessions in tmux).
+rc-revive = ["claude-rc-revive>=0.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

@@ -685,6 +685,31 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
         print(f"  Account-{num}  {value:g}%")
 
 
+def _rc_revive_command(argv: list[str]) -> None:
+    """Handle `cswap rc-revive ...` by handing over to the claude-rc-revive package.
+
+    claude-rc-revive turns Remote Control back on in the Claude Code sessions that
+    lost it to a switch (Linux, sessions running in tmux). It is a companion
+    package with releases of its own, installed by the 'rc-revive' extra, so
+    this only checks that it is there and passes the arguments on: `watch`,
+    `status`, `revive`, `install-service` and the rest are its own commands.
+    Pre-dispatched like `run`/`auto`, with the same limitation: `rc-revive`
+    must be the first argument.
+    """
+    try:
+        import claude_rc_revive  # lazy: optional dependency
+    except ImportError as e:
+        if e.name != "claude_rc_revive":  # installed, but it can't load here (it runs on Linux)
+            error(f"Error: cswap rc-revive: {e}")
+            sys.exit(1)
+        error(
+            "Error: cswap rc-revive needs the 'rc-revive' extra. Install with:\n"
+            "  uv tool install 'claude-swap[rc-revive]'"
+        )
+        sys.exit(1)
+    sys.exit(claude_rc_revive.main(argv, prog=f"{_prog_name()} rc-revive"))
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1126,6 +1151,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "rc-revive":
+        _rc_revive_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1192,6 +1220,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s rc-revive install-service  revive Remote Control after switches (extra)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
