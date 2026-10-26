@@ -175,7 +175,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "manualHoldSeconds", "manual_hold_seconds", "int", 0, 86400,
-            help="Seconds a manual 'cswap switch' pick blocks proactive switches (0 = off)",
+            help="Seconds a 'cswap switch' command's pick blocks proactive switches (0 = off)",
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
