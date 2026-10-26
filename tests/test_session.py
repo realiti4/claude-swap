@@ -1346,7 +1346,7 @@ class TestRun:
         )
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
 
-    def test_preset_config_dir_disables_fast_path(
+    def test_preset_config_dir_still_uses_session_for_other_account(
         self,
         manager,
         capture_exec,
@@ -1356,11 +1356,11 @@ class TestRun:
         capsys,
     ):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-        # Even a matching identity must NOT fast-path when the env var is set.
+        # The default login is a different account: no fast path.
         monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+            session_mod.SessionManager,
+            "_default_login_identity",
+            staticmethod(lambda: ("other@example.com", "")),
         )
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
@@ -1370,6 +1370,35 @@ class TestRun:
         )
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
         assert "overriding it for this launch" in capsys.readouterr().out
+
+    def test_preset_config_dir_fast_paths_for_active_default_account(
+        self, manager, capture_exec, monkeypatch, capsys
+    ):
+        # A session for the active default account would consume the live
+        # login's refresh token and log out every claude running on it.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_default_login_identity",
+            staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "already the active default login" in capsys.readouterr().out
+
+    def test_preset_config_dir_require_session_refuses_active_default(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_default_login_identity",
+            staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
+        )
+        with pytest.raises(SessionError, match="active default"):
+            manager.run("2", [], require_session=True)
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
