@@ -8920,6 +8920,7 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
+            expect_current=None,
         )
 
     def test_switch_to_unknown_alias_raises_account_not_found_not_validation(

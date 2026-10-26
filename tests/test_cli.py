@@ -975,23 +975,31 @@ class TestSubcommandAliases:
         )
 
     @pytest.mark.parametrize(
-        "argv",
-        [["switch", "2"], ["switch"], ["switch", "--strategy", "best"]],
-        ids=["target", "rotate", "best"],
+        ("argv", "method", "explicit"),
+        [
+            (["switch", "2"], "switch_to", True),
+            (["switch"], "switch", False),
+            (["switch", "--strategy", "best"], "switch", False),
+            (["switch", "2", "--json"], "switch_to", True),
+        ],
+        ids=["target", "rotate", "best", "target-json"],
     )
-    def test_human_switch_records_a_manual_pick(self, argv):
-        """Every `cswap switch` form notes the pick for autoswitch's manual hold."""
-        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,              patch.object(sys, "argv", ["claude-swap", *argv]),              patch("os.geteuid", return_value=1000, create=True),              patch("claude_swap.update_check.check_for_update", return_value=None):
-            switcher_cls.return_value.backup_dir = Path("/nonexistent")
+    def test_switch_hands_its_result_to_the_manual_pick(self, argv, method, explicit):
+        """Every `cswap switch` form passes its outcome to note_manual_pick,
+        which decides whether it was a pick (only a named target may re-pick
+        the active account)."""
+        payload = {"schemaVersion": 1, "switched": True, "to": {"number": 2}}
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher = switcher_cls.return_value
+            switcher.backup_dir = Path("/nonexistent")
+            getattr(switcher, method).return_value = payload
             cli.main()
-        switcher_cls.return_value.note_manual_switch.assert_called_once_with()
-
-    def test_cancelled_switch_records_no_pick(self):
-        """A switch that never moved (None payload) must not arm a hold."""
-        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,              patch.object(sys, "argv", ["claude-swap", "switch", "2"]),              patch("os.geteuid", return_value=1000, create=True),              patch("claude_swap.update_check.check_for_update", return_value=None):
-            switcher_cls.return_value.switch_to.return_value = None
-            cli.main()
-        switcher_cls.return_value.note_manual_switch.assert_not_called()
+        switcher.note_manual_pick.assert_called_once_with(
+            payload, explicit=explicit, json_output="--json" in argv
+        )
 
     def test_list_subcommand_with_json(self):
         """`cswap list --json` reaches list_accounts(json_output=True)."""
