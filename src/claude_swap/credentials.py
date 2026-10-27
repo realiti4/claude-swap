@@ -387,7 +387,8 @@ class CredentialStore:
         self._backup_read_cache_gen: (
             tuple[tuple[int, int, int], tuple[int, int, int] | None] | None
         ) = None
-        self._backup_presence_cache: set[tuple[str, str]] = set()
+        # (slot, email) -> monotonic time the item was last seen present.
+        self._backup_presence_cache: dict[tuple[str, str], float] = {}
         self._backup_presence_cache_gen: (
             tuple[tuple[int, int, int], tuple[int, int, int] | None] | None
         ) = None
@@ -1310,7 +1311,12 @@ class CredentialStore:
             if generation != self._backup_presence_cache_gen:
                 self._backup_presence_cache.clear()
                 self._backup_presence_cache_gen = generation
-            if generation is not None and key in self._backup_presence_cache:
+            seen = self._backup_presence_cache.get(key)
+            if (
+                generation is not None
+                and seen is not None
+                and time.monotonic() - seen < BACKUP_READ_CACHE_TTL_S
+            ):
                 return True
             epoch = self._backup_read_cache_epoch
         if time.monotonic() < self._keychain_disabled_until:
@@ -1330,7 +1336,7 @@ class CredentialStore:
                     epoch == self._backup_read_cache_epoch
                     and generation == self._backup_presence_cache_gen
                 ):
-                    self._backup_presence_cache.add(key)
+                    self._backup_presence_cache[key] = time.monotonic()
         return present
 
     def _read_account_credentials(

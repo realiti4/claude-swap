@@ -736,6 +736,8 @@ class AutoSwitchEngine:
         # Earliest rotation deadline the last keepalive pass scheduled; the
         # loop's sleep never runs past it.
         self._keepalive_deadline: float | None = None
+        # Credential bytes a freshen proved dead, by slot, for `_quarantine`.
+        self._condemned_creds: dict[str, str] = {}
         # When each quarantined slot's credential was last compared, so a
         # dead slot is re-read once per KEEPALIVE_RETRY_S, not every tick.
         self._quarantine_checked_at: dict[str, float] = {}
@@ -769,7 +771,12 @@ class AutoSwitchEngine:
     # -- quarantine -----------------------------------------------------------
 
     def _quarantine(self, number: str, email: str, reason: str) -> None:
-        creds = self.switcher.read_account_credentials(number, email)
+        # A freshen that condemned a generation names it; reading the store
+        # now could fingerprint a healthy re-add that landed after the check,
+        # and recovery would then never release it.
+        creds = self._condemned_creds.pop(number, None)
+        if creds is None:
+            creds = self.switcher.read_account_credentials(number, email)
         fingerprint = _refresh_fingerprint(creds) if creds else None
 
         def add(state: dict) -> None:
@@ -891,15 +898,15 @@ class AutoSwitchEngine:
                 return "identity-conflict"
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
-            stored_fp = oauth.credential_fingerprint(
-                self.switcher.read_account_credentials(number, email)
-            )
+            stored = self.switcher.read_account_credentials(number, email)
+            stored_fp = oauth.credential_fingerprint(stored)
             if outcome.consumed_fp and stored_fp != outcome.consumed_fp:
                 # A re-add replaced the dead generation while it was on the
                 # wire. The quarantine fingerprints what is stored now, so
                 # condemning here would bind the dead verdict to the healthy
                 # replacement; judge that one next pass instead.
                 return "transient"
+            self._condemned_creds[number] = stored
             return "invalid_grant"
         if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
@@ -983,7 +990,11 @@ class AutoSwitchEngine:
                 # Its session rotates its own copy; look again later.
                 due[key] = [retry_at, False]
                 continue
-            creds = self.switcher.read_account_credentials(number, email)
+            creds, unreadable = self.switcher.read_account_credentials_ex(number, email)
+            if unreadable:
+                # A locked or denied Keychain says nothing about the login.
+                due[key] = [retry_at, True]
+                continue
             data = oauth.extract_oauth_data(creds) if creds else None
             expires_at = (data or {}).get("expiresAt")
             if (
@@ -2837,7 +2848,10 @@ class AutoSwitchEngine:
         # A blocked or idle-hold sleep can run 10 minutes; a rotation deadline
         # inside it would leave the token to Claude Code's own window.
         until_deadline = self._keepalive_deadline - self.clock()
-        return min(delay, max(until_deadline, self.settings.interval_seconds))
+        # Floored at the planner's urgent cadence, not the configured interval:
+        # a one-hour interval must not sleep through a deadline two minutes out.
+        floor = min(self.settings.interval_seconds, poll_policy.URGENT_INTERVAL_S)
+        return min(delay, max(until_deadline, floor))
 
     def _cadence_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

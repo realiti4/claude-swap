@@ -1313,6 +1313,18 @@ class TestRun:
         )
         assert call.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
 
+    @pytest.mark.parametrize("override", ["", "/other/profile"])
+    def test_session_launch_drops_the_secure_storage_override(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, override,
+    ):
+        # Set or empty, it would point Claude at a credential store other than
+        # the profile the launch just validated.
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", override)
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in exc.value.env
+
     def test_fast_path_for_active_account(
         self, manager, capture_exec, monkeypatch, capsys
     ):
@@ -1935,6 +1947,19 @@ def history_setup(share_setup, temp_home: Path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
 class TestShareHistoryPosix:
+    def test_a_held_sharing_lock_defers_sharing_instead_of_failing(
+        self, history_setup, monkeypatch
+    ):
+        from claude_swap.locking import FileLock
+
+        source, session_dir, mgr = history_setup
+        monkeypatch.setattr(
+            session_mod, "FileLock", lambda path: FileLock(path, timeout=0.2)
+        )
+        with FileLock(mgr.switcher.backup_dir / ".share-sync.lock"):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+        assert not (session_dir / "projects").exists()
+
     def test_not_shared_by_default(self, history_setup):
         source, session_dir, mgr = history_setup
         mgr._sync_sharing(session_dir, share=True)

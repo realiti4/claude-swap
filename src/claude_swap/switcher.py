@@ -1750,6 +1750,12 @@ class ClaudeAccountSwitcher:
         """Public wrapper for session bootstrap. Empty string when missing."""
         return self._read_account_credentials(account_num, email)
 
+    def read_account_credentials_ex(
+        self, account_num: str, email: str
+    ) -> tuple[str, bool]:
+        """Public wrapper: ``(credentials, unreadable)``; absent reads ``("", False)``."""
+        return self._read_account_credentials_ex(account_num, email)
+
     def write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -2428,6 +2434,16 @@ class ClaudeAccountSwitcher:
 
         try:
             with FileLock(self.lock_file):
+                if self.current_account_number() == str(account_num):
+                    # The slot became the default login after the caller's
+                    # snapshot (a switch landed between them). Rotating only
+                    # its backup would leave Claude Code holding the spent
+                    # grant; the active path refreshes it under CC's locks.
+                    self._logger.info(
+                        "Account %s became active; leaving its refresh to the "
+                        "active path.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "transient")
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -3783,8 +3799,14 @@ class ClaudeAccountSwitcher:
 
     @staticmethod
     def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
-        """Return display tag for an account's org context."""
-        return org_name if org_name else "personal"
+        """Return display tag for an account's org context.
+
+        A token registered with ``--org`` knows its organization's uuid but not
+        its name; it shows the uuid's prefix rather than claiming "personal".
+        """
+        if org_name:
+            return org_name
+        return f"org {org_uuid[:8]}" if org_uuid else "personal"
 
     def _find_account_by_alias(self, alias: str) -> str | None:
         """Return the account number whose alias matches (case-insensitive), if any.
@@ -4232,7 +4254,7 @@ class ClaudeAccountSwitcher:
             if not email:
                 raise ValidationError("--org needs the account's real --email")
             try:
-                uuid.UUID(org_uuid)
+                org_uuid = str(uuid.UUID(org_uuid))
             except ValueError as exc:
                 raise ValidationError(f"Invalid organization uuid: {org_uuid}") from exc
 

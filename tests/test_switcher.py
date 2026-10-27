@@ -5786,6 +5786,25 @@ class TestSwitchSkipsBrokenSlots:
         writer._store._delete_account_credentials("1", "a@example.com")
         assert s._account_is_switchable("1") is False
 
+    def test_presence_is_rechecked_after_an_external_keychain_delete(
+        self, temp_home: Path
+    ):
+        # Keychain Access deleting the item touches neither generation; the
+        # cached presence must still lapse within the display TTL.
+        from claude_swap.credentials import BACKUP_READ_CACHE_TTL_S, SECURITY_SERVICE
+
+        s = self._setup(temp_home)
+        s.platform = Platform.MACOS
+        self._seed(s, 1, "a@example.com")
+        with patch("claude_swap.credentials.time.monotonic", return_value=1.0):
+            assert s._account_is_switchable("1") is True
+        macos_keychain.delete_password(
+            SECURITY_SERVICE, s._store._backup_username("1", "a@example.com")
+        )
+        later = 1.0 + BACKUP_READ_CACHE_TTL_S + 1
+        with patch("claude_swap.credentials.time.monotonic", return_value=later):
+            assert s._account_is_switchable("1") is False
+
     def test_switchability_presence_survives_display_cache_expiry(
         self, temp_home: Path
     ):

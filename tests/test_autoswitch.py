@@ -17,6 +17,7 @@ from claude_swap.locking import FileLock
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     KEEPALIVE_LEAD_MS,
+    KEEPALIVE_RETRY_S,
     NO_RESET_FALLBACK_S,
     SPENT_HEADROOM_PCT,
     AllExhaustedEvent,
@@ -7497,3 +7498,63 @@ class TestKeepalive:
             h.tick_with_usage({"1": _usage(10)})
         assert self.live_path.read_text() == live_before
         assert "sk-2\"" in h.switcher.read_account_credentials("2", "b@example.com")
+
+    def test_a_slot_activated_mid_tick_is_not_rotated_as_idle(self, temp_home):
+        # The tick snapshot saw slot 2 idle; a switch then made it the default
+        # login. Rotating only its backup would strand Claude on the spent grant.
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000, idle_expires_in_ms=60_000
+        )
+        h.make_live("b@example.com", 2)
+        backup_before = h.switcher.read_account_credentials("2", "b@example.com")
+        with self._rotate(h):
+            status = h.engine._freshen_target("2", "b@example.com", KEEPALIVE_LEAD_MS)
+        assert status == "transient"
+        assert h.switcher.read_account_credentials("2", "b@example.com") == backup_before
+
+    def test_quarantine_names_the_dead_generation_not_a_later_re_add(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000, idle_expires_in_ms=60_000
+        )
+        healthy = self._blob("2-readded", int(h.clock() * 1000) + 8 * 3_600_000)
+        real_freshen = h.engine._freshen_target
+
+        def freshen_then_re_add(number, email, lead_ms=None):
+            status = real_freshen(number, email, lead_ms)
+            # The user re-adds the account between the verdict and the quarantine.
+            h.switcher._write_account_credentials("2", "b@example.com", healthy)
+            return status
+
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ), patch.object(h.engine, "_freshen_target", side_effect=freshen_then_re_add):
+            h.tick_with_usage({"1": _usage(10)})
+        assert "2" in h.state().get("quarantine", {})
+
+        h.clock.advance(KEEPALIVE_RETRY_S + 1)
+        h.tick_with_usage({"1": _usage(10)})
+        assert "2" not in h.state().get("quarantine", {})
+
+    def test_a_long_interval_never_sleeps_through_a_rotation(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000,
+            idle_expires_in_ms=KEEPALIVE_LEAD_MS + 120_000, interval_seconds=3600.0,
+        )
+        with self._rotate(h):
+            h.tick_with_usage({"1": _usage(10)})
+        assert h.engine._next_delay(TickOutcome.NO_ACTION) <= 120
+
+    def test_an_unreadable_backup_is_retried_not_parked(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000, idle_expires_in_ms=60_000
+        )
+        real = h.switcher.read_account_credentials_ex
+
+        def locked_for_slot_2(number, email):
+            return ("", True) if number == "2" else real(number, email)
+
+        with patch.object(h.switcher, "read_account_credentials_ex", side_effect=locked_for_slot_2):
+            h.tick_with_usage({"1": _usage(10)})
+        due = h.state()["keepaliveDue"]["2|b@example.com"]
+        assert due == [h.clock() + KEEPALIVE_RETRY_S, True]

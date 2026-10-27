@@ -36,6 +36,7 @@ session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -53,6 +54,7 @@ from claude_swap.claude_locks import claude_credentials_lock, proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    LockError,
     SessionError,
 )
 from claude_swap.fsutil import atomic_write_text
@@ -695,6 +697,9 @@ class SessionManager:
         env = {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
+        # Set or empty, it points Claude at another profile's credential store
+        # than the session just validated.
+        env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
 
@@ -1272,7 +1277,19 @@ class SessionManager:
         # Separate from the bootstrap lock: setup already holds that lock.
         # All profiles share the source, so migrations and link changes must
         # serialize, including manifest updates and the destination re-check.
-        with FileLock(self.switcher.backup_dir / ".share-sync.lock"):
+        with contextlib.ExitStack() as held:
+            try:
+                held.enter_context(
+                    FileLock(self.switcher.backup_dir / ".share-sync.lock")
+                )
+            except LockError:
+                # Sharing is optional: a long migration elsewhere must not
+                # fail this launch.
+                self._logger.warning(
+                    "Another launch holds the sharing lock; leaving this "
+                    "profile's shared links as they are for this launch."
+                )
+                return
             managed = self._read_manifest(manifest_path)
             # A flag turned off since last launch: remove the links we created
             # for it (never plain files/dirs the user accumulated themselves).

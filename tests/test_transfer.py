@@ -2281,3 +2281,26 @@ class TestSetupTokensReadFleetUsage:
                 "sk-ant-oat01-bob", email="bob@example.com", org_uuid=self.ORG
             )
         assert s._read_account_credentials("1", "bob@example.com") == before
+
+    def test_an_org_token_is_not_labeled_personal(self, temp_home: Path, capsys):
+        s = _linux_switcher(temp_home)
+        s.add_account_from_token(
+            "sk-ant-oat01-bob", email="bob@example.com", slot=2, org_uuid=self.ORG
+        )
+        assert "bob@example.com [org 11111111]" in capsys.readouterr().out
+
+    def test_an_uppercase_org_still_matches_the_login_s_readings(self, temp_home: Path):
+        from claude_swap.transfer import import_usage
+
+        org = "f34044fb-1128-46d7-bcbd-26a27f615438"
+        s = _linux_switcher(temp_home)
+        s.add_account_from_token(
+            "sk-ant-oat01-bob", email="bob@example.com", slot=2, org_uuid=org.upper(),
+        )
+        path = temp_home / "usage.json"
+        path.write_text(_usage_document(
+            _usage_row("bob@example.com", org, pct=42.0, age_s=30.0)
+        ), encoding="utf-8")
+        import_usage(s, str(path))
+        entry = s._usage_store.entries({"2": ("bob@example.com", org)})["2"]
+        assert entry.last_good["five_hour"]["pct"] == 42.0
