@@ -72,17 +72,17 @@ TAKEOVER_STALENESS_S = 5.0
 _logger = logging.getLogger("claude-swap")
 
 
-def credentials_lock_dir() -> Path:
+def credentials_lock_dir(config_home: Path | None = None) -> Path:
     """Legacy credential lock (``~/.claude.lock``) — CC still takes it for
     compatibility; external exclusion today rests on this one."""
-    home = get_claude_config_home()
+    home = config_home or get_claude_config_home()
     return home.parent / (home.name + ".lock")
 
 
-def oauth_refresh_lock_dir() -> Path:
+def oauth_refresh_lock_dir(config_home: Path | None = None) -> Path:
     """Claude Code's primary OAuth refresh lock
     (``<config-home>/.oauth_refresh.lock``, 2.1.218+)."""
-    return get_claude_config_home() / ".oauth_refresh.lock"
+    return (config_home or get_claude_config_home()) / ".oauth_refresh.lock"
 
 
 def config_lock_dir() -> Path:
@@ -196,7 +196,9 @@ def proper_lockfile(
 
 
 @contextmanager
-def claude_credentials_lock(*, timeout: float | None = None):
+def claude_credentials_lock(
+    *, timeout: float | None = None, config_home: Path | None = None
+):
     """Hold Claude Code's credential-refresh locks, in CC's own order.
 
     2.1.218 takes ``<config-home>/.oauth_refresh.lock`` first, then the
@@ -205,15 +207,18 @@ def claude_credentials_lock(*, timeout: float | None = None):
     cswap and a waiting Claude Code can never deadlock against each other,
     and exclusion holds even after CC drops the legacy lock. Both use CC's
     60s staleness — never steal a lock a live CC may still hold.
+
+    ``config_home`` names another profile's config dir (a ``cswap run``
+    session's) instead of the one this process resolves.
     """
     with (
         proper_lockfile(
-            oauth_refresh_lock_dir(),
+            oauth_refresh_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
         proper_lockfile(
-            credentials_lock_dir(),
+            credentials_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),

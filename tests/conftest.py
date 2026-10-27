@@ -575,6 +575,14 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+def make_live(session_dir: Path, pid: int | None = None) -> None:
+    """Simulate a live claude instance in a profile (own PID is always alive)."""
+    pid = pid or os.getpid()
+    pid_dir = session_dir / "sessions"
+    pid_dir.mkdir(parents=True, exist_ok=True)
+    (pid_dir / f"{pid}.json").write_text(json.dumps({"pid": pid}))
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

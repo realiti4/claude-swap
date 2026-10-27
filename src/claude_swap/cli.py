@@ -145,6 +145,7 @@ Examples:
   cswap run 2 --no-share
   cswap run 2 --share-history
   cswap run 2 --require-session
+  cswap run 2 --own-login
   cswap run 2 -- --resume
         """,
     )
@@ -187,11 +188,23 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--own-login",
+        action="store_true",
+        help=(
+            "Log the account's session profile in on its own (a browser "
+            "login), instead of launching. Its tokens are then independent "
+            "of the stored account, so it can run while the same account is "
+            "the default login, and switching to that account stays allowed"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args(head)
+    if args.own_login and args.account is None:
+        parser.error("--own-login needs an account (NUM|EMAIL)")
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -200,6 +213,14 @@ Examples:
         from claude_swap.session import SessionManager
 
         manager = SessionManager(switcher)
+
+        if args.own_login:
+            manager.own_login(args.account)
+            print(
+                f"{accent('Done:')} account {args.account}'s session profile "
+                "now has its own login."
+            )
+            return
 
         if args.account is not None:
             manager.run(

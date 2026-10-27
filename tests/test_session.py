@@ -32,8 +32,12 @@ from claude_swap.session import (
     SHARE_MANIFEST,
     SessionManager,
     _probe_env,
+    has_own_login,
+    is_session_stale,
     keychain_service_name,
+    mark_session_stale,
     profile_is_quiescent,
+    read_session_credentials,
     read_session_identity,
     scan_live_sessions,
     session_dir_for,
@@ -42,6 +46,7 @@ from claude_swap.session import (
     stale_marker_for,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
+from tests.conftest import make_live
 
 ACCOUNT_EMAIL = "account2@example.com"
 ACCOUNT_NUM = "2"
@@ -171,14 +176,6 @@ def refresh_rotates(monkeypatch):
         ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
     )
     return calls
-
-
-def make_live(session_dir: Path, pid: int | None = None) -> None:
-    """Simulate a live claude instance in a profile (own PID is always alive)."""
-    pid = pid or os.getpid()
-    pid_dir = session_dir / "sessions"
-    pid_dir.mkdir(parents=True, exist_ok=True)
-    (pid_dir / f"{pid}.json").write_text(json.dumps({"pid": pid}))
 
 
 def _mark_stale(session_dir: Path, legacy_location: bool = False) -> None:
@@ -1289,6 +1286,13 @@ def capture_exec(monkeypatch):
     )
 
 
+def _write_default_login(home: Path) -> None:
+    """Make account 2 the default login (``~/.claude.json``)."""
+    (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": ACCOUNT_EMAIL, "organizationUuid": ORG_UUID,
+    }}))
+
+
 class TestRun:
     def test_claude_not_on_path(self, manager, monkeypatch):
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
@@ -1356,7 +1360,8 @@ class TestRun:
         capsys,
     ):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-        # Even a matching identity must NOT fast-path when the env var is set.
+        # The config CLAUDE_CONFIG_DIR names matching is not the default login
+        # matching: only the latter may fast-path.
         monkeypatch.setattr(
             manager.switcher,
             "_get_current_account",
@@ -1370,6 +1375,33 @@ class TestRun:
         )
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
         assert "overriding it for this launch" in capsys.readouterr().out
+
+    def test_preset_config_dir_fast_paths_the_default_login(
+        self, manager, capture_exec, monkeypatch, temp_home,
+        auth_status_tracks_seed, refresh_rotates, capsys
+    ):
+        """The fast path asks about the DEFAULT login, which a preset
+        CLAUDE_CONFIG_DIR does not change. A profile for the account that is
+        already the default login would hold a second copy of its single-use
+        refresh token; the first refresh logs the other copy out."""
+        _write_default_login(temp_home)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "already the active default login" in capsys.readouterr().out
+
+    def test_preset_config_dir_require_session_refuses_the_default_login(
+        self, manager, capture_exec, monkeypatch, temp_home,
+        auth_status_tracks_seed, refresh_rotates
+    ):
+        _write_default_login(temp_home)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+
+        with pytest.raises(SessionError, match="active default login"):
+            manager.run("2", [], require_session=True)
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
@@ -1541,23 +1573,40 @@ class TestGuards:
         assert block_real_keychain.get_password(service, account) is None
         assert not seeded_switcher.backup_dir.exists()
 
-    def test_switch_warns_on_live_target_but_completes(
-        self, seeded_switcher, monkeypatch, capsys
-    ):
+    def test_switch_refuses_live_target(self, seeded_switcher, monkeypatch):
+        """The default login and a live session would hold ONE refresh token.
+        Refresh tokens are single-use, so whichever copy refreshes second gets
+        invalid_grant and Claude Code wipes it — the default login reads as
+        logged out within one access-token lifetime, not "if" anything."""
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         make_live(session_dir)
         # Direct-activation path (no live default identity) keeps this focused.
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
-        monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
 
-        seeded_switcher._perform_switch(ACCOUNT_NUM)
+        with pytest.raises(SwitchError, match="live session-mode"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
 
-        out = capsys.readouterr().out
-        assert "live session-mode" in out
         data = seeded_switcher._get_sequence_data()
-        assert data["activeAccountNumber"] == int(ACCOUNT_NUM)
+        assert data["activeAccountNumber"] == 1
+
+    def test_switch_refuses_target_with_unreadable_session_record(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Not knowing whether a session is live is not knowing it isn't."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        (session_dir / "sessions").mkdir(parents=True)
+        (session_dir / "sessions" / "123.json").write_text("{not json")
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="could not be read"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        data = seeded_switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
 
     def test_switch_refuses_live_target_whose_profile_is_ahead(
         self, seeded_switcher, monkeypatch
@@ -3009,3 +3058,197 @@ def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypat
     with pytest.raises(KeyboardInterrupt):
         mgr._write_manifest(tmp_path / ".cswap-shared.json", ["a"])
     assert not list(tmp_path.glob("*.tmp"))
+
+
+# -- own-login profiles ------------------------------------------------------
+
+OWN_CREDS = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "own-access",
+            "refreshToken": "own-refresh",
+            "expiresAt": 9999999999999,
+        }
+    }
+)
+
+
+@pytest.fixture
+def fake_claude_login(monkeypatch):
+    """Fake `claude auth login` and `claude auth status --json`.
+
+    A login writes OWN_CREDS and the identity in ``who`` into the
+    CLAUDE_CONFIG_DIR it runs under, as claude does; status reports the
+    identity the config dir's .claude.json records.
+    """
+    who = {"email": ACCOUNT_EMAIL, "org": ORG_UUID}
+    logins: list[dict] = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        config_dir = Path(env["CLAUDE_CONFIG_DIR"])
+        if cmd[1:3] == ["auth", "login"]:
+            logins.append({"cmd": cmd, "config_dir": config_dir})
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / ".credentials.json").write_text(OWN_CREDS)
+            (config_dir / ".claude.json").write_text(json.dumps({"oauthAccount": {
+                "emailAddress": who["email"], "organizationUuid": who["org"],
+            }}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        identity = read_session_identity(config_dir)
+        if (config_dir / ".credentials.json").exists() and identity:
+            payload = {"loggedIn": True, "authMethod": "claude.ai",
+                       "email": identity[0], "orgId": identity[1]}
+        else:
+            payload = {"loggedIn": False, "authMethod": "none"}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(session_mod.shutil, "which", lambda name: f"/fake/bin/{name}")
+    return SimpleNamespace(who=who, logins=logins)
+
+
+def _profile(manager) -> Path:
+    return session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+
+class TestOwnLogin:
+    """`cswap run N --own-login`: the profile gets a login of its own, a token
+    family independent of the slot's backup, so it can run alongside the same
+    account as the default login and nothing ever syncs the two."""
+
+    def test_installs_a_verified_login_and_marks_the_profile(
+        self, manager, fake_claude_login
+    ):
+        manager.own_login(ACCOUNT_NUM)
+
+        profile = _profile(manager)
+        assert read_session_credentials(profile) == OWN_CREDS
+        assert has_own_login(profile)
+        # The login ran in a scratch dir, for this account, and is gone.
+        (login,) = fake_claude_login.logins
+        assert login["config_dir"] != profile
+        assert not login["config_dir"].exists()
+        assert login["cmd"][-2:] == ["--email", ACCOUNT_EMAIL]
+        # The slot's own credential is untouched.
+        assert manager.switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+    def test_refuses_a_login_as_another_account(self, manager, fake_claude_login):
+        fake_claude_login.who["email"] = "someone-else@example.com"
+
+        with pytest.raises(SessionError, match="someone-else@example.com"):
+            manager.own_login(ACCOUNT_NUM)
+
+        profile = _profile(manager)
+        assert read_session_credentials(profile) is None
+        assert not has_own_login(profile)
+        assert not fake_claude_login.logins[0]["config_dir"].exists()
+
+    def test_replaces_a_live_profile_credential_in_place(
+        self, manager, fake_claude_login
+    ):
+        """Converting a profile that chain agents are running in: they pick the
+        new login up from the store on their next refresh."""
+        profile = _profile(manager)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text(CREDS)
+        (profile / ".claude.json").write_text(CONFIG)
+        make_live(profile)
+
+        manager.own_login(ACCOUNT_NUM)
+
+        assert read_session_credentials(profile) == OWN_CREDS
+        assert has_own_login(profile)
+        # The profile's own history/settings survive.
+        assert json.loads((profile / ".claude.json").read_text())["theme"] == "light"
+
+    def test_keeps_the_slots_newer_generation_the_profile_held(
+        self, manager, fake_claude_login
+    ):
+        """A session that refreshed holds the slot's newest token generation
+        and the backup a consumed one. Replacing the profile's credential
+        without saving that generation first leaves the slot dead."""
+        profile = _profile(manager)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text(ROTATED_CREDS)
+        (profile / ".claude.json").write_text(CONFIG)
+        make_live(profile)
+
+        manager.own_login(ACCOUNT_NUM)
+
+        assert manager.switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == ROTATED_CREDS
+        assert read_session_credentials(profile) == OWN_CREDS
+
+    def test_setup_session_never_reseeds_an_own_login_profile(
+        self, manager, fake_claude_login, refresh_rotates
+    ):
+        manager.own_login(ACCOUNT_NUM)
+        profile = _profile(manager)
+        mark_session_stale(profile)
+
+        manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert refresh_rotates == []  # the slot's grant is not spent on it
+        assert read_session_credentials(profile) == OWN_CREDS
+
+    def test_run_keeps_an_own_login_profile_for_the_default_login_account(
+        self, manager, fake_claude_login, capture_exec, monkeypatch
+    ):
+        manager.own_login(ACCOUNT_NUM)
+        monkeypatch.setattr(
+            manager.switcher, "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run(ACCOUNT_NUM, [])
+
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(_profile(manager))
+
+    def test_a_new_backup_leaves_an_own_login_profile_alone(
+        self, manager, fake_claude_login
+    ):
+        manager.own_login(ACCOUNT_NUM)
+        profile = _profile(manager)
+
+        manager.switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+        )
+
+        assert read_session_credentials(profile) == OWN_CREDS
+        assert not is_session_stale(profile)
+
+    def test_switch_allows_a_target_whose_live_session_has_its_own_login(
+        self, manager, fake_claude_login, monkeypatch
+    ):
+        manager.own_login(ACCOUNT_NUM)
+        make_live(_profile(manager))
+        switcher = manager.switcher
+        monkeypatch.setattr(switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(switcher, "list_accounts", lambda **kw: None)
+
+        switcher._perform_switch(ACCOUNT_NUM)
+
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+        assert "2" in switcher.switchable_account_numbers()
+
+    def test_an_own_login_profile_is_never_adopted_into_the_backup(
+        self, manager, fake_claude_login
+    ):
+        """Its tokens are newer than the backup's, but a different family:
+        adopting them would put one refresh token in two places again."""
+        manager.own_login(ACCOUNT_NUM)
+        switcher = manager.switcher
+
+        assert switcher._session_profile_ahead(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID
+        ) is None
+        assert not switcher._adopt_session_credential(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID
+        )
+        assert switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
