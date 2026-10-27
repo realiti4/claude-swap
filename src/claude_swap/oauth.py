@@ -18,6 +18,13 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# How long a refresh POST waits for its reply unless the caller passes a
+# tighter budget. The grant is single-use, so a request that reached the server
+# cannot be taken back: giving up on a slow reply discards the only copy of the
+# successor while the server retires the token we still hold, and the slot then
+# needs a fresh /login. Waiting is the cheap side of that trade. 30 s is what
+# Claude Code gives the same request (`timeout:30000` in 2.1.290).
+OAUTH_REFRESH_TIMEOUT_S = 30.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -165,13 +172,16 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = OAUTH_REFRESH_TIMEOUT_S
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
-    contenders' acquire timeout (see ``_fetch_active_usage``).
+    contenders' acquire timeout (see ``_fetch_active_usage``). The consume
+    gate is the deliberate exception: it keeps the default under its own
+    lock, and a contender that gives up first defers (see
+    ``ClaudeAccountSwitcher.consume_backup_grant``).
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -240,10 +250,48 @@ def try_refresh_oauth_credentials(
             # keeps its own kind and lands no strike.
             if err in ("invalid_grant", "invalid_client"):
                 return RefreshOutcome(None, err)
+        if e.code >= 500:
+            # Not a verdict on the grant either: a gateway can report an error
+            # for a request the origin already acted on.
+            _warn_grant_fate_unknown(credentials, f"HTTP {e.code}")
+        return RefreshOutcome(None, "transient")
+    except urllib.error.URLError as e:
+        # The request did not go out whole: urllib wraps resolve, connect, TLS
+        # and send failures in URLError and leaves a failure while reading the
+        # reply unwrapped. No grant was spent, so this is the ordinary
+        # offline case and stays quiet.
+        _logger.debug("OAuth refresh not sent: %r", e)
         return RefreshOutcome(None, "transient")
     except Exception as e:
+        # The request went out and no usable reply came back: a timeout or
+        # reset while waiting, or a reply that could not be read.
         _logger.debug("OAuth refresh failed: %r", e)
+        _warn_grant_fate_unknown(credentials, type(e).__name__)
         return RefreshOutcome(None, "transient")
+
+
+def _warn_grant_fate_unknown(credentials: str, what: str) -> None:
+    """Log a refresh that went out and came back without a verdict on the grant.
+
+    The outcome stays ``transient``: a retry is the only move either way. But
+    a timeout, a reset or a server error is not proof that nothing was spent,
+    and if the server did rotate the grant, the next refresh of these same
+    bytes gets invalid_grant. WARNING is a level the default log keeps, so
+    that later strike can be traced back to this exchange.
+
+    This module is not told which account it serves, so the line carries the
+    head of the credential fingerprint ("sha256:" and 12 hex digits): the
+    value the usage store writes as ``struckFingerprint``. ``what`` is a
+    status or an exception type name, never a repr: a decode error's repr is
+    the reply body, and a reply body can hold tokens.
+    """
+    _logger.warning(
+        "OAuth refresh for %s got no usable reply (%s). The refresh token "
+        "on disk may now be spent; if the next refresh fails with "
+        "invalid_grant, re-run `cswap --add-account` after logging in.",
+        credential_fingerprint(credentials)[:19],
+        what,
+    )
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:
