@@ -1317,3 +1317,58 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
             outcome, _ = _tick(h, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.ERROR
         assert any(isinstance(e, ErrorEvent) for e in h.events)
+
+
+class TestDisabledActivePollCadence:
+    def test_disabled_active_uses_its_line_for_real_poll_plans(
+        self, temp_home, monkeypatch
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine = h._make_engine()
+        # This policy change lands after the engine starts, as it would from
+        # another cswap process. The disabled account remains the active login.
+        h.switcher.set_account_threshold("1", 50.0)
+        h.switcher.set_account_disabled("1", True)
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *args: [])
+        usage = {"1": _usage(34.0), "2": _usage(10.0)}
+        counts: dict[str, int] = {}
+
+        def fetch(num, _email, _creds, **_kwargs):
+            counts[num] = counts.get(num, 0) + 1
+            return oauth.UsageOutcome(usage[num])
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=fetch):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+            usage["1"] = _usage(40.0)
+            h.clock.advance(180)
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+            entry = h.switcher.usage_entries_by_account(fetch=set())["1"]
+            assert entry.poll_interval_s == pytest.approx(60.0)
+
+            h.clock.advance(60)
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+            assert counts["1"] == 3
+
+    def test_initial_and_session_pins_include_disabled_active(self, temp_home):
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 50.0)
+        h.switcher.set_account_disabled("1", True)
+        h.engine = h._make_engine()
+
+        assert h.switcher._poll_inputs_override[0] == pytest.approx(50.0)
+        h.engine.apply_threshold(70.0)
+        assert h.switcher._poll_inputs_override[0] == pytest.approx(50.0)
+
+    def test_only_disabled_active_uses_its_effective_threshold(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        h.switcher.set_account_threshold("1", 99.0)
+        h.switcher.set_account_disabled("1", True)
+        h.engine = h._make_engine()
+
+        assert h.switcher._poll_inputs_override[0] == pytest.approx(99.0)

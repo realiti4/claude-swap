@@ -3542,3 +3542,59 @@ def test_concurrent_history_migrations_keep_shared_transcripts(
     assert (project / "aaa.jsonl").read_text() == "main-a\n"
     assert (project / "bbb.jsonl").read_text() == "profile-b\n"
     assert (session_dir / "projects").readlink() == source / "projects"
+
+
+def test_missing_session_profile_skips_probes_on_repeated_sweeps(
+    seeded_switcher, monkeypatch
+):
+    profile = seeded_switcher._session_dir(ACCOUNT_NUM, ACCOUNT_EMAIL)
+    assert not profile.exists()
+    probes = []
+    original_has_own_login = session_mod.has_own_login
+    original_scan = session_mod.scan_live_sessions
+
+    def has_own_login_spy(session_dir):
+        probes.append(("own-login", session_dir))
+        return original_has_own_login(session_dir)
+
+    def scan_spy(session_dir):
+        probes.append(("scan", session_dir))
+        return original_scan(session_dir)
+
+    monkeypatch.setattr(session_mod, "has_own_login", has_own_login_spy)
+    monkeypatch.setattr(session_mod, "scan_live_sessions", scan_spy)
+
+    assert seeded_switcher.switchable_account_numbers() == [ACCOUNT_NUM]
+    assert seeded_switcher.switchable_account_numbers() == [ACCOUNT_NUM]
+    assert probes == []
+
+
+def test_session_holder_rechecks_profile_between_sweeps(seeded_switcher):
+    profile = seeded_switcher._session_dir(ACCOUNT_NUM, ACCOUNT_EMAIL)
+    assert not profile.exists()
+    assert seeded_switcher.switchable_account_numbers() == [ACCOUNT_NUM]
+
+    records = profile / "sessions"
+    records.mkdir(parents=True)
+    unreadable = records / "9999.json"
+    unreadable.write_text("not json{{{", encoding="utf-8")
+    assert seeded_switcher.switchable_account_numbers() == []
+    assert "could not be read" in seeded_switcher._live_session_holder(
+        ACCOUNT_NUM, ACCOUNT_EMAIL
+    )
+
+    own_login = profile / session_mod.OWN_LOGIN_MARKER
+    own_login.write_text("", encoding="utf-8")
+    assert seeded_switcher.switchable_account_numbers() == [ACCOUNT_NUM]
+    assert seeded_switcher._live_session_holder(ACCOUNT_NUM, ACCOUNT_EMAIL) is None
+
+    own_login.unlink()
+    unreadable.unlink()
+    make_live(profile)
+    assert seeded_switcher.switchable_account_numbers() == []
+    assert str(os.getpid()) in seeded_switcher._live_session_holder(
+        ACCOUNT_NUM, ACCOUNT_EMAIL
+    )
+
+    (records / f"{os.getpid()}.json").unlink()
+    assert seeded_switcher.switchable_account_numbers() == [ACCOUNT_NUM]

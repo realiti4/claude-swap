@@ -5756,6 +5756,54 @@ class TestSwitchSkipsBrokenSlots:
         # Stale sequence reference to a missing account record.
         assert s._account_is_switchable("99") is False
 
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_switchability_checks_presence_without_reading_credentials(
+        self, temp_home: Path, platform: Platform
+    ):
+        s = self._setup(temp_home)
+        s.platform = platform
+        self._seed(s, 1, "a@example.com")
+
+        # A presence-only check can answer even when secret reads are denied.
+        with patch.object(s._store, "_read_account_credentials", return_value=""):
+            assert s._account_is_switchable("1") is True
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_switchability_observes_external_credential_add_and_remove(
+        self, temp_home: Path, platform: Platform
+    ):
+        s = self._setup(temp_home)
+        s.platform = platform
+        self._seed(s, 1, "a@example.com", creds=False)
+        assert s._account_is_switchable("1") is False
+
+        # A separate store does not invalidate this switcher's display cache
+        # or touch sequence.json when it writes/removes the credential.
+        writer = ClaudeAccountSwitcher()
+        writer.platform = platform
+        writer._store._write_account_credentials("1", "a@example.com", "credential")
+        assert s._account_is_switchable("1") is True
+        writer._store._delete_account_credentials("1", "a@example.com")
+        assert s._account_is_switchable("1") is False
+
+    def test_switchability_presence_survives_display_cache_expiry(
+        self, temp_home: Path
+    ):
+        s = self._setup(temp_home)
+        s.platform = Platform.MACOS
+        self._seed(s, 1, "a@example.com")
+        with (
+            patch("claude_swap.credentials.time.monotonic", return_value=1.0),
+            patch.object(macos_keychain, "item_exists", wraps=macos_keychain.item_exists) as presence,
+            patch.object(macos_keychain, "get_password", wraps=macos_keychain.get_password) as reads,
+        ):
+            assert s.switchable_account_numbers() == ["1"]
+            with patch("claude_swap.credentials.time.monotonic", return_value=62.0):
+                assert s.switchable_account_numbers() == ["1"]
+                assert s.switchable_account_numbers() == ["1"]
+            assert presence.call_count == 1
+            assert reads.call_count == 0
+
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
         s = self._setup(temp_home)

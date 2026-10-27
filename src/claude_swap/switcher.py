@@ -954,10 +954,8 @@ class ClaudeAccountSwitcher:
         if not record:
             return False
         email = record.get("email", "")
-        # Eligibility only (the snapshot's `switchable` flag, rotation
-        # candidates): served from the display read cache. Every activation
-        # path re-reads the backup fresh before using it.
-        if not self._read_account_credentials(str(account_num), email, cached=True):
+        # Eligibility needs presence only; activation reads the bytes fresh.
+        if not self._store.account_credentials_exist(str(account_num), email):
             return False
         if not self._read_account_config(str(account_num), email):
             return False
@@ -3078,6 +3076,10 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import has_own_login, scan_live_sessions
 
         session_dir = self._session_dir(account_num, email)
+        # An absent profile has no holder, so avoid probing its own-login
+        # marker and scanning it on every sweep.
+        if not session_dir.exists():
+            return None
         if has_own_login(session_dir):
             return None
         sessions, unreadable = scan_live_sessions(session_dir)
@@ -7991,6 +7993,8 @@ class ClaudeAccountSwitcher:
                             removed_items.append(f"Credential: {username}")
                         except Exception:
                             pass  # Ignore errors during purge
+                        finally:
+                            self._store._drop_backup_read_cache()
 
                 # Best-effort sweep of any pre-migration keyring / Credential
                 # Manager entries left behind by an incomplete keyring → files

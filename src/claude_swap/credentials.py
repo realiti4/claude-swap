@@ -140,16 +140,16 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 # instead of disabling the Keychain for the whole process lifetime.
 KEYCHAIN_RECHECK_COOLDOWN_S = 60.0
 
-# Display/eligibility reads of per-account BACKUP credentials may be served
+# Display reads of per-account BACKUP credentials may be served
 # from a short-lived per-slot cache (`_kc_read_backup(cached=True)`): a
 # dashboard repainting every few seconds must not spawn `security` for every
 # slot on every pass (#496: ~8 spawns/s at 11 accounts, and a stream of killed
-# unlock dialogs once the login keychain locks). Below the usage store's fetch
-# floor (poll_policy.SERVE_TTL_S, 180 s), so a slot's next fetch always
-# re-reads after a rotation that happened inside another process's fetch —
-# and the consume gate re-reads under its lock regardless. Bounds the
-# display's lag behind an external rotation to a minute.
-BACKUP_READ_CACHE_TTL_S = 60.0
+# unlock dialogs once the login keychain locks). Entries are keyed to the
+# backup directory's metadata, which every cswap process touches after each
+# backup write or delete (`_drop_backup_read_cache`), so another process's
+# rotation invalidates them at once; the consume gate re-reads under its lock
+# regardless. The TTL only bounds an edit made outside cswap (Keychain Access).
+BACKUP_READ_CACHE_TTL_S = 15 * 60.0
 
 
 class KeychainBackedOff(macos_keychain.KeychainError):
@@ -384,7 +384,13 @@ class CredentialStore:
         self._backup_read_cache: dict[tuple[str, str], tuple[str, float]] = {}
         self._backup_read_cache_lock = threading.Lock()
         self._backup_read_cache_epoch = 0
-        self._backup_read_cache_gen: tuple[int, int, int] | None = None
+        self._backup_read_cache_gen: (
+            tuple[tuple[int, int, int], tuple[int, int, int] | None] | None
+        ) = None
+        self._backup_presence_cache: set[tuple[str, str]] = set()
+        self._backup_presence_cache_gen: (
+            tuple[tuple[int, int, int], tuple[int, int, int] | None] | None
+        ) = None
         # The cooldown deadline already announced in the log (see
         # KeychainBackedOff): one line per cooldown, not one per skipped read.
         self._backoff_announced_until: float = 0.0
@@ -1103,7 +1109,7 @@ class CredentialStore:
             return None
 
     def _drop_backup_read_cache(self) -> None:
-        """Forget every cached backup read (see ``_kc_read_backup``).
+        """Forget cached backup reads and publish a presence generation.
 
         Runs after each own backup write/delete. The epoch bump also voids a
         fill that was mid-``security`` when the drop landed: its value may
@@ -1111,7 +1117,25 @@ class CredentialStore:
         """
         with self._backup_read_cache_lock:
             self._backup_read_cache.clear()
+            self._backup_presence_cache.clear()
             self._backup_read_cache_epoch += 1
+        # File writes/deletes already change this directory's metadata. A
+        # Keychain mutation must do the same so other stores see it without
+        # reading secrets or relying on the display cache's TTL.
+        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
+        self._host.credentials_dir.touch()
+
+    def _backup_presence_generation(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int] | None] | None:
+        try:
+            st = self._host.credentials_dir.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            self._host._logger.warning(f"Failed to stat credentials directory: {e}")
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns), self._registry_generation()
 
     def _kc_read_backup(
         self, account_num: str, email: str, *, cached: bool = False
@@ -1134,8 +1158,8 @@ class CredentialStore:
         bounded burst, not exactly one probe.
 
         ``cached=True`` serves the value from a per-slot cache for up to
-        ``BACKUP_READ_CACHE_TTL_S``. For DISPLAY and ELIGIBILITY reads only —
-        sentinels, the snapshot's ``switchable`` flag, token-status lines.
+        ``BACKUP_READ_CACHE_TTL_S``. For DISPLAY reads only — sentinels and
+        token-status lines. Eligibility checks use ``account_credentials_exist``.
         Anything whose bytes are POSTed, written, activated or compared to
         decide a write reads fresh (the default): the consume gate, the switch
         path, resync/adopt, session bootstrap, export, migrations, and the
@@ -1150,7 +1174,7 @@ class CredentialStore:
         """
         key = (str(account_num), email)
         if cached:
-            generation = self._registry_generation()
+            generation = self._backup_presence_generation()
             now = time.monotonic()
             with self._backup_read_cache_lock:
                 if generation != self._backup_read_cache_gen:
@@ -1263,6 +1287,52 @@ class CredentialStore:
             )
         self._write_backup_enc(account_num, email, credentials)
 
+    def account_credentials_exist(self, account_num: str, email: str) -> bool:
+        """Check backup presence without reading or caching credential bytes.
+
+        Files are checked live. Keychain presence is cached against the backup
+        directory and registry generations; every Keychain write/delete touches
+        that directory. Activation still reads the credential fresh.
+        """
+        try:
+            self._backup_enc_path(account_num, email).stat()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self._host._logger.warning(f"Failed to stat credentials file: {e}")
+        else:
+            return True
+        if self._host.platform != Platform.MACOS:
+            return False
+        key = (str(account_num), email)
+        generation = self._backup_presence_generation()
+        with self._backup_read_cache_lock:
+            if generation != self._backup_presence_cache_gen:
+                self._backup_presence_cache.clear()
+                self._backup_presence_cache_gen = generation
+            if generation is not None and key in self._backup_presence_cache:
+                return True
+            epoch = self._backup_read_cache_epoch
+        if time.monotonic() < self._keychain_disabled_until:
+            return False
+        present = macos_keychain.item_exists(
+            SECURITY_SERVICE, self._backup_username(account_num, email)
+        )
+        # item_exists conflates errors and absence. Cache only positive
+        # observations, and never retain one that raced a mutation.
+        if (
+            present
+            and generation is not None
+            and generation == self._backup_presence_generation()
+        ):
+            with self._backup_read_cache_lock:
+                if (
+                    epoch == self._backup_read_cache_epoch
+                    and generation == self._backup_presence_cache_gen
+                ):
+                    self._backup_presence_cache.add(key)
+        return present
+
     def _read_account_credentials(
         self,
         account_num: str,
@@ -1277,7 +1347,7 @@ class CredentialStore:
         copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
         Linux/WSL/Windows read the ``.enc`` only. ``cached`` lets the Keychain
         half be served from the display read cache (see ``_kc_read_backup``:
-        display/eligibility sites only); the ``.enc`` half is always live.
+        display sites only); the ``.enc`` half is always live.
         """
         enc_file = self._backup_enc_path(account_num, email)
         try:
