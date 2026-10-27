@@ -1118,7 +1118,7 @@ class AutoSwitchEngine:
     def _min_effective_threshold(
         self, thresholds: ThresholdMap | None = None
     ) -> float:
-        """The lowest effective threshold across switchable accounts.
+        """The lowest effective threshold for the active and switchable accounts.
 
         Used only for poll cadence (``set_poll_policy_inputs``), never for a
         switch decision — cadence is fleet-wide, so it has to be tight enough
@@ -1135,7 +1135,12 @@ class AutoSwitchEngine:
             thresholds[num]
             for num in self.switcher.switchable_account_numbers()
         ]
-        return min(values) if values else self.settings.threshold
+        # The active login is polled and can trigger departure even when it
+        # is disabled or otherwise excluded as an automatic switch target.
+        current = self.switcher.current_account_number()
+        if current is not None:
+            values.append(thresholds[current])
+        return min(values) if values else thresholds.default
 
     def _refresh_poll_policy_inputs(self, thresholds: ThresholdMap) -> None:
         """Re-pin poll cadence from this tick's threshold map.
@@ -1158,8 +1163,9 @@ class AutoSwitchEngine:
         Called before ``_collect_scheduled_usage`` so the tick that discovers
         the change also plans on it. The pin itself is a bare attribute write
         (``ClaudeAccountSwitcher.set_poll_policy_inputs``); the only added
-        per-tick cost is one ``switchable_account_numbers()`` read, which
-        ``_tick_inner`` already performs for candidate construction.
+        per-tick work includes identifying the live managed account as well
+        as reading the switchable accounts. A disabled active account still
+        participates in polling and the departure decision.
         """
         self.switcher.set_poll_policy_inputs(
             self._min_effective_threshold(thresholds),

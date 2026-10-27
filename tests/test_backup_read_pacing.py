@@ -378,12 +378,12 @@ class TestDisplaySitesUseTheCache:
         assert [a.switchable for a in snap.accounts] == [True] * n
         assert [a.usage.sentinel for a in snap.accounts] == [None] * n
         assert keychain.live_calls() == 1
-        # N-1 idle backups (_build_accounts_info) + the active slot's backup
-        # (_account_is_switchable). Not N+2: with no strike on the row the
-        # strike scan reads nothing (it used to read the active backup every
-        # pass).
-        assert sum(keychain.backup_calls(i) for i in range(1, n + 1)) == n
-        assert keychain.backup_calls(1) == 1
+        # N-1 idle backups (_build_accounts_info) only: eligibility
+        # (_account_is_switchable) checks presence without reading the active
+        # slot's backup bytes, and with no strike on the row the strike scan
+        # reads nothing (it used to read the active backup every pass).
+        assert sum(keychain.backup_calls(i) for i in range(1, n + 1)) == n - 1
+        assert keychain.backup_calls(1) == 0
 
         keychain.calls.clear()
         snap = s.accounts_snapshot(fetch=set())
