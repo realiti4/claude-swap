@@ -107,6 +107,14 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 KEEPALIVE_LEAD_MS = 15 * 60 * 1000
 # A keepalive that could not finish retries after this, never every tick.
 KEEPALIVE_RETRY_S = 5 * 60
+# A slot with nothing to rotate (API key, setup-token, no recorded expiry, a
+# dead lineage, a systemic refusal) is looked at again after this. A re-added
+# browser login lives about 8 hours, so its first rotation still lands in time.
+KEEPALIVE_PARK_S = 60 * 60
+# Idle rotations per tick: each can wait out oauth.OAUTH_REFRESH_TIMEOUT_S,
+# and the active slot's usage decision runs after them.
+KEEPALIVE_ROTATIONS_PER_TICK = 2
+KEEPALIVE_STATE_KEY = "keepaliveDue"
 
 # Sleep caps around a known quota reset (RESET_SLACK_S lives in poll_policy
 # with the rest of the cadence numbers). Recheck at the exhausted-account poll
@@ -725,9 +733,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
-        # Per-slot time (engine clock, seconds) before which the keepalive
-        # leaves the slot alone: its token's lead point, or a retry backoff.
-        self._keepalive_due_at: dict[str, float] = {}
+        # Earliest rotation deadline the last keepalive pass scheduled; the
+        # loop's sleep never runs past it.
+        self._keepalive_deadline: float | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -825,13 +833,12 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        if self.switcher.live_session_pids_for(number, email):
+        if self.switcher.live_session_holder_for(number, email) is not None:
             # A live `cswap run` session owns this account's token in its own
-            # profile. Auto-activating it as the default login too would put
-            # one rotating refresh token in two config dirs (the stale-copy
-            # failure class) with nobody reading the warning — and its quota
-            # is already being consumed by that session anyway. Manual
-            # switch_to keeps its warn-and-proceed behavior; auto skips.
+            # profile (an unreadable session record counts: it may be live).
+            # Activating it as the default login too, or rotating its backup,
+            # would put one rotating refresh token in two config dirs. An
+            # own-login profile holds a separate family and never blocks.
             return "skip-live-session"
         creds = self.switcher.read_account_credentials(number, email)
         if not creds:
@@ -854,7 +861,7 @@ class AutoSwitchEngine:
         # consults the session profile for a newer generation, and persists
         # via fingerprint CAS — so a freshen racing the collector (or a
         # sibling surface) can no longer double-consume one grant.
-        outcome = self.switcher.consume_backup_grant(number, email, creds)
+        outcome = self.switcher.consume_backup_grant(number, email, creds, lead_ms)
         if outcome.error is None and outcome.credentials:
             # The gate already persisted the successor (or adopted a racing
             # writer's newer lineage) under its own lock.
@@ -867,6 +874,15 @@ class AutoSwitchEngine:
                 return "identity-conflict"
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
+            stored_fp = oauth.credential_fingerprint(
+                self.switcher.read_account_credentials(number, email)
+            )
+            if outcome.consumed_fp and stored_fp != outcome.consumed_fp:
+                # A re-add replaced the dead generation while it was on the
+                # wire. The quarantine fingerprints what is stored now, so
+                # condemning here would bind the dead verdict to the healthy
+                # replacement; judge that one next pass instead.
+                return "transient"
             return "invalid_grant"
         if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
@@ -879,66 +895,97 @@ class AutoSwitchEngine:
             return outcome.error
         return "transient"
 
-    def _keep_logins_alive(self, current: str, quarantined: set[str]) -> None:
+    def _keep_logins_alive(self, current: str, quarantined: set[str], state: dict) -> None:
         """Rotate every OAuth login ahead of its expiry, outside the usage poll.
 
         The active login goes through the collector's locked refresh, idle
         slots through the consume gate ``_freshen_target`` uses. Neither waits
-        on the usage endpoint, so its backoff cannot withhold a rotation. A slot
-        is re-read only at its lead point or retry time, so a quiet tick makes
-        no Keychain calls.
+        on the usage endpoint, so its backoff cannot withhold a rotation. Each
+        slot's next check (its lead point, a retry, or a park) is keyed by slot
+        and email and kept in the state file, so a quiet tick, a fresh
+        ``--once`` process, or a slot swap reads no credential it need not.
         """
         now = self.clock()
         lead_s = KEEPALIVE_LEAD_MS / 1000
         retry_at = now + KEEPALIVE_RETRY_S
-        due = self._keepalive_due_at
+        park_at = now + KEEPALIVE_PARK_S
+        managed = self.switcher.managed_accounts()
+        live_keys = {f"{number}|{email}" for number, email in managed}
+        stored = state.get(KEEPALIVE_STATE_KEY)
+        # [next check ts, whether it is a rotation deadline the sleep must honor]
+        due: dict[str, list] = {
+            key: entry
+            for key, entry in (stored.items() if isinstance(stored, dict) else ())
+            if key in live_keys
+            and isinstance(entry, list)
+            and len(entry) == 2
+            and isinstance(entry[0], (int, float))
+        }
+        rotations = 0
 
-        if due.get(current, 0.0) <= now:
-            status, expires_at_ms = self.switcher.keep_active_login_fresh(
-                KEEPALIVE_LEAD_MS
-            )
-            if status == "refreshed":
-                _logger.info("Keepalive rotated the active login (account %s)", current)
-                due.pop(current, None)
-            elif status == "fresh" and expires_at_ms is not None:
-                due[current] = expires_at_ms / 1000 - lead_s
-            else:
-                if status in ("invalid_grant", "transient"):
-                    _logger.warning(
-                        "Keepalive could not rotate the active login (account %s): %s",
-                        current, status,
+        for number, email in managed:
+            key = f"{number}|{email}"
+            if not email or number in quarantined or due.get(key, [0.0])[0] > now:
+                continue
+            if number == current:
+                if self.switcher.slot_token_dead(number, email):
+                    due[key] = [park_at, False]
+                    continue
+                status, expires_at_ms = self.switcher.keep_active_login_fresh(
+                    KEEPALIVE_LEAD_MS
+                )
+                if status == "fresh":
+                    due[key] = (
+                        [expires_at_ms / 1000 - lead_s, True]
+                        if expires_at_ms is not None
+                        # API keys, setup-tokens, no recorded expiry.
+                        else [park_at, False]
                     )
-                due[current] = retry_at
-
-        idle_slots = dict.fromkeys(
-            self.switcher.switchable_account_numbers()
-            + self.switcher.disabled_account_numbers()
-        )
-        for number in idle_slots:
-            if number == current or number in quarantined or due.get(number, 0.0) > now:
+                elif status == "refreshed":
+                    _logger.info("Keepalive rotated the active login (account %s)", number)
+                    due[key] = [retry_at, True]
+                elif status == "invalid_grant":
+                    _logger.warning(
+                        "Keepalive found the active login (account %s) dead; "
+                        "recorded for failover", number,
+                    )
+                    due[key] = [park_at, False]
+                else:
+                    if status == "transient":
+                        _logger.warning(
+                            "Keepalive could not rotate the active login (account %s)",
+                            number,
+                        )
+                    due[key] = [retry_at, True]
                 continue
-            email = self.switcher.account_email(number)
-            creds = self.switcher.read_account_credentials(number, email) if email else ""
+            if self.switcher.live_session_holder_for(number, email) is not None:
+                # Its session rotates its own copy; look again later.
+                due[key] = [retry_at, False]
+                continue
+            creds = self.switcher.read_account_credentials(number, email)
             data = oauth.extract_oauth_data(creds) if creds else None
-            if not data or not data.get("refreshToken"):
-                # API keys and setup-tokens have no lineage to keep alive.
-                due[number] = retry_at
-                continue
-            expires_at = data.get("expiresAt")
-            if not isinstance(expires_at, (int, float)):
-                # No recorded expiry: nothing to schedule a rotation against.
-                due[number] = retry_at
+            expires_at = (data or {}).get("expiresAt")
+            if (
+                not data
+                or not data.get("refreshToken")
+                or not isinstance(expires_at, (int, float))
+            ):
+                # API keys, setup-tokens, no recorded expiry: no lineage to
+                # rotate until a re-add replaces the credential.
+                due[key] = [park_at, False]
                 continue
             if now * 1000 + KEEPALIVE_LEAD_MS < expires_at:
-                due[number] = expires_at / 1000 - lead_s
+                due[key] = [expires_at / 1000 - lead_s, True]
                 continue
+            if rotations >= KEEPALIVE_ROTATIONS_PER_TICK:
+                due[key] = [now, True]  # next tick, behind this tick's budget
+                continue
+            rotations += 1
             status = self._freshen_target(number, email, KEEPALIVE_LEAD_MS)
             if status == "ok":
                 _logger.info("Keepalive rotated idle account %s", number)
-                due.pop(number, None)
-                continue
-            due[number] = retry_at
-            if status in ("invalid_grant", "identity-conflict"):
+                due[key] = [retry_at, True]
+            elif status in ("invalid_grant", "identity-conflict"):
                 _logger.warning(
                     "Keepalive found account %s unrefreshable (%s); quarantining",
                     number, status,
@@ -946,10 +993,24 @@ class AutoSwitchEngine:
                 self._quarantine(number, email, status)
                 # The tick's candidate selection reads this same set.
                 quarantined.add(number)
-            elif status != "skip-live-session":
+                due[key] = [park_at, False]
+            elif status in _SYSTEMIC_STATUSES:
                 _logger.warning(
                     "Keepalive could not rotate idle account %s: %s", number, status
                 )
+                due[key] = [park_at, False]
+            else:
+                if status != "skip-live-session":
+                    _logger.warning(
+                        "Keepalive could not rotate idle account %s: %s", number, status
+                    )
+                due[key] = [retry_at, status != "skip-live-session"]
+
+        self._keepalive_deadline = min(
+            (at for at, deadline in due.values() if deadline), default=None
+        )
+        if due != stored:
+            self._mutate_state(lambda s: s.__setitem__(KEEPALIVE_STATE_KEY, due))
 
     def _note_token_identity(
         self, number: str, token_account: dict | None
@@ -1214,7 +1275,7 @@ class AutoSwitchEngine:
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
         if not self.dry_run:
-            self._keep_logins_alive(current, quarantined)
+            self._keep_logins_alive(current, quarantined, state)
         entries, usage, headroom = self._collect_scheduled_usage(
             current,
             quarantined,
@@ -2746,6 +2807,15 @@ class AutoSwitchEngine:
         )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
+        delay = self._cadence_delay(outcome)
+        if self._keepalive_deadline is None:
+            return delay
+        # A blocked or idle-hold sleep can run 10 minutes; a rotation deadline
+        # inside it would leave the token to Claude Code's own window.
+        until_deadline = self._keepalive_deadline - self.clock()
+        return min(delay, max(until_deadline, self.settings.interval_seconds))
+
+    def _cadence_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:

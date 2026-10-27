@@ -9972,6 +9972,9 @@ class TestConsumeGate:
         sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
         sdir.mkdir(parents=True, exist_ok=True)
         (sdir / ".credentials.json").write_text(profile_newer)
+        (sdir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com"},
+        }))
         posted = {}
 
         def mock_refresh(credentials, **kw):
@@ -9984,6 +9987,39 @@ class TestConsumeGate:
             s.consume_backup_grant("1", "test@example.com", self._OLD)
 
         assert posted["creds"] == profile_newer
+
+    def test_gate_defers_on_newer_profile_with_unreadable_identity(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A newer profile credential whose identity cannot be read may be
+        another account's /login: the gate neither adopts it into the backup
+        nor POSTs the backup's likely-consumed grant."""
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        foreign_newer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-other", "refreshToken": "rt-other",
+                "expiresAt": 5000,
+            }
+        })
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(foreign_newer)
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert result.error == "transient"
+        assert posted == []
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict

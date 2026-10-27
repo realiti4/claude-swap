@@ -16,10 +16,13 @@ else:
 from claude_swap.exceptions import LockError
 
 
+DEFAULT_LOCK_TIMEOUT_S = 10.0
+
+
 class FileLock:
     """Cross-process file lock using platform-specific APIs."""
 
-    def __init__(self, lock_path: Path, timeout: float = 10.0):
+    def __init__(self, lock_path: Path, timeout: float = DEFAULT_LOCK_TIMEOUT_S):
         self.lock_path = lock_path
         self.timeout = timeout
         self._lock_file: IO | None = None

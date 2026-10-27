@@ -101,6 +101,21 @@ def login_expires_at_iso(credentials: str) -> str | None:
     )
 
 
+def is_newer_generation(candidate: dict, reference: dict) -> bool:
+    """Whether ``candidate`` was issued after ``reference`` in one lineage.
+
+    ``expiresAt`` moves forward on every rotation, so only a strictly later
+    recorded expiry proves it; a missing one proves nothing.
+    """
+    candidate_exp = candidate.get("expiresAt")
+    reference_exp = reference.get("expiresAt")
+    return (
+        isinstance(candidate_exp, (int, float))
+        and isinstance(reference_exp, (int, float))
+        and candidate_exp > reference_exp
+    )
+
+
 def is_oauth_token_expired(
     expires_at: object, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS
 ) -> bool:

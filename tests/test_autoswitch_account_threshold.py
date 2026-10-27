@@ -1297,7 +1297,8 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
         live.switcher.set_account_threshold("1", 50.0)
         live.engine = live._make_engine()
         with patch.object(
-            live.switcher, "live_session_pids_for", return_value=[4242]
+            live.switcher, "live_session_holder_for",
+            return_value="a live session-mode Claude instance (PID 4242)"
         ):
             outcome, _ = _tick(live, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.BLOCKED

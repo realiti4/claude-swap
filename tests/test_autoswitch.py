@@ -13,8 +13,10 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import oauth, poll_policy
+from claude_swap.locking import FileLock
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
+    KEEPALIVE_LEAD_MS,
     NO_RESET_FALLBACK_S,
     SPENT_HEADROOM_PCT,
     AllExhaustedEvent,
@@ -2091,7 +2093,8 @@ class TestFreshening:
         h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
         h.make_live("a@example.com", 1)
         with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
+            h.switcher, "live_session_holder_for",
+            return_value="a live session-mode Claude instance (PID 4242)"
         ), patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
@@ -2106,7 +2109,8 @@ class TestFreshening:
         h.seed(2, "b@example.com", expires_at=1)  # long expired
         h.make_live("a@example.com", 1)
         with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
+            h.switcher, "live_session_holder_for",
+            return_value="a live session-mode Claude instance (PID 4242)"
         ), patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
@@ -6896,7 +6900,7 @@ class TestFreshenRoutesThroughGate:
             }
         })
 
-        def gate(num, email, snapshot):
+        def gate(num, email, snapshot, lead_ms=None):
             gate_calls["args"] = (num, email, snapshot)
             return oauth_mod.RefreshOutcome(fresh, None)
 
@@ -7357,3 +7361,81 @@ class TestKeepalive:
             h.tick_with_usage({"1": _usage(10)})
         assert self.live_path.read_text() == live_before
         assert "sk-2\"" in h.switcher.read_account_credentials("2", "b@example.com")
+
+    def test_dead_active_login_is_recorded_for_failover(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=10 * 60_000, idle_expires_in_ms=3_600_000
+        )
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            h.tick_with_usage({"1": _usage(10)})
+        assert h.switcher.slot_token_dead("1", "a@example.com")
+
+    def test_a_swapped_slot_is_scheduled_by_its_own_login(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000, idle_expires_in_ms=3_600_000
+        )
+        with self._rotate(h):
+            h.tick_with_usage({"1": _usage(10)})
+        # Slot 2 now holds another account whose token is inside the lead;
+        # the schedule kept for b@ must not hold it back.
+        h.seed(2, "c@example.com", expires_at=int(h.clock() * 1000) + 60_000)
+        h.clock.advance(60)
+        with self._rotate(h):
+            h.tick_with_usage({"1": _usage(10)})
+        assert "sk-2-next" in h.switcher.read_account_credentials("2", "c@example.com")
+
+    def test_sleep_never_passes_a_rotation_deadline(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000,
+            idle_expires_in_ms=KEEPALIVE_LEAD_MS + 120_000,
+        )
+        with self._rotate(h):
+            h.tick_with_usage({"1": _usage(10)})
+        # A truly exhausted fleet sleeps NO_RESET_FALLBACK_S between ticks.
+        h.engine._blocked_wait_long = True
+        assert h.engine._next_delay(TickOutcome.BLOCKED) <= 120
+
+    def test_switch_waits_out_an_inflight_rotation_and_activates_its_successor(
+        self, temp_home
+    ):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000, idle_expires_in_ms=3_600_000
+        )
+        successor = self._blob("2-next", int(time.time() * 1000) + 8 * 3_600_000)
+        holding = threading.Event()
+
+        def rotate_slot_2():
+            lock = FileLock(h.switcher.credentials_dir / ".consume-2.lock")
+            lock.acquire()
+            holding.set()
+            time.sleep(0.5)
+            h.switcher._write_account_credentials("2", "b@example.com", successor)
+            lock.release()
+
+        rotation = threading.Thread(target=rotate_slot_2)
+        rotation.start()
+        holding.wait()
+        with patch.object(h.switcher, "list_accounts"), patch(
+            "claude_swap.oauth.fetch_oauth_profile", return_value=None
+        ):
+            h.switcher._perform_switch("2")
+        rotation.join()
+        assert "sk-2-next" in self.live_path.read_text()
+
+    def test_backup_resync_never_restores_a_spent_predecessor(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=14 * 60_000, idle_expires_in_ms=3_600_000
+        )
+        spent = self.live_path.read_text()
+        successor = self._blob("1-next", int(time.time() * 1000) + 8 * 3_600_000)
+        h.switcher._write_account_credentials("1", "a@example.com", successor)
+        h.switcher._probe_verdicts[
+            h.switcher._lineage_key(
+                "1", "a@example.com", oauth.credential_fingerprint(spent) or ""
+            )
+        ] = True
+        h.switcher._resync_rotated_backup("1", "a@example.com", "", spent)
+        assert h.switcher.read_account_credentials("1", "a@example.com") == successor

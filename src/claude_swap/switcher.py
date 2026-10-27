@@ -56,7 +56,7 @@ from claude_swap.fsutil import (
     atomic_write_text,
     read_text_with_retry,
 )
-from claude_swap.locking import FileLock
+from claude_swap.locking import DEFAULT_LOCK_TIMEOUT_S, FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
     AccountPolicy,
@@ -624,7 +624,11 @@ class ClaudeAccountSwitcher:
         return self._store._use_keychain()
 
     def _read_credentials(self) -> str | None:
-        return self._store._read_credentials()
+        # Every live read refreshes this thread's verdict, so a check of
+        # `_active_read_degraded` after it describes these bytes.
+        active = self._read_active_credentials()
+        self._record_active_verdict(active)
+        return active.value
 
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
@@ -2165,6 +2169,36 @@ class ClaudeAccountSwitcher:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
 
+    def managed_accounts(self) -> list[tuple[str, str]]:
+        """Every managed slot and its email, in sequence order, from one read."""
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        return [
+            (str(num), (accounts.get(str(num)) or {}).get("email", ""))
+            for num in data.get("sequence", [])
+        ]
+
+    def slot_token_dead(self, account_num: str, email: str) -> bool:
+        """Public wrapper: whether the slot is quarantined as refresh-token-dead."""
+        return self._slot_token_dead(account_num, email)
+
+    def live_session_holder_for(self, account_num: str, email: str) -> str | None:
+        """Public wrapper: what keeps a slot's session profile on its token family."""
+        return self._live_session_holder(account_num, email)
+
+    def _activation_consume_lock(self, account_num: str) -> FileLock:
+        """The consume gate's slot lock, held by activation.
+
+        The gate POSTs a slot's refresh token outside the account lock, so a
+        switch that skipped this lock could activate a token whose grant is on
+        the wire and leave Claude Code to present it a second time. The wait
+        outlasts one bounded refresh POST, so activation reads its successor.
+        """
+        return FileLock(
+            self.credentials_dir / f".consume-{account_num}.lock",
+            timeout=oauth.OAUTH_REFRESH_TIMEOUT_S + DEFAULT_LOCK_TIMEOUT_S,
+        )
+
     def keep_active_login_fresh(self, lead_ms: int) -> tuple[str, int | None]:
         """Rotate the active login once it is within ``lead_ms`` of expiry.
 
@@ -2197,15 +2231,20 @@ class ClaudeAccountSwitcher:
         expires_at_ms = int(expires_at) if isinstance(expires_at, (int, float)) else None
         if not oauth.is_oauth_token_expired(expires_at, lead_ms):
             return "fresh", expires_at_ms
+        org_uuid = account.get("organizationUuid", "") or ""
         record = self._fetch_active_usage(
             account_num,
             email,
             active.value,
-            account.get("organizationUuid", "") or "",
+            org_uuid,
             refresh_lead_ms=lead_ms,
             fetch_usage=False,
         )
         if record.error in ("invalid_grant", "no_refresh_token"):
+            # The strike the collector would record for the same failure, so
+            # failover and "re-login needed" see it now and no pass re-POSTs
+            # the dead grant.
+            self._usage_store.record({account_num: record}, {account_num: (email, org_uuid)})
             return "invalid_grant", expires_at_ms
         if record.error is not None:
             return "transient", expires_at_ms
@@ -2274,7 +2313,11 @@ class ClaudeAccountSwitcher:
                 self._write_json(self.sequence_file, data)
 
     def consume_backup_grant(
-        self, account_num: str, email: str, snapshot: str
+        self,
+        account_num: str,
+        email: str,
+        snapshot: str,
+        lead_ms: int = oauth.OAUTH_EXPIRY_BUFFER_MS,
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
@@ -2356,19 +2399,20 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
             return self._consume_backup_grant_locked(
-                account_num, email, snapshot
+                account_num, email, snapshot, lead_ms
             )
         finally:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self, account_num: str, email: str, snapshot: str, lead_ms: int
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
             is_session_stale,
             profile_holds_slot_family,
             read_session_credentials,
+            read_session_identity,
             session_dir_for,
         )
 
@@ -2449,8 +2493,10 @@ class ClaudeAccountSwitcher:
                     .get("organizationUuid", "")
                     or ""
                 )
-                if not self._live_session_pids(account_num, email):
-                    sdir = session_dir_for(self.backup_dir, account_num, email)
+                sdir = session_dir_for(self.backup_dir, account_num, email)
+                # An unreadable session record may be a live claude rotating
+                # its own copy, so it counts as a holder.
+                if self._live_session_holder(account_num, email) is None:
                     profile = read_session_credentials(sdir)
                     if (
                         profile
@@ -2472,6 +2518,19 @@ class ClaudeAccountSwitcher:
                             != oauth.credential_fingerprint(refresh_input)
                             and prof_exp > cur_exp
                         ):
+                            if read_session_identity(sdir) is None:
+                                # The backup rt is likely consumed, but an
+                                # unreadable identity may be another account's
+                                # /login: adopting could poison the slot, and
+                                # POSTing the backup could spend a dead grant.
+                                # The positive proof `_adopt_session_credential`
+                                # requires is missing; consume nothing.
+                                self._logger.info(
+                                    "Account %s's session profile holds a newer "
+                                    "credential but its identity is unreadable; "
+                                    "deferring the refresh.", account_num,
+                                )
+                                return oauth.RefreshOutcome(None, "transient")
                             # The profile holds the newer generation: the
                             # backup rt is already consumed. Resync so the
                             # slot's stored credential is the live lineage,
@@ -2527,7 +2586,7 @@ class ClaudeAccountSwitcher:
             input_oauth.get("accessToken")
             and snap_at
             and input_oauth.get("accessToken") != snap_at
-            and not oauth.is_oauth_token_expired(input_oauth.get("expiresAt"))
+            and not oauth.is_oauth_token_expired(input_oauth.get("expiresAt"), lead_ms)
         ):
             # The world already moved past the caller's snapshot AND the
             # current generation is fresh: the refresh the caller wanted
@@ -4650,11 +4709,12 @@ class ClaudeAccountSwitcher:
                 claude_credentials_lock(),
             ):
                 live = self._read_credentials()
-                if live is None:
-                    # Read ERROR (locked keychain, unreadable store) — not
-                    # absence. The store may hold a newer credential we
-                    # cannot see; guessing here could consume a superseded
-                    # grant. Defer to the next pass.
+                if live is None or self._active_read_degraded:
+                    # Read ERROR (locked keychain, unreadable store), or a
+                    # Keychain failure a plaintext fallback covered on this
+                    # locked read — not absence. The store may hold a newer
+                    # credential we cannot see; guessing here could consume a
+                    # superseded grant. Defer to the next pass.
                     return _defer(force_refresh)
                 live_oauth = oauth.extract_oauth_data(live) if live else None
                 # Under-lock TOCTOU guards. A `cswap switch` or `/login`
@@ -5129,6 +5189,20 @@ class ClaudeAccountSwitcher:
                     and live_oauth.get("refreshToken")
                     and oauth.credential_fingerprint(live)
                     == oauth.credential_fingerprint(creds)
+                ):
+                    return
+                # expiresAt moves forward on every rotation: a backup at or
+                # past the live generation is its successor (a locked refresh
+                # whose live write failed), and the live bytes are the spent
+                # predecessor. Writing them back would destroy the only copy
+                # of the successor's refresh token.
+                backup_now = oauth.extract_oauth_data(
+                    self._read_account_credentials(account_num, email)
+                )
+                if (
+                    backup_now
+                    and backup_now.get("refreshToken")
+                    and oauth.is_newer_generation(backup_now, live_oauth)
                 ):
                     return
                 self._write_account_credentials(account_num, email, live)
@@ -6936,6 +7010,19 @@ class ClaudeAccountSwitcher:
         ):
             return ("own-family", None)
         live_oauth = oauth.extract_oauth_data(original_creds)
+        backup_oauth = oauth.extract_oauth_data(backup) if backup else None
+        if (
+            live_oauth
+            and backup_oauth
+            and backup_oauth.get("refreshToken")
+            and oauth.is_newer_generation(backup_oauth, live_oauth)
+        ):
+            # expiresAt moves forward on every rotation: the backup is the
+            # successor of these live bytes (a locked refresh whose live write
+            # failed), so they are a spent predecessor. Capture nothing, as
+            # for unchanged bytes; backing them up would destroy the backup's
+            # only refresh token.
+            return ("own-bytes", None)
         if live_oauth is not None and not (
             live_oauth.get("accessToken") or live_oauth.get("refreshToken")
         ):
@@ -7235,7 +7322,12 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            self._activation_consume_lock(target_account),
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
