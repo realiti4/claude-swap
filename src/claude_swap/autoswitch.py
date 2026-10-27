@@ -1292,7 +1292,7 @@ class AutoSwitchEngine:
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
-        if not self.dry_run:
+        if not self.dry_run and settings.keepalive:
             self._keep_logins_alive(current, quarantined, state)
         entries, usage, headroom = self._collect_scheduled_usage(
             current,

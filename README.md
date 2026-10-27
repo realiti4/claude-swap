@@ -232,7 +232,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
   preserved instead of being overwritten by a slot's older snapshot
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
-- While auto-switch runs, it rotates every login 15 minutes before its access token expires, separately from usage polling: a failing or rate-limited usage endpoint can no longer let an idle account's login die, and parallel Claude Code sessions on the active login adopt the rotated token instead of all refreshing in the same minute
+- While auto-switch runs, it rotates every login 15 minutes before its access token expires (`cswap config set autoswitch.keepalive false` turns this off on a machine holding a copy of a login another machine also renews; one renewal kills the other copy), separately from usage polling: a failing or rate-limited usage endpoint can no longer let an idle account's login die, and parallel Claude Code sessions on the active login adopt the rotated token instead of all refreshing in the same minute
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
 
@@ -390,6 +390,17 @@ cswap add-token --email user@example.com     # optional label override
 
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
+
+**Setup-tokens across machines.** A browser login hard-expires 30 days after sign-in and its refresh token is single-use, so a login copied to several machines dies on all but one at the first renewal. A setup-token lasts a year and never renews, so the same token can serve every machine. It cannot read usage itself (it is inference-only), so keep each account's browser login on exactly one machine and push that machine's readings to the others:
+
+```bash
+# on every other machine, once per account (org uuid from the login machine's `cswap list --json`)
+op read "op://<vault>/<item>/credential" | cswap add-token - --email you@example.com --org <org-uuid>
+# on the login machine, on a timer
+cswap list --json | ssh <machine> cswap import-usage - --hold 600
+```
+
+`--org` gives the token the login's identity so the pushed rows land on it; cswap never asks the usage endpoint about a setup-token, and refuses to replace a slot that holds a browser login.
 
 **API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
 (`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses

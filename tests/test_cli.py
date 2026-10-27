@@ -695,7 +695,7 @@ class TestCLICommands:
 
         mock_add.assert_called_once_with(
             token="sk-ant-oat01-abc", email=None, slot=None
-        )
+        , org_uuid="")
 
     def test_email_without_add_token_errors(self, capsys):
         """--email without --add-token should exit with a clear error."""
@@ -719,7 +719,7 @@ class TestCLICommands:
 
         mock_add.assert_called_once_with(
             token="mytoken", email="u@example.com", slot=None
-        )
+        , org_uuid="")
 
     def test_add_token_with_slot(self, temp_home: Path, capsys):
         """--add-token --slot should forward slot to add_account_from_token."""
@@ -735,7 +735,7 @@ class TestCLICommands:
 
         mock_add.assert_called_once_with(
             token="tok", email="u@example.com", slot=3
-        )
+        , org_uuid="")
 
     def test_add_token_in_help(self):
         """The add-token subcommand and the still-visible --email modifier appear."""

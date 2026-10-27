@@ -61,6 +61,10 @@ class AutoSwitchSettings:
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # Opt-in alternatives are in AUTOSWITCH_STRATEGIES.
     include_api_key_accounts: bool = False
+    # Rotate every browser login ahead of expiry. A machine holding a copy of
+    # a login another machine also renews must not: one renewal kills the
+    # other copy (refresh tokens are single-use).
+    keepalive: bool = True
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
@@ -163,6 +167,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
+        ),
+        SettingSpec(
+            "autoswitch", "keepalive", "keepalive", "bool",
+            help="Renew browser logins ahead of expiry (off on a machine that shares them)",
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,

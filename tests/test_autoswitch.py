@@ -7353,8 +7353,8 @@ class TestKeepalive:
             "expiresAt": expires_at,
         }})
 
-    def _harness(self, temp_home, *, active_expires_in_ms, idle_expires_in_ms):
-        h = EngineHarness(temp_home)
+    def _harness(self, temp_home, *, active_expires_in_ms, idle_expires_in_ms, **settings):
+        h = EngineHarness(temp_home, **settings)
         # The active login's refresh path reads the wall clock, the engine's
         # idle pass its injected one; each expiry is relative to its reader.
         h.seed(1, "a@example.com",
@@ -7486,3 +7486,14 @@ class TestKeepalive:
         ] = True
         h.switcher._resync_rotated_backup("1", "a@example.com", "", spent)
         assert h.switcher.read_account_credentials("1", "a@example.com") == successor
+
+    def test_a_machine_sharing_its_logins_can_turn_renewal_off(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=10 * 60_000, idle_expires_in_ms=60_000,
+            keepalive=False,
+        )
+        live_before = self.live_path.read_text()
+        with self._rotate(h):
+            h.tick_with_usage({"1": _usage(10)})
+        assert self.live_path.read_text() == live_before
+        assert "sk-2\"" in h.switcher.read_account_credentials("2", "b@example.com")

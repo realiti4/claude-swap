@@ -2224,3 +2224,60 @@ class TestImportUsage:
                 s, temp_home, _usage_document(_usage_row("alice@example.com"), bad)
             )
         assert not s._usage_store.path.exists()
+
+
+class TestSetupTokensReadFleetUsage:
+    """A setup-token cannot read usage itself; a machine holding the account's
+    browser login pushes its readings, which land on the token's slot when the
+    token carries the same (email, org) identity."""
+
+    ORG = "11111111-2222-3333-4444-555555555555"
+
+    def test_org_token_takes_pushed_readings_and_is_never_fetched(
+        self, temp_home: Path
+    ):
+        from claude_swap import oauth
+        from claude_swap.transfer import import_usage
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        s.add_account_from_token(
+            "sk-ant-oat01-bob", email="bob@example.com", slot=2, org_uuid=self.ORG
+        )
+        path = temp_home / "usage.json"
+        path.write_text(_usage_document(
+            _usage_row("bob@example.com", self.ORG, pct=42.0, age_s=400.0)
+        ), encoding="utf-8")
+        import_usage(s, str(path))
+
+        fetched: list[str] = []
+
+        def fake_fetch(num, email, creds, **kwargs):
+            fetched.append(email)
+            return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account", side_effect=fake_fetch
+        ):
+            payload = s.list_accounts(json_output=True)
+
+        # Past the freshness window with no hold, the old collector fetched
+        # the token (a 403 every time); now only pushed readings reach it.
+        assert "bob@example.com" not in fetched
+        bob = next(a for a in payload["accounts"] if a["email"] == "bob@example.com")
+        assert bob["organizationUuid"] == self.ORG
+        entry = s._usage_store.entries({"2": ("bob@example.com", self.ORG)})["2"]
+        assert entry.last_good["five_hour"]["pct"] == 42.0
+
+    def test_a_token_never_replaces_a_browser_login(self, temp_home: Path):
+        from claude_swap.exceptions import ValidationError
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "bob@example.com", self.ORG, creds=_live_creds("bob"))
+        before = s._read_account_credentials("1", "bob@example.com")
+
+        with pytest.raises(ValidationError, match="holds a browser login"):
+            s.add_account_from_token(
+                "sk-ant-oat01-bob", email="bob@example.com", org_uuid=self.ORG
+            )
+        assert s._read_account_credentials("1", "bob@example.com") == before

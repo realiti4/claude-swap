@@ -101,6 +101,22 @@ def login_expires_at_iso(credentials: str) -> str | None:
     )
 
 
+# The usage endpoint answers only logins carrying this scope; setup-tokens
+# are inference-only and get 403 there on every attempt.
+USAGE_READ_SCOPE = "user:profile"
+
+
+def can_read_usage(credentials: str) -> bool:
+    """Whether a stored OAuth credential may query ``/api/oauth/usage``.
+
+    A credential with recorded scopes must include ``USAGE_READ_SCOPE``; one
+    without recorded scopes (older captures) is assumed to.
+    """
+    data = extract_oauth_data(credentials)
+    scopes = (data or {}).get("scopes")
+    return not isinstance(scopes, list) or USAGE_READ_SCOPE in scopes
+
+
 def is_newer_generation(candidate: dict, reference: dict) -> bool:
     """Whether ``candidate`` was issued after ``reference`` in one lineage.
 

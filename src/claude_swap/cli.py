@@ -1382,6 +1382,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--org",
+        metavar="UUID",
+        help=(
+            "Organization uuid for 'add-token' (from 'cswap list --json' on a "
+            "machine holding the account's browser login), so pushed usage "
+            "readings ('cswap import-usage') reach this slot. Needs --email."
+        ),
+    )
+    parser.add_argument(
         "--account",
         metavar="NUM|EMAIL",
         help="Limit export to one account (use with 'export')",
@@ -1587,6 +1596,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
+    if args.org is not None and args.add_token is None:
+        parser.error("--org can only be used with 'add-token'")
+
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
 
@@ -1647,6 +1659,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 token=args.add_token,
                 email=args.email,
                 slot=args.slot,
+                org_uuid=args.org or "",
             )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)

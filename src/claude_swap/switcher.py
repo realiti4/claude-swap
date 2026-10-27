@@ -11,6 +11,7 @@ import shutil
 import threading
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -3720,7 +3721,32 @@ class ClaudeAccountSwitcher:
                 "'cswap add-token sk-ant-...' instead of 'cswap add'."
             )
 
-    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
+    def _reject_replacing_a_renewable_login(
+        self, email: str, org_uuid: str, is_api_key: bool
+    ) -> None:
+        """Refuse to overwrite a browser login with a setup-token or API key.
+
+        The same (email, org) is one slot, so registering a token for an account
+        whose slot holds a refresh-token login would replace that login in place
+        and lose its usage readings (setup-tokens cannot read usage).
+        """
+        data = self._get_sequence_data()
+        slot = self._find_account_slot(data, email, org_uuid) if data else None
+        if slot is None:
+            return
+        stored = oauth.extract_oauth_data(
+            self._read_account_credentials(slot, email)
+        )
+        if stored and stored.get("refreshToken"):
+            raise ValidationError(
+                f"Slot {slot} holds a browser login for '{email}'; registering a "
+                "token would replace it. Keep the token on machines without "
+                "that login, or remove the slot first."
+            )
+
+    def _reject_cross_kind_collision(
+        self, email: str, is_api_key: bool, org_uuid: str = ""
+    ) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
 
@@ -3734,7 +3760,7 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data()
         if not data:
             return
-        slot = self._find_account_slot(data, email, "")
+        slot = self._find_account_slot(data, email, org_uuid)
         if slot is None:
             return
         existing_kind = self._account_kind(slot)
@@ -4151,6 +4177,7 @@ class ClaudeAccountSwitcher:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        org_uuid: str = "",
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -4170,6 +4197,11 @@ class ClaudeAccountSwitcher:
                    ``api-key-{slot}@token.local`` for API keys) since these tokens
                    carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``.
+            org_uuid: The account's organization uuid (``cswap list --json``
+                   on a machine that holds its browser login prints it), so the
+                   slot carries the same identity as that login and readings
+                   pushed with ``cswap import-usage`` land on it. ``""`` keeps
+                   the token personal.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
         """
@@ -4189,6 +4221,13 @@ class ClaudeAccountSwitcher:
 
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
+        if org_uuid:
+            if not email:
+                raise ValidationError("--org needs the account's real --email")
+            try:
+                uuid.UUID(org_uuid)
+            except ValueError as exc:
+                raise ValidationError(f"Invalid organization uuid: {org_uuid}") from exc
 
         self._setup_directories()
         self._init_sequence_file()
@@ -4206,7 +4245,8 @@ class ClaudeAccountSwitcher:
         # Don't silently overwrite/convert an existing account of the other kind:
         # identity is matched on (email, org) only, so an api-key and an OAuth
         # account sharing an email would be indistinguishable at switch time.
-        self._reject_cross_kind_collision(email, is_api_key)
+        self._reject_cross_kind_collision(email, is_api_key, org_uuid)
+        self._reject_replacing_a_renewable_login(email, org_uuid, is_api_key)
 
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
@@ -4224,15 +4264,15 @@ class ClaudeAccountSwitcher:
             "oauthAccount": {
                 "emailAddress": email,
                 "accountUuid": "",
-                "organizationUuid": None,
+                "organizationUuid": org_uuid or None,
                 "organizationName": None,
             }
         })
 
         # If the account already exists (same email, personal), refresh in place.
-        if slot is None and self._account_exists(email, ""):
+        if slot is None and self._account_exists(email, org_uuid):
             seq = self._get_sequence_data()
-            account_num = self._find_account_slot(seq, email, "")
+            account_num = self._find_account_slot(seq, email, org_uuid)
             if account_num is None:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
@@ -4242,9 +4282,9 @@ class ClaudeAccountSwitcher:
             # A refreshed credential invalidates any dead-token quarantine on this
             # slot (mirrors ``add_account``); otherwise the stale strike row keeps
             # the account stuck at "re-login needed" and it never fetches the new
-            # token. Token accounts are always personal, so org is "".
+            # token.
             self._usage_store.clear_dead_token(
-                [account_num], {account_num: (email, "")}
+                [account_num], {account_num: (email, org_uuid)}
             )
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
@@ -4252,7 +4292,7 @@ class ClaudeAccountSwitcher:
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
-                f"({email} {muted('[personal]')})."
+                f"({email} {muted(f'[{self._get_display_tag(email, '', org_uuid)}]')})."
             )
             return
 
@@ -4265,8 +4305,8 @@ class ClaudeAccountSwitcher:
             account_num = str(slot)
             data = self._get_sequence_data()
 
-            if self._account_exists(email, ""):
-                old_num = self._find_account_slot(data, email, "")
+            if self._account_exists(email, org_uuid):
+                old_num = self._find_account_slot(data, email, org_uuid)
                 if old_num and old_num != account_num:
                     migrate_from = old_num
 
@@ -4275,7 +4315,7 @@ class ClaudeAccountSwitcher:
                 existing_email = existing.get("email", "unknown")
                 is_same = (
                     existing_email == email
-                    and existing.get("organizationUuid", "") == ""
+                    and (existing.get("organizationUuid", "") or "") == org_uuid
                 )
                 if not is_same:
                     existing_tag = self._get_display_tag(
@@ -4326,14 +4366,14 @@ class ClaudeAccountSwitcher:
         # Reusing/overwriting a slot with a fresh credential lifts any dead-token
         # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
         self._usage_store.clear_dead_token(
-            [account_num], {account_num: (email, "")}
+            [account_num], {account_num: (email, org_uuid)}
         )
 
         data = self._get_sequence_data()
         record = {
             "email": email,
             "uuid": "",
-            "organizationUuid": "",
+            "organizationUuid": org_uuid,
             "organizationName": "",
             "added": get_timestamp(),
         }
@@ -4352,7 +4392,8 @@ class ClaudeAccountSwitcher:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(
             f"{accent('Added')} Account {account_num}: {email} "
-            f"{muted('[personal]')} {muted(f'(from {source_label})')}"
+            f"{muted(f'[{self._get_display_tag(email, '', org_uuid)}]')} "
+            f"{muted(f'(from {source_label})')}"
         )
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
@@ -5492,10 +5533,15 @@ class ClaudeAccountSwitcher:
                     [num], {num: identities[num]}
                 )
                 entries = store.entries(identities, models)
+        # A setup-token's usage arrives only from a machine holding the
+        # account's browser login (`cswap import-usage`); asking the endpoint
+        # itself is a 403 every time, and the retries end in 429s.
         requested = [
             num
             for num in info_by_num
-            if num not in sentinels and (fetch is None or num in fetch)
+            if num not in sentinels
+            and (fetch is None or num in fetch)
+            and oauth.can_read_usage(info_by_num[num][5])
         ]
         if fetch is None:
             # Repair reset-parked plans written by releases that stopped
