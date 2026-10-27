@@ -13,7 +13,7 @@ CACHE_DIR = get_backup_root() / "cache"
 MISSING = object()
 
 
-def read_cache(path: Path, ttl: float, default=MISSING):
+def read_cache(path: Path, ttl: float, default=MISSING, *, context=MISSING):
     """Read cached JSON data if the file exists and is within TTL.
 
     Returns the stored 'data' value, or *default* if missing/expired/invalid.
@@ -22,6 +22,8 @@ def read_cache(path: Path, ttl: float, default=MISSING):
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if context is not MISSING and raw.get("context", MISSING) != context:
+            return default
         if time.time() - raw["timestamp"] < ttl:
             return raw["data"]
     except (
@@ -30,15 +32,16 @@ def read_cache(path: Path, ttl: float, default=MISSING):
         UnicodeDecodeError,
         KeyError,
         TypeError,
+        AttributeError,
     ):
         pass
     return default
 
 
-def write_cache(path: Path, data) -> None:
+def write_cache(path: Path, data, *, context=MISSING) -> None:
     """Write data to a cache file with a timestamp."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"timestamp": time.time(), "data": data}),
-        encoding="utf-8",
-    )
+    entry = {"timestamp": time.time(), "data": data}
+    if context is not MISSING:
+        entry["context"] = context
+    path.write_text(json.dumps(entry), encoding="utf-8")

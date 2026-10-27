@@ -373,6 +373,23 @@ class TestAtomicWriteThroughSymlink:
         assert link.is_symlink()
         assert json.loads(target.read_text()) == {"dangling": "ok"}
 
+    def test_fallback_creates_missing_target_parent_through_link_chain(
+        self, tmp_path, monkeypatch,
+    ):
+        if hasattr(os.path, "ALLOW_MISSING"):
+            monkeypatch.setattr("claude_swap.fsutil._RESOLVE_STRICT", None)
+        target = tmp_path / "gone" / "nested" / "settings.json"
+        hop = tmp_path / "hop"
+        hop.symlink_to(Path("gone") / "nested" / "settings.json")
+        link = tmp_path / "settings.json"
+        link.symlink_to("hop")
+
+        atomic_write_json(link, {"created": "through links"})
+
+        assert link.is_symlink()
+        assert hop.is_symlink()
+        assert json.loads(target.read_text()) == {"created": "through links"}
+
     def test_plain_file_write_unchanged(self, tmp_path):
         p = tmp_path / "settings.json"
         atomic_write_json(p, {"plain": 1})

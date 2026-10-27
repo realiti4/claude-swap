@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import claude_swap.update_check as update_check
 from claude_swap.update_check import (
     CACHE_TTL,
     FAILURE_TTL,
@@ -40,9 +41,13 @@ _OUTDATED = [{"name": "claude-swap", "version": "0.27.2", "latest_version": "0.2
 def _write_cache(path, version, timestamp=None):
     """Write a cache file in the shared cache format."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    method = update_check._detect_install_method()
+    current = "0.27.2" if method == "uv" else "0.3.2"
+    receipt = update_check._read_receipt() if method == "uv" else {}
     path.write_text(json.dumps({
         "timestamp": timestamp if timestamp is not None else time.time(),
         "data": version,
+        "context": update_check._update_cache_context(current, method, receipt),
     }))
 
 
@@ -510,6 +515,97 @@ class TestUvInstall(_UvInstall):
         assert check_for_update("0.27.2") is not None
         mock_run.assert_not_called()
 
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_pinned_main_requirement_does_not_advertise_an_uninstallable_release(
+        self, mock_run, tmp_path
+    ):
+        self._write_receipt(
+            tmp_path,
+            'exclude-newer-span = "P14D"',
+            '{ name = "claude-swap", specifier = "==0.27.2" }',
+        )
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+
+        assert check_for_update("0.27.2") is None
+        assert held_back_release_notice("0.27.2") is None
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_bounded_requirement_offers_latest_version_inside_range(self, mock_run, tmp_path):
+        self._write_receipt(
+            tmp_path, requirements='{ name = "claude-swap", specifier = ">=0.27,<0.29" }'
+        )
+
+        def uv_response(cmd, **kwargs):
+            if cmd[1:3] == ["pip", "compile"]:
+                assert kwargs["input"] == "claude-swap>=0.27,<0.29\n"
+                return MagicMock(returncode=0, stdout="claude-swap==0.28.0\n")
+            return _uv_pip_list([{"name": "claude-swap", "latest_version": "0.29.0"}])
+
+        mock_run.side_effect = uv_response
+        result = check_for_update("0.27.2")
+
+        assert result is not None
+        assert "(0.28.0)" in result
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_cache_is_invalidated_when_cooldown_changes(self, mock_run, monkeypatch):
+        mock_run.side_effect = [_uv_pip_list(_OUTDATED), _uv_pip_list([])]
+        assert check_for_update("0.27.2") is not None
+
+        monkeypatch.setenv("UV_EXCLUDE_NEWER", "7 days")
+        assert check_for_update("0.27.2") is None
+        assert mock_run.call_count == 2
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_cache_is_invalidated_when_receipt_requirement_changes(self, mock_run, tmp_path):
+        self._write_receipt(tmp_path)
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+        assert check_for_update("0.27.2") is not None
+
+        self._write_receipt(tmp_path, requirements='{ name = "claude-swap", specifier = "==0.27.2" }')
+        assert check_for_update("0.27.2") is None
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_cache_is_invalidated_when_installation_changes(self, mock_run, tmp_path, monkeypatch):
+        mock_run.side_effect = [_uv_pip_list(_OUTDATED), _uv_pip_list([])]
+        assert check_for_update("0.27.2") is not None
+
+        other_prefix = tmp_path / "other-install"
+        other_prefix.mkdir()
+        monkeypatch.setattr("claude_swap.update_check.sys.prefix", str(other_prefix))
+        assert check_for_update("0.27.2") is None
+        assert mock_run.call_count == 2
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_cache_is_invalidated_when_install_method_changes(
+        self, mock_run, mock_urlopen, monkeypatch
+    ):
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+        mock_urlopen.return_value = _make_pypi_response("0.27.2")
+        assert check_for_update("0.27.2") is not None
+
+        monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "pipx")
+        assert check_for_update("0.27.2") is None
+        mock_urlopen.assert_called_once()
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_unkeyed_legacy_cache_is_not_reused(self, mock_run, tmp_path):
+        (tmp_path / "cache.json").write_text(json.dumps({
+            "timestamp": time.time(), "data": "0.28.0",
+        }))
+        mock_run.return_value = _uv_pip_list([])
+
+        assert check_for_update("0.27.2") is None
+        mock_run.assert_called_once()
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_cache_context_does_not_store_index_credentials(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("UV_INDEX_URL", "https://user:example-secret@example.invalid/simple")
+        mock_run.return_value = _uv_pip_list([])
+        assert check_for_update("0.27.2") is None
+        assert "example-secret" not in (tmp_path / "cache.json").read_text()
+
 
 class TestHeldBackReleaseNotice(_UvInstall):
     """`uv tool upgrade` prints "Nothing to upgrade" both when the install is
@@ -572,6 +668,20 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert "overrides UV_EXCLUDE_NEWER" in notice
         assert "unset" not in notice
         assert "To restore the cooldown" not in notice
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_env_override_still_restores_the_saved_receipt_cooldown(
+        self, mock_run, tmp_path, monkeypatch
+    ):
+        self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
+        monkeypatch.setenv("UV_EXCLUDE_NEWER", "7 days")
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+
+        notice = held_back_release_notice("0.27.2")
+
+        assert notice is not None
+        assert "UV_EXCLUDE_NEWER=7 days" in notice
+        assert "To restore the cooldown: uv tool upgrade claude-swap --exclude-newer P14D" in notice
 
     @patch("claude_swap.update_check.subprocess.run")
     def test_no_cooldown_means_no_notice_and_no_uv_call(self, mock_run):

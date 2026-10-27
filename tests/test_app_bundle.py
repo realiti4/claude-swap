@@ -259,12 +259,22 @@ def test_interpreter_error_reports_an_unrunnable_interpreter(tmp_path: Path):
 @pytest.mark.skipif(
     bool(getattr(sys, "_framework", "")), reason="framework builds never re-exec"
 )
-def test_bundle_built_from_the_real_interpreter_starts_and_imports(tmp_path: Path):
+def test_bundle_built_from_the_real_interpreter_starts_and_imports(tmp_path: Path, monkeypatch):
     """Regression for stub interpreters: a copy of uv's CPython 3.12/3.13 aborts in
     dyld unless Contents/lib holds libpython3.X.dylib. Fake-interpreter tests
     cannot catch that, so this one builds from the interpreter running pytest."""
     apps = tmp_path / "Applications"
     apps.mkdir()
+    # This test checks interpreter startup, including on hosts where the
+    # macOS-only menu bar extra is not installed.
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    (dependencies / "rumps.py").write_text("")
+    (dependencies / "AppKit.py").write_text("")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, [str(dependencies), os.environ.get("PYTHONPATH", "")])),
+    )
 
     python = app_bundle.build(tmp_path / "data", applications=apps)
 
@@ -277,3 +287,85 @@ def test_bundle_built_from_the_real_interpreter_starts_and_imports(tmp_path: Pat
     assert proc.returncode == 0, proc.stderr
     assert Path(proc.stdout.strip()) == apps / app_bundle.BUNDLE_DIRNAME / "Contents"
     assert app_bundle.interpreter_error(python) is None
+
+
+def _test_venv(tmp_path: Path, monkeypatch, *, system_site_packages: bool) -> tuple[Path, Path]:
+    """Create an isolated source venv with the package in its own site-packages."""
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("PYTHONHOME", raising=False)
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "user"))
+    prefix = tmp_path / "source-venv"
+    cmd = [sys.executable, "-m", "venv", "--without-pip"]
+    if system_site_packages:
+        cmd.append("--system-site-packages")
+    subprocess.run([*cmd, str(prefix)], check=True, capture_output=True, text=True)
+    site_packages = (
+        prefix / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    )
+    package = site_packages / "claude_swap"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    return prefix, site_packages
+
+
+def _user_site(python: Path) -> Path:
+    return Path(subprocess.run(
+        [str(python), "-c", "import site; print(site.getusersitepackages())"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip())
+
+
+@pytest.mark.skipif(
+    bool(getattr(sys, "_framework", "")), reason="framework builds never re-exec"
+)
+def test_bundle_keeps_inherited_menu_bar_dependencies(tmp_path: Path, monkeypatch):
+    prefix, _ = _test_venv(tmp_path, monkeypatch, system_site_packages=True)
+    source_python = prefix / "bin" / "python"
+    user_site = _user_site(source_python)
+    user_site.mkdir(parents=True)
+    (user_site / "rumps.py").write_text("")
+    (user_site / "AppKit.py").write_text("")
+    code = "import claude_swap, rumps, AppKit; print(rumps.__file__); print(AppKit.__file__)"
+    source = subprocess.run([str(source_python), "-c", code], capture_output=True, text=True)
+    assert source.returncode == 0, source.stderr
+    assert [Path(line).parent for line in source.stdout.splitlines()] == [user_site, user_site]
+
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    python = app_bundle.build(tmp_path / "data", prefix=prefix, applications=apps)
+    bundled = subprocess.run([str(python), "-c", code], capture_output=True, text=True)
+    assert bundled.returncode == 0, bundled.stderr
+    assert [Path(line).parent for line in bundled.stdout.splitlines()] == [user_site, user_site]
+    assert app_bundle.interpreter_error(python) is None
+
+
+@pytest.mark.skipif(
+    bool(getattr(sys, "_framework", "")), reason="framework builds never re-exec"
+)
+@pytest.mark.parametrize("missing", ["rumps", "AppKit"])
+def test_reexec_stays_put_when_menu_bar_dependency_is_missing(tmp_path: Path, monkeypatch, missing):
+    prefix, site_packages = _test_venv(tmp_path, monkeypatch, system_site_packages=False)
+    available = "AppKit" if missing == "rumps" else "rumps"
+    (site_packages / f"{available}.py").write_text("")
+    # The source venv deliberately excludes user packages. A bundle that
+    # accidentally enables them would find this module and re-exec unsafely.
+    source_python = prefix / "bin" / "python"
+    user_site = _user_site(source_python)
+    user_site.mkdir(parents=True)
+    (user_site / f"{missing}.py").write_text("")
+    source = subprocess.run(
+        [str(source_python), "-c", f"import {missing}"], capture_output=True, text=True,
+    )
+    assert source.returncode != 0
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    python = app_bundle.build(tmp_path / "data", prefix=prefix, applications=apps)
+    calls = []
+    monkeypatch.setattr(app_bundle, "reexec_reason", lambda: None)
+    monkeypatch.setattr(app_bundle, "build", lambda _: python)
+    monkeypatch.setattr(app_bundle.os, "execv", lambda *args: calls.append(args))
+
+    reason = app_bundle.maybe_reexec(tmp_path / "data")
+
+    assert calls == []
+    assert reason is not None and f"No module named '{missing}'" in reason

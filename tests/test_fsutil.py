@@ -473,6 +473,51 @@ class TestAtomicWriteSymlinks:
         assert (tmp_path / "gone" / "config.json").read_text(encoding="utf-8") == "{}"
         assert [p.name for p in (tmp_path / "gone").iterdir()] == ["config.json"]
 
+    def test_fallback_writes_through_a_dangling_link(self, tmp_path, monkeypatch):
+        if hasattr(os.path, "ALLOW_MISSING"):
+            monkeypatch.setattr("claude_swap.fsutil._RESOLVE_STRICT", None)
+        target = tmp_path / "config.json"
+        link = tmp_path / "link.json"
+        link.symlink_to(target)
+
+        atomic_write_text(link, "new")
+
+        assert link.is_symlink()
+        assert target.read_text(encoding="utf-8") == "new"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink loop semantics")
+    def test_fallback_rejects_loop_after_missing_component(self, tmp_path, monkeypatch):
+        if hasattr(os.path, "ALLOW_MISSING"):
+            monkeypatch.setattr("claude_swap.fsutil._RESOLVE_STRICT", None)
+        victim = tmp_path / "victim.json"
+        victim.write_text("untouched")
+        (tmp_path / "loop").symlink_to("loop")
+        link = tmp_path / "link.json"
+        link.symlink_to("missing/../loop/../victim.json")
+
+        with pytest.raises(OSError) as info:
+            atomic_write_text(link, "new")
+
+        assert info.value.errno == errno.ELOOP
+        assert link.is_symlink()
+        assert victim.read_text() == "untouched"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX path semantics")
+    def test_fallback_rejects_file_before_dotdot(self, tmp_path, monkeypatch):
+        if hasattr(os.path, "ALLOW_MISSING"):
+            monkeypatch.setattr("claude_swap.fsutil._RESOLVE_STRICT", None)
+        (tmp_path / "file").write_text("not a directory")
+        victim = tmp_path / "victim.json"
+        victim.write_text("untouched")
+        link = tmp_path / "link.json"
+        link.symlink_to("file/../victim.json")
+
+        with pytest.raises(NotADirectoryError):
+            atomic_write_text(link, "new")
+
+        assert link.is_symlink()
+        assert victim.read_text() == "untouched"
+
     def test_follow_symlinks_false_replaces_the_link(self, tmp_path):
         target = tmp_path / "elsewhere.json"
         target.write_text("untouched")

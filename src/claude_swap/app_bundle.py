@@ -177,6 +177,20 @@ def _populate_lib(lib: Path, venv_lib: Path, base_lib: Path) -> None:
             entry.unlink()
 
 
+def _includes_system_site_packages(prefix: Path) -> bool:
+    """Match the source interpreter's venv package visibility."""
+    try:
+        lines = (prefix / "pyvenv.cfg").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return True  # A non-venv interpreter includes its system packages.
+    include_system = True  # CPython's default when the key is absent.
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator and key.strip().lower() == "include-system-site-packages":
+            include_system = value.strip().lower() == "true"
+    return include_system
+
+
 def build(
     backup_dir: Path,
     *,
@@ -194,7 +208,8 @@ def build(
     src = Path(
         executable or getattr(sys, "_base_executable", None) or sys.executable
     ).resolve()
-    lib_target = Path(prefix or sys.prefix) / "lib"
+    install_prefix = Path(prefix or sys.prefix)
+    lib_target = install_prefix / "lib"
 
     contents = bundle_path(backup_dir, applications) / "Contents"
     macos = contents / "MacOS"
@@ -216,11 +231,13 @@ def build(
             }
         ),
     )
-    # `home` is the directory holding the base interpreter; CPython derives
-    # the stdlib location from it exactly as it does for a normal venv.
+    # Match the source venv's system-package visibility as well as its home.
+    # Otherwise a --system-site-packages install can lose dependencies when
+    # the copied interpreter starts inside this synthetic venv.
+    include_system = str(_includes_system_site_packages(install_prefix)).lower()
     _write_if_changed(
         contents / "pyvenv.cfg",
-        f"home = {src.parent}\ninclude-system-site-packages = false\n".encode(),
+        f"home = {src.parent}\ninclude-system-site-packages = {include_system}\n".encode(),
     )
     _populate_lib(contents / "lib", lib_target, src.parent.parent / "lib")
     python = macos / "python"
@@ -231,13 +248,13 @@ def build(
 def interpreter_error(python: Path) -> str | None:
     """Run the bundled interpreter once; the error if it cannot start, else None.
 
-    Importing claude_swap exercises both failure modes of a bad bundle: a stub
-    interpreter whose libpython is missing aborts in dyld, and a broken ``lib``
-    wiring leaves site-packages unreachable.
+    Importing the package and the menu-bar dependencies exercises both failure
+    modes of a bad bundle: a stub interpreter whose libpython is missing aborts
+    in dyld, and broken package visibility prevents imports after re-exec.
     """
     try:
         proc = subprocess.run(
-            [str(python), "-c", "import claude_swap"],
+            [str(python), "-c", "import claude_swap, rumps, AppKit"],
             capture_output=True,
             text=True,
             timeout=30,

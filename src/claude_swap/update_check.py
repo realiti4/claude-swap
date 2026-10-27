@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -124,6 +125,11 @@ def _uv_cooldown(receipt: dict[str, Any]) -> _Cooldown | None:
     env_value = os.environ.get("UV_EXCLUDE_NEWER", "").strip()
     if env_value:
         return _Cooldown(env_value, f"UV_EXCLUDE_NEWER={env_value}", from_env=True)
+    return _receipt_cooldown(receipt)
+
+
+def _receipt_cooldown(receipt: dict[str, Any]) -> _Cooldown | None:
+    """The saved setting, even while an environment override is active."""
     options = receipt.get("options", {})
     if not isinstance(options, dict):
         return None
@@ -139,12 +145,74 @@ def _uv_cooldown(receipt: dict[str, Any]) -> _Cooldown | None:
 _CUTOFF_RE = re.compile(r"^[A-Za-z0-9.:+-]+$")
 
 
-def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str | None:
+def _uv_requirements(receipt: dict[str, Any]) -> list[str] | None:
+    """Convert ordinary saved requirements to input for uv's resolver.
+
+    Unknown sources or saved resolver settings cannot be represented by this
+    query. In that case do not advertise a potentially uninstallable release.
+    """
+    for field in ("constraints", "overrides", "excludes", "build-constraint-dependencies"):
+        if receipt.get(field):
+            return None
+    options = receipt.get("options", {})
+    if not isinstance(options, dict) or options.keys() - {"exclude-newer", "exclude-newer-span"}:
+        return None
+    requirements = receipt.get("requirements", [])
+    if not isinstance(requirements, list):
+        return None
+    result = []
+    for requirement in requirements:
+        if isinstance(requirement, str):
+            if not re.fullmatch(r"[A-Za-z0-9_.\-\[\],<>=!~*+ \t]+", requirement):
+                return None
+            result.append(requirement.strip())
+        elif isinstance(requirement, dict):
+            if requirement.keys() - {"name", "specifier", "extras"}:
+                return None
+            name = requirement.get("name")
+            specifier = requirement.get("specifier", "")
+            extras = requirement.get("extras", [])
+            if (
+                not isinstance(name, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+                or not isinstance(specifier, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.<>=!~*+, \t-]*", specifier)
+                or not isinstance(extras, list)
+                or not all(isinstance(extra, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", extra) for extra in extras)
+            ):
+                return None
+            extra_text = f"[{','.join(extras)}]" if extras else ""
+            result.append(f"{name}{extra_text}{specifier}")
+        else:
+            return None
+    return result
+
+
+def _uv_needs_resolution(receipt: dict[str, Any]) -> bool:
+    """Whether a package listing alone omits saved upgrade constraints."""
+    requirements = receipt.get("requirements", [])
+    if not isinstance(requirements, list) or len(requirements) > 1:
+        return True
+    if requirements:
+        main = requirements[0]
+        if isinstance(main, str):
+            if not re.fullmatch(r"\s*claude[-_.]swap\s*", main, flags=re.IGNORECASE):
+                return True
+        elif not isinstance(main, dict) or main.keys() - {"name"}:
+            return True
+    if any(receipt.get(field) for field in ("constraints", "overrides", "excludes", "build-constraint-dependencies")):
+        return True
+    options = receipt.get("options", {})
+    return not isinstance(options, dict) or bool(options.keys() - {"exclude-newer", "exclude-newer-span"})
+
+
+def _uv_latest_version(
+    current_version: str, cooldown: _Cooldown | None, receipt: dict[str, Any]
+) -> str | None:
     """The newest claude-swap release uv would install into this environment.
 
-    ``uv pip list --outdated`` resolves against the index the way ``uv tool
-    upgrade`` does once it is handed the same exclude-newer setting, so the
-    version it reports is one uv can actually install. Returns the current
+    A saved main requirement must also be respected: a package listing does
+    not apply it, so constrained installs use uv's resolver instead. Returns the current
     version when nothing newer is visible and None when uv fails. A uv that
     is not on PATH raises FileNotFoundError, since the caller treats that
     differently from a failed resolve. The environment variable is dropped so that the cooldown passed
@@ -153,7 +221,25 @@ def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str 
     whatever project the shell happens to be in. ``uv tool upgrade`` does
     not, so a project's own cutoff must not hide releases from this check.
     """
-    cmd = ["uv", "pip", "list", "--outdated", "--format", "json", "--python", sys.executable]
+    requirements = receipt.get("requirements", [])
+    if isinstance(requirements, list) and requirements:
+        main = requirements[0]
+        if isinstance(main, dict):
+            specifier = main.get("specifier")
+            if isinstance(specifier, str) and specifier.strip() == f"=={current_version}":
+                return current_version
+        elif isinstance(main, str):
+            if re.fullmatch(rf"\s*claude[-_.]swap\s*==\s*{re.escape(current_version)}\s*", main, re.IGNORECASE):
+                return current_version
+    resolve = _uv_needs_resolution(receipt)
+    if resolve:
+        sources = _uv_requirements(receipt)
+        if not sources:
+            return None
+        cmd = ["uv", "pip", "compile", "-", "--no-header", "--no-annotate", "--python", sys.executable]
+    else:
+        sources = []
+        cmd = ["uv", "pip", "list", "--outdated", "--format", "json", "--python", sys.executable]
     if cooldown is not None:
         cmd += ["--exclude-newer", cooldown.value]
     env = {k: v for k, v in os.environ.items() if k != "UV_EXCLUDE_NEWER"}
@@ -166,7 +252,15 @@ def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str 
             env=env,
             check=True,
             cwd=sys.prefix,
+            **({"input": "\n".join(sources) + "\n"} if resolve else {}),
         )
+        if resolve:
+            match = re.search(
+                r"^claude[-_.]swap(?:\[[^\]\n]+\])?==([^\s;]+)",
+                result.stdout,
+                re.MULTILINE | re.IGNORECASE,
+            )
+            return match.group(1) if match else None
         rows = json.loads(result.stdout)
     except FileNotFoundError:
         raise
@@ -197,7 +291,7 @@ class _Lookup(NamedTuple):
     cache: bool
 
 
-def _latest_version(current_version: str, method: str | None) -> _Lookup:
+def _latest_version(current_version: str, method: str | None, receipt: dict[str, Any]) -> _Lookup:
     """The newest release the user's package manager will actually install.
 
     uv is often off PATH when cswap runs under cron or launchd. Without a
@@ -210,16 +304,16 @@ def _latest_version(current_version: str, method: str | None) -> _Lookup:
     """
     if method != "uv":
         return _Lookup(_pypi_latest_version(), cache=True)
-    cooldown = _uv_cooldown(_read_receipt())
+    cooldown = _uv_cooldown(receipt)
     uv_missing = False
     try:
-        latest = _uv_latest_version(current_version, cooldown)
+        latest = _uv_latest_version(current_version, cooldown, receipt)
     except FileNotFoundError:
         latest = None
         uv_missing = True
     if latest is not None:
         return _Lookup(latest, cache=True)
-    if cooldown is None:
+    if cooldown is None and not _uv_needs_resolution(receipt):
         return _Lookup(_pypi_latest_version(), cache=True)
     return _Lookup(None, cache=not uv_missing)
 
@@ -236,15 +330,15 @@ def held_back_release_notice(current_version: str) -> str | None:
     takes the release and leaves the receipt's extras, ``--with`` packages,
     Python version and index options alone. uv stores the zero as
     ``exclude-newer-span = "PT0S"``, so a second line restores the receipt's
-    own value. The flag also wins over ``UV_EXCLUDE_NEWER`` for that one
-    run, and since the variable keeps applying afterwards there is nothing
-    to restore in that case.
+    own value, even when ``UV_EXCLUDE_NEWER`` currently overrides it. The
+    variable remains in effect for subsequent upgrades until it is unset.
     """
-    cooldown = _uv_cooldown(_read_receipt())
+    receipt = _read_receipt()
+    cooldown = _uv_cooldown(receipt)
     if cooldown is None:
         return None
     try:
-        latest = _uv_latest_version(current_version, None)
+        latest = _uv_latest_version(current_version, None, receipt)
         if latest is None or not _is_newer(latest, current_version):
             return None
     except (FileNotFoundError, ValueError):
@@ -258,32 +352,47 @@ def held_back_release_notice(current_version: str) -> str | None:
         lines.append(f"  To take it now (the flag overrides UV_EXCLUDE_NEWER): {take_now}")
     else:
         lines.append(f"  To take it now:          {take_now}")
-        if _CUTOFF_RE.match(cooldown.value):
-            lines.append(
-                "  To restore the cooldown: "
-                f"uv tool upgrade claude-swap --exclude-newer {cooldown.value}"
-            )
+    saved = _receipt_cooldown(receipt)
+    if saved is not None and _CUTOFF_RE.fullmatch(saved.value):
+        lines.append(
+            "  To restore the cooldown: "
+            f"uv tool upgrade claude-swap --exclude-newer {saved.value}"
+        )
     return "\n".join(lines)
+
+
+def _update_cache_context(current_version: str, method: str | None, receipt: dict[str, Any]) -> str:
+    """Identify lookup inputs without storing index credentials in the cache."""
+    context = {
+        "method": method,
+        "prefix": sys.prefix,
+        "executable": sys.executable,
+        "current": current_version,
+        "receipt": receipt,
+        "uv_environment": {key: value for key, value in os.environ.items() if key.startswith("UV_")},
+    }
+    return hashlib.sha256(json.dumps(context, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
         method = _detect_install_method()
-        cached_data = read_cache(CACHE_PATH, CACHE_TTL)
+        receipt = _read_receipt() if method == "uv" else {}
+        context = _update_cache_context(current_version, method, receipt)
+        cached_data = read_cache(CACHE_PATH, CACHE_TTL, context=context)
         if cached_data is None:
-            # A cached failure. Keep it for an hour, not a day.
-            cached_data = read_cache(CACHE_PATH, FAILURE_TTL)
+            cached_data = read_cache(CACHE_PATH, FAILURE_TTL, context=context)
         if cached_data is not MISSING and isinstance(cached_data, str | None):
             latest_version = cached_data
         else:
-            lookup = _latest_version(current_version, method)
+            lookup = _latest_version(current_version, method, receipt)
             latest_version = lookup.latest
             # A failure is cached as None and expires after FAILURE_TTL.
             # The one exception is uv missing under a cooldown, see
             # _latest_version.
             if lookup.cache:
-                write_cache(CACHE_PATH, latest_version)
+                write_cache(CACHE_PATH, latest_version, context=context)
 
         if latest_version and _is_newer(latest_version, current_version):
             direct = {
