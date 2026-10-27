@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tomllib
 import urllib.request
+from importlib.metadata import distribution
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -69,6 +70,15 @@ def _is_newer(latest: str, current: str) -> bool:
     if latest_version.pre_rank != _FINAL_RANK and current_version.pre_rank == _FINAL_RANK:
         return False
     return latest_version > current_version
+
+
+def _is_editable_install() -> bool:
+    """Return True if claude-swap runs from an editable install (PEP 610)."""
+    try:
+        text = distribution("claude-swap").read_text("direct_url.json")
+        return bool(text and json.loads(text).get("dir_info", {}).get("editable"))
+    except Exception:
+        return False
 
 
 def _detect_install_method() -> str | None:
@@ -269,6 +279,9 @@ def held_back_release_notice(current_version: str) -> str | None:
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
+        if _is_editable_install():
+            return None
+
         method = _detect_install_method()
         cached_data = read_cache(CACHE_PATH, CACHE_TTL)
         if cached_data is None:
