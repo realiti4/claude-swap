@@ -313,6 +313,11 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+# How long activation waits on a lock a refresh may hold across its POST: one
+# full refresh reply plus an ordinary lock wait.
+ACTIVATION_LOCK_TIMEOUT_S = oauth.OAUTH_REFRESH_TIMEOUT_S + DEFAULT_LOCK_TIMEOUT_S
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -2203,7 +2208,7 @@ class ClaudeAccountSwitcher:
         """
         return FileLock(
             self.credentials_dir / f".consume-{account_num}.lock",
-            timeout=oauth.OAUTH_REFRESH_TIMEOUT_S + DEFAULT_LOCK_TIMEOUT_S,
+            timeout=ACTIVATION_LOCK_TIMEOUT_S,
         )
 
     def keep_active_login_fresh(self, lead_ms: int) -> tuple[str, int | None]:
@@ -4950,13 +4955,14 @@ class ClaudeAccountSwitcher:
                         working = backup
                     else:
                         # The POST runs while holding the account FileLock
-                        # (contended by `cswap switch` with a 10s acquire
-                        # budget) and CC's credential locks. Bound it well
-                        # inside that budget so a slow network can't make a
-                        # concurrent switch's acquire expire — the switch
-                        # then waits out the tail instead of erroring.
+                        # and CC's credential locks. It waits as long as
+                        # Claude Code's own refresh does: abandoning a reply
+                        # the server already rotated for strands the slot on
+                        # the spent grant, and its next attempt is
+                        # invalid_grant. `cswap switch` waits on the account
+                        # lock for ACTIVATION_LOCK_TIMEOUT_S, past this POST.
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                            refresh_input
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -7378,7 +7384,9 @@ class ClaudeAccountSwitcher:
         # here is local I/O — no network while locks are held.
         with (
             self._activation_consume_lock(target_account),
-            FileLock(self.lock_file),
+            # The outgoing slot's locked refresh holds this lock across its
+            # POST; activation waits that out instead of failing mid-switch.
+            FileLock(self.lock_file, timeout=ACTIVATION_LOCK_TIMEOUT_S),
             claude_credentials_lock(),
             claude_config_lock(),
         ):
