@@ -736,6 +736,9 @@ class AutoSwitchEngine:
         # Earliest rotation deadline the last keepalive pass scheduled; the
         # loop's sleep never runs past it.
         self._keepalive_deadline: float | None = None
+        # When each quarantined slot's credential was last compared, so a
+        # dead slot is re-read once per KEEPALIVE_RETRY_S, not every tick.
+        self._quarantine_checked_at: dict[str, float] = {}
 
     # -- state file ---------------------------------------------------------
 
@@ -789,15 +792,29 @@ class AutoSwitchEngine:
         """
         quarantine = state.get("quarantine")
         if not isinstance(quarantine, dict) or not quarantine:
+            self._quarantine_checked_at.clear()
             return state
+        now = self.clock()
+        emails = dict(self.switcher.managed_accounts())
+        self._quarantine_checked_at = {
+            number: at
+            for number, at in self._quarantine_checked_at.items()
+            if number in quarantine
+        }
         to_release: list[tuple[str, str, str]] = []
         for number, entry in quarantine.items():
-            email_now = self.switcher.account_email(number)
+            email_now = emails.get(number, "")
             if not email_now or email_now != entry.get("email"):
                 to_release.append(
                     (number, entry.get("email", ""), "account-replaced")
                 )
                 continue
+            # A re-add is a human step; seeing it within the keepalive retry
+            # costs nothing, while a credential read per dead slot per tick
+            # is a Keychain spawn each on macOS.
+            if now - self._quarantine_checked_at.get(number, float("-inf")) < KEEPALIVE_RETRY_S:
+                continue
+            self._quarantine_checked_at[number] = now
             creds = self.switcher.read_account_credentials(number, email_now)
             fingerprint = _refresh_fingerprint(creds) if creds else None
             if fingerprint != entry.get("refreshTokenFingerprint"):
