@@ -1692,7 +1692,10 @@ class TestAdaptiveScheduler:
         h.seed(2, "b@example.com", expires_at=expires_ms)
         usage = {"1": _usage(50), "2": _usage(10)}
         counts: dict[str, int] = {}
-        self._tick(h, counts, usage)
+        # The plan is the fallback for a keepalive that could not rotate;
+        # with the keepalive running, both tokens would rotate first.
+        with patch.object(h.engine, "_keep_logins_alive"):
+            self._tick(h, counts, usage)
         assert counts == {"1": 1, "2": 1}
         entries = h.switcher._usage_store.entries({
             "1": ("a@example.com", ""), "2": ("b@example.com", ""),
@@ -6064,7 +6067,11 @@ class TestAllAboveHeadroomDoesNotFlap:
             ranking_now, ranking_now, stale_reread,
             stale_reread, stale_reread, stale_reread,
         ])
-        with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
+        # The scripted sequence counts the ranking's clock reads; the
+        # keepalive's own reads before it are outside this test's subject.
+        with patch.object(h.engine, "_keep_logins_alive"), patch.object(
+            h.engine, "clock", side_effect=lambda: next(clock_values)
+        ):
             outcome = h.tick_with_usage({
                 "1": _usage(95, reset_at),
                 "2": _usage(10),
@@ -7280,3 +7287,73 @@ class TestWeeklyThreshold:
         h.engine.apply_threshold(72.0)
         assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
         assert h.engine.settings.weekly_threshold == 97.0
+
+
+class TestKeepalive:
+    """Every OAuth login rotates ahead of its expiry from the engine, whatever
+    the usage endpoint answers (#415) and before Claude Code's own refresh
+    window (#510)."""
+
+    @staticmethod
+    def _blob(token: str, expires_at: int) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": f"sk-{token}",
+            "refreshToken": f"rt-{token}",
+            "expiresAt": expires_at,
+        }})
+
+    def _harness(self, temp_home, *, active_expires_in_ms, idle_expires_in_ms):
+        h = EngineHarness(temp_home)
+        # The active login's refresh path reads the wall clock, the engine's
+        # idle pass its injected one; each expiry is relative to its reader.
+        h.seed(1, "a@example.com",
+               expires_at=int(time.time() * 1000) + active_expires_in_ms)
+        h.seed(2, "b@example.com",
+               expires_at=int(h.clock() * 1000) + idle_expires_in_ms)
+        h.make_live("a@example.com", 1)
+        # The live login is the slot's own lineage, as after a switch.
+        self.live_path = temp_home / ".claude" / ".credentials.json"
+        self.live_path.write_text(
+            h.switcher.read_account_credentials("1", "a@example.com")
+        )
+        return h
+
+    def _rotate(self, h):
+        later = int(time.time() * 1000) + 8 * 3_600_000
+
+        def refresh(creds, **_kwargs):
+            token = json.loads(creds)["claudeAiOauth"]["refreshToken"][3:]
+            return oauth.RefreshOutcome(self._blob(f"{token}-next", later), None)
+
+        return patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            side_effect=refresh,
+        )
+
+    def test_idle_slot_rotates_while_its_usage_is_unreadable(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000, idle_expires_in_ms=60_000
+        )
+        with self._rotate(h):
+            outcome = h.tick_with_usage({"1": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert "sk-2-next" in h.switcher.read_account_credentials("2", "b@example.com")
+
+    def test_active_login_rotates_before_claude_codes_window(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=10 * 60_000, idle_expires_in_ms=3_600_000
+        )
+        with self._rotate(h):
+            h.tick_with_usage({"1": _usage(10)})
+        assert "sk-1-next" in self.live_path.read_text()
+        assert "sk-1-next" in h.switcher.read_account_credentials("1", "a@example.com")
+
+    def test_logins_far_from_expiry_are_left_alone(self, temp_home):
+        h = self._harness(
+            temp_home, active_expires_in_ms=3_600_000, idle_expires_in_ms=3_600_000
+        )
+        live_before = self.live_path.read_text()
+        with self._rotate(h):
+            h.tick_with_usage({"1": _usage(10)})
+        assert self.live_path.read_text() == live_before
+        assert "sk-2\"" in h.switcher.read_account_credentials("2", "b@example.com")

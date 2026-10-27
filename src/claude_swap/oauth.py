@@ -101,13 +101,15 @@ def login_expires_at_iso(credentials: str) -> str | None:
     )
 
 
-def is_oauth_token_expired(expires_at: object) -> bool:
-    """Return whether an OAuth token is expired or about to expire."""
+def is_oauth_token_expired(
+    expires_at: object, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS
+) -> bool:
+    """Return whether an OAuth token expires within ``buffer_ms``."""
     if not isinstance(expires_at, (int, float)):
         return False
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+    return now_ms + buffer_ms >= int(expires_at)
 
 
 def _refresh_request_body(oauth_data: dict) -> dict[str, str]:

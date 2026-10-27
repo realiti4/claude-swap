@@ -2165,6 +2165,54 @@ class ClaudeAccountSwitcher:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
 
+    def keep_active_login_fresh(self, lead_ms: int) -> tuple[str, int | None]:
+        """Rotate the active login once it is within ``lead_ms`` of expiry.
+
+        Parallel Claude Code sessions on one login all refresh inside the same
+        5-minute window, and a refresh the server accepted but no process
+        saved kills the lineage (#510). Rotating earlier, from this one
+        long-lived process, under the collector's locked path, keeps every
+        session out of that window: each takes one 401 on the old access token
+        and adopts the stored successor without a POST.
+
+        Returns ``(status, expires_at_ms)``: status is ``"fresh"`` (nothing to
+        do), ``"refreshed"``, ``"deferred"`` (locks held, degraded read,
+        unattributable bytes), ``"invalid_grant"`` or ``"transient"``;
+        ``expires_at_ms`` is the active token's expiry when it was read.
+        """
+        account_num = self.current_account_number()
+        if account_num is None:
+            return "fresh", None
+        account = (self._get_sequence_data() or {}).get("accounts", {}).get(
+            account_num, {}
+        )
+        email = account.get("email", "")
+        active = self._read_active_credentials()
+        self._record_active_verdict(active)
+        oauth_data = oauth.extract_oauth_data(active.value) if active.value else None
+        if not email or not oauth_data or not oauth_data.get("refreshToken"):
+            # API keys and setup-tokens have no lineage to keep alive.
+            return "fresh", None
+        expires_at = oauth_data.get("expiresAt")
+        expires_at_ms = int(expires_at) if isinstance(expires_at, (int, float)) else None
+        if not oauth.is_oauth_token_expired(expires_at, lead_ms):
+            return "fresh", expires_at_ms
+        record = self._fetch_active_usage(
+            account_num,
+            email,
+            active.value,
+            account.get("organizationUuid", "") or "",
+            refresh_lead_ms=lead_ms,
+            fetch_usage=False,
+        )
+        if record.error in ("invalid_grant", "no_refresh_token"):
+            return "invalid_grant", expires_at_ms
+        if record.error is not None:
+            return "transient", expires_at_ms
+        if record.sentinel is not None:
+            return "deferred", expires_at_ms
+        return "refreshed", expires_at_ms
+
     def persist_backup_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -4376,7 +4424,14 @@ class ClaudeAccountSwitcher:
         return accounts_info
 
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str, org_uuid: str = ""
+        self,
+        account_num: str,
+        email: str,
+        creds: str,
+        org_uuid: str = "",
+        *,
+        refresh_lead_ms: int = oauth.OAUTH_EXPIRY_BUFFER_MS,
+        fetch_usage: bool = True,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -4414,6 +4469,11 @@ class ClaudeAccountSwitcher:
           generation left as the live credential is the account-death shape —
           the token endpoint rejects its reuse (verified: invalid_grant on
           re-presentation, siblings unaffected).
+
+        ``refresh_lead_ms`` widens what counts as expired at all three expiry
+        checks (fast path, adopt, backup restore), so the keepalive can rotate
+        ahead of Claude Code's own window; ``fetch_usage=False`` returns an
+        empty record instead of querying the usage endpoint.
         """
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
@@ -4441,7 +4501,11 @@ class ClaudeAccountSwitcher:
         # so this path could take it, read the same lineage and POST it too —
         # one wins, the loser gets invalid_grant and strikes a live account.
         force_refresh: FetchRecord | None = None
-        if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+        if not oauth.is_oauth_token_expired(
+            oauth_data.get("expiresAt"), refresh_lead_ms
+        ):
+            if not fetch_usage:
+                return FetchRecord()
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
             )
@@ -4625,7 +4689,7 @@ class ClaudeAccountSwitcher:
                     and live_oauth.get("accessToken")
                     and live_oauth.get("refreshToken")
                     and not oauth.is_oauth_token_expired(
-                        live_oauth.get("expiresAt")
+                        live_oauth.get("expiresAt"), refresh_lead_ms
                     )
                 ):
                     # Someone (a live CC) already rotated it — adopt, consume
@@ -4766,7 +4830,7 @@ class ClaudeAccountSwitcher:
                         and not force_refresh
                         and input_oauth
                         and not oauth.is_oauth_token_expired(
-                            input_oauth.get("expiresAt")
+                            input_oauth.get("expiresAt"), refresh_lead_ms
                         )
                     ):
                         # The backup already holds a live, non-expired
@@ -4933,6 +4997,8 @@ class ClaudeAccountSwitcher:
             )
             return _defer(force_refresh)
 
+        if not fetch_usage:
+            return FetchRecord()
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
         )

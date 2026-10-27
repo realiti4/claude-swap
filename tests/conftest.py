@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import types
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -724,6 +725,21 @@ def sample_sequence_data_with_org():
             },
         },
     }
+
+
+@pytest.fixture(autouse=True)
+def _no_live_anthropic_requests(monkeypatch):
+    """No test may reach api.anthropic.com or the OAuth token endpoint.
+
+    The engine keepalive refreshes any login within 15 minutes of expiry, so
+    tests seeding near-expiry fixtures without patching the refresh used to
+    POST their fake refresh tokens to the real token endpoint. Tests that
+    exercise HTTP patch ``urlopen`` (or a caller above it) over this."""
+
+    def refuse(*_args, **_kwargs):
+        raise urllib.error.URLError("live network is blocked under pytest")
+
+    monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", refuse)
 
 
 @pytest.fixture(autouse=True)
