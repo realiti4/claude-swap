@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -118,10 +119,8 @@ _FSYNC_UNSUPPORTED = frozenset(
 
 # ``os.path.ALLOW_MISSING`` (3.12.11 / 3.13.4 and later) resolves a symlink
 # chain strictly -- a loop or any other resolution error raises -- while
-# allowing the final referent to be missing. Older patch releases fall back to
-# fully strict resolution, which refuses a dangling link rather than guess.
-# Module-level so a test can pin the fallback without touching ``os.path``.
-_RESOLVE_STRICT = getattr(os.path, "ALLOW_MISSING", True)
+# allowing missing components. Older patch releases use the fallback below.
+_RESOLVE_STRICT = getattr(os.path, "ALLOW_MISSING", None)
 
 # NAME_MAX is 255 bytes on every filesystem cswap meets, and ``mkstemp`` adds
 # eight random characters plus ``.tmp`` to the prefix. A prefix carrying the
@@ -129,6 +128,65 @@ _RESOLVE_STRICT = getattr(os.path, "ALLOW_MISSING", True)
 # the limit -- ENAMETOOLONG at the temp, for a file that itself fits. Keep
 # the association readable for ordinary names and bounded for long ones.
 _TEMP_PREFIX_CHARS = 40
+
+
+def _realpath_allow_missing(path: Path) -> Path:
+    """Resolve a path component by component, ignoring only missing entries."""
+    name = os.fspath(path)
+    if sys.platform == "win32":
+        # Windows' own realpath normalizes before resolving reparse points.
+        name = os.path.abspath(name)
+    elif not os.path.isabs(name):
+        name = os.path.join(os.getcwd(), name)
+    drive, root, tail = os.path.splitroot(name)
+    resolved = Path(drive + root)
+    pending: list[str | Path] = list(reversed(tail.split(os.sep)))
+    active: set[Path] = set()
+
+    while pending:
+        part = pending.pop()
+        if isinstance(part, Path):
+            active.remove(part)
+            continue
+        if not part or part == ".":
+            continue
+        if part == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        try:
+            entry = os.lstat(candidate)
+        except FileNotFoundError:
+            resolved = candidate
+            continue
+        if stat.S_ISLNK(entry.st_mode) or (
+            sys.platform == "win32"
+            and getattr(entry, "st_reparse_tag", None) == stat.IO_REPARSE_TAG_MOUNT_POINT
+        ):
+            if candidate in active:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), candidate)
+            active.add(candidate)
+            link = os.readlink(candidate)
+            if os.path.altsep:
+                link = link.replace(os.path.altsep, os.sep)
+            drive, root, tail = os.path.splitroot(link)
+            if drive or root:
+                name = os.path.join(os.fspath(resolved), link)
+                if sys.platform == "win32":
+                    name = os.path.abspath(name)
+                drive, root, tail = os.path.splitroot(name)
+                resolved = Path(drive + root)
+            pending.append(candidate)
+            pending.extend(reversed(tail.split(os.sep)))
+        else:
+            if not stat.S_ISDIR(entry.st_mode) and any(
+                isinstance(p, str) for p in pending
+            ):
+                raise NotADirectoryError(
+                    errno.ENOTDIR, os.strerror(errno.ENOTDIR), candidate
+                )
+            resolved = candidate
+    return resolved
 
 
 def publish_target(path: os.PathLike | str) -> Path:
@@ -141,7 +199,7 @@ def publish_target(path: os.PathLike | str) -> Path:
     silently stops receiving updates (#192). Claude Code's own config writer
     writes through a symlinked ``~/.claude.json`` for the same reason.
 
-    Resolution is ``os.path.realpath`` with ``strict=os.path.ALLOW_MISSING``:
+    Resolution follows ``os.path.realpath`` with ``strict=os.path.ALLOW_MISSING``:
     the whole chain (not one hop), a missing final referent allowed (a
     dangling link writes where it points), a loop or any other resolution
     error raised. Not the non-strict default: that collapses
@@ -151,6 +209,8 @@ def publish_target(path: os.PathLike | str) -> Path:
     target = Path(path)
     if not target.is_symlink():
         return target
+    if _RESOLVE_STRICT is None:
+        return _realpath_allow_missing(target)
     return Path(os.path.realpath(target, strict=_RESOLVE_STRICT))
 
 
