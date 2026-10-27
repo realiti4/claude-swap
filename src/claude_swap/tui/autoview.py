@@ -192,7 +192,7 @@ class AutoScreen(Screen):
         self.app.threshold_pct = value
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
-        # The Next best list ranks by the lines in force, so it must follow
+        # The headroom list ranks by the lines in force, so it must follow
         # the session value now rather than at the next snapshot: under a
         # weekly line the order and the 5h rows' "(line N%)" both move.
         self._on_snapshot(self.app.snapshot)
@@ -306,14 +306,13 @@ class AutoScreen(Screen):
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by headroom against their own switch lines
-        (best first) — the engine's own ordering."""
+        """Candidates ordered by headroom, not the engine's strategy ranking."""
         # Same window set AND the same lines as the engine: autoswitch.model,
         # each account's own line (its policy threshold, else the session
         # threshold — `_settings` is what `_set_threshold` replaces), the
         # weekly line, and the session threshold as the ruler every account is
-        # scored on, so the displayed ranking can never disagree with the
-        # account it picks.
+        # scored on. Strategy-specific eligibility and reset/priority ordering
+        # remain the engine's responsibility; this is a headroom overview.
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
@@ -360,7 +359,7 @@ class AutoScreen(Screen):
             lines[acc.number] = entry
 
         text = Text()
-        text.append("Next best", style=palette.muted)
+        text.append("Candidates by headroom", style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
