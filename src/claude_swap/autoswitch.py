@@ -923,10 +923,14 @@ class AutoSwitchEngine:
         }
         rotations = 0
 
-        for number, email in managed:
+        # The active slot first: the idle budget below ends the pass early.
+        for number, email in sorted(managed, key=lambda slot: slot[0] != current):
             key = f"{number}|{email}"
             if not email or number in quarantined or due.get(key, [0.0])[0] > now:
                 continue
+            if number != current and rotations >= KEEPALIVE_ROTATIONS_PER_TICK:
+                # The rest stay due for the next tick, unread.
+                break
             if number == current:
                 if self.switcher.slot_token_dead(number, email):
                     due[key] = [park_at, False]
@@ -976,9 +980,6 @@ class AutoSwitchEngine:
                 continue
             if now * 1000 + KEEPALIVE_LEAD_MS < expires_at:
                 due[key] = [expires_at / 1000 - lead_s, True]
-                continue
-            if rotations >= KEEPALIVE_ROTATIONS_PER_TICK:
-                due[key] = [now, True]  # next tick, behind this tick's budget
                 continue
             rotations += 1
             status = self._freshen_target(number, email, KEEPALIVE_LEAD_MS)
