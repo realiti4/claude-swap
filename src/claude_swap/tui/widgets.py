@@ -371,7 +371,12 @@ class AccountsPanel(Static):
             if acc.is_active:
                 blocks.append(
                     account_card_text(
-                        acc, width, threshold=app.threshold_pct,
+                        acc, width,
+                        threshold=(
+                            acc.policy.threshold
+                            if acc.policy.threshold is not None
+                            else app.threshold_pct
+                        ),
                         weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette,
                     )

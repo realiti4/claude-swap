@@ -107,6 +107,40 @@ class TestThresholdBadge:
         assert "60%" in row
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("weekly_threshold", [None, 75.0])
+async def test_active_panel_ticks_at_the_account_override(tmp_path, weekly_threshold):
+    from claude_swap.tui.widgets import AccountsPanel
+
+    (tmp_path / "settings.json").write_text(json.dumps({
+        "schemaVersion": 1,
+        "autoswitch": {"threshold": 90, "weeklyThreshold": weekly_threshold},
+    }))
+    acc = with_policy(
+        make_account(
+            1, active=True,
+            entry=make_entry(
+                25.0, 10.0, scoped=[("Fable", 15.0)],
+                spend={"pct": 20.0, "used": 2.0, "limit": 10.0},
+            ),
+        ),
+        threshold=60.0,
+    )
+    app = make_app(FakeSwitcher([acc], tmp_path))
+    async with app.run_test(size=(100, 40)) as pilot:
+        await settle(pilot)
+        plain = app.screen.query_one(AccountsPanel).render().plain
+        assert "th 60%" in plain.splitlines()[0]
+        bars = {row.split()[0]: row.split()[1] for row in plain.splitlines()[1:]}
+        for label in ("$$", "5h", "7d", "Fable"):
+            line = (
+                weekly_threshold
+                if weekly_threshold is not None and label in ("7d", "Fable")
+                else 60.0
+            )
+            assert bars[label].index("┃") == round(line / 100 * len(bars[label]))
+
+
 class TestUnpolicedAccountsRenderExactlyAsBefore:
     """The negative half, and the reason this file has goldens.
 
@@ -218,3 +252,25 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 "user2@example.com"
             )
             assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "priority-consume-first"])
+    async def test_candidates_explicitly_label_headroom_ordering(
+        self, tmp_path, fake_engine, strategy
+    ):
+        from textual.widgets import Static
+
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "strategy": strategy},
+        }))
+        app = make_app(FakeSwitcher([
+            make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+            with_policy(make_account(2, entry=make_entry(85.0, 10.0)), priority=10),
+            with_policy(make_account(3, entry=make_entry(15.0, 5.0)), priority=0),
+        ], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.splitlines()[0] == "Candidates by headroom"
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
