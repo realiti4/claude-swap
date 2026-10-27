@@ -48,9 +48,11 @@ def ensure_notification_identity(
 ) -> Path | None:
     """Ensure rumps can resolve a bundle identifier for notifications.
 
-    Command-line Python tools have no app bundle, so rumps looks for an
-    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
-    environment; repair the tiny plist on every launch when needed.
+    Fallback for runs outside the wrapper bundle (``claude_swap.app_bundle``),
+    whose Info.plist already carries the identifier: a bare command-line
+    interpreter has no app bundle, so rumps looks for an ``Info.plist`` beside
+    it. uv/pipx reinstalls can recreate that environment; repair the tiny
+    plist on every launch when needed.
     """
     if platform != "darwin":
         return None
@@ -518,14 +520,6 @@ def framework_build_warning(
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    ensure_notification_identity()
-    _warn = framework_build_warning()
-    if _warn:
-        # stderr, not stdout: launchd sends stdout to the .log file where it
-        # would sit in a block buffer for the life of the process, and the
-        # install output points the user at the .err file anyway. stderr stays
-        # line-buffered even when redirected, so it lands immediately.
-        warning(_warn, file=sys.stderr)
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
@@ -538,6 +532,23 @@ def run(switcher) -> int:
             "Menu bar mode requires 'rumps'. "
             "Install with: pip install 'claude-swap[menubar]'"
         ) from e
+
+    from claude_swap import app_bundle
+
+    # Hop into the wrapper .app before anything AppKit-side is set up, so the
+    # status item's owner has a bundle identifier that menu bar managers can
+    # key on. Returns only when staying in this interpreter (already bundled,
+    # opted out, framework build, or the bundle could not be built).
+    app_bundle.maybe_reexec(switcher.backup_dir)
+    if not app_bundle.in_bundle():
+        ensure_notification_identity()
+    _warn = framework_build_warning()
+    if _warn:
+        # stderr, not stdout: launchd sends stdout to the .log file where it
+        # would sit in a block buffer for the life of the process, and the
+        # install output points the user at the .err file anyway. stderr stays
+        # line-buffered even when redirected, so it lands immediately.
+        warning(_warn, file=sys.stderr)
 
     # rumps never sets an activation policy, so under a framework Python the
     # process launches as a regular app and parks a "Python" icon in the Dock

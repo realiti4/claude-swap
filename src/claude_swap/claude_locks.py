@@ -59,6 +59,15 @@ TOUCH_INTERVAL_S = 3.0
 # Note this is a PER-LOCK budget: claude_credentials_lock acquires two locks
 # sequentially, so its worst case is ~2x this value.
 DEFAULT_TIMEOUT_S = 9.0
+# A stale-lock takeover is a stat followed by an rmdir, and two waiters that
+# both saw the same dead holder could each run it: the second rmdir then hit
+# the first waiter's fresh lock (#420). Takeovers are serialized through this
+# sibling directory and re-check staleness inside it. Claude Code never looks
+# at it, so the lock protocol itself is unchanged.
+TAKEOVER_SUFFIX = ".takeover"
+# The takeover directory is held for one stat + rmdir; older than this, its
+# holder died mid-takeover.
+TAKEOVER_STALENESS_S = 5.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -80,6 +89,40 @@ def config_lock_dir() -> Path:
     """Lock directory guarding the global config file (``~/.claude.json.lock``)."""
     path = get_global_config_path()
     return path.parent / (path.name + ".lock")
+
+
+def _remove_if_still_stale(lock_dir: Path, staleness: float) -> bool:
+    """Remove ``lock_dir`` if it is still stale, under the takeover directory.
+
+    Returns True if this call removed it. False means another waiter is mid-
+    takeover, the lock was already gone or retaken, or it can't be removed.
+    """
+    takeover = lock_dir.with_name(lock_dir.name + TAKEOVER_SUFFIX)
+    try:
+        os.mkdir(takeover)
+    except FileExistsError:
+        try:
+            if time.time() - os.stat(takeover).st_mtime > TAKEOVER_STALENESS_S:
+                os.rmdir(takeover)  # its holder died mid-takeover
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+    try:
+        # Re-check inside: the waiter before us may already have removed the
+        # dead lock and taken a fresh one at the same path.
+        if time.time() - os.stat(lock_dir).st_mtime <= staleness:
+            return False
+        os.rmdir(lock_dir)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.rmdir(takeover)
+        except OSError:
+            pass
 
 
 @contextmanager
@@ -121,10 +164,8 @@ def proper_lockfile(
         if time.time() - held_mtime > staleness:
             # Dead holder per the protocol: remove and retake. Losing the
             # rmdir/mkdir race to another waiter just means looping again.
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                time.sleep(0.05)  # can't remove it either; don't spin hot
+            if not _remove_if_still_stale(lock_dir, staleness):
+                time.sleep(0.05)  # not removed this time; don't spin hot
             continue
         time.sleep(0.25 + random.random() * 0.25)
 

@@ -1607,6 +1607,31 @@ class TestGuards:
         # The profile is the source of that generation, not a stale seed.
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
 
+    def test_switch_refuses_exited_target_whose_ahead_profile_cannot_be_adopted(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Nothing running and the profile ahead, but its identity unreadable:
+        adoption refuses to write (it cannot tell whose credential that is),
+        and the switch must not then activate the consumed backup silently."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text("not json{{{")
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="could not be adopted"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        data = seeded_switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
     def test_backup_credential_write_invalidates_stale_profile(
         self, seeded_switcher, block_real_keychain
     ):
@@ -1928,6 +1953,41 @@ class TestShareHistoryPosix:
         ).read_text() == "main-a\n"
         assert (session_dir / "projects").is_symlink()
 
+    def test_merge_keeps_an_unterminated_shared_line_whole(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (source / "history.jsonl").write_text('{"p": "main"}')  # torn tail
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        lines = (source / "history.jsonl").read_text().splitlines()
+        assert lines == ['{"p": "main"}', '{"p": "profile"}']
+
+    def test_merge_skipped_when_profile_history_is_byte_corrupt(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (session_dir / "history.jsonl").write_bytes(b'{"p": "\xff\xfe"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # Unreadable history is skipped, not fatal: the launch goes ahead and
+        # the bytes stay put for a later attempt.
+        assert (session_dir / "history.jsonl").read_bytes() == b'{"p": "\xff\xfe"}\n'
+        assert (session_dir / "settings.json").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "history.jsonl" not in manifest["items"]
+
+    def test_merge_skipped_when_shared_history_is_byte_corrupt(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (source / "history.jsonl").write_bytes(b'{"p": "\xff\xfe"}\n')
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "history.jsonl").read_text() == '{"p": "profile"}\n'
+        assert (session_dir / "settings.json").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "history.jsonl" not in manifest["items"]
+
     def test_merge_deferred_while_profile_live(self, history_setup, monkeypatch):
         source, session_dir, mgr = history_setup
         (session_dir / "projects").mkdir()
@@ -2140,6 +2200,75 @@ class TestReadSessionCredentials:
         )
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-own" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_relative_symlink_target_is_normalised_before_hashing(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """``sessions/profile -> ../space`` hashes ``/x/space``, the path a
+        tool launching at the target exports, not ``/x/sessions/../space``."""
+        target = tmp_path / "space"
+        target.mkdir()
+        (target / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        (tmp_path / "sessions").mkdir()
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        block_real_keychain.set_password(
+            keychain_service_name(target),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_lexical_target_naming_another_directory_is_not_consulted(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """When the link's parent is itself a symlink elsewhere, ``..`` resolves
+        under the parent's target, so the lexical spelling names an unrelated
+        directory whose entry must never be served as this profile's."""
+        (tmp_path / "leases" / "sessions").mkdir(parents=True)
+        (tmp_path / "leases" / "space").mkdir()
+        (tmp_path / "leases" / "space" / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-seed"}}'
+        )
+        (tmp_path / "sessions").symlink_to("leases/sessions")
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        unrelated = tmp_path / "space"
+        unrelated.mkdir()
+        block_real_keychain.set_password(
+            keychain_service_name(unrelated),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-unrelated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-seed" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_raw_joined_target_spelling_still_matches(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """A tool that exports ``$(dirname link)/$(readlink link)`` verbatim
+        hashes the un-normalised join; that spelling stays a candidate."""
+        target = tmp_path / "space"
+        target.mkdir()
+        (target / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        (tmp_path / "sessions").mkdir()
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        block_real_keychain.set_password(
+            keychain_service_name(f"{session_dir.parent}/../space"),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
 
 
 ACTIVE_TOKEN = "active-store-token"
@@ -2861,3 +2990,22 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypatch):
+    """The manifest writer swallows OSError on purpose (best effort), but a
+    Ctrl-C must still propagate and must not strand the temp."""
+    from types import SimpleNamespace
+
+    from claude_swap.session import SessionManager
+
+    mgr = SessionManager.__new__(SessionManager)
+    mgr.switcher = SimpleNamespace(platform=object())  # anything but WINDOWS
+
+    def interrupt(fd):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("claude_swap.fsutil.os.fsync", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        mgr._write_manifest(tmp_path / ".cswap-shared.json", ["a"])
+    assert not list(tmp_path.glob("*.tmp"))

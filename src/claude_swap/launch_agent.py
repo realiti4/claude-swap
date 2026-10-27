@@ -2,8 +2,10 @@
 
 ``cswap menubar`` blocks the terminal that started it, so the status item dies
 with that terminal — and never comes back after a logout or reboot. launchd is
-the native macOS answer: a per-user LaunchAgent starts the menu bar at login,
-restarts it if it crashes, and needs no ``.app`` bundle.
+the native macOS answer: a per-user LaunchAgent starts the menu bar at login and
+restarts it if it crashes. (The wrapper ``.app`` the menu bar runs inside is
+``claude_swap.app_bundle``'s business: ``cswap menubar`` builds it and execs
+into it itself, so launchd only ever needs the console script.)
 
 Two decisions here are worth stating, because both differ from the obvious
 approach:

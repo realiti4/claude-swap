@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import gc
 import json
 import os
 import shutil
@@ -724,6 +726,13 @@ def _deterministic_poll_jitter(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_fsync(monkeypatch):
+    """Durability is not under test, and one real fsync per atomic write is
+    most of the suite's I/O. Tests that inject at fsync patch over this."""
+    monkeypatch.setattr(os, "fsync", lambda fd: None)
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_colour(monkeypatch):
     """A developer's terminal must not decide whether the suite passes.
 
@@ -878,3 +887,11 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+def pytest_configure():
+    # A disposable xdist worker skips the exit-time collection of the heap the
+    # session built. atexit runs after pytest's whole cleanup stack, the final
+    # unraisable-exception sweep included; the controller and -n 0 never freeze.
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        atexit.register(gc.freeze)

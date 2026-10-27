@@ -16,8 +16,8 @@ would couple us to Claude's internal storage format and naming, where a
 mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
-``CLAUDE.md``, ``skills/``, ``commands/``, and ``agents/`` follow them into
-the session profile — symlinks on macOS/Linux (Claude's settings writer
+``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
+them into the session profile — symlinks on macOS/Linux (Claude's settings writer
 detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
@@ -42,20 +42,19 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
     SessionError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
@@ -80,6 +79,7 @@ SHARED_ITEMS = (
     "skills",
     "commands",
     "agents",
+    "rules",
 )
 
 # Conversation-history items linked additionally under --share-history.
@@ -348,8 +348,15 @@ def _keychain_services(config_dir: str, override: str | None = None) -> list[str
     the link's name would miss every rotation claude wrote under the
     target's and serve the plaintext seed left behind, which is how a leased
     profile's usage silently froze at the last pre-rotation measurement. The
-    profile's own name is tried first, then the target's. ``override`` names
-    the unsuffixed default-profile item and stands alone.
+    profile's own name is tried first, then the target's. A relative target
+    is joined onto the link's parent and tried in two spellings, likeliest
+    first: the lexical form with ``..`` collapsed (``/x/space``, what a tool
+    launching at the target usually exports), offered only when it names the
+    link's own directory — under a parent that is itself a symlink elsewhere
+    it can name an unrelated directory with its own entry — and then the raw
+    join (``/x/sessions/../space``, what ``$(dirname link)/$(readlink link)``
+    exports). ``override`` names the unsuffixed default-profile item and
+    stands alone.
     """
     if override is not None:
         return [override]
@@ -358,9 +365,17 @@ def _keychain_services(config_dir: str, override: str | None = None) -> list[str
         target = os.readlink(config_dir)
     except OSError:
         return services
-    if not os.path.isabs(target):
-        target = os.path.join(os.path.dirname(config_dir), target)
-    services.append(keychain_service_name(target))
+    if os.path.isabs(target):
+        services.append(keychain_service_name(target))
+        return services
+    raw = os.path.join(os.path.dirname(config_dir), target)
+    lexical = os.path.normpath(raw)
+    try:
+        if lexical != raw and os.path.samefile(lexical, raw):
+            services.append(keychain_service_name(lexical))
+    except OSError:
+        pass  # nothing at the lexical path: not a spelling of this directory
+    services.append(keychain_service_name(raw))
     return services
 
 
@@ -402,7 +417,11 @@ def read_config_dir_credentials(
     The seed may predate an in-profile ``/login``, and capturing it would file
     one account's email against another's token — the very mismatch the capture
     path exists to prevent. An *absent* entry (rc 44) still falls back either
-    way: absence is claude's own signal to read the file.
+    way: absence is claude's own signal to read the file. For a symlinked
+    profile that fallback includes the target's entry under both modes, on
+    purpose: it is the newest generation claude wrote for that directory,
+    and the seed it would otherwise capture is the one claude stopped
+    updating when it first wrote the keychain.
     """
     directory = Path(config_dir)
     if not directory.is_dir():
@@ -467,7 +486,10 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     ``_is_session_valid``: the email must match, the org only when both sides
     have a value. An unreadable identity is NOT drift — missing metadata
     degrades to trusting the profile (its token family is normally the slot's
-    freshest) rather than abandoning it over a broken ``.claude.json``.
+    freshest) rather than abandoning it over a broken ``.claude.json``. That
+    is a read-side policy: ``_adopt_session_credential``, which writes the
+    profile's credential into the backup, requires ``read_session_identity``
+    to succeed on top of this.
     """
     identity = read_session_identity(session_dir)
     if identity is None:
@@ -904,9 +926,7 @@ class SessionManager:
             os.chmod(session_dir, 0o700)
 
         creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
+        atomic_write_text(creds_path, creds)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
@@ -922,9 +942,7 @@ class SessionManager:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        atomic_write_text(config_path, json.dumps(existing, indent=2))
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
@@ -980,7 +998,7 @@ class SessionManager:
         # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
         try:
-            result = subprocess.run(
+            result = spawn.run(
                 [claude_bin, "auth", "status", "--json"],
                 env=_probe_env(session_dir),
                 capture_output=True,
@@ -1386,7 +1404,11 @@ class SessionManager:
                 return False
             try:
                 self._merge_history_into_source(src, dest)
-            except OSError as e:
+            except (OSError, ValueError) as e:
+                # ValueError covers UnicodeDecodeError: a byte-corrupt
+                # history file is "nothing readable to merge", and losing a
+                # launch to a stray byte in ~/.claude/history.jsonl would
+                # strand every account that has not migrated yet.
                 self._logger.warning(
                     f"Could not merge {dest.name} into {src}: {e}"
                 )
@@ -1427,8 +1449,9 @@ class SessionManager:
         Directories merge file-by-file (transcript filenames are UUIDs, so
         collisions mean identical sessions — first writer wins and the
         duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        not already present. ``dest`` is removed once empty; any failure —
+        an OSError, or a UnicodeDecodeError on a byte-corrupt history file —
+        propagates and leaves remaining files in place for the next try.
         """
         if dest.is_dir():
             _mkdir_private(src)
@@ -1445,9 +1468,10 @@ class SessionManager:
                 shutil.move(str(path), str(target))
             dest.rmdir()
         else:
-            existing: set[str] = set()
+            existing_text = ""
             if src.exists():
-                existing = set(src.read_text(encoding="utf-8").splitlines())
+                existing_text = src.read_text(encoding="utf-8")
+            existing = set(existing_text.splitlines())
             lines = [
                 line
                 for line in dest.read_text(encoding="utf-8").splitlines()
@@ -1457,8 +1481,14 @@ class SessionManager:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 if not src.exists():
                     src.touch(mode=0o600)  # match Claude Code's history mode
+                # A history.jsonl torn by a crashed append ends mid-line, and
+                # appending onto it would weld that tail to the first merged
+                # entry — one line that parses as neither, with no second
+                # copy to recover from once dest is unlinked below.
+                torn = bool(existing_text) and not existing_text.endswith("\n")
+                terminator = "\n" if torn else ""
                 with src.open("a", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
+                    f.write(terminator + "\n".join(lines) + "\n")
             dest.unlink()
 
     @staticmethod
@@ -1474,18 +1504,10 @@ class SessionManager:
     def _write_manifest(self, manifest_path: Path, items: list[str]) -> None:
         mode = "symlink" if self.switcher.platform != Platform.WINDOWS else "copy"
         payload = json.dumps({"items": items, "mode": mode}, indent=2)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(manifest_path.parent), prefix=".cswap-shared-", suffix=".tmp"
-        )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            replace_with_retry(tmp, manifest_path)
+            atomic_write_text(manifest_path, payload)
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            pass  # best effort: a failed manifest must not fail a launch
 
     @staticmethod
     def _remove_managed(dest: Path) -> None:

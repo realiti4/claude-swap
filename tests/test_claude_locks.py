@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -73,6 +74,120 @@ class TestProperLockfile:
         nested = tmp_path / "a" / "b" / "target.lock"
         with proper_lockfile(nested):
             assert nested.is_dir()
+
+    def test_two_waiters_cannot_both_take_over_one_stale_lock(
+        self, lock_dir, monkeypatch
+    ):
+        """#420: two waiters that saw the same dead holder must not both end
+        up holding the lock. The second used to remove the first's fresh lock
+        as if it were the stale one, then take it as well."""
+        lock_dir.mkdir()
+        past = time.time() - 30
+        os.utime(lock_dir, (past, past))
+        monkeypatch.setattr(claude_locks, "os", _ForcedTakeoverRace(lock_dir))
+
+        inside = most = 0
+        count = threading.Lock()
+        finished: list[bool] = []
+        errors: list[BaseException] = []
+
+        def waiter() -> None:
+            nonlocal inside, most
+            try:
+                with proper_lockfile(lock_dir, timeout=5.0):
+                    with count:
+                        inside += 1
+                        most = max(most, inside)
+                    time.sleep(0.3)
+                    with count:
+                        inside -= 1
+                finished.append(True)
+            except BaseException as e:  # surfaced by the asserts below
+                errors.append(e)
+
+        threads = [threading.Thread(target=waiter) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        assert errors == []
+        assert len(finished) == 2  # both still get the lock, one at a time
+        assert most == 1
+
+    def test_takeover_leaves_no_takeover_dir(self, lock_dir):
+        lock_dir.mkdir()
+        past = time.time() - 30
+        os.utime(lock_dir, (past, past))
+        with proper_lockfile(lock_dir, timeout=2.0):
+            pass
+        assert sorted(p.name for p in lock_dir.parent.iterdir()) == []
+
+    def test_dead_takeover_dir_does_not_block_takeover(self, lock_dir):
+        """A waiter killed mid-takeover leaves the takeover directory behind;
+        once that is older than TAKEOVER_STALENESS_S it is cleared."""
+        lock_dir.mkdir()
+        takeover = lock_dir.with_name(lock_dir.name + claude_locks.TAKEOVER_SUFFIX)
+        takeover.mkdir()
+        past = time.time() - 30
+        os.utime(lock_dir, (past, past))
+        os.utime(takeover, (past, past))
+        with proper_lockfile(lock_dir, timeout=2.0):
+            assert time.time() - lock_dir.stat().st_mtime < 5.0
+        assert not takeover.exists()
+
+
+class _ForcedTakeoverRace:
+    """Stand-in for ``claude_locks.os`` that forces the #420 interleaving:
+    both waiters stat the same stale lock before either removes it, and the
+    second waiter's takeover (its takeover-directory mkdir, or before the
+    fix its rmdir) waits until the first waiter has retaken the lock."""
+
+    def __init__(self, lock_dir: Path) -> None:
+        self._lock_dir = str(lock_dir)
+        self._takeover_dir = self._lock_dir + claude_locks.TAKEOVER_SUFFIX
+        self._both_saw_stale = threading.Barrier(2, timeout=5)
+        self._retaken = threading.Event()
+        self._statted: set[int] = set()
+        self._first_taker: int | None = None
+        self._removals = 0
+        self._guard = threading.Lock()
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def mkdir(self, path, *args, **kwargs):
+        if str(path) == self._takeover_dir:
+            me = threading.get_ident()
+            with self._guard:
+                if self._first_taker is None:
+                    self._first_taker = me
+                later = me != self._first_taker
+            if later:
+                self._retaken.wait(2)
+        result = os.mkdir(path, *args, **kwargs)
+        if str(path) == self._lock_dir:
+            self._retaken.set()
+        return result
+
+    def stat(self, path, *args, **kwargs):
+        result = os.stat(path, *args, **kwargs)
+        if str(path) == self._lock_dir:
+            me = threading.get_ident()
+            with self._guard:
+                first = me not in self._statted
+                self._statted.add(me)
+            if first:
+                self._both_saw_stale.wait()
+        return result
+
+    def rmdir(self, path, *args, **kwargs):
+        if str(path) == self._lock_dir:
+            with self._guard:
+                self._removals += 1
+                second = self._removals == 2
+            if second:
+                self._retaken.wait(2)
+        return os.rmdir(path, *args, **kwargs)
 
 
 class TestLockPaths:

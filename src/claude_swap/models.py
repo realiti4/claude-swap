@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -12,6 +13,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.usage_store import UsageEntry
 
 if TYPE_CHECKING:
@@ -45,6 +47,104 @@ def normalize_alias(name: str) -> str:
             f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
         )
     return normalized
+
+
+#: Per-account switch-away threshold bounds, in binding-window utilization
+#: percent. Mirrors ``SETTING_SPECS["autoswitch.threshold"]``, written as
+#: literals rather than imported: ``models`` is a leaf and must not import
+#: ``settings``. The two are asserted equal in
+#: ``tests/test_account_policy_values.py`` so they cannot drift apart.
+ACCOUNT_THRESHOLD_MIN = 50.0
+ACCOUNT_THRESHOLD_MAX = 99.9
+
+
+def normalize_account_threshold(value: object) -> float:
+    """Validate a per-account switch-away threshold; raise ValueError if invalid.
+
+    Strict, in the manner of ``settings.parse_setting_value`` and unlike the
+    forgiving clamp applied when *reading* a record: a user who types 150 learns
+    about it at set time rather than by watching the account never switch away.
+    This is the single write-boundary validator for the value — the CLI verb,
+    the store setter, and any future UI all route through it.
+
+    Accepts ``int``, ``float``, and numeric ``str`` (the CLI hands over argv
+    strings). Rejects ``bool`` explicitly: ``True`` is an ``int`` in Python and
+    would otherwise normalize to 1.0, failing the range test for the wrong
+    reason.
+
+    Args:
+        value: The proposed threshold.
+
+    Returns:
+        The threshold as a ``float`` in ``[ACCOUNT_THRESHOLD_MIN,
+        ACCOUNT_THRESHOLD_MAX]``.
+
+    Raises:
+        ValueError: If the value is not numeric, is NaN or infinite, or falls
+            outside the valid range. The message always names the range.
+    """
+    range_text = (
+        f"must be between {ACCOUNT_THRESHOLD_MIN:g} and {ACCOUNT_THRESHOLD_MAX:g}"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"threshold {range_text}, got {value!r}")
+    if isinstance(value, str):
+        try:
+            pct = float(value.strip())
+        except ValueError:
+            raise ValueError(f"threshold {range_text}, got {value!r}") from None
+    else:
+        pct = float(value)
+    # NaN fails every comparison and infinity passes the lower bound, so both
+    # are rejected by name rather than left to the range test to catch by luck.
+    if math.isnan(pct) or math.isinf(pct):
+        raise ValueError(f"threshold {range_text}, got {value!r}")
+    if not ACCOUNT_THRESHOLD_MIN <= pct <= ACCOUNT_THRESHOLD_MAX:
+        raise ValueError(f"threshold {range_text}, got {pct:g}")
+    return pct
+
+
+ACCOUNT_PRIORITY_MAX = 1000
+
+
+def normalize_account_priority(value: object) -> int:
+    """Validate a priority tier. Higher numbers are preferred; zero is default."""
+    message = f"priority must be an integer between 0 and {ACCOUNT_PRIORITY_MAX}"
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError(message)
+        # Avoid converting an arbitrarily long hand-edited integer.
+        value = value.lstrip("0") or "0"
+        if len(value) > len(str(ACCOUNT_PRIORITY_MAX)):
+            raise ValueError(message)
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(message)
+    if not 0 <= value <= ACCOUNT_PRIORITY_MAX:
+        raise ValueError(message)
+    return value
+
+
+@dataclass(frozen=True)
+class AccountPolicy:
+    """Per-account auto-switch overrides, stored in the sequence record.
+
+    Defaults preserve existing behavior. Priority is read only by the
+    opt-in ``priority-consume-first`` strategy.
+
+    ``threshold``
+        This account's own switch-away line, in binding-window utilization
+        percent. ``None`` inherits ``autoswitch.threshold``. Reserving headroom
+        on one shared account no longer means taxing the whole fleet with a
+        global line set to the strictest member's.
+
+    Frozen because ``AccountSnapshot`` is frozen — a mutable member would
+    silently break that guarantee for the whole row.
+    """
+
+    threshold: float | None = None
+    priority: int = 0
 
 
 class Platform(Enum):
@@ -140,6 +240,9 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    #: Per-account auto-switch overrides. Appended last and defaulted, so every
+    #: pre-existing construction site keeps working and yields the default.
+    policy: AccountPolicy = AccountPolicy()
 
     @property
     def display_tag(self) -> str:
@@ -188,11 +291,8 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
-                    )
-                    if sys.platform != "win32":
-                        os.chmod(self.config_path, 0o600)
+                    # By rename, never in place (#419): see atomic_write_text.
+                    atomic_write_text(self.config_path, self.original_config)
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()
                     if data:

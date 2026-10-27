@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap.fsutil import (
+    atomic_write_bytes,
+    atomic_write_text,
+    publish_target,
+    read_text_with_retry,
+    replace_with_retry,
+)
+
+# Captured at import, before conftest's autouse fixture stubs os.fsync per test.
+_REAL_FSYNC = os.fsync
 
 
 class TestReplaceWithRetry:
@@ -284,3 +294,273 @@ class TestStrictRosterReadBranches:
         p = tmp_path / "config.json"
         p.write_text("[1, 2, 3]")
         assert self._switcher(tmp_path)._read_json(p) is None
+
+
+class TestAtomicWrite:
+    """``atomic_write_text`` is how every published file lands: temp beside
+    the target, fsync, rename. The switch rollback restores ``~/.claude.json``
+    through it because ``Path.write_text`` truncates the live file before it
+    writes, and Claude Code, which watches that file, treats a torn read as a
+    corrupted config (#419)."""
+
+    def test_publishes_by_rename(self, tmp_path):
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+        before = target.stat().st_ino
+        atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "new"
+        assert list(tmp_path.iterdir()) == [target]
+        if sys.platform != "win32":
+            assert target.stat().st_ino != before  # published, not rewritten
+            assert target.stat().st_mode & 0o777 == 0o600
+
+    def test_failed_publish_leaves_destination_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+
+        def refuse(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr("claude_swap.fsutil.replace_with_retry", refuse)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_interrupted_write_leaves_no_temp(self, tmp_path, monkeypatch):
+        """A Ctrl-C is not an OSError; the temp must still go. Injected at
+        fsync, the one call in the sequence only this writer makes."""
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+
+        def interrupt(fd):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_temp_is_private_from_creation(self, tmp_path, monkeypatch):
+        """With the mode call neutralised the published mode is the one the
+        temp was created with: a write-then-chmod writer shows up as 0644."""
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
+        old_umask = os.umask(0o022)
+        try:
+            atomic_write_text(tmp_path / "secret.json", "{}")
+        finally:
+            os.umask(old_umask)
+        assert (tmp_path / "secret.json").stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_failing_mode_call_aborts_before_publishing(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "secret.json"
+        target.write_text("old")
+
+        def refuse(fd, mode):
+            raise PermissionError("fchmod denied (injected)")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", refuse)
+        with pytest.raises(PermissionError):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_fsync_unsupported_is_tolerated_other_errors_are_not(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "x.json"
+        target.write_text("old")
+
+        def unsupported(fd):
+            raise OSError(errno.EINVAL, "fsync not supported here")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", unsupported)
+        atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "new"
+
+        def broken(fd):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", broken)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "newer")
+        assert target.read_text(encoding="utf-8") == "new"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_suite_runs_with_fsync_stubbed(self):
+        """conftest stubs ``os.fsync``; the real one rejects a bad descriptor."""
+        os.fsync(-1)
+
+    def test_atomic_write_with_real_fsync(self, tmp_path, monkeypatch):
+        """The stub leaves no other test a real fsync: one on a closed fd
+        (EBADF) would pass the whole suite."""
+        with pytest.raises(ValueError):
+            _REAL_FSYNC(-1)  # the capture is the real function, not the stub
+        monkeypatch.setattr(os, "fsync", _REAL_FSYNC)
+        atomic_write_text(tmp_path / "x.json", "new")
+        assert (tmp_path / "x.json").read_text(encoding="utf-8") == "new"
+
+    def test_missing_parent_is_not_created(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            atomic_write_text(tmp_path / "missing" / "x.json", "{}")
+        assert not (tmp_path / "missing").exists()
+
+    def test_bytes_round_trip(self, tmp_path):
+        target = tmp_path / "blob.bin"
+        payload = bytes(range(256)) * 300
+        atomic_write_bytes(target, payload)
+        assert target.read_bytes() == payload
+        assert list(tmp_path.iterdir()) == [target]
+
+
+class TestAtomicWriteSymlinks:
+    """A rename never follows a link: renaming onto a symlinked path detaches
+    it silently (#192). The writer publishes onto the end of the chain, as
+    Claude Code's own config writer does for ``~/.claude.json``."""
+
+    def test_writes_through_a_link_and_keeps_it(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        live = tmp_path / "live"
+        live.mkdir()
+        tracked = repo / ".claude.json"
+        tracked.write_text("old")
+        link = live / ".claude.json"
+        link.symlink_to(tracked)
+
+        atomic_write_text(link, "new")
+
+        assert link.is_symlink(), "the dotfiles link must survive the write"
+        assert tracked.read_text(encoding="utf-8") == "new"
+        assert [p.name for p in repo.iterdir()] == [".claude.json"]
+        assert [p.name for p in live.iterdir()] == [".claude.json"]
+
+    def test_follows_a_relative_two_hop_chain(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        final = tmp_path / "real" / "final.json"
+        final.write_text("old")
+        # Native separator: Windows rejects a forward slash inside a reparse
+        # point (WinError 123 from realpath), which is the link, not the writer.
+        (tmp_path / "hop2").symlink_to(Path("real") / "final.json")
+        (tmp_path / "hop1").symlink_to("hop2")
+
+        atomic_write_text(tmp_path / "hop1", "new")
+
+        assert (tmp_path / "hop1").is_symlink()
+        assert (tmp_path / "hop2").is_symlink()
+        assert final.read_text(encoding="utf-8") == "new"
+        assert publish_target(tmp_path / "hop1") == final.resolve()
+
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
+    def test_dangling_link_writes_where_it_points(self, tmp_path):
+        (tmp_path / "gone").mkdir()
+        link = tmp_path / ".claude.json"
+        link.symlink_to(tmp_path / "gone" / "config.json")
+
+        atomic_write_text(link, "{}")
+
+        assert link.is_symlink()
+        assert (tmp_path / "gone" / "config.json").read_text(encoding="utf-8") == "{}"
+        assert [p.name for p in (tmp_path / "gone").iterdir()] == ["config.json"]
+
+    def test_follow_symlinks_false_replaces_the_link(self, tmp_path):
+        target = tmp_path / "elsewhere.json"
+        target.write_text("untouched")
+        link = tmp_path / "out.cswap"
+        link.symlink_to(target)
+
+        atomic_write_text(link, "export", follow_symlinks=False)
+
+        assert not link.is_symlink()
+        assert link.read_text(encoding="utf-8") == "export"
+        assert target.read_text(encoding="utf-8") == "untouched"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["elsewhere.json", "out.cswap"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink loop semantics")
+    def test_loop_raises_eloop_and_writes_nothing(self, tmp_path):
+        loop = tmp_path / "loop.json"
+        loop.symlink_to("loop.json")
+
+        with pytest.raises(OSError) as info:
+            atomic_write_text(loop, "{}")
+
+        assert info.value.errno == errno.ELOOP
+        assert loop.is_symlink()
+        assert [p.name for p in tmp_path.iterdir()] == ["loop.json"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink loop semantics")
+    def test_loop_hidden_behind_dotdot_is_still_refused(self, tmp_path):
+        """Non-strict realpath would collapse ``loop/..`` lexically and aim
+        the write at ``victim.json``, a file ``open`` cannot even reach."""
+        victim = tmp_path / "victim.json"
+        victim.write_bytes(b"victim")
+        (tmp_path / "loop").symlink_to("loop")
+        config = tmp_path / "config.json"
+        config.symlink_to("loop/../victim.json")
+
+        with pytest.raises(OSError) as info:
+            atomic_write_text(config, "{}")
+
+        assert info.value.errno == errno.ELOOP
+        assert victim.read_bytes() == b"victim"
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "config.json", "loop", "victim.json",
+        ]
+
+    def test_publish_target_of_a_plain_path_is_the_path(self, tmp_path):
+        p = tmp_path / "plain.json"
+        assert publish_target(p) == p
+        p.write_text("x")
+        assert publish_target(p) == p
+
+    def test_strict_fallback_refuses_a_dangling_link(self, tmp_path, monkeypatch):
+        """On a 3.12 release without ``ALLOW_MISSING`` the resolver runs
+        fully strict: a dangling link is refused rather than guessed, while
+        an existing target is still written through."""
+        monkeypatch.setattr("claude_swap.fsutil._RESOLVE_STRICT", True)
+        (tmp_path / "gone").mkdir()
+        dangling = tmp_path / "dangling.json"
+        dangling.symlink_to(tmp_path / "gone" / "config.json")
+
+        with pytest.raises(FileNotFoundError):
+            atomic_write_text(dangling, "{}")
+
+        assert dangling.is_symlink()
+        assert list((tmp_path / "gone").iterdir()) == []
+        assert not list(tmp_path.glob("*.tmp"))
+
+        tracked = tmp_path / "tracked.json"
+        tracked.write_text("old")
+        link = tmp_path / "link.json"
+        link.symlink_to(tracked)
+        atomic_write_text(link, "new")
+        assert link.is_symlink()
+        assert tracked.read_text(encoding="utf-8") == "new"
+
+
+class TestAtomicWriteTempName:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="MAX_PATH turns a 251-character name into a path-length question",
+    )
+    def test_a_destination_name_near_name_max_still_publishes(self, tmp_path):
+        """The temp carries a bounded slice of the destination name: a legal
+        251-character destination must not fail with ENAMETOOLONG at the temp
+        (mkstemp adds eight random characters and ``.tmp`` to the prefix)."""
+        target = tmp_path / ("x" * 245 + ".cswap")
+        target.write_text("old")
+
+        atomic_write_text(target, "new")
+
+        assert target.read_text(encoding="utf-8") == "new"
+        assert [p.name for p in tmp_path.iterdir()] == [target.name]

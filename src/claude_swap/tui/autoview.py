@@ -24,12 +24,13 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
-    binding_pct,
     pct_label,
 )
+from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -108,6 +109,9 @@ class AutoScreen(Screen):
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
         self.app.threshold_pct = self._settings.threshold
+        # The weekly line is not session-adjustable, so this is only the same
+        # sync-to-the-file correction; nothing to restore on unmount.
+        self.app.weekly_threshold_pct = self._settings.weekly_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -188,6 +192,10 @@ class AutoScreen(Screen):
         self.app.threshold_pct = value
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
+        # The Next best list ranks by the lines in force, so it must follow
+        # the session value now rather than at the next snapshot: under a
+        # weekly line the order and the 5h rows' "(line N%)" both move.
+        self._on_snapshot(self.app.snapshot)
 
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
@@ -199,6 +207,10 @@ class AutoScreen(Screen):
         )
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
+        if self._settings.weekly_threshold is not None:
+            text.append(
+                f" · weekly {pct_label(self._settings.weekly_threshold)}%"
+            )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
@@ -294,17 +306,33 @@ class AutoScreen(Screen):
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by remaining headroom (best first)."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
+        """Switch targets ranked by headroom against their own switch lines
+        (best first) — the engine's own ordering."""
+        # Same window set AND the same lines as the engine: autoswitch.model,
+        # each account's own line (its policy threshold, else the session
+        # threshold — `_settings` is what `_set_threshold` replaces), the
+        # weekly line, and the session threshold as the ruler every account is
+        # scored on, so the displayed ranking can never disagree with the
+        # account it picks.
         palette = Palette.from_theme(self.app.current_theme)
-        models = parse_model_names(self._settings.model) if self._settings else ()
-        ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
+        settings = self._settings
+        models = parse_model_names(settings.model) if settings else ()
+        threshold = settings.threshold if settings else 90.0
+        weekly = settings.weekly_threshold if settings else None
+        ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
-            pct = binding_pct(acc.usage.last_good, models)
+            line = (
+                acc.policy.threshold if acc.policy.threshold is not None else threshold
+            )
+            binding = binding_window(
+                oauth.relevant_windows(acc.usage.last_good, models),
+                line,
+                weekly,
+                scale=threshold,
+            )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
@@ -313,12 +341,22 @@ class AutoScreen(Screen):
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
                 ranked.append((998.0, acc.number))
-            elif pct is None:
+            elif binding is None:
                 entry.append("  usage unknown", style=palette.muted)
                 ranked.append((999.0, acc.number))
             else:
-                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                ranked.append((pct, acc.number))
+                # The raw pct of the window that binds, and — only once the
+                # lines differ, globally or for this account — the line it is
+                # judged against.
+                entry.append(
+                    f"  {binding.label} {binding.pct:3.0f}% used",
+                    style=palette.severity(binding.pct),
+                )
+                if weekly is not None or acc.policy.threshold is not None:
+                    entry.append(
+                        f" (line {pct_label(binding.line)}%)", style=palette.muted
+                    )
+                ranked.append((-binding.line_headroom, acc.number))
             lines[acc.number] = entry
 
         text = Text()

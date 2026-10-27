@@ -1155,7 +1155,7 @@ class TestPollPlan:
 
 
 class TestDueCandidate:
-    """Candidate selection shared by the auto engine and the TUI watch view."""
+    """The auto engine's one-alternate-per-tick candidate pick."""
 
     NOW = 1_000_000.0
 
@@ -1237,6 +1237,32 @@ class TestDueCandidate:
         # due_candidate has no current scoped-model selection: repair keys on
         # the impossible deadline shape rather than stale policy semantics.
         assert due_candidate(["2"], entries, self.NOW) == "2"
+
+    def test_attempted_but_unmeasured_slot_yields_to_an_older_due_row(self):
+        """A fetch-path sentinel (a live session's expired or refused
+        credential) records no measurement, plan or backoff. Keyed on
+        fetchedAt alone it stayed the stalest due row every tick and the
+        other alternates were never polled; the pick keys on the attempt
+        stamp reserve() writes, so a no-op pick rotates to the back."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 400, last_attempt_at=self.NOW - 400),
+            "3": UsageEntry(last_attempt_at=self.NOW - 60),  # picked last tick, no data
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "2"
+        # ...and comes back around once nothing was touched more recently,
+        # so a rotated credential is noticed on the next idle tick.
+        entries["2"] = UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 30)
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
+
+    def test_adopted_reading_counts_as_a_touch(self):
+        """``UsageStore.adopt`` moves fetchedAt without an attempt: the later
+        of the two stamps is the touch, so a freshly adopted row is not the
+        least recent."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 900),
+            "3": UsageEntry(fetched_at=self.NOW - 600, last_attempt_at=self.NOW - 600),
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
 
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None

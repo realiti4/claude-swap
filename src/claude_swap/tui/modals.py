@@ -83,8 +83,8 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
         with Vertical(classes="modal-box"):
             yield Label("Add account from token", classes="modal-title")
             yield Static(
-                "OAuth setup-token (sk-ant-oat…) or managed API key "
-                "(sk-ant-api…); the type is auto-detected.",
+                "OAuth setup-token (sk-ant-oat…) or Console API key "
+                "(sk-ant-api…, sk-ant-usr…); the type is auto-detected.",
                 classes="modal-body",
             )
             yield Input(password=True, placeholder="token (required)", id="token")

@@ -439,7 +439,7 @@ def plan_oversleeps_interval(entry: UsageEntry, now: float) -> bool:
 def due_candidate(
     candidates: list[str], entries: dict[str, UsageEntry], now: float
 ) -> str | None:
-    """The due candidate with the stalest data, or None.
+    """The due candidate least recently attempted or measured, or None.
 
     Due = past its ``nextPollAt``, not in failure backoff and not held for
     another machine's reading (``UsageStore.adopt``). Sentinel
@@ -447,17 +447,16 @@ def due_candidate(
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
-    Shared by the auto engine and the TUI watch view so both pick the same
-    single alternate to poll per pass. Poll plans
+    The auto engine's one-alternate-per-tick pick. Poll plans
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
     every surface inherits the same adaptive cadence.
     """
-    due: list[tuple[int, float, str]] = []
+    due: list[tuple[float, str]] = []
     for num in candidates:
         entry = entries.get(num)
         if entry is None:
-            due.append((0, 0.0, num))
+            due.append((0.0, num))
             continue
         if entry.sentinel is not None:
             continue
@@ -473,14 +472,23 @@ def due_candidate(
             and not plan_oversleeps_interval(entry, now)
         ):
             continue
-        if entry.fetched_at is None:
-            due.append((0, 0.0, num))
-        else:
-            due.append((1, entry.fetched_at, num))
+        # Least recently touched wins: the last attempt (``reserve`` stamps
+        # it on every claim) or the last measurement, whichever is later. A
+        # fetch-path sentinel -- a live session's expired or refused
+        # credential -- records no measurement, plan or backoff, so keyed on
+        # ``fetchedAt`` alone that slot stayed the stalest due row and took
+        # this pick every tick while the other alternates went unpolled;
+        # keyed on the attempt, a no-op pick rotates to the back and only
+        # fills ticks nothing else is due on, where re-deriving it costs no
+        # request. An adopted reading (``adopt``) moves ``fetchedAt`` with no
+        # attempt, hence the later of the two. A never-touched row keys 0.
+        due.append(
+            (max(entry.fetched_at or 0.0, entry.last_attempt_at or 0.0), num)
+        )
     if not due:
         return None
     due.sort()
-    return due[0][2]
+    return due[0][1]
 
 
 def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> float | None:
