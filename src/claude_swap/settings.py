@@ -527,6 +527,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
+        ("keepalive", "keepalive"),
         ("model", "model"),
         ("strategy", "strategy"),
     ):

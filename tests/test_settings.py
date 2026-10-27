@@ -329,6 +329,13 @@ class TestMergedWithCli:
         )
         assert merged.include_api_key_accounts is True
 
+    def test_keepalive_flag_overrides_the_fleet_file(self):
+        # The fleet's shared settings turn renewal off; the one machine that
+        # keeps the browser logins turns it back on from its command line.
+        fleet = AutoSwitchSettings(keepalive=False)
+        assert merged_with_cli(fleet, _args(keepalive=True)).keepalive is True
+        assert merged_with_cli(fleet, _args()).keepalive is False
+
     def test_model_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"

@@ -880,6 +880,15 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--keepalive",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Renew browser logins ahead of expiry (overrides autoswitch.keepalive; "
+            "only the one machine that keeps a login should renew it)"
+        ),
+    )
+    parser.add_argument(
         "--strategy",
         choices=AUTOSWITCH_STRATEGIES,
         default=None,
