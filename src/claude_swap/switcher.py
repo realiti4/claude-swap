@@ -930,14 +930,20 @@ class ClaudeAccountSwitcher:
             return config_file.read_text(encoding="utf-8")
         return ""
 
-    def _account_is_switchable(self, account_num: str) -> bool:
+    def _account_is_switchable(
+        self, account_num: str, data: dict | None = None
+    ) -> bool:
         """Whether a slot has both stored credentials and config backups.
 
         Used by switch() and switch_to() to decide whether a target slot can
         be activated without re-adding the account. Tolerates stale sequence
-        entries that reference a removed account record.
+        entries that reference a removed account record. ``data`` is an
+        already-loaded ``_get_sequence_data()`` result — callers sweeping
+        every slot pass the one they already hold so the sweep costs one
+        read, not one per slot; omitted, it is read here.
         """
-        data = self._get_sequence_data() or {}
+        if data is None:
+            data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num))
         if not record:
             return False
@@ -1810,7 +1816,7 @@ class ClaudeAccountSwitcher:
                     org_uuid=org_uuid,
                     is_active=is_active,
                     kind=self._account_kind(n),
-                    switchable=self._account_is_switchable(n),
+                    switchable=self._account_is_switchable(n, data=seq_data),
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
@@ -1893,7 +1899,7 @@ class ClaudeAccountSwitcher:
         return [
             str(num)
             for num in data.get("sequence", [])
-            if self._account_is_switchable(str(num))
+            if self._account_is_switchable(str(num), data=data)
             and not self._disabled_from_data(data, str(num))
             and not self._in_use_by_session(data, str(num))
         ]
@@ -4607,6 +4613,7 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    served_expires_at=oauth_data.get("expiresAt"),
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -5066,6 +5073,9 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            served_expires_at=(
+                oauth.extract_oauth_data(working) or {}
+            ).get("expiresAt"),
         )
 
     def _resync_rotated_backup(
@@ -5693,15 +5703,12 @@ class ClaudeAccountSwitcher:
             is_active = bool(info_by_num[num][4])
             # Only the active slot's expiry is surfaced between polls (the
             # USAGE_TOKEN_EXPIRED gate in the collect pass), so only its
-            # refresh point pulls the plan in. info[5] is the pre-fetch read:
-            # when this fetch refreshed the token, that read's refresh point
-            # is already past and the planner ignores it.
+            # refresh point pulls the plan in. The point is anchored on the
+            # credential the fetch actually served: when the fetch itself
+            # refreshed the token, the pre-fetch read's point lands ~now and
+            # would clamp the plan to an immediate re-poll.
             refresh_at = (
-                poll_policy.refresh_poll_ts(
-                    (oauth.extract_oauth_data(info_by_num[num][5]) or {}).get(
-                        "expiresAt"
-                    )
-                )
+                poll_policy.refresh_poll_ts(rec.served_expires_at)
                 if is_active
                 else None
             )
@@ -5825,7 +5832,7 @@ class ClaudeAccountSwitcher:
         others = [
             str(n) for n in data.get("sequence", [])
             if str(n) != str(current_num)
-            and self._account_is_switchable(str(n))
+            and self._account_is_switchable(str(n), data=data)
             and not self._disabled_from_data(data, str(n))
             and not self._in_use_by_session(data, str(n))
         ]
@@ -6380,7 +6387,7 @@ class ClaudeAccountSwitcher:
 
             target = str(preferred)
             target_disabled = self._disabled_from_data(data, target)
-            if target_disabled or not self._account_is_switchable(target):
+            if target_disabled or not self._account_is_switchable(target, data=data):
                 if target_disabled:
                     reason = console_reason = "(disabled)"
                 else:
@@ -6397,12 +6404,13 @@ class ClaudeAccountSwitcher:
                     (str(num) for num in sequence
                      if str(num) != target
                      and not self._disabled_from_data(data, str(num))
-                     and self._account_is_switchable(str(num))),
+                     and self._account_is_switchable(str(num), data=data)),
                     None,
                 )
                 if not fallback:
                     if any(
-                        self._account_is_switchable(str(num)) for num in sequence
+                        self._account_is_switchable(str(num), data=data)
+                        for num in sequence
                     ):
                         raise ConfigError(
                             "No accounts remain in rotation. Re-enable one with: "
@@ -6597,7 +6605,7 @@ class ClaudeAccountSwitcher:
                 else:
                     print(f"{accent('Skipping')} Account-{candidate} (disabled)")
                 continue
-            if not self._account_is_switchable(candidate):
+            if not self._account_is_switchable(candidate, data=data):
                 if json_output:
                     warnings.append(
                         f"Skipped Account-{candidate} (no stored credentials/config)"

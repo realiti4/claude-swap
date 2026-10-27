@@ -267,6 +267,13 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # ``expiresAt`` (epoch ms) of the credential the usage request actually
+    # ran on — the rotated successor when the fetch itself refreshed the
+    # token. The poll planner anchors the active slot's refresh point on
+    # it: the pre-fetch read's point is stale exactly then, landing ~now
+    # and clamping the plan to an immediate re-poll instead of the normal
+    # interval.
+    served_expires_at: float | None = None
 
 
 @dataclass(frozen=True)

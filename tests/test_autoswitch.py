@@ -1747,6 +1747,53 @@ class TestAdaptiveScheduler:
             1 - poll_policy.JITTER_FRAC
         )
 
+    def test_refreshing_fetch_at_the_crossing_keeps_the_normal_cadence(
+        self, temp_home, monkeypatch
+    ):
+        # The same refreshing fetch, but with the token entering its expiry
+        # buffer right now: the pre-fetch read's refresh point lands 1-31s
+        # in the FUTURE (crossing+1+spread), and planning from it clamps the
+        # next poll to an immediate re-poll instead of the normal interval.
+        # The plan must anchor on the credential the fetch actually served.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        # The fetch path's expiry check reads the wall clock; pin the store's
+        # clock to it so "inside the buffer" and the plan agree about now.
+        h.clock.now = time.time()
+        expires_ms = int(h.clock.now * 1000 + oauth.OAUTH_EXPIRY_BUFFER_MS)
+        h.seed(1, "a@example.com", expires_at=expires_ms)
+        (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-live",
+                "expiresAt": expires_ms,
+            },
+        }))
+        h.seed(2, "b@example.com")
+        rotated = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-new", "refreshToken": "rt-new",
+                "expiresAt": int((time.time() + 8 * 3600) * 1000),
+            },
+        })
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        # Keepalive is patched out so THIS collect pass's fetch is the one
+        # rotating the token — otherwise it rotates first and the pass only
+        # ever sees the fresh credential.
+        with (
+            patch.object(h.engine, "_keep_logins_alive"),
+            patch(
+                "claude_swap.oauth.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated, None),
+            ),
+        ):
+            self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        entry = h.switcher._usage_store.entries({"1": ("a@example.com", "")})["1"]
+        assert entry.poll_interval_s == poll_policy.MIN_INTERVAL_S
+        assert entry.next_poll_at >= h.clock.now + poll_policy.MIN_INTERVAL_S * (
+            1 - poll_policy.JITTER_FRAC
+        )
+
     def test_poll_event_carries_fetch_errors(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch, accounts=2, unhealthy_ticks=3)
         counts: dict[str, int] = {}
