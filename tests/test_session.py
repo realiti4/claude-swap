@@ -3116,6 +3116,222 @@ class TestOwnLogin:
     family independent of the slot's backup, so it can run alongside the same
     account as the default login and nothing ever syncs the two."""
 
+    @pytest.mark.parametrize("secure_override", ["redirected", "empty"])
+    def test_scratch_login_isolates_secure_storage(
+        self, manager, monkeypatch, temp_home, secure_override,
+        block_real_keychain,
+    ):
+        """Claude routes credential writes by the defined secure-storage env."""
+        from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
+
+        default_store = temp_home / ".claude"
+        redirected_store = temp_home / "other-secure-storage"
+        redirected_store.mkdir()
+        for directory in (default_store, redirected_store):
+            (directory / ".credentials.json").write_text("existing credential")
+        account = session_mod._keychain_account_name()
+        redirected_service = keychain_service_name(redirected_store)
+        block_real_keychain.set_password(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, account, "default keychain credential"
+        )
+        block_real_keychain.set_password(
+            redirected_service, account, "redirected keychain credential"
+        )
+        override = str(redirected_store) if secure_override == "redirected" else ""
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", override)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: f"/fake/{name}")
+        observed_envs = []
+
+        def fake_run(cmd, env=None, **kwargs):
+            observed_envs.append(env.copy())
+            config_dir = Path(env["CLAUDE_CONFIG_DIR"])
+            secure_value = env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+            store = (
+                config_dir if secure_value is None
+                else Path(secure_value) if secure_value else default_store
+            )
+            service = (
+                CLAUDE_CODE_KEYCHAIN_SERVICE if secure_value == ""
+                else keychain_service_name(store)
+            )
+            if cmd[1:3] == ["auth", "login"]:
+                block_real_keychain.set_password(service, account, OWN_CREDS)
+                (config_dir / ".claude.json").write_text(CONFIG)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            identity = read_session_identity(config_dir)
+            payload = {
+                "loggedIn": bool(block_real_keychain.get_password(service, account))
+                or (store / ".credentials.json").exists(),
+                "authMethod": "claude.ai",
+                "email": identity[0] if identity else "",
+                "orgId": identity[1] if identity else "",
+            }
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
+        manager.own_login(ACCOUNT_NUM)
+
+        assert observed_envs
+        assert all("CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env for env in observed_envs)
+        assert read_session_credentials(_profile(manager)) == OWN_CREDS
+        assert (default_store / ".credentials.json").read_text() == "existing credential"
+        assert (
+            (redirected_store / ".credentials.json").read_text()
+            == "existing credential"
+        )
+        assert (
+            block_real_keychain.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account)
+            == "default keychain credential"
+        )
+        assert (
+            block_real_keychain.get_password(redirected_service, account)
+            == "redirected keychain credential"
+        )
+
+    @pytest.mark.parametrize("identity", ["missing", "corrupt", "foreign"])
+    def test_does_not_adopt_an_ahead_profile_without_matching_identity(
+        self, manager, fake_claude_login, identity
+    ):
+        profile = _profile(manager)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text(ROTATED_CREDS)
+        if identity == "corrupt":
+            (profile / ".claude.json").write_text("not json")
+        elif identity == "foreign":
+            config = json.loads(CONFIG)
+            config["oauthAccount"]["emailAddress"] = "other@example.com"
+            (profile / ".claude.json").write_text(json.dumps(config))
+
+        if identity == "foreign":
+            # Another account's /login is not this slot's family: nothing to
+            # save, so the own login replaces it.
+            manager.own_login(ACCOUNT_NUM)
+            assert read_session_credentials(profile) == OWN_CREDS
+            assert has_own_login(profile)
+        else:
+            # Unreadable identity: replacing would lose a possibly-newer
+            # generation and adopting could file a foreign one; refuse.
+            with pytest.raises(SessionError):
+                manager.own_login(ACCOUNT_NUM)
+            assert read_session_credentials(profile) == ROTATED_CREDS
+            assert not has_own_login(profile)
+
+        assert manager.switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS
+
+    @pytest.mark.parametrize("already_own", [False, True])
+    def test_failed_keychain_deletion_leaves_profile_unchanged(
+        self, manager, fake_claude_login, block_real_keychain, monkeypatch,
+        already_own,
+    ):
+        profile = _profile(manager)
+        profile.mkdir(parents=True)
+        credential_file = profile / ".credentials.json"
+        config_file = profile / ".claude.json"
+        marker = profile / session_mod.OWN_LOGIN_MARKER
+        credential_file.write_text(CREDS)
+        config_file.write_text(CONFIG)
+        if already_own:
+            marker.write_text("existing own login")
+        before = [path.read_bytes() for path in (credential_file, config_file)]
+        service = keychain_service_name(profile)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, ROTATED_CREDS)
+        delete_password = macos_keychain.delete_password
+
+        def deny_profile_delete(service_name, account_name):
+            if service_name == service:
+                raise macos_keychain.KeychainError("access denied")
+            return delete_password(service_name, account_name)
+
+        monkeypatch.setattr(macos_keychain, "delete_password", deny_profile_delete)
+        with pytest.raises(SessionError, match="Keychain.*profile was left unchanged"):
+            manager.own_login(ACCOUNT_NUM)
+
+        assert [path.read_bytes() for path in (credential_file, config_file)] == before
+        assert has_own_login(profile) == already_own
+        if already_own:
+            assert marker.read_text() == "existing own login"
+        assert block_real_keychain.get_password(service, account) == ROTATED_CREDS
+
+    def test_setup_rechecks_own_login_after_acquiring_bootstrap_lock(
+        self, manager, fake_claude_login, refresh_rotates, monkeypatch
+    ):
+        profile = _profile(manager)
+        real_lock = session_mod.FileLock
+
+        class InstallDuringWait:
+            def __init__(self, *args, **kwargs):
+                self.lock = real_lock(*args, **kwargs)
+
+            def __enter__(self):
+                self.lock.__enter__()
+                if self.lock.lock_path != manager.switcher.lock_file:
+                    return self
+                profile.mkdir(parents=True, exist_ok=True)
+                (profile / ".credentials.json").write_text(OWN_CREDS)
+                (profile / ".claude.json").write_text(CONFIG)
+                (profile / session_mod.OWN_LOGIN_MARKER).touch()
+                mark_session_stale(profile)
+                return self
+
+            def __exit__(self, *args):
+                return self.lock.__exit__(*args)
+
+        monkeypatch.setattr(session_mod, "FileLock", InstallDuringWait)
+        manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert refresh_rotates  # the other installation appeared after this pre-lock work
+        assert read_session_credentials(profile) == OWN_CREDS
+        assert has_own_login(profile)
+        assert is_session_stale(profile)
+
+    def test_own_login_merges_a_concurrent_config_write_under_claudes_lock(
+        self, manager, fake_claude_login, monkeypatch
+    ):
+        import threading
+
+        profile = _profile(manager)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text(CREDS)
+        config_file = profile / ".claude.json"
+        config_file.write_text(CONFIG)
+        lock_dir = profile / ".claude.json.lock"
+        attempted = threading.Event()
+        errors = []
+        original_mkdir = os.mkdir
+
+        def observe_mkdir(path, *args, **kwargs):
+            if Path(path) == lock_dir:
+                attempted.set()
+            return original_mkdir(path, *args, **kwargs)
+
+        def login():
+            try:
+                manager.own_login(ACCOUNT_NUM)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=login, daemon=True)
+        with session_mod.proper_lockfile(lock_dir):
+            monkeypatch.setattr(os, "mkdir", observe_mkdir)
+            thread.start()
+            reached_lock = attempted.wait(4)
+            if reached_lock:
+                config = json.loads(config_file.read_text())
+                config["projects"] = {"/updated": {"history": ["new"]}}
+                config_file.write_text(json.dumps(config))
+        thread.join(timeout=10)
+
+        assert reached_lock, f"own-login did not attempt the config lock: {errors}"
+        assert not thread.is_alive()
+        assert not errors
+        config = json.loads(config_file.read_text())
+        assert config["projects"] == {"/updated": {"history": ["new"]}}
+        assert config["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
+        assert has_own_login(profile)
+
     def test_installs_a_verified_login_and_marks_the_profile(
         self, manager, fake_claude_login
     ):
@@ -3252,3 +3468,77 @@ class TestOwnLogin:
         assert switcher.read_account_credentials(
             ACCOUNT_NUM, ACCOUNT_EMAIL
         ) == CREDS
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
+def test_concurrent_history_migrations_keep_shared_transcripts(
+    history_setup, monkeypatch
+):
+    """A delayed launch must not follow a peer's new link into the source."""
+    import threading
+
+    source, session_dir, manager = history_setup
+    profile_project = session_dir / "projects" / "-home-user-app"
+    profile_project.mkdir(parents=True)
+    (profile_project / "bbb.jsonl").write_text("profile-b\n")
+
+    checked_profile = threading.Event()
+    release_first = threading.Event()
+    second_reached_lock_or_finished = threading.Event()
+    errors: list[BaseException] = []
+    original_quiescent = session_mod.profile_is_quiescent
+    original_lock = session_mod.FileLock
+
+    class ObservedFileLock(original_lock):
+        def __enter__(self):
+            if threading.current_thread() is second:
+                # Signal before acquiring: the first launch may hold this lock.
+                second_reached_lock_or_finished.set()
+            return super().__enter__()
+
+    def paused_quiescence(profile):
+        if threading.current_thread() is first:
+            # The destination was just observed as real history. A concurrent
+            # launch used to be able to replace it while this check ran.
+            checked_profile.set()
+            if not release_first.wait(timeout=10):
+                raise AssertionError("timed out waiting to resume first launch")
+        return original_quiescent(profile)
+
+    def launch(*, second_launch=False):
+        try:
+            manager._sync_sharing(session_dir, share=False, share_history=True)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if second_launch:
+                # The old implementation takes no lock, so it reaches here
+                # after migrating and creating the link while the first waits.
+                second_reached_lock_or_finished.set()
+
+    monkeypatch.setattr(session_mod, "FileLock", ObservedFileLock)
+    monkeypatch.setattr(session_mod, "profile_is_quiescent", paused_quiescence)
+    first = threading.Thread(target=launch, name="history-first", daemon=True)
+    second = threading.Thread(
+        target=launch, kwargs={"second_launch": True},
+        name="history-second", daemon=True,
+    )
+    first.start()
+    try:
+        assert checked_profile.wait(timeout=5), "first launch did not reach migration"
+        second.start()
+        assert second_reached_lock_or_finished.wait(timeout=5), (
+            "second launch did not reach the lock or finish"
+        )
+    finally:
+        release_first.set()
+        first.join(timeout=10)
+        if second.ident is not None:
+            second.join(timeout=10)
+
+    assert not first.is_alive() and not second.is_alive(), "launch did not finish"
+    assert not errors, f"launch failed: {errors}"
+    project = source / "projects" / "-home-user-app"
+    assert (project / "aaa.jsonl").read_text() == "main-a\n"
+    assert (project / "bbb.jsonl").read_text() == "profile-b\n"
+    assert (session_dir / "projects").readlink() == source / "projects"

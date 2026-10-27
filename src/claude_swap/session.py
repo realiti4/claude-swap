@@ -267,10 +267,11 @@ def _keychain_account_name() -> str:
     return macos_keychain.keychain_account_name()
 
 
-def delete_macos_keychain_entry(session_dir: Path) -> None:
+def delete_macos_keychain_entry(session_dir: Path, *, strict: bool = False) -> None:
     """Best-effort delete of a session profile's hashed keychain entry.
 
-    No-op off macOS. Needed before seeding (Claude reads the keychain before
+    No-op off macOS; strict mode raises if deletion cannot be confirmed.
+    Needed before seeding (Claude reads the keychain before
     the plaintext file, so a stale entry would shadow a fresh seed) and on
     profile removal (once the dir is gone the hashed name is unrecoverable).
     """
@@ -280,7 +281,13 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         macos_keychain.delete_password(
             keychain_service_name(session_dir), _keychain_account_name()
         )
-    except macos_keychain.KEYCHAIN_ERRORS:
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        if strict:
+            raise SessionError(
+                f"Could not delete the session profile's Keychain credential "
+                f"at {session_dir}; the profile was left unchanged. "
+                "Unlock the Keychain and retry."
+            ) from e
         pass  # best-effort; absent entry is already success (rc 44)
 
 
@@ -580,6 +587,8 @@ def _mkdir_private(path: Path) -> None:
 def _probe_env(session_dir: Path) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped."""
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
+    # Defined-but-empty selects the default store too: remove by presence.
+    env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
     return env
 
@@ -841,6 +850,17 @@ class SessionManager:
                 )
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            # Own-login may have installed an independent family while we
+            # waited. Never invalidate or seed that family from the backup.
+            if has_own_login(session_dir):
+                if not self._is_session_valid(session_dir, email, org_uuid):
+                    raise SessionError(
+                        f"Account-{account_num}'s session profile has its own "
+                        f"login, and it is no longer valid. Log it in again: "
+                        f"cswap run {account_num} --own-login"
+                    )
+                self._sync_sharing(session_dir, share, share_history)
+                return session_dir, account_num, email
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
@@ -985,7 +1005,9 @@ class SessionManager:
                 )
             with FileLock(
                 self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT
-            ), claude_credentials_lock(config_home=session_dir):
+            ), claude_credentials_lock(config_home=session_dir), proper_lockfile(
+                session_dir / ".claude.json.lock"
+            ):
                 # A session that refreshed holds the slot's newest token
                 # generation, the backup a consumed one: save it before the
                 # profile's copy is replaced, or the slot is left dead.
@@ -993,10 +1015,24 @@ class SessionManager:
                     account_num, email, org_uuid
                 )
                 if ahead:
+                    if read_session_identity(session_dir) is None:
+                        # Replacing the profile would discard the slot's newest
+                        # generation, and adopting it unidentified could file
+                        # another account's /login under this slot.
+                        raise SessionError(
+                            f"Account-{account_num}'s session profile holds a "
+                            "newer credential than the stored backup, but its "
+                            "identity (.claude.json) is unreadable; the profile "
+                            "was left unchanged. Run 'cswap run "
+                            f"{account_num}' and /login once so its identity is "
+                            "rewritten, then retry --own-login."
+                        )
                     self.switcher._store._write_account_credentials(
                         account_num, email, ahead
                     )
-                self._write_profile(session_dir, creds, oauth_account, "dark")
+                self._write_profile(
+                    session_dir, creds, oauth_account, "dark", strict_keychain=True
+                )
                 (session_dir / OWN_LOGIN_MARKER).touch()
                 clear_session_stale(session_dir)
         finally:
@@ -1008,7 +1044,13 @@ class SessionManager:
         return session_dir
 
     def _write_profile(
-        self, session_dir: Path, creds: str, oauth_account: dict, theme: str
+        self,
+        session_dir: Path,
+        creds: str,
+        oauth_account: dict,
+        theme: str,
+        *,
+        strict_keychain: bool = False,
     ) -> None:
         """Install a credential and identity into a profile. Caller holds the lock.
 
@@ -1019,7 +1061,7 @@ class SessionManager:
         load-bearing: claude shows onboarding when
         ``!config.theme || !config.hasCompletedOnboarding``.
         """
-        delete_macos_keychain_entry(session_dir)
+        delete_macos_keychain_entry(session_dir, strict=strict_keychain)
         session_dir.mkdir(parents=True, exist_ok=True)
         if sys.platform != "win32":
             os.chmod(session_dir, 0o700)
@@ -1211,10 +1253,9 @@ class SessionManager:
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
-        is set in the invoking environment. File/dir sharing is lock-free on
-        the reuse path — concurrent runs with different flags are last-writer-
-        wins and self-heal on the next launch; only the MCP mirror takes
-        Claude's config lock, and only when it needs to write.
+        is set in the invoking environment. File/dir sharing and its manifest
+        share a source lock so history migration and linking are serialized.
+        The MCP mirror takes Claude's config lock when it needs to write.
         """
         if not session_dir.is_dir():
             return
@@ -1228,94 +1269,97 @@ class SessionManager:
         )
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
-        managed = self._read_manifest(manifest_path)
-
-        # A flag turned off since last launch: remove the links we created
-        # for it (never plain files/dirs the user accumulated themselves).
-        # For history items that holds even when the manifest claims them:
-        # a stale manifest (lock-free launches race) must never be able to
-        # delete real conversation history — only ever unlink symlinks.
-        for name in managed:
-            if name not in active_items:
-                dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
-                    continue
-                self._remove_managed(dest)
-        if not active_items:
-            manifest_path.unlink(missing_ok=True)
-            return
-
-        use_symlinks = self.switcher.platform != Platform.WINDOWS
-        new_managed: list[str] = []
-
-        for name in active_items:
-            src = source_root / name
-            dest = session_dir / name
-
-            if name in HISTORY_ITEMS and not self._prepare_history_share(
-                src, dest, session_dir
-            ):
-                continue
-
-            if not src.exists():
-                # Source vanished (or never existed): prune our own entry.
-                if name in managed:
-                    self._remove_managed(dest)
-                continue
-
-            # Link to the fully resolved target. When ~/.claude/<name> is itself
-            # a symlink (a dotfiles setup), linking to the unresolved path makes
-            # a link-to-a-link, and Claude Code's atomic settings write — which
-            # resolves only one hop — renames its temp file over the intermediate
-            # link, silently replacing it with a regular file
-            # (anthropics/claude-code#78162).
-            link_target = src.resolve() if src.is_symlink() else src
-
-            if dest.is_symlink():
-                if name not in managed:
-                    managed = [*managed, name]  # adopt: only cswap links here
-                if use_symlinks:
-                    try:
-                        if dest.readlink() != link_target:
-                            dest.unlink()
-                            dest.symlink_to(link_target)
-                    except OSError:
+        # Separate from the bootstrap lock: setup already holds that lock.
+        # All profiles share the source, so migrations and link changes must
+        # serialize, including manifest updates and the destination re-check.
+        with FileLock(self.switcher.backup_dir / ".share-sync.lock"):
+            managed = self._read_manifest(manifest_path)
+            # A flag turned off since last launch: remove the links we created
+            # for it (never plain files/dirs the user accumulated themselves).
+            # For history items that holds even when the manifest claims them:
+            # a stale manifest (lock-free launches race) must never be able to
+            # delete real conversation history — only ever unlink symlinks.
+            for name in managed:
+                if name not in active_items:
+                    dest = session_dir / name
+                    if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
                         continue
-                    new_managed.append(name)
+                    self._remove_managed(dest)
+            if not active_items:
+                manifest_path.unlink(missing_ok=True)
+                return
+
+            use_symlinks = self.switcher.platform != Platform.WINDOWS
+            new_managed: list[str] = []
+
+            for name in active_items:
+                src = source_root / name
+                dest = session_dir / name
+
+                if name in HISTORY_ITEMS and not self._prepare_history_share(
+                    src, dest, session_dir
+                ):
                     continue
-                # Platform moved POSIX → Windows: replace link with a copy.
-                dest.unlink()
-            elif dest.exists() and name not in managed:
-                # Pre-existing user data in the profile — never touch it.
-                print(
-                    dimmed(
-                        f"Not sharing {name}: the session profile already has "
-                        "its own copy."
+
+                if not src.exists():
+                    # Source vanished (or never existed): prune our own entry.
+                    if name in managed:
+                        self._remove_managed(dest)
+                    continue
+
+                # Link to the fully resolved target. When ~/.claude/<name> is itself
+                # a symlink (a dotfiles setup), linking to the unresolved path makes
+                # a link-to-a-link, and Claude Code's atomic settings write — which
+                # resolves only one hop — renames its temp file over the intermediate
+                # link, silently replacing it with a regular file
+                # (anthropics/claude-code#78162).
+                link_target = src.resolve() if src.is_symlink() else src
+
+                if dest.is_symlink():
+                    if name not in managed:
+                        managed = [*managed, name]  # adopt: only cswap links here
+                    if use_symlinks:
+                        try:
+                            if dest.readlink() != link_target:
+                                dest.unlink()
+                                dest.symlink_to(link_target)
+                        except OSError:
+                            continue
+                        new_managed.append(name)
+                        continue
+                    # Platform moved POSIX → Windows: replace link with a copy.
+                    dest.unlink()
+                elif dest.exists() and name not in managed:
+                    # Pre-existing user data in the profile — never touch it.
+                    print(
+                        dimmed(
+                            f"Not sharing {name}: the session profile already has "
+                            "its own copy."
+                        )
                     )
-                )
-                continue
+                    continue
 
-            try:
-                if use_symlinks:
-                    if dest.exists():
-                        self._remove_managed(dest)
-                    dest.symlink_to(link_target)
-                else:
-                    if dest.exists():
-                        self._remove_managed(dest)
-                    if src.is_dir():
-                        shutil.copytree(src, dest)
+                try:
+                    if use_symlinks:
+                        if dest.exists():
+                            self._remove_managed(dest)
+                        dest.symlink_to(link_target)
                     else:
-                        shutil.copy2(src, dest)
-            except OSError as e:
-                self._logger.warning(f"Failed to share {name} into session: {e}")
-                continue
-            new_managed.append(name)
+                        if dest.exists():
+                            self._remove_managed(dest)
+                        if src.is_dir():
+                            shutil.copytree(src, dest)
+                        else:
+                            shutil.copy2(src, dest)
+                except OSError as e:
+                    self._logger.warning(f"Failed to share {name} into session: {e}")
+                    continue
+                new_managed.append(name)
 
-        # Anything we managed before but no longer created gets removed above;
-        # write the manifest atomically so a concurrent reader never sees a
-        # truncated file.
-        self._write_manifest(manifest_path, new_managed)
+            # Anything we managed before but no longer created gets removed above;
+            # write the manifest atomically so a concurrent reader never sees a
+            # truncated file.
+            self._write_manifest(manifest_path, new_managed)
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:
         """Mirror the default profile's user-scope ``mcpServers`` (issue #139).
