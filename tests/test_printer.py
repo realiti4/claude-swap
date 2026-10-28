@@ -223,7 +223,8 @@ class TestColourEnvDoesNotLeakIntoTests:
     """
 
     @pytest.fixture(autouse=True, scope="class")
-    def _exported(self):
+    @classmethod
+    def _exported(cls):
         """Export both variables BEFORE ``_deterministic_colour`` runs.
 
         A test cannot set them in its own body: the fixture has already
