@@ -26,7 +26,8 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first")
+# "dynamic" is consume-first's ranking with a fixed ~97% switch bar.
+AUTOSWITCH_STRATEGIES = ("best", "consume-first", "dynamic", "priority-consume-first")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -59,8 +60,9 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # Opt-in alternatives are in AUTOSWITCH_STRATEGIES.
+    strategy: str = "consume-first"  # The others are in AUTOSWITCH_STRATEGIES.
     include_api_key_accounts: bool = False
+    decision_log: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
@@ -163,6 +165,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
+        ),
+        SettingSpec(
+            "autoswitch", "decisionLog", "decision_log", "bool",
+            help="Record why each tick switched or did not, to its own log file",
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,

@@ -239,7 +239,10 @@ class AccountSnapshot:
     switchable: bool
     usage: UsageEntry
     alias: str = ""
-    disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # Held out of auto-rotation. Still an explicit `cswap switch` target, but a
+    # RUNNING engine leaves a disabled ACTIVE on its next tick, so the explicit
+    # switch holds only while auto is stopped.
+    disabled: bool = False
     #: Per-account auto-switch overrides. Appended last and defaulted, so every
     #: pre-existing construction site keeps working and yields the default.
     policy: AccountPolicy = AccountPolicy()
