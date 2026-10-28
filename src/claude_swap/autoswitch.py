@@ -162,6 +162,15 @@ PACE_MARGIN_PCT = 10.0
 # an account that resets soon is exactly the quota pace exists to spend.
 PACE_LANDING_5H_ROOM_PCT = 25.0
 
+# How close to its weekly reset an account's leftover quota counts as about to
+# expire. Below the threshold `pace` moves to such an account whatever its
+# deficit, and stays on one until it resets or reaches a line: quota spent
+# there is quota a later-resetting account keeps. The deficit alone misses
+# this when both accounts are in reserve — a 19-point reserve that expires in
+# hours never beats a 26-point one that lasts days. A day is about one day's
+# share of the week, the size of a typical leftover.
+PACE_LAST_CALL_S = 24 * 3600.0
+
 # Strategies that may move BELOW the threshold with the strategy name as the
 # trigger, and share the plumbing a voluntary move needs: the cooldown, the
 # healthy-landing gate, the phase-2 refetch before switching, and holding
@@ -538,6 +547,12 @@ def _five_hour_room(usage: dict | str | None, line: float) -> float | None:
         if label == oauth.FIVE_HOUR_LABEL:
             return line - pct
     return None
+
+
+def _in_last_call(reset_ts: float | None, now: float) -> bool:
+    """Whether a weekly window resetting at ``reset_ts`` is within
+    PACE_LAST_CALL_S of its reset."""
+    return reset_ts is not None and reset_ts - now <= PACE_LAST_CALL_S
 
 
 def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
@@ -1518,19 +1533,24 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.BLOCKED
             if trigger == "pace":
-                # Below the threshold with no candidate far enough behind
-                # its own pace: staying put is the strategy working, not a
-                # block — the same contract as consume-first's holds below.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="on-best-pace",
-                        detail=(
-                            f"no account is {PACE_MARGIN_PCT:.0f} points "
-                            "further behind its weekly pace with "
-                            f"{PACE_LANDING_5H_ROOM_PCT:.0f} points of 5h room"
-                        ),
+                # Below the threshold with the active account's leftover
+                # about to expire, or no candidate far enough behind its own
+                # pace or about to expire: staying put is the strategy
+                # working, not a block — the same contract as consume-first's
+                # holds below.
+                if _in_last_call(active_reset_ts, decided_now):
+                    reason, detail = "last-call", (
+                        "active account's weekly window resets within "
+                        f"{PACE_LAST_CALL_S / 3600:.0f}h; using its quota first"
                     )
-                )
+                else:
+                    reason, detail = "on-best-pace", (
+                        f"no account is {PACE_MARGIN_PCT:.0f} points further "
+                        "behind its weekly pace or resets within "
+                        f"{PACE_LAST_CALL_S / 3600:.0f}h, with "
+                        f"{PACE_LANDING_5H_ROOM_PCT:.0f} points of 5h room"
+                    )
+                self._emit(NoSwitchEvent(reason=reason, detail=detail))
                 return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
@@ -2194,10 +2214,13 @@ class AutoSwitchEngine:
         weekly_first = settings.strategy == "weekly-first"
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
-        active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
-        )
         by_pace = settings.strategy == "pace"
+        active_reset_ts = (
+            _seven_day_reset_ts(usage.get(current), now)
+            if consume_first or by_pace
+            else None
+        )
+        active_last_call = by_pace and _in_last_call(active_reset_ts, now)
         active_deficit = (
             weekly_deficit(usage.get(current), now, work_days=settings.work_days)
             if by_pace
@@ -2295,9 +2318,10 @@ class AutoSwitchEngine:
             )
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now)
-                if consume_first or weekly_first
+                if consume_first or weekly_first or by_pace
                 else None
             )
+            last_call = by_pace and _in_last_call(reset_ts, now)
             deficit = (
                 weekly_deficit(usage.get(num), now, work_days=settings.work_days)
                 if by_pace
@@ -2342,14 +2366,17 @@ class AutoSwitchEngine:
                         continue
                 elif trigger == "pace":
                     # Only accounts measurably further behind their weekly
-                    # schedule than the active one, with room to work in their
+                    # schedule than the active one, or whose leftover is about
+                    # to expire (PACE_LAST_CALL_S), with room to work in their
                     # 5h window. An unknown deficit on either side cannot prove
-                    # that, so it never qualifies. Above the threshold the
-                    # trigger is `proactive` and the `best` hysteresis below
-                    # applies instead.
-                    if (
-                        cramped
-                        or deficit is None
+                    # the first, so it never qualifies on it. An active account
+                    # in its own last call is spent before any move. Above the
+                    # threshold the trigger is `proactive` and the `best`
+                    # hysteresis below applies instead.
+                    if cramped or active_last_call:
+                        continue
+                    if not last_call and (
+                        deficit is None
                         or active_deficit is None
                         or deficit > active_deficit - PACE_MARGIN_PCT
                     ):
@@ -2389,11 +2416,13 @@ class AutoSwitchEngine:
                 # behind its schedule. Accounts over a line sort after every
                 # account under one (at-limit and failover skip the landing
                 # gate), then accounts short of PACE_LANDING_5H_ROOM_PCT after
-                # the rest, unknown deficits after known ones, and policy
-                # headroom breaks ties.
+                # the rest, then accounts whose leftover is about to expire
+                # before the rest, unknown deficits after known ones, and
+                # policy headroom breaks ties.
                 key = (
                     over,
                     cramped,
+                    not last_call,
                     deficit if deficit is not None else float("inf"),
                     -lh,
                 )

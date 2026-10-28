@@ -7541,3 +7541,35 @@ class TestPaceStrategy:
         assert h.active_number() == 1
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
+
+    def test_moves_to_an_account_that_resets_within_a_day(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 0, 19, 3.5),
+            "2": self._usage(h, 0, 79, 0.15),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "pace"
+
+    def test_holds_while_the_active_account_resets_within_a_day(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 0, 70, 0.5),
+            "2": self._usage(h, 0, 0, 3),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["last-call"]
+
+    def test_at_the_threshold_an_account_that_resets_within_a_day_ranks_first(self, temp_home):
+        h = self._harness(temp_home, accounts=3)
+        outcome = h.tick_with_usage({
+            "1": self._usage(h, 95, 50, 3.5),
+            "2": self._usage(h, 0, 0, 3),
+            "3": self._usage(h, 0, 70, 0.5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
