@@ -188,6 +188,7 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap proxy                     # Read live usage off Claude Code's own API replies (see Advanced)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
@@ -326,6 +327,30 @@ cswap list --json | ssh laptop cswap import-usage - --hold 600
 <summary>How it works — matching, holds & when a hold ends</summary>
 
 The input is `cswap list --json` output. Each row with `usageStatus: "ok"` is matched to a local account by email and organization, and adopted when it is newer than the reading already stored. Its age comes from `usageAgeSeconds`, so the two machines' clocks never have to agree; a script that delays the hand-over should add the delay to that field. `--hold SECONDS` keeps every collector on the receiving machine (`list`, `status`, `auto`, the dashboard, the menu bar) from fetching those accounts for that long, and the held reading stays trusted for switch decisions meanwhile. A hold never runs past the reading's earliest window reset (per-model windows included), nor past an hour after the reading was taken. Renew it with each hand-over, or lift it early with `--hold 0`; when it lapses, the machine goes back to fetching for itself.
+
+</details>
+
+### Live usage from Claude Code's own requests (proxy)
+
+The usage endpoint allows about 30 requests an hour per account, so a busy account's reading is minutes old, and several sessions on one account can take it from below the threshold to its limit between two readings. Every API reply Claude Code gets already carries that account's current 5h/7d usage in its rate-limit headers. `cswap proxy` relays Claude Code's requests and reads those headers, so `auto` switches on numbers as fresh as the last request:
+
+```bash
+cswap proxy                                        # listens on 127.0.0.1:18999
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18999   # every Claude Code session
+export ENABLE_TOOL_SEARCH=true                     # keep deferred tool loading (see below)
+cswap auto                                         # unchanged: now decides on live numbers
+```
+
+**Set `ENABLE_TOOL_SEARCH=true` too.** With a base URL that is not Anthropic's own, Claude Code turns off deferred tool loading and sends every MCP tool definition with every request. Measured on one machine with many MCP servers (Claude Code 2.1.280, the same one-word `claude -p` request): 26,475 prompt tokens direct, 145,866 through the proxy, 26,504 through the proxy with `ENABLE_TOOL_SEARCH=true`. The proxy forwards tool-search requests unchanged, so the setting is safe. Claude Code also leaves out two experimental betas for a non-Anthropic base URL (`cache-diagnosis-2026-04-07`, `thinking-binding-controls-2026-08-01`); `ENABLE_TOOL_SEARCH` does not restore those.
+
+<details>
+<summary>How it works, and what it will not do</summary>
+
+- Each request goes to `api.anthropic.com` unchanged, and the reply (streamed or not, compressed or not) comes back unchanged. On the way the proxy reads the `anthropic-ratelimit-unified-*` headers and records the 5h and 7d windows for the account whose access token sent the request. A token it does not manage writes nothing. A `rejected` reply (HTTP 429) marks that window at its limit, so `auto` leaves at once.
+- `cswap list`, `cswap status`, the dashboard (`cswap tui` / `cswap watch`) and the menu bar show the live numbers as soon as the proxy records them, marked `live` (the dashboard picks them up on its next 3-second repaint and flashes the row).
+- The live reading is kept beside the polled one, not in place of it. Decisions use it while it is newer than the last poll and at most 5 minutes old. The per-model and spend windows the headers do not carry still come from polling, which keeps its own cadence.
+- It listens on loopback only and refuses absolute-form requests, so it cannot be used as a general proxy. It never stores or logs a token or a request or reply body: a token is hashed on arrival and only the hash is compared.
+- While it is not running, sessions that point at it cannot reach the API. Run it under the same supervisor as `cswap auto` (launchd, systemd, a container entrypoint), or set `ANTHROPIC_BASE_URL` only in the sessions you start while it runs.
 
 </details>
 

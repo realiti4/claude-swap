@@ -211,6 +211,9 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
+    if acc.usage.shows_live and acc.usage.sentinel is None:
+        # Read off this account's own API replies by `cswap proxy`.
+        text.append("   ● live", style=palette.accent)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:

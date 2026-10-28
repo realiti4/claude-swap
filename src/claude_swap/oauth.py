@@ -67,6 +67,12 @@ def access_token_fingerprint(credentials: str) -> str | None:
     token = data.get("accessToken") if data else None
     if not isinstance(token, str) or not token:
         return None
+    return fingerprint_access_token(token)
+
+
+def fingerprint_access_token(token: str) -> str:
+    """The ``access_token_fingerprint`` of a bare access token, for a caller
+    that holds the token itself (``cswap proxy`` reads it off a request)."""
     return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
 
 
