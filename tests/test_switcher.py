@@ -7277,6 +7277,138 @@ class TestProvenanceGuard:
         assert switcher.list_unclaimed_credentials() == {}
         assert any("already matches Account-2" in w for w in op["warnings"])
 
+    # -- #489: a foreign credential that is the owning slot's newer generation
+
+    @staticmethod
+    def _oauth(access: str, refresh: str | None, expires_at: int) -> str:
+        blob = {"accessToken": access, "expiresAt": expires_at}
+        if refresh is not None:
+            blob["refreshToken"] = refresh
+        return json.dumps({"claudeAiOauth": blob})
+
+    def _add_third_slot(self, sample_sequence_data: dict) -> None:
+        sample_sequence_data["accounts"]["3"] = {
+            "email": "account3@example.com",
+            "uuid": "uuid-3",
+            "added": "2024-01-03T00:00:00Z",
+        }
+        sample_sequence_data["sequence"] = [1, 2, 3]
+
+    def test_rotation_under_a_stale_label_advances_the_owning_slot(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """#489's field case: Claude Code rotated slot 3's token while
+        ``~/.claude.json`` named slot 1, so slot 3's backup holds the consumed
+        predecessor. A switch from 1 to 2 resolves the live bytes to slot 3
+        (uuid-positive) and finds them a strictly newer generation: slot 3's
+        backup advances to them, the safety copy is still written, and
+        neither slot 1 nor the switch target is touched by the rescue."""
+        self._add_third_slot(sample_sequence_data)
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = creds_store[("2", "account2@example.com")]
+        consumed = self._oauth("sk-3-old", "rt-3-old", 1_000)
+        creds_store[("3", "account3@example.com")] = consumed
+        successor = self._oauth("sk-3-new", "rt-3-new", 2_000)
+        live_state = {"creds": successor}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-3", "email": "account3@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("3", "account3@example.com")] == successor
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == a2_backup
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert _read_safety_copy(switcher, entry_id) == successor
+        assert any(
+            "Account-3's backup was updated" in w for w in op["warnings"]
+        )
+
+    def test_newer_foreign_generation_of_the_target_is_what_activates(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """When the owning slot is also the switch target, the target is read
+        after the rescue, so the switch activates the newer generation rather
+        than the consumed one."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        creds_store[("2", "account2@example.com")] = self._oauth(
+            "sk-2-old", "rt-2-old", 1_000,
+        )
+        successor = self._oauth("sk-2-new", "rt-2-new", 2_000)
+        live_state = {"creds": successor}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("2", "account2@example.com")] == successor
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert json.loads(live_state["creds"])["claudeAiOauth"][
+            "accessToken"] == "sk-2-new"
+
+    @pytest.mark.parametrize(
+        ("live_refresh", "live_exp", "why"),
+        [
+            ("rt-2-other", 1_000, "same issue time"),
+            ("rt-2-other", 500, "older generation"),
+            (None, 2_000, "no refresh token"),
+        ],
+    )
+    def test_foreign_bytes_that_are_not_a_newer_full_pair_are_never_written(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+        live_refresh, live_exp, why,
+    ):
+        """Ownership alone never licenses a write: an equal or older
+        generation, or a partial token pair, keeps the pre-#489 behavior —
+        preserved in a safety copy, the owning slot's backup untouched."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        stored = self._oauth("sk-2-stored", "rt-2-stored", 1_000)
+        creds_store[("2", "account2@example.com")] = stored
+        live = self._oauth("sk-2-live", live_refresh, live_exp)
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("2", "account2@example.com")] == stored, why
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert any(
+            "ownership mismatch" in w and "cswap add --slot 2" in w
+            for w in op["warnings"]
+        )
+
     def test_alien_credential_preserved_and_skipped(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
