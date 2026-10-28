@@ -50,11 +50,12 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "ui.showOrgTag",
             "run.shareHistory",
             "updates.check",
         ):
             assert key in out
-        assert out.count("(default)") == 12
+        assert out.count("(default)") == 13
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -81,7 +82,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 12
+        assert len(by_key) == 13
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back

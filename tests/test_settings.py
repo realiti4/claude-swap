@@ -157,6 +157,19 @@ class TestUiSettings:
         with pytest.raises(ConfigError, match="dark, light"):
             set_setting(tmp_path, "ui.theme", "purple")
 
+    def test_show_org_tag_defaults_true_round_trips_and_ignores_bad_values(
+        self, tmp_path: Path
+    ):
+        assert load_ui_settings(tmp_path).show_org_tag is True
+        assert set_setting(tmp_path, "ui.showOrgTag", "false") is False
+        assert load_ui_settings(tmp_path).show_org_tag is False
+        raw = {"ui": {"showOrgTag": "no", "theme": "light"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(theme="light")
+        raw = {"ui": {"showOrgTag": False, "theme": "purple"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(show_org_tag=False)
+
 
 class TestRunSettings:
     def test_missing_file_defaults_to_per_account_history(self, tmp_path: Path):

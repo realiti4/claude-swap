@@ -74,9 +74,11 @@ class AutoSwitchSettings:
 @dataclass(frozen=True)
 class UiSettings:
     """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection."""
+    color theme; ``auto`` follows terminal-background detection.
+    ``show_org_tag`` shows the ``[org]`` tag beside each account in the TUI."""
 
     theme: str = "auto"
+    show_org_tag: bool = True
 
 
 @dataclass(frozen=True)
@@ -175,6 +177,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "ui", "showOrgTag", "show_org_tag", "bool",
+            help="Show the [org] tag beside accounts in the TUI "
+            "(when off, kept only to tell same-email accounts apart)",
         ),
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
@@ -286,7 +293,7 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
-    """Load the ui section; missing/corrupt file or unknown theme → default."""
+    """Load the ui section; missing/corrupt file or a bad value → its default."""
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("ui")
     default = UiSettings()
@@ -298,8 +305,15 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             "settings.json: unsupported ui.theme %r; using %r",
             theme, default.theme,
         )
-        return default
-    return UiSettings(theme=theme)
+        theme = default.theme
+    show_org_tag = section.get("showOrgTag", default.show_org_tag)
+    if not isinstance(show_org_tag, bool):
+        _logger.warning(
+            "settings.json: ui.showOrgTag must be true or false, got %r; using %r",
+            show_org_tag, default.show_org_tag,
+        )
+        show_org_tag = default.show_org_tag
+    return UiSettings(theme=theme, show_org_tag=show_org_tag)
 
 
 def load_run_settings(backup_root: Path) -> RunSettings:
