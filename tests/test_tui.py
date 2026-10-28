@@ -1783,7 +1783,7 @@ class TestThemeWiring:
             assert app.theme == "cswap-light"          # → light
             app.action_toggle_theme(); await pilot.pause()
             assert app.theme == "cswap-light"          # → auto, detected=light
-            assert json.loads((tmp_path / "settings.json").read_text())["ui"]["theme"] == "auto"
+            assert json.loads((tmp_path / "settings.local.json").read_text())["ui"]["theme"] == "auto"
             app.action_toggle_theme(); await pilot.pause()
             assert app.theme == "cswap-dark"           # → back to dark
 

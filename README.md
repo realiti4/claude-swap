@@ -277,7 +277,7 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 
 ### Configuration
 
-Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges.
+Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges. Edits are written to an untracked `settings.local.json` beside it that overrides it, so a `settings.json` kept in version control is never touched.
 
 <details>
 <summary>Commands & usage</summary>
