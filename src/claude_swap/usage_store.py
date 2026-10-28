@@ -850,7 +850,8 @@ class UsageStore:
     a row whose stored identity differs is invisible to reads and replaced on
     write, so slot reuse never serves the previous account's usage. Rows for
     slots outside the map are left alone (callers like ``--status`` operate
-    on a single slot).
+    on a single slot); only ``relocate`` and ``prune``, driven by the roster
+    itself, reach past it.
     """
 
     def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
@@ -995,6 +996,37 @@ class UsageStore:
                     rows[num] = self._fresh_row(identity)
                 mutator(num, rows[num])
             self._write_rows(rows)
+
+    def relocate(self, old: str, new: str) -> None:
+        """Carry slot ``old``'s row to ``new``; when both exist they trade
+        places (a swap). Rows are keyed by slot number, so a renumbered
+        account must take its reading, schedule and marks with it."""
+        with self._lock():
+            rows = self._read_rows()
+            old_row, new_row = rows.pop(old, None), rows.pop(new, None)
+            if old_row is None and new_row is None:
+                return
+            if old_row is not None:
+                rows[new] = old_row
+            if new_row is not None:
+                rows[old] = new_row
+            self._write_rows(rows)
+
+    def prune(self, slots: Iterable[str]) -> list[str]:
+        """Drop every row whose slot is not in ``slots`` (the roster), so a
+        later account landing on a freed number inherits nothing. Returns the
+        dropped slot numbers."""
+        keep = set(slots)
+        if keep.issuperset(self._read_rows()):  # lock-free: the common case
+            return []
+        with self._lock():
+            rows = self._read_rows()
+            dropped = [num for num in rows if num not in keep]
+            for num in dropped:
+                del rows[num]
+            if dropped:
+                self._write_rows(rows)
+        return dropped
 
     def claim(
         self, nums: Iterable[str], identities: dict[str, Identity]
