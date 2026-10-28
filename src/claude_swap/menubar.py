@@ -30,6 +30,17 @@ from pathlib import Path
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.json_output import (
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+)
+from claude_swap.menubar_alerts import (
+    ALERT_ICON,
+    ReloginAlerts,
+    relogin_menu_label,
+    relogin_notice,
+)
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -306,8 +317,24 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    alert: bool = False,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    ``alert`` prefixes a warning badge, set while any account needs re-login so
+    the problem is visible without opening the menu.
+    """
+    title = _account_title(active_email, active_usage, settings, now, alias)
+    return f"{ALERT_ICON} {title}" if alert else title
+
+
+def _account_title(
+    active_email: str | None,
+    active_usage: dict | str | None,
+    settings: MenuBarSettings,
+    now: float | None,
+    alias: str | None,
+) -> str:
     if active_email is None:
         return ICON
     if now is None:
@@ -407,15 +434,24 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
+    "relogin": [],
 }
 
 
-def _adapt_snapshot(snap) -> dict:
+def _adapt_snapshot(snap, quarantine: dict | None = None) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
+    "active_alias": str | None, "relogin": [((num, email, alias), confirmed), ...]}``.
+    ``relogin`` feeds ``ReloginAlerts``: ``confirmed`` accounts need re-login
+    (a dead-token sentinel, or an auto-switch ``invalid_grant`` quarantine from
+    ``quarantine``, the engine's slot -> entry map); unconfirmed ones showed a
+    credential-read sentinel this pass, which the collector reports ahead of
+    (so in place of) the dead-token verdict. Disabled accounts
+    are left out: the user already holds those out of rotation.
+
+    The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
@@ -424,8 +460,23 @@ def _adapt_snapshot(snap) -> dict:
     active_email = None
     active_usage = None
     active_alias = None
+    relogin = []
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
+        if not acc.disabled:
+            q = (quarantine or {}).get(acc.number)
+            quarantined_dead = (
+                isinstance(q, dict)
+                and q.get("email") == acc.email
+                and q.get("reason") == "invalid_grant"
+            )
+            account = (acc.number, acc.email, acc.alias)
+            if acc.usage.sentinel == USAGE_RELOGIN_REQUIRED or quarantined_dead:
+                relogin.append((account, True))
+            elif acc.usage.sentinel in (USAGE_KEYCHAIN_UNAVAILABLE, USAGE_NO_CREDENTIALS):
+                # An unreadable Keychain, or a live credential Claude Code wiped
+                # after its own invalid_grant: neither says the token recovered.
+                relogin.append((account, False))
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
@@ -439,6 +490,7 @@ def _adapt_snapshot(snap) -> dict:
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
+        "relogin": relogin,
     }
 
 
@@ -580,9 +632,11 @@ def run(switcher) -> int:
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
+            self._refresh_pending = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
             self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
+            self._relogin_alerts = ReloginAlerts()
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
             # background thread while enabled.
             self._engine = None
@@ -602,8 +656,12 @@ def run(switcher) -> int:
         # ---- display refresh plumbing ----------------------------------------
         def refresh_async(self, full=False):
             if self._refreshing:
-                return  # in-flight guard: one worker at a time (SnapshotSource
-                        # pacing state is only touched by this single worker)
+                # In-flight guard: one worker at a time (SnapshotSource pacing
+                # state is only touched by this single worker). The running
+                # pass may predate what prompted this request (e.g. a fresh
+                # quarantine), so on_sync_tick re-runs once it finishes.
+                self._refresh_pending = True
+                return
             self._refreshing = True
             threading.Thread(target=self._worker, args=(full,), daemon=True).start()
 
@@ -612,15 +670,22 @@ def run(switcher) -> int:
             # CPython); the main-thread sync tick reads them. While the engine
             # runs it already paces all fetching, so the display reads store-only.
             try:
+                engine = self._engine
                 try:
                     raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
+                        full=full, store_only=engine is not None
                     )
+                    # A hosted engine quarantines a candidate whose refresh fails
+                    # with invalid_grant without striking the usage store, and
+                    # stops polling it, so no dead-token sentinel would follow.
+                    # Only a running engine releases recovered entries, so the
+                    # state file is consulted only while one runs here.
+                    quarantine = engine.quarantine() if engine is not None else None
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
                     return
-                snap = _adapt_snapshot(raw)
+                snap = _adapt_snapshot(raw, quarantine)
                 self._log_usage(snap)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
@@ -650,9 +715,14 @@ def run(switcher) -> int:
         def on_sync_tick(self, _timer):
             if self._dirty:
                 self._dirty = False
+                fresh = self._relogin_alerts.update(self.snapshot["relogin"])
                 self.rebuild_menu()
+                self._announce_relogin(fresh)
             self._detect_active_change()
             self._drain_engine_events()
+            if self._refresh_pending and not self._refreshing:
+                self._refresh_pending = False
+                self.refresh_async()
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -675,6 +745,15 @@ def run(switcher) -> int:
             email = current[0] if current else None
             if email and email != self.snapshot.get("active_email"):
                 self.refresh_async()
+
+        def _announce_relogin(self, accounts):
+            for account in accounts:
+                num, email, _alias = account
+                self.switcher._logger.warning(
+                    "account %s (%s) needs re-login: refresh token dead", num, email
+                )
+                headline, body = relogin_notice(account)
+                rumps.notification("claude-swap", headline, body)
 
         # ---- auto-switch engine ----------------------------------------------
         def _start_engine(self):
@@ -725,6 +804,10 @@ def run(switcher) -> int:
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
                     rumps.notification("claude-swap", "Auto-switched account", ev.human())
                     self.refresh_async()  # reflect the switch promptly
+                elif ev.kind == "account-quarantined" and ev.reason == "invalid_grant":
+                    # Announced as "re-login needed" by the next snapshot, which
+                    # also keeps it badged; notifying here too would double up.
+                    self.refresh_async()
                 elif ev.kind == "account-quarantined":
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
@@ -749,6 +832,7 @@ def run(switcher) -> int:
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                alert=bool(self._relogin_alerts.accounts),
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -782,8 +866,15 @@ def run(switcher) -> int:
                 account_items.append(item)
             if not account_items:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+            alert_items = [
+                rumps.MenuItem(relogin_menu_label(acc), callback=self._make_relogin_help(acc))
+                for acc in self._relogin_alerts.accounts
+            ]
+            if alert_items:
+                alert_items.append(None)
 
             self.menu = [
+                *alert_items,
                 *account_items,
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._switch(None)),
@@ -926,6 +1017,12 @@ def run(switcher) -> int:
                 if self._guard(lambda: self.switcher.switch(strategy=strategy)):
                     self._notify_switched()
                     self.refresh_async()
+            return cb
+
+        def _make_relogin_help(self, account):
+            def cb(_sender):
+                headline, body = relogin_notice(account)
+                rumps.alert(title=headline, message=body)
             return cb
 
         def _make_remove(self, num):

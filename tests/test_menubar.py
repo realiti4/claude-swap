@@ -18,7 +18,13 @@ import pytest
 
 from claude_swap import menubar
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.switcher import USAGE_API_KEY
+from claude_swap.switcher import (
+    USAGE_API_KEY,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 
 
 # --- notification identity -----------------------------------------------------
@@ -357,6 +363,16 @@ def test_format_title_both_drops_unavailable_windows():
     assert menubar.format_title("loc@x.com", "no credentials", s) == "⇄"
 
 
+def test_format_title_alert_badge_leads_the_title():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s, alert=True) == "⚠️ ⇄ loc · 42% · 18%"
+
+
+def test_format_title_alert_badge_shows_with_no_active_account():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
+    assert menubar.format_title(None, None, s, alert=True) == "⚠️ ⇄"
+
+
 def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
@@ -490,6 +506,47 @@ def test_adapt_snapshot_shape_and_active_selection():
     assert snap["accounts"][1] == (
         "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
     )
+
+
+def test_adapt_snapshot_reports_relogin_observations():
+    accts = [
+        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good={"five_hour": {"pct": 10.0}})),
+        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_RELOGIN_REQUIRED), alias="yahoo"),
+        # disabled: the user already holds it out of rotation, so no alert
+        _FakeAcct("3", "c@x.com", False, _FakeEntry(sentinel=USAGE_RELOGIN_REQUIRED), disabled=True),
+        # transient sentinel that heals on its own
+        _FakeAcct("4", "d@x.com", False, _FakeEntry(sentinel=USAGE_TOKEN_EXPIRED)),
+        # unreadable Keychain / wiped live credential: can't tell this pass
+        _FakeAcct("5", "e@x.com", False, _FakeEntry(sentinel=USAGE_KEYCHAIN_UNAVAILABLE)),
+        _FakeAcct("6", "f@x.com", False, _FakeEntry(sentinel=USAGE_NO_CREDENTIALS)),
+        # API key accounts have no refresh token to die
+        _FakeAcct("7", "g@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY)),
+    ]
+    snap = menubar._adapt_snapshot(_FakeSnap(accts))
+    assert snap["relogin"] == [
+        (("2", "b@x.com", "yahoo"), True),
+        (("5", "e@x.com", ""), False),
+        (("6", "f@x.com", ""), False),
+    ]
+
+
+def test_adapt_snapshot_counts_invalid_grant_quarantine_as_relogin():
+    lg = {"five_hour": {"pct": 10.0}}
+    accts = [
+        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg)),
+        _FakeAcct("2", "b@x.com", False, _FakeEntry(last_good=lg)),
+        _FakeAcct("3", "c@x.com", False, _FakeEntry(last_good=lg)),
+        _FakeAcct("4", "d@x.com", False, _FakeEntry(last_good=lg)),
+    ]
+    quarantine = {
+        "2": {"email": "b@x.com", "reason": "invalid_grant"},
+        # alive but the wrong account: not a re-login problem
+        "3": {"email": "c@x.com", "reason": "identity-conflict"},
+        # entry left by the slot's previous occupant
+        "4": {"email": "old@x.com", "reason": "invalid_grant"},
+    }
+    snap = menubar._adapt_snapshot(_FakeSnap(accts), quarantine)
+    assert snap["relogin"] == [(("2", "b@x.com", ""), True)]
 
 
 def test_adapt_snapshot_empty():
