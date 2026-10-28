@@ -17,7 +17,9 @@ from pathlib import Path
 import pytest
 
 from claude_swap import menubar
+from claude_swap.autoswitch import ErrorEvent
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.menubar import ENGINE_ERROR_REPEAT_S, should_surface_engine_error
 from claude_swap.switcher import USAGE_API_KEY
 
 
@@ -617,3 +619,60 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- engine errors must not vanish -------------------------------------------
+#
+# The hosted auto-switch engine reports a failed tick as an ErrorEvent. The
+# menu bar dropped those: nothing in the log, nothing on screen. Field case —
+# every tick's switch raised "Current account credential is empty" for two
+# days while the icon sat there looking healthy.
+
+
+def test_engine_error_is_surfaced_the_first_time():
+    ev = ErrorEvent(message="Current account credential is empty")
+    assert should_surface_engine_error(ev, {}, now=1000.0) is True
+
+
+def test_engine_error_repeating_every_tick_is_not_a_notification_storm():
+    ev = ErrorEvent(message="Current account credential is empty")
+    seen: dict = {}
+    assert should_surface_engine_error(ev, seen, now=1000.0) is True
+    assert should_surface_engine_error(ev, seen, now=1060.0) is False
+
+
+def test_engine_error_resurfaces_after_the_quiet_period():
+    ev = ErrorEvent(message="Current account credential is empty")
+    seen: dict = {}
+    should_surface_engine_error(ev, seen, now=1000.0)
+    assert should_surface_engine_error(ev, seen, now=1000.0 + ENGINE_ERROR_REPEAT_S) is True
+
+
+def test_two_alternating_engine_errors_are_each_limited():
+    a = ErrorEvent(message="Current account credential is empty")
+    b = ErrorEvent(message="Claude config file not found")
+    seen: dict = {}
+    surfaced = [
+        should_surface_engine_error(ev, seen, now=1000.0 + 60 * i)
+        for i, ev in enumerate([a, b, a, b, a, b])
+    ]
+    assert surfaced == [True, True, False, False, False, False]
+
+
+def test_engine_errors_differing_only_in_numbers_are_one_error():
+    seen: dict = {}
+    first = ErrorEvent(message="LockError: lock held by pid 4242 for 31s")
+    later = ErrorEvent(message="LockError: lock held by pid 4243 for 92s")
+    assert should_surface_engine_error(first, seen, now=1000.0) is True
+    assert should_surface_engine_error(later, seen, now=1060.0) is False
+
+
+def test_engine_error_table_is_pruned():
+    seen: dict = {}
+    for i in range(50):
+        should_surface_engine_error(
+            ErrorEvent(message=f"error kind {chr(65 + i % 26)}{i}"), seen, now=0.0
+        )
+    should_surface_engine_error(ErrorEvent(message="x"), seen, now=ENGINE_ERROR_REPEAT_S)
+    assert list(seen) == ["x"]
+
