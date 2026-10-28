@@ -16,6 +16,7 @@ from claude_swap.process_detection import (
     ClaudeSession,
     IdeInstance,
     _lstart_seconds,
+    _parse_procargs2,
     _stat_start_ticks,
     get_claude_dir,
     get_running_instances,
@@ -23,6 +24,7 @@ from claude_swap.process_detection import (
     list_ide_instances,
     list_sessions,
     pid_matches_record,
+    process_config_dir,
     process_is_claude,
     process_start_ticks,
     process_started_at,
@@ -235,6 +237,60 @@ class TestProcessIsClaude:
                    return_value=proc) as run:
             assert process_is_claude(1234) is expected
         assert run.call_args[0][0] == ["ps", "-o", "comm=,args=", "-p", "1234"]
+
+
+class TestParseProcargs2:
+    def _procargs2(self, args: list[bytes], env: list[bytes]) -> bytes:
+        return (
+            len(args).to_bytes(4, sys.byteorder)
+            + b"/usr/local/bin/claude\0\0\0\0"
+            + b"".join(a + b"\0" for a in args)
+            + b"".join(e + b"\0" for e in env)
+            + b"\0garbage-after-the-environment\0"
+        )
+
+    def test_reads_the_environment_after_argc_arguments(self):
+        raw = self._procargs2(
+            [b"claude", b"-p", b"CLAUDE_CONFIG_DIR=/from/an/argument"],
+            [b"HOME=/Users/me", b"CLAUDE_CONFIG_DIR=/Users/me/with space"],
+        )
+        assert _parse_procargs2(raw) == {
+            "HOME": "/Users/me",
+            "CLAUDE_CONFIG_DIR": "/Users/me/with space",
+        }
+
+    @pytest.mark.parametrize("raw", [b"", b"\x01\0\0\0no-terminator"])
+    def test_rejects_garbage(self, raw):
+        assert _parse_procargs2(raw) is None
+
+
+class TestProcessConfigDir:
+    def test_windows_is_unknowable(self):
+        with patch("claude_swap.process_detection.sys.platform", "win32"):
+            assert process_config_dir(os.getpid()) is None
+
+    def test_unreadable_process_is_unknowable(self):
+        assert process_config_dir(2**22 + 12345) is None
+
+    @pytest.mark.skipif(
+        not (sys.platform == "darwin" or sys.platform.startswith("linux")),
+        reason="reads another process's environment",
+    )
+    @pytest.mark.parametrize("configured", [True, False])
+    def test_reads_a_child_process(self, tmp_path, configured):
+        import subprocess
+
+        config_dir = tmp_path / "profile with space"
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        if configured:
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=env)
+        try:
+            expected = config_dir if configured else Path.home() / ".claude"
+            assert process_config_dir(child.pid) == expected
+        finally:
+            child.kill()
+            child.wait()
 
 
 class TestPidMatchesRecord:
