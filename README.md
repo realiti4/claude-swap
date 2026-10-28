@@ -167,6 +167,28 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Remote Control attachments
+
+If you use Claude Code [Remote Control](https://code.claude.com/docs/en/remote-control) from the phone app while cswap switches accounts, files you attach can arrive as `[attachment did not arrive]`. Install the recovery hook once:
+
+```bash
+cswap hook install      # adds a UserPromptSubmit hook to ~/.claude/settings.json (backs it up first)
+cswap hook status
+cswap hook uninstall
+```
+
+It applies to Claude Code sessions started after you install it.
+
+<details>
+<summary>Why it happens & what the hook does</summary>
+
+- **Cause.** A Remote Control session belongs to the account that started it, and so does every file you attach from the phone. Files and sessions are per user, not per organization. Claude Code downloads the attachment (`/api/oauth/files/<id>/content`) with whatever OAuth login is on disk at that moment. After `cswap switch` or `cswap auto` has moved the default login to another account, that download gets a 404. Claude Code doesn't retry it, so the message reaches the model without its file.
+- **Fix.** When a prompt starts with the `[… did not arrive]` placeholder, the hook looks up the session's Remote Control id. It finds the message's attachments by listing the session's recent events with each stored account until the owner's token answers. It downloads the files with that token into `~/.claude/uploads/<session>/` and hands their paths to the model in the same turn. Normal prompts return immediately without touching the network.
+- **Tokens.** The live login is only read; Claude Code owns its refresh. Another account's stored token is refreshed only when it has expired, the same way usage polling does it.
+- **Risk.** The hook relies on undocumented Claude Code endpoints and session files. If they change, it fails silently: no output, and you get the old behaviour of a placeholder without the file. It never blocks a prompt.
+
+</details>
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.

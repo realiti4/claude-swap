@@ -14,6 +14,7 @@ import pytest
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
+    LOOP_LOCK_FILENAME,
     NO_RESET_FALLBACK_S,
     SPENT_HEADROOM_PCT,
     AllExhaustedEvent,
@@ -29,6 +30,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.locking import FileLock
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
@@ -2260,6 +2262,41 @@ class TestRunLoop:
         with patch.object(harness.engine, "tick") as tick:
             assert harness.engine.run_loop() == 0
         tick.assert_not_called()
+
+    def test_second_live_loop_refuses_to_start(self, harness):
+        # Two live loops on one pool each read the other's switch as drift
+        # and race their own decisions against it. The second must report
+        # and bail without ticking, not run alongside.
+        held = FileLock(harness.switcher.backup_dir / LOOP_LOCK_FILENAME)
+        assert held.acquire(timeout=0)
+        try:
+            with patch.object(harness.engine, "tick") as tick:
+                assert harness.engine.run_loop() == TickOutcome.ERROR.value
+            tick.assert_not_called()
+        finally:
+            held.release()
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert len(errors) == 1
+        assert not errors[0].transient
+        assert "already running" in errors[0].message
+
+    def test_loop_lock_is_released_on_exit(self, harness):
+        harness.engine.stop()
+        assert harness.engine.run_loop() == 0
+        again = FileLock(harness.switcher.backup_dir / LOOP_LOCK_FILENAME)
+        assert again.acquire(timeout=0)
+        again.release()
+
+    def test_dry_run_loop_runs_beside_a_live_one(self, harness):
+        held = FileLock(harness.switcher.backup_dir / LOOP_LOCK_FILENAME)
+        assert held.acquire(timeout=0)
+        try:
+            harness.engine.dry_run = True
+            harness.engine.stop()
+            assert harness.engine.run_loop() == 0
+        finally:
+            held.release()
+        assert not any(isinstance(e, ErrorEvent) for e in harness.events)
 
     def test_wake_during_tick_cuts_the_following_sleep_short(self, harness):
         # No wait patching on purpose: if the clear-at-top ordering were

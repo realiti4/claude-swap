@@ -66,6 +66,11 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+# Held for the whole life of a live run_loop so only one loop per backup root
+# ever switches. Two loops each see the other's switch as "the account moved
+# under me" and race their own decisions against it; the state lock only
+# serializes the individual switches, not the loops.
+LOOP_LOCK_FILENAME = ".autoswitch_loop.lock"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -2708,7 +2713,35 @@ class AutoSwitchEngine:
             return delay
 
     def run_loop(self) -> int:
-        """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        """Tick forever (until :meth:`stop`); a failing tick never kills it.
+
+        A live loop is single-instance per backup root: when another live
+        loop already holds the loop lock this one reports it and returns
+        ``TickOutcome.ERROR`` without ticking. Dry-run loops never switch, so
+        they run alongside a live one. ``--once`` ticks go through
+        :meth:`tick` and are serialized by the state lock instead.
+        """
+        guard: FileLock | None = None
+        if not self.dry_run:
+            guard = FileLock(self.state_path.parent / LOOP_LOCK_FILENAME)
+            if not guard.acquire(timeout=0):
+                self._emit(
+                    ErrorEvent(
+                        message=(
+                            "another live auto-switch loop is already running "
+                            "for this account pool; not starting a second one"
+                        ),
+                        transient=False,
+                    )
+                )
+                return TickOutcome.ERROR.value
+        try:
+            return self._run_loop_inner()
+        finally:
+            if guard is not None:
+                guard.release()
+
+    def _run_loop_inner(self) -> int:
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
