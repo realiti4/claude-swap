@@ -994,6 +994,85 @@ def _set_default_mcp(default_config: Path, servers: dict | None) -> None:
     default_config.write_text(json.dumps(data))
 
 
+def _set_default_projects(default_config: Path, projects: dict) -> None:
+    data = json.loads(default_config.read_text())
+    data["projects"] = projects
+    default_config.write_text(json.dumps(data))
+
+
+class TestFolderTrustMirror:
+    def test_copies_only_accepted_trust(self, mcp_setup):
+        default_config, session_dir, mgr = mcp_setup
+        _set_default_projects(
+            default_config,
+            {
+                "/trusted": {"hasTrustDialogAccepted": True, "allowedTools": ["Bash"]},
+                "/untrusted": {"hasTrustDialogAccepted": False},
+                "/never-asked": {"lastCost": 1.5},
+            },
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        projects = _session_config(session_dir)["projects"]
+        assert projects["/trusted"] == {"hasTrustDialogAccepted": True}
+        assert "/untrusted" not in projects
+        assert "/never-asked" not in projects
+        # The profile's own per-project state is preserved.
+        assert projects["/w"] == {"allowedTools": []}
+
+    def test_marks_existing_profile_entry(self, mcp_setup):
+        default_config, session_dir, mgr = mcp_setup
+        _set_default_projects(default_config, {"/w": {"hasTrustDialogAccepted": True}})
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_config(session_dir)["projects"]["/w"] == {
+            "allowedTools": [],
+            "hasTrustDialogAccepted": True,
+        }
+
+    def test_never_revokes_profile_trust(self, mcp_setup):
+        default_config, session_dir, mgr = mcp_setup
+        config = _session_config(session_dir)
+        config["projects"]["/w"]["hasTrustDialogAccepted"] = True
+        (session_dir / ".claude.json").write_text(json.dumps(config))
+        _set_default_projects(default_config, {"/w": {"hasTrustDialogAccepted": False}})
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_config(session_dir)["projects"]["/w"]["hasTrustDialogAccepted"]
+
+    def test_in_sync_profile_is_not_rewritten(self, mcp_setup):
+        default_config, session_dir, mgr = mcp_setup
+        _set_default_projects(default_config, {"/t": {"hasTrustDialogAccepted": True}})
+        mgr._sync_sharing(session_dir, share=True)
+        before = (session_dir / ".claude.json").stat().st_mtime_ns
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / ".claude.json").stat().st_mtime_ns == before
+
+    def test_no_share_leaves_trust_alone(self, mcp_setup):
+        default_config, session_dir, mgr = mcp_setup
+        _set_default_projects(default_config, {"/t": {"hasTrustDialogAccepted": True}})
+
+        mgr._sync_sharing(session_dir, share=False)
+
+        assert "/t" not in _session_config(session_dir)["projects"]
+
+    def test_malformed_profile_projects_left_alone(self, mcp_setup):
+        default_config, session_dir, mgr = mcp_setup
+        config = _session_config(session_dir)
+        config["projects"] = ["not", "a", "map"]
+        (session_dir / ".claude.json").write_text(json.dumps(config))
+        _set_default_projects(default_config, {"/t": {"hasTrustDialogAccepted": True}})
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_config(session_dir)["projects"] == ["not", "a", "map"]
+
+
 class TestMcpMirror:
     def test_bootstrap_launch_mirrors(
         self, temp_home, manager, auth_status_tracks_seed, refresh_rotates
