@@ -54,6 +54,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
+from claude_swap.pace import weekly_deficit
 from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -144,6 +145,38 @@ HORIZON_HEADROOM_RATIO = 2.0
 # the no-return bar's release asks the account we left to have gained at least
 # this much.
 SPENT_HEADROOM_PCT = 3.0
+
+# How much less weekly deficit (pace.weekly_deficit, in points) a candidate
+# needs before the `pace` strategy moves to it below the threshold. Both sides
+# drift once we move — the new account burns, the idle one falls further
+# behind its schedule — so the move back needs roughly twice this margin of
+# real change. The same number as the default hysteresis, on the pace axis.
+PACE_MARGIN_PCT = 10.0
+
+# How much room (in points) a candidate's 5h window needs under its line for a
+# `pace` move to land there. A move below the threshold is optional, so it
+# must not land on an account that reaches its 5h line minutes later and
+# forces a second move: every switch drops the prompt cache of every running
+# session. At the threshold these accounts rank after every other one, so a
+# forced move still has somewhere to go. 5h only: room near a WEEKLY line on
+# an account that resets soon is exactly the quota pace exists to spend.
+PACE_LANDING_5H_ROOM_PCT = 25.0
+
+# How close to its weekly reset an account's leftover quota counts as about to
+# expire. Below the threshold `pace` moves to such an account whatever its
+# deficit, and stays on one until it resets or reaches a line: quota spent
+# there is quota a later-resetting account keeps. The deficit alone misses
+# this when both accounts are in reserve — a 19-point reserve that expires in
+# hours never beats a 26-point one that lasts days. A day is about one day's
+# share of the week, the size of a typical leftover.
+PACE_LAST_CALL_S = 24 * 3600.0
+
+# Strategies that may move BELOW the threshold with the strategy name as the
+# trigger, and share the plumbing a voluntary move needs: the cooldown, the
+# healthy-landing gate, the phase-2 refetch before switching, and holding
+# rather than blocking when nothing qualifies. priority-consume-first moves
+# below the threshold too, as "priority", with its own ranking.
+_NUDGE_TRIGGERS = ("consume-first", "pace")
 
 
 def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
@@ -334,7 +367,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority" | "pace"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -505,6 +538,21 @@ def _window_pcts(
 _limiting_reset_ts = poll_policy.limiting_reset_ts
 _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
+
+
+def _five_hour_room(usage: dict | str | None, line: float) -> float | None:
+    """Points left under ``line`` in an account's 5h window, or None when it
+    reports no 5h window."""
+    for label, pct, _resets_at in oauth.relevant_windows(usage):
+        if label == oauth.FIVE_HOUR_LABEL:
+            return line - pct
+    return None
+
+
+def _in_last_call(reset_ts: float | None, now: float) -> bool:
+    """Whether a weekly window resetting at ``reset_ts`` is within
+    PACE_LAST_CALL_S of its reset."""
+    return reset_ts is not None and reset_ts - now <= PACE_LAST_CALL_S
 
 
 def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
@@ -1188,7 +1236,7 @@ class AutoSwitchEngine:
                 else (100.0 - active_headroom) < thresholds[current]
             )
             if below:
-                if settings.strategy != "consume-first" and not priority_mode:
+                if settings.strategy not in _NUDGE_TRIGGERS and not priority_mode:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1206,7 +1254,9 @@ class AutoSwitchEngine:
                 # whichever account's weekly window resets soonest, to burn the
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
-                trigger = "priority" if priority_mode else "consume-first"
+                # pace does the same on the weekly-deficit axis: move when a
+                # candidate is PACE_MARGIN_PCT behind the active's pace.
+                trigger = "priority" if priority_mode else settings.strategy
             else:
                 # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
@@ -1258,7 +1308,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+        if trigger in ("proactive", *_NUDGE_TRIGGERS, "priority") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1282,7 +1332,7 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger in ("consume-first", "priority")
+            trigger in (*_NUDGE_TRIGGERS, "priority")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1414,7 +1464,7 @@ class AutoSwitchEngine:
             thresholds=thresholds,
         )
 
-        if (trigger == "consume-first" or priority_mode) and ordered:
+        if (trigger in _NUDGE_TRIGGERS or priority_mode) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1451,7 +1501,7 @@ class AutoSwitchEngine:
         )
         if (
             not ordered and api_key_candidates
-            and trigger not in ("consume-first", "priority")
+            and trigger not in (*_NUDGE_TRIGGERS, "priority")
             and not priority_active_ready
         ):
             # Last resort when we must move: metered API-key accounts
@@ -1482,6 +1532,26 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "pace":
+                # Below the threshold with the active account's leftover
+                # about to expire, or no candidate far enough behind its own
+                # pace or about to expire: staying put is the strategy
+                # working, not a block — the same contract as consume-first's
+                # holds below.
+                if _in_last_call(active_reset_ts, decided_now):
+                    reason, detail = "last-call", (
+                        "active account's weekly window resets within "
+                        f"{PACE_LAST_CALL_S / 3600:.0f}h; using its quota first"
+                    )
+                else:
+                    reason, detail = "on-best-pace", (
+                        f"no account is {PACE_MARGIN_PCT:.0f} points further "
+                        "behind its weekly pace or resets within "
+                        f"{PACE_LAST_CALL_S / 3600:.0f}h, with "
+                        f"{PACE_LANDING_5H_ROOM_PCT:.0f} points of 5h room"
+                    )
+                self._emit(NoSwitchEvent(reason=reason, detail=detail))
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -1568,7 +1638,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first" or (priority_mode and num in oauth_candidates):
+            if trigger in _NUDGE_TRIGGERS or (priority_mode and num in oauth_candidates):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1730,7 +1800,19 @@ class AutoSwitchEngine:
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        # A `pace` departure is not a move this bar can be asked to protect:
+        # the account was left for being AHEAD of its schedule, not for being
+        # near its limit, so going back to it at the threshold undoes nothing.
+        # Barred, a two-account fleet stayed on the new account until it hit
+        # 100% (the at-limit escape) while the old one sat under the line.
+        # `pace` itself is not in the trigger list: its own margin is the
+        # anti-flap bound on its axis. The next switch records its own
+        # trigger, so the bar is back after one move.
+        if (
+            trigger not in ("proactive", "consume-first")
+            or came_from is None
+            or state.get("leftTrigger") == "pace"
+        ):
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -2127,8 +2209,17 @@ class AutoSwitchEngine:
             thresholds = ThresholdMap({}, settings.threshold)
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
+        by_pace = settings.strategy == "pace"
         active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
+            _seven_day_reset_ts(usage.get(current), now)
+            if consume_first or by_pace
+            else None
+        )
+        active_last_call = by_pace and _in_last_call(active_reset_ts, now)
+        active_deficit = (
+            weekly_deficit(usage.get(current), now, work_days=settings.work_days)
+            if by_pace
+            else None
         )
         # One binding window per account under THIS snapshot's lines — the
         # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
@@ -2221,9 +2312,24 @@ class AutoSwitchEngine:
                 else (100.0 - h) >= thresholds[num]
             )
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(usage.get(num), now)
+                if consume_first or by_pace
+                else None
             )
-            if trigger in ("proactive", "consume-first"):
+            last_call = by_pace and _in_last_call(reset_ts, now)
+            deficit = (
+                weekly_deficit(usage.get(num), now, work_days=settings.work_days)
+                if by_pace
+                else None
+            )
+            five_hour_room = (
+                _five_hour_room(usage.get(num), thresholds[num]) if by_pace else None
+            )
+            cramped = (
+                five_hour_room is not None
+                and five_hour_room < PACE_LANDING_5H_ROOM_PCT
+            )
+            if trigger in ("proactive", *_NUDGE_TRIGGERS):
                 # Landing must be healthy: an account at/over any of its own
                 # lines would re-trigger on the very next tick. At-limit and
                 # failover are escapes that skip this whole block — any account
@@ -2253,6 +2359,23 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                elif trigger == "pace":
+                    # Only accounts measurably further behind their weekly
+                    # schedule than the active one, or whose leftover is about
+                    # to expire (PACE_LAST_CALL_S), with room to work in their
+                    # 5h window. An unknown deficit on either side cannot prove
+                    # the first, so it never qualifies on it. An active account
+                    # in its own last call is spent before any move. Above the
+                    # threshold the trigger is `proactive` and the `best`
+                    # hysteresis below applies instead.
+                    if cramped or active_last_call:
+                        continue
+                    if not last_call and (
+                        deficit is None
+                        or active_deficit is None
+                        or deficit > active_deficit - PACE_MARGIN_PCT
+                    ):
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
@@ -2280,6 +2403,22 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+            elif by_pace:
+                # Least weekly deficit first, for every trigger: a sooner
+                # reset or more raw headroom does not beat an account that is
+                # behind its schedule. Accounts over a line sort after every
+                # account under one (at-limit and failover skip the landing
+                # gate), then accounts short of PACE_LANDING_5H_ROOM_PCT after
+                # the rest, then accounts whose leftover is about to expire
+                # before the rest, unknown deficits after known ones, and
+                # policy headroom breaks ties.
+                key = (
+                    over,
+                    cramped,
+                    not last_call,
+                    deficit if deficit is not None else float("inf"),
+                    -lh,
+                )
             else:
                 key = (-lh,)
             qualifying.append((key, num))
@@ -2473,7 +2612,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+            if trigger in ("proactive", *_NUDGE_TRIGGERS, "priority") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

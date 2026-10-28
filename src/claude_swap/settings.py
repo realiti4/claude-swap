@@ -26,7 +26,7 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first")
+AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first", "pace")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -60,6 +60,9 @@ class AutoSwitchSettings:
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # Opt-in alternatives are in AUTOSWITCH_STRATEGIES.
+    # Days per week, from Monday, that count toward the weekly pace the `pace`
+    # strategy ranks by. 7 is the plain linear week; 6 leaves Sunday out.
+    work_days: int = 7
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -159,6 +162,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "strategy", "strategy", "choice",
             choices=AUTOSWITCH_STRATEGIES,
             help="How auto-switch picks the target account",
+        ),
+        SettingSpec(
+            "autoswitch", "workDays", "work_days", "int", 2, 7,
+            help="Days per week (from Monday) that count toward weekly pace",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",

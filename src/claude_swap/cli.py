@@ -863,10 +863,11 @@ Defaults live in settings.json in the backup root; flags override them.
         choices=AUTOSWITCH_STRATEGIES,
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest), or 'priority-consume-first' (highest account "
-            "priority, then soonest weekly reset; only targets below all switch lines)"
+            "resets soonest), 'priority-consume-first' (highest account "
+            "priority, then soonest weekly reset; only targets below all switch lines), "
+            "or 'pace' (proactively use the account furthest behind its weekly pace)"
         ),
     )
     parser.add_argument(
