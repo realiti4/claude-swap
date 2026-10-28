@@ -90,7 +90,11 @@ from claude_swap.paths import (
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
 )
-from claude_swap.process_detection import get_running_instances
+from claude_swap.process_detection import (
+    ClaudeSession,
+    get_running_instances,
+    remote_control_sessions,
+)
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
@@ -5876,13 +5880,19 @@ class ClaudeAccountSwitcher:
                     label = entrypoint_label(session.entrypoint)
                     cwd = abbreviate_path(session.cwd)
                     key = (label, cwd)
-                    counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
+                    counts = groups.setdefault(
+                        key, {"sessions": 0, "ide": 0, "rc": 0}
+                    )
                     counts["sessions"] += 1
+                    if session.bridge_session_id:
+                        counts["rc"] += 1
                 for ide in ide_instances:
                     name = ide_short_name(ide.ide_name)
                     for folder in ide.workspace_folders:
                         key = (name, abbreviate_path(folder))
-                        counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
+                        counts = groups.setdefault(
+                            key, {"sessions": 0, "ide": 0, "rc": 0}
+                        )
                         counts["ide"] += 1
 
                 print()
@@ -5890,8 +5900,14 @@ class ClaudeAccountSwitcher:
                 for (label, cwd), counts in groups.items():
                     parts = []
                     s = counts["sessions"]
+                    rc = counts["rc"]
                     if s:
                         parts.append(f"{s} session{'s' if s > 1 else ''}")
+                        if rc:
+                            parts.append(
+                                "Remote Control" if rc == s and s == 1
+                                else f"{rc} on Remote Control"
+                            )
                     if counts["ide"]:
                         parts.append("IDE")
                     print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
@@ -7082,6 +7098,19 @@ class ClaudeAccountSwitcher:
                 else self._prefetch_live_identity()
             )
 
+        # Remote Control snapshot, taken BEFORE the swap: Claude Code drops RC
+        # a few seconds after a session picks up the new account, but the
+        # session files still show the bridge the instant this command ends.
+        # Best-effort -- a scan error must never affect the switch.
+        rc_before: list[ClaudeSession] = []
+        if emit_output:
+            try:
+                rc_before = remote_control_sessions()
+            except Exception:
+                self._logger.debug(
+                    "Failed to snapshot Remote Control sessions", exc_info=True
+                )
+
         # Beyond cswap's own lock, hold Claude Code's advisory locks for the
         # whole mutation (including rollback paths): its token refresh runs
         # under ~/.claude.lock and re-reads credentials there — holding it
@@ -7291,6 +7320,8 @@ class ClaudeAccountSwitcher:
                     )
                     print()
                     self._print_switch_followup()
+                    if current_account != target_account:
+                        self._print_rc_report(rc_before)
                     print()
                 self._replan_new_active(
                     target_account,
@@ -7557,6 +7588,8 @@ class ClaudeAccountSwitcher:
                 print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
             print()
             self._print_switch_followup()
+            if current_account != target_account:
+                self._print_rc_report(rc_before)
             print()
         self._replan_new_active(
             target_account,
@@ -7564,6 +7597,36 @@ class ClaudeAccountSwitcher:
             data["accounts"][target_account].get("organizationUuid", ""),
         )
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+
+    def _print_rc_report(self, sessions: list[ClaudeSession]) -> None:
+        """List the Remote Control sessions this switch will disconnect.
+
+        Claude Code drops RC when a session picks up a changed account. A
+        terminal session stays off until /remote-control; Claude Desktop
+        re-enables it on the session's next message, unless RC was toggled
+        by hand in that session.
+        """
+        if not sessions:
+            return
+        n = len(sessions)
+        if n == 1:
+            head = "1 running session was connected and will disconnect when it picks"
+        else:
+            head = f"{n} running sessions were connected and will disconnect when they pick"
+        print(f"{bolded('Remote Control:')} {head} up the new account")
+        for session in sessions:
+            label = entrypoint_label(session.entrypoint)
+            cwd = abbreviate_path(session.cwd)
+            print(f"  {dimmed('•')} {muted(cwd)} ({label})")
+        where = "the session" if n == 1 else "each session"
+        if any(s.entrypoint == "claude-desktop" for s in sessions):
+            hint = (
+                "Desktop sessions usually come back on your next message; "
+                f"otherwise run /remote-control in {where}"
+            )
+        else:
+            hint = f"run /remote-control in {where}"
+        print(dimmed(f"  Reconnect: {hint}"))
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
