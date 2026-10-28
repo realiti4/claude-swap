@@ -36,6 +36,16 @@ pipx upgrade claude-swap
 
 ## Usage
 
+**Account scope:** claude-swap supports Claude Code OAuth accounts (including setup
+tokens) and [Anthropic Console API keys](#add-an-account-from-a-raw-token-or-api-key).
+It does not manage or switch third-party API provider configurations.
+
+`cswap switch` updates stored credentials; it does not change exported
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or `ANTHROPIC_BASE_URL` environment
+variables. These can override the stored login or send requests to a custom
+endpoint even after a successful switch. Unset them in the environment used to
+launch Claude Code if you want to use the switched account.
+
 ### Add your first account
 
 Log into Claude Code with your first account, then:
