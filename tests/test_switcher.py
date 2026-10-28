@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from claude_swap.secret_files import unseal
+
 import base64
 import json
 import os
@@ -6455,50 +6457,41 @@ class TestMacosKeychainFallback:
         s._keychain_disabled_until = time.monotonic() + 100  # still within cooldown
         assert s._use_keychain() is False
 
-    def test_write_keychain_failure_pins_file_mode(self, temp_home: Path, monkeypatch):
-        # An active write whose Keychain attempt fails falls back to the file; the
-        # stale-item delete is best-effort. Even though the failed op scheduled a
-        # re-probe, the write must pin file mode so a later cooldown can't re-probe
-        # onto the residual Keychain item and resurrect the wrong account.
+    def test_write_keychain_failure_refuses_file_mode(self, temp_home: Path, monkeypatch):
+        from claude_swap.exceptions import CredentialWriteError
         s = self._macos_switcher()
         store = s._store
         monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
-        monkeypatch.setattr(macos_keychain, "delete_password", _raise_locked)
-        monkeypatch.setattr(store, "_write_active_credentials_file", lambda creds: None)
-        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "x"}}')
-        assert store._last_active_credentials_backend == "file"
-        assert s._keychain_disabled_until == 0.0   # no re-probe scheduled
-        assert s._use_keychain() is False          # pinned, stays file mode
+        with patch.object(store, "_write_active_credentials_file") as write_file, patch.object(store, "_update_global_config") as write_config:
+            with pytest.raises(CredentialWriteError, match="refusing plaintext"):
+                store._write_oauth_credentials('sk-ant-api03-secret')
+            write_file.assert_not_called()
+            write_config.assert_not_called()
+        assert store._file_mode_is_ours is False
 
-    def test_write_fallback_clears_pending_read_reprobe(self, temp_home: Path, monkeypatch):
-        # The owner's edge: already in file mode from a read timeout with a
-        # re-probe still pending, then a write leaves a stale item behind. The
-        # write must clear that pending re-probe (pin) so it never resurrects.
-        s = self._macos_switcher()
-        store = s._store
-        s._keychain_usable_cache = False
-        s._keychain_disabled_until = time.monotonic() + 100  # pending read re-probe
-        monkeypatch.setattr(macos_keychain, "delete_password", _raise_locked)
-        monkeypatch.setattr(store, "_write_active_credentials_file", lambda creds: None)
-        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "x"}}')
-        assert store._last_active_credentials_backend == "file"
-        assert s._keychain_disabled_until == 0.0   # pending re-probe cleared
-        assert s._use_keychain() is False
-
-    def test_managed_key_write_fallback_pins_file_mode(self, temp_home: Path, monkeypatch):
-        # Managed API-key variant of the same guard: a failed Keychain write
-        # falls back to plaintext primaryApiKey, and managed-key reads check the
-        # Keychain first — so the fallback must pin file mode too, or a cooldown
-        # re-probe could read a stale "Claude Code" Keychain item over the key.
+    def test_write_fallback_preserves_pending_read_reprobe(self, temp_home: Path, monkeypatch):
+        from claude_swap.exceptions import CredentialWriteError
         s = self._macos_switcher()
         store = s._store
         monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
-        monkeypatch.setattr(store, "_update_global_config", lambda mutate: None)
-        monkeypatch.setattr(store, "_clear_oauth_credential", lambda: None)
-        store._write_managed_credentials("sk-ant-api03-" + "x" * 40)
-        assert store._last_active_credentials_backend == "file"
-        assert s._keychain_disabled_until == 0.0   # pinned, no re-probe
-        assert s._use_keychain() is False
+        with patch.object(store, "_write_active_credentials_file") as write_file, patch.object(store, "_update_global_config") as write_config:
+            with pytest.raises(CredentialWriteError, match="refusing plaintext"):
+                store._write_oauth_credentials('sk-ant-api03-secret')
+            write_file.assert_not_called()
+            write_config.assert_not_called()
+        assert store._file_mode_is_ours is False
+
+    def test_managed_key_write_fallback_refuses_file_mode(self, temp_home: Path, monkeypatch):
+        from claude_swap.exceptions import CredentialWriteError
+        s = self._macos_switcher()
+        store = s._store
+        monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
+        with patch.object(store, "_write_active_credentials_file") as write_file, patch.object(store, "_update_global_config") as write_config:
+            with pytest.raises(CredentialWriteError, match="refusing plaintext"):
+                store._write_managed_credentials('sk-ant-api03-secret')
+            write_file.assert_not_called()
+            write_config.assert_not_called()
+        assert store._file_mode_is_ours is False
 
     def test_item_exists_is_capability_neutral(
         self, temp_home: Path, block_real_keychain
@@ -6667,21 +6660,16 @@ class TestMacosKeychainFallback:
         # misleading "no credentials" that prompted the re-login.
         assert "keychain unavailable — locked or in use; try again" in out
 
-    def test_active_write_falls_back_to_file_and_clears_stale_keychain(
-        self, temp_home: Path, monkeypatch, block_real_keychain
-    ):
+    def test_active_write_refuses_file_and_preserves_existing_keychain(self, temp_home: Path, monkeypatch, block_real_keychain):
+        from claude_swap.exceptions import CredentialWriteError
         s = self._macos_switcher()
         acct = macos_keychain.keychain_account_name()
-        # A stale keychain entry that Claude Code's keychain-first read would
-        # otherwise resurrect (#30337).
         block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = "STALE"
         monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
-
-        s._write_credentials('{"fresh":1}')
-
-        assert s._last_active_credentials_backend == "file"
-        assert get_credentials_path().read_text() == '{"fresh":1}'
-        assert (CLAUDE_CODE_KEYCHAIN_SERVICE, acct) not in block_real_keychain.data
+        with pytest.raises(CredentialWriteError, match="refusing plaintext"):
+            s._write_credentials('{"fresh":1}')
+        assert not get_credentials_path().exists()
+        assert block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] == "STALE"
 
     def test_keychain_write_refreshes_existing_file(
         self, temp_home: Path, block_real_keychain
@@ -6802,7 +6790,7 @@ class TestMacosKeychainFallback:
 
         # Could not delete the .enc → it was rewritten fresh, so .enc-wins reads
         # still return the new creds (no stale shadow).
-        assert base64.b64decode(enc.read_text()).decode() == "NEW-KC"
+        assert unseal(enc, enc.read_text()) == "NEW-KC"
         assert s._read_account_credentials("1", "a@example.com") == "NEW-KC"
 
     def test_backup_file_mode_writes_enc_and_clears_keychain(
@@ -7058,7 +7046,7 @@ def _read_safety_copy(switcher, entry_id: str) -> str:
     """Decode a preserved credential entry straight from its file (the store
     is write-only by design — no read helper exists in production code)."""
     path = switcher._store._stash_entry_path(entry_id)
-    return base64.b64decode(path.read_text().strip(), validate=True).decode()
+    return unseal(path, path.read_text().strip())
 
 
 class TestProvenanceGuard:
@@ -8641,7 +8629,7 @@ class TestStashStorageHardening:
         assert id_a != id_b
         for entry_id in (id_a, id_b):
             raw = store._stash_entry_path(entry_id).read_text().strip()
-            assert base64.b64decode(raw, validate=True).decode() == "same-bytes"
+            assert unseal(store._stash_entry_path(entry_id), raw) == "same-bytes"
 
     def test_corrupt_manifest_is_preserved_not_clobbered(self, temp_home):
         store = self._store(temp_home)
@@ -8661,7 +8649,7 @@ class TestStashStorageHardening:
         assert new_id in entries and entries[new_id]["reason"] == "y"
         assert entry_id in entries
         raw = store._stash_entry_path(entry_id).read_text().strip()
-        assert base64.b64decode(raw, validate=True).decode() == "bytes-1"
+        assert unseal(store._stash_entry_path(entry_id), raw) == "bytes-1"
 
 
 class TestStashManifestConcurrentMutation:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from claude_swap.secret_files import PREFIX, seal, unseal, write_secret
+
 import dataclasses
 import json
 import logging
@@ -917,7 +919,8 @@ class ClaudeAccountSwitcher:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
-            return config_file.read_text(encoding="utf-8")
+            text = config_file.read_text(encoding="utf-8")
+            return unseal(config_file, text) if text.startswith(PREFIX) else text
         return ""
 
     def _account_is_switchable(self, account_num: str) -> bool:
@@ -947,7 +950,7 @@ class ClaudeAccountSwitcher:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         # Atomic: a torn backup config is a broken future restore.
-        atomic_write_text(config_file, config)
+        write_secret(config_file, config)
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
@@ -1342,7 +1345,7 @@ class ClaudeAccountSwitcher:
                         )
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fd = -1  # the file object owns the descriptor now
-                        fh.write(content)
+                        fh.write(seal(path, content))
         except ConfigError:
             # Leftover found.
             abort()
@@ -2218,7 +2221,7 @@ class ClaudeAccountSwitcher:
                 self._write_json(self.sequence_file, data)
 
     def consume_backup_grant(
-        self, account_num: str, email: str, snapshot: str
+        self, account_num: str, email: str, snapshot: str, *, session_setup: bool = False
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
@@ -2298,13 +2301,13 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
             return self._consume_backup_grant_locked(
-                account_num, email, snapshot
+                account_num, email, snapshot, session_setup=session_setup
             )
         finally:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self, account_num: str, email: str, snapshot: str, *, session_setup: bool = False
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
@@ -2316,6 +2319,10 @@ class ClaudeAccountSwitcher:
 
         try:
             with FileLock(self.lock_file):
+                # Setup alone may refresh a reserved family's credential,
+                # before writing the profile seed. Other collectors are read-only.
+                if not session_setup and self._has_session_reservation(account_num, email):
+                    return oauth.RefreshOutcome(None, "session-owned")
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -5077,7 +5084,8 @@ class ClaudeAccountSwitcher:
             session_identity_drifted,
         )
 
-        has_live_session = bool(self._live_session_pids(str(num), email))
+        reserved = self._has_session_reservation(str(num), email)
+        has_live_session = reserved or bool(self._live_session_pids(str(num), email))
 
         # A session profile supersedes the backup copy as this account's
         # credential truth: claude rotates the token family inside the profile
@@ -5102,7 +5110,7 @@ class ClaudeAccountSwitcher:
                 f"different account; fetching usage from the backup credential"
             )
             session_creds = None
-            has_live_session = False
+            has_live_session = reserved
         if session_creds and not has_live_session:
             # The session has exited, so its family is nobody's to rotate but
             # the store's: adopt the profile head into the backup (which is a
@@ -6967,6 +6975,25 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _has_session_reservation(self, number: str, email: str) -> bool:
+        marker = self._session_dir(number, email) / ".cswap-session-reservation"
+        try:
+            marker.stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def _refuse_reserved_session(self, number: str, email: str) -> None:
+        if not self._has_session_reservation(number, email):
+            return
+        raise SwitchError(
+            f"Account-{number} is reserved for a session profile. Close its "
+            "sessions and remove/re-add the account before using it as the "
+            "default login."
+        )
+
     def _perform_switch(
         self,
         target_account: str,
@@ -7009,6 +7036,7 @@ class ClaudeAccountSwitcher:
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
         if pre_email:
+            self._refuse_reserved_session(target_account, pre_email)
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
                 self._session_dir(target_account, pre_email)
@@ -7095,6 +7123,7 @@ class ClaudeAccountSwitcher:
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
+            self._refuse_reserved_session(target_account, target_email)
             to_ref = account_ref(int(target_account), target_email)
             current_identity = self._get_current_account()
             if current_identity is not None:

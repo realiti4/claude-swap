@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap.secret_files import unseal
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.exceptions import ConfigError, ValidationError
 
@@ -672,7 +673,7 @@ def test_the_refresh_in_place_path_also_refuses_a_login_in_the_window(
             s.add_account(assume_yes=True)          # slot=None -> refresh in place
 
     blob = s.configs_dir / ".claude-config-7-ax@example.com.json"
-    stored = json.loads(blob.read_text())
+    stored = json.loads(unseal(blob, blob.read_text()))
     assert stored["oauthAccount"]["emailAddress"] == "ax@example.com", (
         f"slot 7's stored config now says {stored['oauthAccount']['emailAddress']}"
     )

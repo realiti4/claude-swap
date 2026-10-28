@@ -139,7 +139,7 @@ def auth_status_tracks_seed(monkeypatch):
     def fake_run(cmd, env=None, **kwargs):
         probe_envs.append(env)
         config_dir = Path(env["CLAUDE_CONFIG_DIR"])
-        if (config_dir / ".credentials.json").exists():
+        if session_mod.read_session_credentials(config_dir) and (config_dir / ".claude.json").exists():
             payload = {
                 "loggedIn": True,
                 "authMethod": "claude.ai",
@@ -160,7 +160,7 @@ def refresh_rotates(monkeypatch):
     real one does (bootstrap re-reads the backup afterwards)."""
     calls: list[str] = []
 
-    def fake_gate(self, account_num: str, email: str, snapshot: str):
+    def fake_gate(self, account_num: str, email: str, snapshot: str, **kwargs):
         from claude_swap import oauth as oauth_mod
         calls.append(snapshot)
         self._write_account_credentials(account_num, email, ROTATED_CREDS)
@@ -357,7 +357,7 @@ class TestBootstrap:
 
         assert (num, email) == (ACCOUNT_NUM, ACCOUNT_EMAIL)
         creds_path = session_dir / ".credentials.json"
-        assert creds_path.read_text() == ROTATED_CREDS
+        assert session_mod.read_session_credentials(session_dir) == ROTATED_CREDS
 
         config = json.loads((session_dir / ".claude.json").read_text())
         assert config["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
@@ -374,33 +374,33 @@ class TestBootstrap:
     def test_profile_permissions(self, manager, auth_status_tracks_seed, refresh_rotates):
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir.stat().st_mode & 0o777) == 0o700
-        assert ((session_dir / ".credentials.json").stat().st_mode & 0o777) == 0o600
+        assert not (session_dir / ".credentials.json").exists()
         assert ((session_dir / ".claude.json").stat().st_mode & 0o777) == 0o600
 
     def test_reuse_skips_refresh_and_writes(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
     ):
         session_dir, _, _ = manager.setup_session("2", share=False)
-        first_creds = (session_dir / ".credentials.json").read_text()
+        first_creds = session_mod.read_session_credentials(session_dir)
         refresh_calls_after_bootstrap = len(refresh_rotates)
 
         session_dir2, _, _ = manager.setup_session("2", share=False)
 
         assert session_dir2 == session_dir
         assert len(refresh_rotates) == refresh_calls_after_bootstrap  # no new refresh
-        assert (session_dir / ".credentials.json").read_text() == first_creds
+        assert session_mod.read_session_credentials(session_dir) == first_creds
 
     def test_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
+            lambda self, num, email, snap, **kwargs: oauth.RefreshOutcome(
                 None, "transient"
             ),
         )
         session_dir, _, _ = manager.setup_session("2", share=False)
-        assert (session_dir / ".credentials.json").read_text() == CREDS
+        assert session_mod.read_session_credentials(session_dir) == CREDS
         assert "Could not refresh" in capsys.readouterr().out
 
     def test_setup_token_account_skips_refresh_silently(
@@ -414,7 +414,7 @@ class TestBootstrap:
         refresh_calls = []
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: refresh_calls.append(snap)
+            lambda self, num, email, snap, **kwargs: refresh_calls.append(snap)
             or oauth.RefreshOutcome(None, "transient"),
         )
 
@@ -422,7 +422,7 @@ class TestBootstrap:
 
         assert refresh_calls == []
         assert "Could not refresh" not in capsys.readouterr().out
-        assert (session_dir / ".credentials.json").read_text() == token_creds
+        assert session_mod.read_session_credentials(session_dir) == token_creds
 
     def test_missing_credentials(self, manager, seeded_switcher, auth_status_tracks_seed):
         seeded_switcher._delete_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
@@ -483,7 +483,8 @@ class TestBootstrap:
 
         manager.setup_session("2", share=False)
 
-        assert block_real_keychain.get_password(service, account) is None
+        assert block_real_keychain.get_password(service, account) == ROTATED_CREDS
+        assert not (session_dir / ".credentials.json").exists()
 
     @pytest.mark.parametrize("legacy_location", [False, True])
     def test_stale_marker_forces_rebootstrap_after_session_exits(
@@ -507,7 +508,7 @@ class TestBootstrap:
         manager.setup_session("2", share=False)
 
         # Re-bootstrapped: fresh (refreshed) creds, marker cleared.
-        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert session_mod.read_session_credentials(session_dir) == ROTATED_CREDS
         assert not session_mod.is_session_stale(session_dir)
 
     def test_stale_marker_plus_probe_timeout_still_rebootstraps(
@@ -532,7 +533,7 @@ class TestBootstrap:
 
         manager.setup_session("2", share=False)
 
-        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert session_mod.read_session_credentials(session_dir) == ROTATED_CREDS
         assert not (session_dir / session_mod.STALE_MARKER).exists()
 
     @pytest.mark.parametrize("legacy_location", [False, True])
@@ -543,13 +544,13 @@ class TestBootstrap:
         """A second `cswap run` joining a live session must not invalidate
         under the running claude; the marker survives for later."""
         session_dir, _, _ = manager.setup_session("2", share=False)
-        (session_dir / ".credentials.json").write_text("live lineage")
+        session_mod.macos_keychain.set_password(keychain_service_name(session_dir), session_mod._keychain_account_name(), "live lineage")
         _mark_stale(session_dir, legacy_location)
         make_live(session_dir)
 
         manager.setup_session("2", share=False)
 
-        assert (session_dir / ".credentials.json").read_text() == "live lineage"
+        assert session_mod.read_session_credentials(session_dir) == "live lineage"
         assert session_mod.is_session_stale(session_dir)
 
     def test_rebootstrap_preserves_profile_history(
@@ -560,7 +561,7 @@ class TestBootstrap:
         config = json.loads((session_dir / ".claude.json").read_text())
         config["projects"] = {"/some/project": {"history": ["x"]}}
         (session_dir / ".claude.json").write_text(json.dumps(config))
-        (session_dir / ".credentials.json").unlink()
+        (session_dir / ".credentials.json").unlink(missing_ok=True)
 
         manager.setup_session("2", share=False)
 
@@ -1346,30 +1347,11 @@ class TestRun:
         )
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
 
-    def test_preset_config_dir_disables_fast_path(
-        self,
-        manager,
-        capture_exec,
-        monkeypatch,
-        auth_status_tracks_seed,
-        refresh_rotates,
-        capsys,
-    ):
+    def test_preset_config_dir_refused_before_token_refresh(self, manager, capture_exec, monkeypatch, refresh_rotates):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-        # Even a matching identity must NOT fast-path when the env var is set.
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
-        with pytest.raises(_ExecCalled) as exc:
+        with pytest.raises(SessionError, match="Nested"):
             manager.run("2", [])
-
-        session_dir = session_dir_for(
-            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
-        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
-        assert "overriding it for this launch" in capsys.readouterr().out
+        assert refresh_rotates == []
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
@@ -1394,10 +1376,10 @@ class TestRun:
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
-    def test_fast_path_keeps_env_untouched(
+    def test_fast_path_scrubs_auth_overrides(
         self, manager, capture_exec, monkeypatch
     ):
-        """Plain-claude fast path must NOT scrub: it's normal claude behavior."""
+        """An explicitly selected account must win over inherited API keys."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
         monkeypatch.setattr(
             manager.switcher,
@@ -1407,7 +1389,7 @@ class TestRun:
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
-        assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
+        assert "ANTHROPIC_API_KEY" not in exc.value.env
 
     def test_exec_default_uses_plain_env(self, manager, capture_exec, monkeypatch):
         """exec_default launches plain claude with the unmodified environment."""
@@ -1605,7 +1587,7 @@ class TestGuards:
         )
         assert seeded_switcher._read_credentials() == ROTATED_CREDS
         # The profile is the source of that generation, not a stale seed.
-        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert session_mod.read_session_credentials(session_dir) == ROTATED_CREDS
 
     def test_switch_refuses_exited_target_whose_ahead_profile_cannot_be_adopted(
         self, seeded_switcher, monkeypatch
@@ -1630,7 +1612,7 @@ class TestGuards:
             seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
             == CREDS
         )
-        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert session_mod.read_session_credentials(session_dir) == ROTATED_CREDS
 
     def test_backup_credential_write_invalidates_stale_profile(
         self, seeded_switcher, block_real_keychain
@@ -1656,6 +1638,7 @@ class TestGuards:
         assert not (session_dir / ".credentials.json").exists()
         assert (session_dir / ".claude.json").exists()  # history preserved
         assert block_real_keychain.get_password(service, account) is None
+        assert not (session_dir / ".credentials.json").exists()
 
     @pytest.mark.parametrize(
         "dir_still_there", [True, False],
@@ -1801,7 +1784,7 @@ class TestGuards:
                 session_dir.parent.chmod(0o700)
 
         # Live copy untouched either way.
-        assert (session_dir / ".credentials.json").read_text() == "live session creds"
+        assert session_mod.read_session_credentials(session_dir) == "live session creds"
 
         if marker_lands:
             assert session_mod.is_session_stale(session_dir)
@@ -2707,7 +2690,7 @@ class TestBootstrapRefreshRoutesThroughGate:
         })
         gate = {}
 
-        def mock_gate(num, email, snapshot):
+        def mock_gate(num, email, snapshot, **kwargs):
             gate["args"] = (num, email)
             return oauth_mod.RefreshOutcome(fresh, None)
 
@@ -2760,7 +2743,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
 
         # The gate rotates the backup, exactly as the real one does.
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **kwargs):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -2787,7 +2770,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         got, _, _ = manager.setup_session("2", share=False)
 
-        assert (got / ".credentials.json").read_text() == ROTATED_CREDS, (
+        assert session_mod.read_session_credentials(got) == ROTATED_CREDS, (
             "the profile kept a generation the consume already spent"
         )
 
@@ -2812,7 +2795,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
 
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **kwargs):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -2841,7 +2824,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         got, _, _ = manager.setup_session("2", share=False)
 
-        assert (got / ".credentials.json").read_text() == CREDS, (
+        assert session_mod.read_session_credentials(got) == CREDS, (
             "re-seeded a profile a live claude is running against; "
             "_bootstrap would delete its Keychain entry mid-session"
         )
@@ -2926,7 +2909,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        def gate_consumes_then_fails_to_persist(self, num, email, snapshot):
+        def gate_consumes_then_fails_to_persist(self, num, email, snapshot, **kwargs):
             # Grant spent; successor NOT written to the backup, which still
             # holds CREDS, but it DID reach the stash. Exactly the shape
             # switcher.py returns when the persist fails and the successor is
@@ -2976,7 +2959,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         monkeypatch.setattr(
             ClaudeAccountSwitcher,
             "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
+            lambda self, num, email, snap, **kwargs: oauth.RefreshOutcome(
                 ROTATED_CREDS, "transient", stashed=False
             ),
         )

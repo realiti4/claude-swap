@@ -70,6 +70,7 @@ _SUBCOMMAND_FLAGS = {
     "rm": "--remove-account",
     "disable": "--disable-account",
     "enable": "--enable-account",
+    "secure-storage": "--secure-storage",
     "export": "--export",
     "import": "--import",
     "import-usage": "--import-usage",
@@ -156,11 +157,12 @@ Examples:
         "directory's mapping (see `cswap map`).",
     )
     parser.add_argument(
-        "--no-share",
-        action="store_true",
+        "--share",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
-            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
-            "from ~/.claude into the session profile (and remove previously "
+            "Opt in to sharing settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
+            "from ~/.claude into the session profile (--no-share removes previously "
             "shared items)"
         ),
     )
@@ -205,7 +207,7 @@ Examples:
             manager.run(
                 args.account,
                 tail,
-                share=not args.no_share,
+                share=args.share,
                 share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
@@ -217,7 +219,7 @@ Examples:
             manager.run(
                 slot,
                 tail,
-                share=not args.no_share,
+                share=args.share,
                 share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
@@ -1272,7 +1274,8 @@ Commands:
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
-  %(prog)s export <path>              export accounts
+  %(prog)s secure-storage             encrypt existing legacy backups
+  %(prog)s export <path>              export accounts with password encryption
   %(prog)s import <path>              import accounts
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
@@ -1380,6 +1383,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--plaintext", action="store_true",
+        help="Explicitly export unencrypted credentials (for external encryption)",
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
@@ -1467,6 +1474,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    group.add_argument("--secure-storage", action="store_true", help=argparse.SUPPRESS)
     group.add_argument(
         "--export",
         metavar="PATH",
@@ -1531,6 +1539,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.disable_account is not None
         or args.enable_account is not None
         or args.switch_to is not None
+        or args.secure_storage
         or args.export is not None
         or args.import_ is not None
         or args.import_usage is not None
@@ -1574,6 +1583,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
+
+    if args.plaintext and not args.export:
+        parser.error("--plaintext can only be used with export")
 
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
@@ -1668,10 +1680,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.status(json_output=args.json)
         elif args.purge:
             switcher.purge()
+        elif args.secure_storage:
+            from claude_swap.secret_files import migrate_backups
+            print(f"Encrypted {migrate_backups(switcher)} legacy backup file(s)")
         elif args.export:
             from claude_swap.transfer import export_accounts
 
-            export_accounts(switcher, args.export, account=args.account, full=args.full)
+            export_accounts(switcher, args.export, account=args.account, full=args.full, plaintext=args.plaintext)
         elif args.import_:
             from claude_swap.transfer import import_accounts
 

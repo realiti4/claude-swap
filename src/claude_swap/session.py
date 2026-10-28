@@ -8,14 +8,10 @@ untouched. ``CLAUDE_CONFIG_DIR`` fully isolates Claude Code's config and
 credential lookup; on macOS, Claude hashes the (NFC-normalized) env var value
 into its keychain service name, so each profile gets its own keychain entry.
 
-Profiles are seeded with a plaintext ``.credentials.json`` — deliberate,
-including on macOS: the plaintext fallback is Claude's only credential
-mechanism on Linux (a stable contract), and Claude migrates it into its
-hashed keychain entry on first write. Writing that keychain entry ourselves
-would couple us to Claude's internal storage format and naming, where a
-mismatch is a hard "logged out" failure instead of a harmless stale entry.
+Profiles use the macOS Keychain directly. Linux/Windows seed the native
+plaintext .credentials.json required by Claude Code.
 
-Sharing: by default the user's ``settings.json``, ``keybindings.json``,
+Sharing: with explicit --share the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
 them into the session profile — symlinks on macOS/Linux (Claude's settings writer
 detects symlinks and writes through to the target, so in-session ``/config``
@@ -562,7 +558,7 @@ class SessionManager:
         self,
         identifier: str,
         claude_args: list[str],
-        share: bool = True,
+        share: bool = False,
         share_history: bool = False,
         require_session: bool = False,
     ) -> NoReturn:
@@ -586,43 +582,15 @@ class SessionManager:
                 "of sharing it."
             )
 
+        if os.environ.get("CLAUDE_CONFIG_DIR"):
+            raise SessionError(
+                "Nested cswap run is refused to protect the active refresh token. "
+                "Launch from a fresh terminal without CLAUDE_CONFIG_DIR."
+            )
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
-
-        config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir_preset:
-            # With CLAUDE_CONFIG_DIR set, "current default account" is
-            # meaningless (we may already be inside a session terminal), so
-            # the same-account fast path below must not trigger.
-            warning(
-                f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
-                "overriding it for this launch."
-            )
-        else:
-            # Same-account fast path: never create a second credential copy
-            # for the account that is already the active default login —
-            # two copies of one account can drift if the server rotates the
-            # refresh token.
-            current = self.switcher._get_current_account()
-            if current is not None and current == (email, org_uuid):
-                if require_session:
-                    raise SessionError(
-                        f"Account-{account_num} ({email}) is the active default "
-                        "login, so this launch would run plain claude on the "
-                        "default login rather than in a session profile (a "
-                        "second copy of the active credential would drift). "
-                        "Switch the default login to another account first, "
-                        "or run `claude` directly."
-                    )
-                print(
-                    dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
-                    )
-                )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -630,6 +598,29 @@ class SessionManager:
                 f"Ignoring {', '.join(scrubbed)} for this session — it would "
                 f"override the selected account inside Claude Code."
             )
+
+        # Same-account fast path: never create a second credential copy
+        # for the account that is already the active default login —
+        # two copies of one account can drift if the server rotates the
+        # refresh token.
+        current = self.switcher._get_current_account()
+        if current is not None and current == (email, org_uuid):
+            if require_session:
+                raise SessionError(
+                    f"Account-{account_num} ({email}) is the active default "
+                    "login, so this launch would run plain claude on the "
+                    "default login rather than in a session profile (a "
+                    "second copy of the active credential would drift). "
+                    "Switch the default login to another account first, "
+                    "or run `claude` directly."
+                )
+            print(
+                dimmed(
+                    f"Account-{account_num} ({email}) is already the active "
+                    "default login — launching claude directly."
+                )
+            )
+            self._exec(claude_bin, claude_args, env={k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS})
 
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
@@ -698,6 +689,21 @@ class SessionManager:
     def setup_session(
         self, identifier: str, share: bool, share_history: bool = False
     ) -> tuple[Path, str, str]:
+        # Same lock order as auto activation: state -> store. Reserve before
+        # refresh/bootstrap, closing the gap before Claude registers its PID.
+        with FileLock(self.switcher.backup_dir / ".autoswitch_state.lock"):
+            num, email, org = self.switcher.resolve_account(identifier)
+            with FileLock(self.switcher.lock_file):
+                if self.switcher._get_current_account() == (email, org):
+                    raise SessionError("The target is the active default login; run claude directly")
+                directory = session_dir_for(self.switcher.backup_dir, num, email)
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                atomic_write_text(directory / ".cswap-session-reservation", "reserved\n")
+            return self._setup_session(identifier, share, share_history)
+
+    def _setup_session(
+        self, identifier: str, share: bool, share_history: bool = False
+    ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
@@ -728,7 +734,7 @@ class SessionManager:
         pre_creds = self.switcher.read_account_credentials(account_num, email)
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
-                account_num, email, pre_creds
+                account_num, email, pre_creds, session_setup=True
             )
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
@@ -883,10 +889,6 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
-        # Claude reads the keychain before the plaintext file — a stale hashed
-        # entry from an earlier profile at this path would shadow the seed.
-        delete_macos_keychain_entry(session_dir)
-
         creds, unreadable = self.switcher._read_account_credentials_ex(
             account_num, email
         )
@@ -909,6 +911,14 @@ class SessionManager:
         # non-reentrant) may have already rotated the backup; the read
         # above picked that successor up. No POST happens here.
 
+        # A session must never inherit another profile's MCP/plugin OAuth tokens.
+        try:
+            parsed_creds = json.loads(creds)
+        except (ValueError, TypeError):
+            parsed_creds = None
+        if isinstance(parsed_creds, dict) and "claudeAiOauth" in parsed_creds:
+            creds = json.dumps({"claudeAiOauth": parsed_creds["claudeAiOauth"]})
+
         config_text = self.switcher.read_account_config(account_num, email)
         try:
             config_data = json.loads(config_text) if config_text else {}
@@ -926,7 +936,19 @@ class SessionManager:
             os.chmod(session_dir, 0o700)
 
         creds_path = session_dir / ".credentials.json"
-        atomic_write_text(creds_path, creds)
+        if self.switcher.platform == Platform.MACOS:
+            service = keychain_service_name(str(session_dir))
+            account = macos_keychain.keychain_account_name()
+            try:
+                macos_keychain.set_password(service, account, creds)
+                verified_creds = macos_keychain.get_password(service, account)
+            except macos_keychain.KEYCHAIN_ERRORS as exc:
+                raise SessionError("Session Keychain write failed; no plaintext fallback") from exc
+            if verified_creds != creds:
+                raise SessionError("Could not verify session Keychain credential")
+            creds_path.unlink(missing_ok=True)
+        else:
+            atomic_write_text(creds_path, creds)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The

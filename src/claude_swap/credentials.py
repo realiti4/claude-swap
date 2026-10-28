@@ -17,7 +17,6 @@ orchestration would re-couple. The store owns only its two pieces of state:
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -27,6 +26,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
+from claude_swap.secret_files import unseal, write_secret
 from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     CredentialError,
@@ -862,10 +862,13 @@ class CredentialStore:
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall back to config below.
                 self._host._logger.warning(
-                    f"Managed-key Keychain write failed, falling back to config: {e}"
+                    f"Managed-key Keychain write failed; refusing plaintext fallback"
                 )
             else:
                 wrote_to_keychain = True
+
+        if self._host.platform == Platform.MACOS and not wrote_to_keychain:
+            raise CredentialWriteError("Keychain unavailable; refusing plaintext API-key fallback")
 
         approved = approved_form(api_key)
 
@@ -985,9 +988,8 @@ class CredentialStore:
         (#1414) rather than stranding it on stale content. Keychain-only users keep
         their fileless posture — their absent-file path already hot-reloads via the
         ~30s Keychain TTL — and never gain a plaintext credential on disk. If the
-        Keychain write fails — or the Keychain is already known unusable — it writes
-        the plaintext file and best-effort clears any stale Keychain entry (#30337),
-        recording backend ``"file"``. Linux/WSL/Windows always write the file.
+        Keychain write fails — or the Keychain is already known unusable — the
+        operation fails closed. Linux/WSL/Windows use the native active file.
 
         Raises:
             CredentialWriteError: If writing credentials fails.
@@ -1003,7 +1005,7 @@ class CredentialStore:
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall through to the file.
                 # (A programming error is NOT caught here — it propagates.)
-                self._host._logger.warning(f"Keychain write failed, falling back to file: {e}")
+                self._host._logger.warning("Keychain write failed; refusing plaintext fallback")
             else:
                 # Keychain (primary) now holds the fresh credential. Bump an
                 # already-present shadow file's mtime so running sessions hot-reload
@@ -1012,10 +1014,10 @@ class CredentialStore:
                 self._last_active_credentials_backend = "keychain"
                 return
 
-        # File mode: non-macOS, macOS Keychain known unusable, or a Keychain write
-        # that just failed. Write the plaintext file and (macOS) best-effort clear
-        # any stale Keychain entry so Claude Code's keychain-first read can't shadow
-        # it (#30337).
+        if self._host.platform == Platform.MACOS:
+            raise CredentialWriteError("Keychain unavailable; refusing plaintext OAuth fallback")
+
+        # Native active credential files are required on non-macOS platforms.
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
@@ -1061,7 +1063,7 @@ class CredentialStore:
     def _uses_file_backup_backend(self) -> bool:
         """Whether per-account backup *writes* go to files vs. the Keychain.
 
-        Linux/WSL/Windows always use base64 ``.enc`` files under ``credentials_dir``
+        Linux/WSL/Windows always use encrypted ``.enc`` files under ``credentials_dir``
         (Windows moved off the Credential Manager because it rejects entries over
         ~2,500 bytes, #45). macOS uses the Keychain while it's usable and falls back
         to ``.enc`` files when it isn't (headless/SSH/locked); UNKNOWN platforms have
@@ -1072,7 +1074,7 @@ class CredentialStore:
 
     # -- backup credential backends ---------------------------------------
     #
-    # Two backends for per-account backups: base64 ``.enc`` files under
+    # Two backends for per-account backups: encrypted ``.enc`` files under
     # ``credentials_dir`` and the macOS Keychain (``SECURITY_SERVICE``). On macOS
     # reads are ``.enc``-wins: a fallback ``.enc`` (written while the Keychain was
     # unusable) is authoritative over a possibly-stale Keychain copy, so a Keychain
@@ -1232,14 +1234,13 @@ class CredentialStore:
             self._host._logger.warning(f"Failed to delete credentials from Keychain: {e}")
 
     def _write_backup_enc(self, account_num: str, email: str, credentials: str) -> None:
-        """Atomically write a per-account backup ``.enc`` (base64) file."""
+        """Atomically write a per-account encrypted per-account backup file."""
         self._atomic_b64_write(self._backup_enc_path(account_num, email), credentials)
 
     def _atomic_b64_write(self, target: Path, credentials: str) -> None:
-        """Atomically write a base64-encoded credential file (0600)."""
+        """Atomically write an authenticated encrypted credential encrypted file (0600)."""
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
-        encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-        atomic_write_text(target, encoded)
+        write_secret(target, credentials)
 
     def _reconcile_enc_after_keychain_write(
         self, account_num: str, email: str, credentials: str
@@ -1323,7 +1324,11 @@ class CredentialStore:
                     # validate=True: reject non-alphabet junk (e.g. "!!!!") instead
                     # of silently discarding it to empty bytes, which would let a
                     # corrupt .enc shadow a valid Keychain copy.
-                    decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+                    decoded = unseal(enc_file, encoded)
+                except CredentialReadError:
+                    if failed is not None:
+                        failed.append(True)
+                    return ""
                 except Exception as e:
                     # Corrupt/garbled .enc → on macOS fall through to the Keychain
                     # copy (documented recovery) — content-level, not a read
@@ -1654,7 +1659,7 @@ class CredentialStore:
         if prev_file.exists():
             try:
                 encoded = prev_file.read_text(encoding="utf-8").strip()
-                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+                decoded = unseal(prev_file, encoded)
                 if decoded:
                     return decoded
             except Exception as e:
@@ -1950,7 +1955,9 @@ class CredentialStore:
             )
             return "", True
         try:
-            return base64.b64decode(encoded, validate=True).decode("utf-8"), False
+            return unseal(path, encoded), False
+        except CredentialReadError:
+            return "", True
         except Exception as e:
             self._host._logger.warning(
                 f"Failed to decode unclaimed credential {entry_id}: {e}"

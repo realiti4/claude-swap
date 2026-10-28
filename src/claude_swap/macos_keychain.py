@@ -16,9 +16,8 @@ The read/write/delete shapes mirror Claude Code's own implementation
 
 - ``set_password`` hex-encodes the value (``-X``) and pipes the command through
   ``security -i`` (stdin) so the secret never appears in process argv (a
-  process-monitor / CrowdStrike concern). It falls back to argv only when the
-  command would overflow ``security -i``'s 4096-byte stdin line buffer, which
-  would otherwise truncate mid-argument and silently corrupt the entry.
+  process-monitor / CrowdStrike concern). Oversized values are refused before spawning a process, so a secret
+  never appears in argv.
 - ``get_password`` uses ``find-generic-password ... -w`` and treats exit code 44
   as "not found" (returns ``None``); any *other* non-zero exit raises so callers
   can tell a genuine miss apart from a locked/denied/unavailable Keychain.
@@ -161,8 +160,8 @@ def item_exists(service: str, account: str) -> bool:
 def set_password(service: str, account: str, password: str) -> None:
     """Create or update a generic-password item (``-U``).
 
-    Prefers ``security -i`` stdin so the secret stays out of argv; falls back to
-    argv only for payloads that would overflow the stdin line buffer. Raises
+    Uses ``security -i`` stdin so the secret stays out of argv; refuses
+    payloads that would overflow the stdin line buffer. Raises
     :class:`KeychainError` on a non-zero exit or a timeout.
     """
     hex_value = password.encode("utf-8").hex()
@@ -181,17 +180,9 @@ def set_password(service: str, account: str, password: str) -> None:
                 timeout=_TIMEOUT,
             )
         else:
-            # Overflows the stdin line buffer; fall back to argv. Hex in argv is
-            # recoverable by a determined observer but defeats naive plaintext-grep
-            # rules, and the alternative — silent corruption — is strictly worse.
-            result = spawn.run(
-                [
-                    _SECURITY, "add-generic-password", "-U",
-                    "-a", account, "-s", service, "-X", hex_value,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
+            raise KeychainError(
+                "Credential exceeds the secure Keychain stdin limit; "
+                "refusing to expose it in process arguments"
             )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(
@@ -199,8 +190,7 @@ def set_password(service: str, account: str, password: str) -> None:
         ) from e
     if result.returncode != 0:
         raise KeychainError(
-            f"security add-generic-password failed (rc={result.returncode}): "
-            f"{result.stderr.strip()}"
+            f"security add-generic-password failed (rc={result.returncode})"
         )
 
 

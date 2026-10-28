@@ -797,7 +797,23 @@ class AutoSwitchEngine:
 
     # -- freshening -----------------------------------------------------------
 
+    def _reserved_session(self, number: str, email: str) -> bool:
+        from claude_swap.session import session_dir_for
+        try:
+            session_dir_for(self.switcher.backup_dir, number, email).stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # unreadable is not evidence that no session exists
+        return True
+
     def _freshen_target(self, number: str, email: str) -> str:
+        with self._state_lock():
+            if self._reserved_session(number, email):
+                return "skip-live-session"
+            return self._freshen_unreserved_target(number, email)
+
+    def _freshen_unreserved_target(self, number: str, email: str) -> str:
         """Ensure a candidate's stored token outlives Claude Code's 5-min
         refresh buffer before it gets activated.
 
@@ -2472,6 +2488,9 @@ class AutoSwitchEngine:
         # switch path (cswap FileLock + Claude Code locks) never takes the
         # state lock.
         with self._state_lock():
+            if self._reserved_session(number, email):
+                self._emit(NoSwitchEvent(reason="skip-live-session", detail="Account has a reserved session profile"))
+                return TickOutcome.NO_ACTION
             state = self._read_state()
             if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))

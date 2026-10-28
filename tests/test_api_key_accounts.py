@@ -385,7 +385,7 @@ class TestExportImport:
             src = _linux_switcher()
             src.add_account_from_token(key, slot=1)
             out = tmp_path / "b.cswap"
-            export_accounts(src, str(out))
+            export_accounts(src, str(out), plaintext=True)
             payload = json.loads(out.read_text(encoding="utf-8"))
             # exported as a raw string, tagged api_key — not a JSON object.
             assert payload["accounts"][0]["credentials"] == key

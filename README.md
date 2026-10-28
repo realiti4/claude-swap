@@ -1,5 +1,7 @@
 # claude-swap
 
+> See [SECURITY.md](SECURITY.md) for credential-storage requirements, migration, encrypted exports, and session-isolation defaults.
+
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
 ## Installation
@@ -133,17 +135,17 @@ cswap run 2 --share-history     # share your chat history with this account too
 cswap run 2 --require-session   # refuse rather than run plain claude if 2 is the default login
 ```
 
-Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations, or make it the default for every `cswap run` with `cswap config set run.shareHistory true` (`--no-share-history` still opts out per launch; on Windows the setting is ignored with a warning, while an explicit `--share-history` errors).
+Sessions keep settings, skills, MCP configuration and history separate by default. Pass `--share` to mirror your normal `~/.claude` setup; each account still keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations, or make it the default for every `cswap run` with `cswap config set run.shareHistory true` (`--no-share-history` still opts out per launch; on Windows the setting is ignored with a warning, while an explicit `--share-history` errors).
 
 Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
   
-A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account. While a session runs, its account's usage is read with the session's own credential and never refreshed by cswap; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
+A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. Profiles created by this fork reserve their account: manual and automatic switching cannot also activate it as the default login. Close its sessions and remove/re-add that account to release the profile; see SECURITY.md. While a session runs, its account's usage is read with the session's own credential and never refreshed by cswap; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
 
 <details>
 <summary>Sharing details — MCP servers & chat history</summary>
 
 - With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
-- User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
+- With `--share`, user-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
 
 </details>
@@ -303,14 +305,14 @@ cswap config path                         # where settings.json lives
 Move account data between machines or back it up:
 
 ```bash
-cswap export backup.cswap                    # All accounts to a file
+cswap export backup.cswap                    # Password-encrypted backup
 cswap export backup.cswap --account 2        # One account
 cswap export backup.cswap --full             # Include full ~/.claude.json and credential object (same-PC backup)
 cswap import backup.cswap                    # Skips accounts that already exist
 cswap import backup.cswap --force            # Overwrite existing
 ```
 
-The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
+Exports are password-encrypted by default. With explicit `--plaintext`, the JSON carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - --plaintext | gpg -c > backup.gpg`).
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
 
