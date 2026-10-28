@@ -20,6 +20,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    LiveAccountChanged,
     LockError,
     SessionError,
     SwitchError,
@@ -6120,6 +6121,10 @@ class ClaudeAccountSwitcher:
         back to plain rotation when usage is unavailable. Both apply only to the
         normal path (a live Claude login present); the fresh-machine path (no
         live login, e.g. right after --import) ignores them.
+
+        Returns the switch result whenever an account switch ran, regardless
+        of ``json_output`` (which only governs printing); ``None`` when the
+        call stayed put or bailed before switching.
         """
         strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
         warnings: list[str] = []
@@ -6190,10 +6195,7 @@ class ClaudeAccountSwitcher:
                     )
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
-            return (
-                self._switch_result_from_op(op, strategy_label, warnings)
-                if json_output else None
-            )
+            return self._switch_result_from_op(op, strategy_label, warnings)
 
         current_email, current_org_uuid = identity
 
@@ -6256,10 +6258,7 @@ class ClaudeAccountSwitcher:
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
-                return (
-                    self._switch_result_from_op(op, strategy_label, warnings)
-                    if json_output else None
-                )
+                return self._switch_result_from_op(op, strategy_label, warnings)
             if note == "current-unavailable":
                 if json_output:
                     return self._switch_noop(
@@ -6476,19 +6475,29 @@ class ClaudeAccountSwitcher:
         op = self._perform_switch(
             next_account, emit_output=not json_output, provenance=provenance
         )
-        return (
-            self._switch_result_from_op(op, strategy_label, warnings)
-            if json_output else None
-        )
+        return self._switch_result_from_op(op, strategy_label, warnings)
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        expect_current: str | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+
+        ``expect_current`` is the slot the caller decided to leave; see
+        ``_perform_switch``.
+
+        Returns the switch result whenever the pick resolved — a real switch
+        or the already-active no-op — regardless of ``json_output``, which
+        only governs what gets printed. ``None`` means nothing happened
+        (cancelled prompt), so callers can gate side effects such as the
+        manual-hold marker on "did the human's pick land" without ``--json``.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -6573,7 +6582,6 @@ class ClaudeAccountSwitcher:
                             "(e.g. after --import), run: "
                             f"cswap --switch-to {target_account} --force"
                         ))
-                        return None
                     return self._switch_noop(
                         strategy="direct",
                         reason="already-active",
@@ -6587,8 +6595,9 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            expect_current=expect_current,
         )
-        result = self._switch_result_from_op(op, "direct") if json_output else None
+        result = self._switch_result_from_op(op, "direct")
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
         # A cross-slot force stays "switched": reason reports the outcome, not
@@ -6600,6 +6609,51 @@ class ClaudeAccountSwitcher:
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
         return result
+
+    def note_manual_pick(
+        self, result: dict | None, *, explicit: bool, json_output: bool = False
+    ) -> None:
+        """Record a person's ``switch`` as the pick ``manualHoldSeconds``
+        protects. Called by the CLI — never by the engine, whose moves are not
+        picks.
+
+        Only an outcome counts: a switch that landed, or — ``explicit`` (a
+        named target) only — a re-pick of the already-active account, which
+        refreshes the hold on purpose. A ``switch --strategy best`` that stayed
+        put is no pick even though ``--json`` reports it as a payload.
+
+        The account comes from ``result``, never a fresh live read: an engine
+        switch landing between this switch and the write would otherwise be
+        recorded as the person's choice.
+
+        Pure bookkeeping for a switch that already completed: with the hold off
+        nothing is written, and a failed write is reported as a warning rather
+        than raised, so it can never turn that switch into a failed command.
+        """
+        if result is None:
+            return
+        landed = result.get("switched") or (
+            explicit and result.get("reason") in ("already-active", "activated")
+        )
+        number = (result.get("to") or {}).get("number")
+        if not landed or number is None:
+            return
+        from claude_swap.autoswitch import record_manual_switch
+        from claude_swap.settings import load_settings
+
+        if load_settings(self.backup_dir).manual_hold_seconds <= 0:
+            return
+        try:
+            record_manual_switch(self.backup_dir, str(number), time.time())
+        except (LockError, OSError) as e:
+            msg = (
+                f"The manual hold could not be recorded ({e}); cswap auto "
+                f"may move off Account-{number} before the hold ends."
+            )
+            if json_output:
+                result.setdefault("warnings", []).append(msg)
+            else:
+                warning(msg)
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
         """Whether the live credential is provably the slot's stored lineage.
@@ -6973,6 +7027,7 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        expect_current: str | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -6987,6 +7042,13 @@ class ClaudeAccountSwitcher:
         managed live login exists: the stored backup is written over the live
         credentials without backing the live ones up first (post-import recovery
         when the live login is stale).
+
+        ``expect_current`` is the slot a caller's decision was made against (the
+        auto-switch engine's tick). It is re-checked against the live identity
+        under the switch lock, the way ``_live_identity_matches`` guards the
+        refresh paths: a switch landing since the decision raises
+        ``LiveAccountChanged`` before the live login is touched, so a stale
+        decision never undoes it.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -7102,6 +7164,20 @@ class ClaudeAccountSwitcher:
                 current_account = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+            # Compared to the live slot, not `current_account`, which falls
+            # back to the recorded active slot when there is no live login.
+            if expect_current is not None:
+                live_slot = (
+                    current_account if current_identity is not None else None
+                )
+                if live_slot != expect_current:
+                    now = (
+                        f"Account-{live_slot}" if live_slot else "unmanaged or absent"
+                    )
+                    raise LiveAccountChanged(
+                        f"Live account is now {now}, not Account-{expect_current}; "
+                        "not switching"
+                    )
 
             config_path = self._get_claude_config_path()
 
