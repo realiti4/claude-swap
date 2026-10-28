@@ -6906,6 +6906,62 @@ class ClaudeAccountSwitcher:
         )
         return entry_id
 
+    def _rescue_foreign_successor(
+        self, foreign_slot: str, data: dict, original_creds: str
+    ) -> bool:
+        """Advance the owning slot's backup when the displaced live credential
+        is its newer generation. Returns whether the backup was written.
+
+        The ``"foreign"`` verdict is uuid-positive ownership by
+        ``foreign_slot``, and that slot's stored lineage differs (otherwise it
+        would be ``"foreign-synced"``). Ownership alone never licenses a
+        write — the live bytes could be an older generation, or another
+        machine's (#117). The generation ordering used elsewhere
+        (``expiresAt`` moves forward on every refresh and every login)
+        supplies the missing half: when the live access token was issued
+        after the stored one, the stored refresh token is the consumed
+        predecessor, and keeping it strands the slot (``invalid_grant`` on its
+        next refresh) while its only valid successor sits in the safety copy.
+        That is the shape a rotation under a stale ``~/.claude.json`` label
+        produces (#489): Claude Code rotated the slot's token while the config
+        named another slot, so no collect pass could attribute it.
+
+        Strictly newer and a full token pair only; equal, older, unreadable or
+        partial leaves the backup as it was. The caller has already written
+        the safety copy, so this never removes the only copy of anything.
+        Called inside the switch's locks. Never raises.
+        """
+        try:
+            live = oauth.extract_oauth_data(original_creds) or {}
+            if not (live.get("accessToken") and live.get("refreshToken")):
+                return False
+            email = data.get("accounts", {}).get(foreign_slot, {}).get("email", "")
+            backup, unreadable = self._read_account_credentials_ex(
+                foreign_slot, email
+            )
+            if unreadable:
+                return False
+            stored = oauth.extract_oauth_data(backup) or {}
+            if float(live.get("expiresAt") or 0) <= float(
+                stored.get("expiresAt") or 0
+            ):
+                return False
+            self._write_account_credentials(foreign_slot, email, original_creds)
+            self._logger.info(
+                "Resynced account %s's backup to its newer live credential "
+                "(found under another account's config label; the safety "
+                "copy is kept).",
+                foreign_slot,
+            )
+            return True
+        except Exception:
+            self._logger.warning(
+                "Could not advance account %s's backup to its newer live "
+                "credential; the safety copy keeps it.",
+                foreign_slot, exc_info=True,
+            )
+            return False
+
     def _read_target_credentials(self, account_num: str, email: str) -> str:
         """The switch target's stored credential, or a SwitchError naming why.
 
@@ -7352,7 +7408,18 @@ class ClaudeAccountSwitcher:
                         original_creds, kind, current_account,
                         provenance.get("resolved"),
                     )
-                    if kind == "foreign":
+                    if kind == "foreign" and self._rescue_foreign_successor(
+                        foreign_slot, data, original_creds
+                    ):
+                        msg = (
+                            "Credential ownership mismatch detected. The live "
+                            f"credential belongs to Account-{foreign_slot} "
+                            "and is newer than its stored backup, so Account-"
+                            f"{foreign_slot}'s backup was updated to it (a "
+                            "safety copy is kept). Nothing was written into "
+                            f"Account-{current_account}."
+                        )
+                    elif kind == "foreign":
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             "credential was preserved and was not written "
