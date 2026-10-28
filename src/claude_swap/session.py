@@ -592,37 +592,42 @@ class SessionManager:
         self._ensure_not_api_key(account_num, email)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
+        # Same-account fast path: never create a second credential copy
+        # for the account that is already the active default login —
+        # two copies of one account can drift if the server rotates the
+        # refresh token. With CLAUDE_CONFIG_DIR preset (we may be inside
+        # another session's terminal) the *default* login is still what a
+        # session for this account would copy, so it is read from the
+        # default profile rather than from the preset directory.
         if config_dir_preset:
-            # With CLAUDE_CONFIG_DIR set, "current default account" is
-            # meaningless (we may already be inside a session terminal), so
-            # the same-account fast path below must not trigger.
+            current = self._default_login_identity()
+        else:
+            current = self.switcher._get_current_account()
+        if current is not None and current == (email, org_uuid):
+            if require_session:
+                raise SessionError(
+                    f"Account-{account_num} ({email}) is the active default "
+                    "login, so this launch would run plain claude on the "
+                    "default login rather than in a session profile (a "
+                    "second copy of the active credential would drift). "
+                    "Switch the default login to another account first, "
+                    "or run `claude` directly."
+                )
+            print(
+                dimmed(
+                    f"Account-{account_num} ({email}) is already the active "
+                    "default login — launching claude directly."
+                )
+            )
+            env = dict(os.environ)
+            # Run on the default login, not on the preset profile.
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            self._exec(claude_bin, claude_args, env=env)
+        if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-        else:
-            # Same-account fast path: never create a second credential copy
-            # for the account that is already the active default login —
-            # two copies of one account can drift if the server rotates the
-            # refresh token.
-            current = self.switcher._get_current_account()
-            if current is not None and current == (email, org_uuid):
-                if require_session:
-                    raise SessionError(
-                        f"Account-{account_num} ({email}) is the active default "
-                        "login, so this launch would run plain claude on the "
-                        "default login rather than in a session profile (a "
-                        "second copy of the active credential would drift). "
-                        "Switch the default login to another account first, "
-                        "or run `claude` directly."
-                    )
-                print(
-                    dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
-                    )
-                )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -644,6 +649,18 @@ class SessionManager:
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
+
+    @staticmethod
+    def _default_login_identity() -> tuple[str, str] | None:
+        """``(email, org_uuid)`` of the default profile's login, if any.
+
+        Ignores ``CLAUDE_CONFIG_DIR``, like ``_read_mcp_source``.
+        """
+        config = SessionManager._load_json_object(get_default_global_config_path())
+        oauth = config.get("oauthAccount") if config else None
+        if not isinstance(oauth, dict) or not oauth.get("emailAddress"):
+            return None
+        return oauth["emailAddress"], oauth.get("organizationUuid", "") or ""
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
