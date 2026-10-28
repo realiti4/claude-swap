@@ -1522,3 +1522,50 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+@pytest.mark.no_policy_limits_fake
+class TestThePolicyFetchActuallyCarriesItsBudget:
+    """THE ONLY LINE THAT DELIVERS THE BUDGET HAD NO WITNESS.
+
+    `_perform_switch` blocks on this fetch between writing the credential and
+    writing `activeAccountNumber`, so the timeout bounds a window where the
+    two disagree. The seam and the call site are both tested -- but reverting
+    `timeout=timeout_s` to a literal left the whole suite byte-identical,
+    because those tests spy on `fetch_policy_limits` itself and never on what
+    it hands `urlopen`. A seam that passes 2.0 to a function that ignores it
+    is a budget in name only.
+    """
+
+    def _run(self, monkeypatch, timeout_s):
+        import claude_swap.oauth as oauth
+
+        seen = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def _fake_urlopen(req, timeout=None, **_kw):
+            seen["timeout"] = timeout
+            return _Resp()
+
+        monkeypatch.setattr(oauth.urllib.request, "urlopen", _fake_urlopen)
+        oauth.fetch_policy_limits("tok", timeout_s=timeout_s)
+        return seen
+
+    def test_the_caller_s_budget_reaches_urlopen(self, monkeypatch):
+        assert self._run(monkeypatch, 0.25)["timeout"] == 0.25, (
+            "the request went out on some other deadline, so the switch can "
+            "block for longer than the budget it was given")
+
+    def test_a_second_value_proves_it_is_not_hardcoded(self, monkeypatch):
+        """THE CONTROL. One value can be matched by a literal that happens to
+        agree; two cannot."""
+        assert self._run(monkeypatch, 3.5)["timeout"] == 3.5
