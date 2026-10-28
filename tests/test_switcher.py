@@ -2298,6 +2298,7 @@ class TestActiveAccountRefresh:
         switcher = self._switcher(sample_sequence_data)
         holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
         assert holder.acquire(), "could not seed the contended lock"
+        started = time.monotonic()
         try:
             with patch.object(
                 switcher, "_read_credentials", return_value=self._EXPIRED
@@ -2307,6 +2308,9 @@ class TestActiveAccountRefresh:
                 "claude_swap.oauth.try_refresh_oauth_credentials"
             ) as mock_refresh, patch(
                 "claude_swap.oauth.try_fetch_usage_for_account"
+            ), patch(
+                "claude_swap.switcher.FileLock",
+                lambda path: FileLock(path, timeout=0.2),
             ):
                 result = switcher._fetch_active_usage(
                     "1", "test@example.com", self._EXPIRED
@@ -2318,6 +2322,9 @@ class TestActiveAccountRefresh:
             "POSTed a backup grant while another consume held its lock"
         )
         assert result.sentinel == USAGE_TOKEN_EXPIRED
+        # The default 10s wait made this one case the longest pole of the
+        # parallel run; the deferral needs only that the wait ends.
+        assert time.monotonic() - started < 5
 
     def test_filelock_contention_defers_instead_of_raising(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
