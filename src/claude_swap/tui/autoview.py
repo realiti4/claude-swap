@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     pct_label,
 )
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
@@ -319,11 +320,16 @@ class AutoScreen(Screen):
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
+        candidates = [
+            acc for acc in snap.accounts
+            if acc.number != active_number and acc.switchable
+        ]
+        # Widest email among the candidates, so every row's login column
+        # starts at the same offset regardless of which email is longest.
+        email_width = max((len(acc.email) for acc in candidates), default=0)
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
         lines: dict[str, Text] = {}
-        for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
-                continue
+        for acc in candidates:
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
             )
@@ -335,7 +341,12 @@ class AutoScreen(Screen):
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+            quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+            login_value = oauth.format_login_expiry(
+                acc.login_expires_at, quarantined
+            )
+            entry.append(f"  login {login_value}", style=palette.muted)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
