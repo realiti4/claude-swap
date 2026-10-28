@@ -33,6 +33,7 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+desktop = ["pywebview>=5.0"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

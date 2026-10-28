@@ -79,6 +79,7 @@ _SUBCOMMAND_FLAGS = {
     "tui": "--tui",
     "watch": "--watch",
     "menubar": "--menubar",
+    "desktop": "--desktop",
 }
 
 
@@ -1279,6 +1280,7 @@ Commands:
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
+  %(prog)s desktop                    desktop window (Tkinter)
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1499,6 +1501,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--desktop",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--upgrade",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1526,6 +1533,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.tui
         or args.watch
         or args.menubar
+        or args.desktop
         or args.upgrade
         or args.remove_account is not None
         or args.disable_account is not None
@@ -1699,6 +1707,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.menubar import run as menubar_run
 
             sys.exit(menubar_run(switcher))
+        elif args.desktop:
+            from claude_swap.desktop import run as desktop_run
+
+            sys.exit(desktop_run(switcher))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
