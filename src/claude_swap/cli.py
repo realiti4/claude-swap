@@ -793,6 +793,7 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --install-service     # keep it running via a systemd user service (Linux)
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -879,7 +880,58 @@ Defaults live in settings.json in the backup root; flags override them.
         action="store_true",
         help="Enable debug logging",
     )
+    service = parser.add_mutually_exclusive_group()
+    service.add_argument(
+        "--install-service",
+        action="store_true",
+        help=(
+            "Install a systemd user service that runs 'cswap auto' in the "
+            "background, starts with your session and restarts on crash (Linux). "
+            "It uses the autoswitch.* settings; re-run after a config change or upgrade"
+        ),
+    )
+    service.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="Stop and disable the systemd user service and remove its unit (Linux)",
+    )
+    service.add_argument(
+        "--service-status",
+        action="store_true",
+        help="Show whether the systemd user service is installed and running (Linux)",
+    )
     args = parser.parse_args(argv)
+
+    if args.install_service or args.uninstall_service or args.service_status:
+        # The service runs plain `cswap auto` and takes its tuning from the
+        # autoswitch.* settings, so a tuning flag here would be silently dropped.
+        # Presence, not truthiness: `--cooldown 0` and `--no-include-api-key-accounts`
+        # are explicit choices too. Every value option defaults to None.
+        given = [
+            flag
+            for flag, present in (
+                ("--once", args.once), ("--dry-run", args.dry_run), ("--json", args.json),
+                ("--debug", args.debug),
+                ("--interval", args.interval is not None),
+                ("--threshold", args.threshold is not None),
+                ("--weekly-threshold", args.weekly_threshold is not None),
+                ("--cooldown", args.cooldown is not None),
+                ("--model", args.model is not None),
+                ("--strategy", args.strategy is not None),
+                ("--[no-]include-api-key-accounts", args.include_api_key_accounts is not None),
+            )
+            if present
+        ]
+        if given:
+            parser.error(
+                f"{', '.join(given)} cannot be combined with the service options; "
+                "the service uses the autoswitch.* settings (cswap config set autoswitch.threshold 85)"
+            )
+        try:
+            sys.exit(_auto_service(args))
+        except ClaudeSwitchError as e:
+            error(f"Error: {e}")
+            sys.exit(1)
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
@@ -945,6 +997,62 @@ Defaults live in settings.json in the backup root; flags override them.
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)
+
+
+def _auto_service(args) -> int:
+    """Handle ``auto --install-service|--uninstall-service|--service-status``.
+
+    The Linux counterpart of :func:`_menubar_service`: same three verbs, same
+    output shape, backed by a systemd user unit instead of a LaunchAgent.
+    """
+    from claude_swap import systemd_service
+
+    linger_hint = (
+        "It stops when you log out; to keep it running without a session, run: "
+        "loginctl enable-linger"
+    )
+    if args.install_service:
+        result = systemd_service.install()
+        print(f"Auto-switch service installed and started ({result['unit']}).")
+        print(f"  unit: {result['unit_path']}")
+        print(f"  runs: {' '.join(result['program'])}")
+        print("  logs: journalctl --user -u cswap-auto -f")
+        print(
+            dimmed(
+                "It starts with your session from now on and uses the "
+                "autoswitch.* settings. Re-run this after a 'cswap config set' "
+                "change or a cswap upgrade to restart it with both. Stop any "
+                "'cswap auto' still running in a terminal; one loop is enough."
+            )
+        )
+        if result["linger"] is False:
+            print(dimmed(linger_hint))
+        return 0
+
+    if args.uninstall_service:
+        result = systemd_service.uninstall()
+        if result["was_active"] or result["removed_unit"]:
+            print("Auto-switch service removed.")
+        else:
+            print("Auto-switch service was not installed.")
+        return 0
+
+    result = systemd_service.status()
+    if not result["installed"] and not result["loaded"]:
+        print("Auto-switch service is not installed.")
+        print(dimmed("Install it with: cswap auto --install-service"))
+        return 0
+    state = result["state"] or ("active" if result["active"] else "inactive")
+    pid = f" (pid {result['pid']})" if result["pid"] else ""
+    enabled = "enabled" if result["enabled"] else "not enabled at login"
+    print(f"Auto-switch service: {state}{pid}, {enabled}")
+    print(f"  unit: {result['unit_path']}")
+    print("  logs: journalctl --user -u cswap-auto -f")
+    if not result["installed"]:
+        print(dimmed("systemd still has it loaded, but the unit file is gone."))
+    if result["linger"] is False:
+        print(dimmed(linger_hint))
+    return 0
 
 
 def _config_command(argv: list[str]) -> None:
