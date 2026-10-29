@@ -3771,6 +3771,14 @@ class ClaudeAccountSwitcher:
                 current_account_uuid,
             )
             self._reject_credential_drift_since_verify(current_creds)
+            # Capturing a login activates it, so clear the managed key of the
+            # account that was active until now, as a switch onto OAuth does.
+            # Claude Code's own /login drops primaryApiKey but knows nothing of the
+            # apiKeyHelper hook cswap registered, and that hook outranks the OAuth
+            # login: left in place it keeps every session on the old key while
+            # cswap reports the captured account as active. Cleared before the
+            # config snapshot below so the old key is not copied into this slot.
+            self._store._clear_managed_key()
 
             config_path = self._get_claude_config_path()
             try:
@@ -3897,6 +3905,9 @@ class ClaudeAccountSwitcher:
             current_creds, current_email, current_org_uuid, current_account_uuid
         )
         self._reject_credential_drift_since_verify(current_creds)
+        # Activating the captured login clears the previous account's managed key
+        # and apiKeyHelper hook, for the reason given in the refresh branch above.
+        self._store._clear_managed_key()
 
         config_path = self._get_claude_config_path()
         try:
@@ -7711,6 +7722,13 @@ class ClaudeAccountSwitcher:
             removed_items.append(
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
+
+        # The apiKeyHelper script lives in the backup directory: unregister it
+        # first, or every Claude Code session would be left calling a helper
+        # that no longer exists. primaryApiKey stays, so a newly started session
+        # keeps the current API key, as the note above promises.
+        if self._store._api_key_helper.remove():
+            removed_items.append("apiKeyHelper hook in Claude Code settings.json")
 
         # Remove backup directory
         if self.backup_dir.exists():

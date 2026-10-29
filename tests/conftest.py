@@ -733,6 +733,15 @@ def _no_fsync(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_api_key_helper_settle(monkeypatch):
+    """Every switch onto an API key would otherwise wait for running Claude Code
+    sessions to reload settings.json. Tests of the wait set it back."""
+    from claude_swap import api_key_helper
+
+    monkeypatch.setattr(api_key_helper, "SETTLE_SECONDS", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_colour(monkeypatch):
     """A developer's terminal must not decide whether the suite passes.
 
