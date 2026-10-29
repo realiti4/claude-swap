@@ -221,6 +221,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 - **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
 - **Continuing sessions after switching:** You can keep using the same Claude Code session after switching — run `cswap switch` in any terminal and carry on. If you'd prefer a clean start, close and reopen Claude Code (or the VS Code extension tab) and use `--resume` to pick your previous session. Either way, the first message on the new account may use extra usage as its conversation cache rebuilds.
+- **Carrying context to a new session:** Claude's thinking is tied to the organization that wrote it, so after switching accounts Claude Code warns that it "can't use thinking from another organization" and re-reads the whole session. For a clean hand-over, see [`examples/handoff`](examples/handoff): a `/handoff` skill writes a short note, and a `SessionStart` hook feeds it into the next fresh session once. `examples/handoff/switch-with-handoff.sh` chains handoff, `cswap switch` and a new `claude`.
 
 ## How it works
 
