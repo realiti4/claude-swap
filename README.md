@@ -121,6 +121,45 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+### Claude Code hook (usage advice)
+
+A [Claude Code hook](https://code.claude.com/docs/en/hooks) can hand the model a one-line heads-up when your usage is running high, so it eases off *before* a rate-limit error ends a long task. `cswap hook claude` prints nothing while the active account is under its lines, so a healthy setup costs no context:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "cswap hook claude", "timeout": 10 }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Agent|Task",
+        "hooks": [{ "type": "command", "command": "cswap hook claude", "timeout": 10 }] }
+    ]
+  }
+}
+```
+
+Over a line (5-hour window `--threshold`, default 80; weekly window `--weekly-threshold`, default 90) it adds context like:
+
+> Claude usage is high on the active account #2 (work): 5h window at 91% (resets in 56m). Account #3 has more room (5h 12%, 7d 31%); `cswap switch 3` moves to it, or let `cswap auto` rotate. Until then, keep parallel subagents and model size modest.
+
+When *every* account with a usable reading is over a line, the advice is to slow down instead: fewer parallel subagents, a smaller model, long runs later. Add `--alternative "TEXT"` to append your own line to either kind of advice, for instance how to hand heavy work to another agent or tool; without the flag nothing of the kind is ever suggested.
+
+<details>
+<summary>Details</summary>
+
+- It judges the usage readings `cswap list --json` would show, so it refreshes them under the same poll plan as `cswap list` (and `cswap auto`, if running, keeps them warm). `--cache-only` never calls the usage API and uses whatever is already known.
+- The same advice is said about once per session and hook event per `--repeat` seconds (default 600; `0` = every time), sooner if the situation changes (another account, window or level). The heads-up at a prompt therefore does not silence the one right before a subagent is spawned. It is best effort, without a lock: parallel tool calls that start at the same instant can each say it.
+- Accounts are named by number and alias only, never by email address. Disabled accounts are never suggested as a switch target, and a window whose reset time has passed counts as empty.
+- The hook never gets in the way of a prompt: any runtime error is swallowed (see it with `--debug`) and the exit status stays 0. Two things exit 1 on purpose: a mistyped flag (not 2, because Claude Code treats exit 2 from a hook as a block) and, like every other command, running as root outside a container.
+- Inside a `cswap run` session shell it stays silent: the default login's usage is not that session's. Only `UserPromptSubmit`, `PreToolUse`, `PostToolUse` and `SessionStart` are answered; any other event (e.g. `Stop`, where added context would make the model carry on) gets no output, and Claude Code rejects output that names a different event than the one it ran for.
+- Following the advice (`cswap switch N`) is up to the model or you; nothing is switched by the hook itself.
+- The lines are the hook's own flags: it does not read `autoswitch.threshold`, `autoswitch.weeklyThreshold` or per-account thresholds. The defaults (80 / 90) sit at or below auto-switch's default of 90 on purpose, so the model eases off no later than an automatic switch.
+- The output is `{"hookSpecificOutput": {"hookEventName": "...", "additionalContext": "..."}}`, with the event name taken from the hook input on stdin (`UserPromptSubmit` when there is none).
+
+</details>
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
@@ -188,6 +227,7 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap hook claude               # Usage advice for a Claude Code hook (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics

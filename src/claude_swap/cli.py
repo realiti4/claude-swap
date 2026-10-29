@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -757,6 +758,139 @@ def _priority_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+class _HookArgumentParser(argparse.ArgumentParser):
+    """A usage error exits 1, not argparse's 2: for Claude Code a hook that
+    exits 2 blocks the event, and a mistyped flag must never do that."""
+
+    def error(self, message: str):  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
+def _read_hook_stdin() -> str:
+    """Claude Code's hook input: one JSON object on stdin. Empty on a terminal.
+
+    Read as bytes and decoded leniently: only ASCII fields matter here, and a
+    prompt must not lose its advice to a Windows code page that cannot decode
+    the rest of the payload."""
+    stream = sys.stdin
+    if stream is None or stream.isatty():
+        return ""
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        return buffer.read().decode("utf-8", "replace")
+    return stream.read()
+
+
+def _hook_command(argv: list[str]) -> None:
+    """Handle `cswap hook claude [...]`.
+
+    Pre-dispatched before the main parser, like `run`/`auto`. Reads Claude
+    Code's hook input from stdin and, when the active account is over a usage
+    line, prints one JSON object with advice for the model's context; prints
+    nothing otherwise. Fails open (see `claude_swap.hook`).
+    """
+    from claude_swap import hook
+
+    def percent(text: str) -> float:
+        value = float(text)
+        if not 0 < value <= 100:
+            raise argparse.ArgumentTypeError("must be above 0 and at most 100")
+        return value
+
+    def seconds(text: str) -> float:
+        value = float(text)
+        if not (math.isfinite(value) and value >= 0):
+            raise argparse.ArgumentTypeError("must be a non-negative number of seconds")
+        return value
+
+    parser = _HookArgumentParser(
+        prog="cswap hook",
+        description=(
+            "Usage advice for a Claude Code hook. Prints nothing while the "
+            "active account is under its lines; over one, prints JSON that "
+            "Claude Code adds to the model's context (switch to an account "
+            "with more room, or slow down when every account with a usable reading is high)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Claude Code settings (~/.claude/settings.json):
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "cswap hook claude", "timeout": 10}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "Agent|Task",
+       "hooks": [{"type": "command", "command": "cswap hook claude", "timeout": 10}]}
+    ]
+  }
+
+Examples:
+  cswap hook claude --threshold 85 --weekly-threshold 95
+  cswap hook claude --alternative "Hand build work to the other agent: run-other-agent <task>"
+  cswap hook claude --cache-only     # never call the usage API; use what cswap already knows
+        """,
+    )
+    parser.add_argument("target", choices=["claude"], help="The tool to advise (only 'claude')")
+    parser.add_argument(
+        "--threshold", type=percent, default=hook.DEFAULT_THRESHOLD, metavar="PCT",
+        help=f"5-hour usage that counts as high (default {hook.DEFAULT_THRESHOLD:g})",
+    )
+    parser.add_argument(
+        "--weekly-threshold", type=percent, default=hook.DEFAULT_WEEKLY_THRESHOLD, metavar="PCT",
+        help=f"7-day usage that counts as high (default {hook.DEFAULT_WEEKLY_THRESHOLD:g})",
+    )
+    parser.add_argument(
+        "--alternative", metavar="TEXT",
+        help=(
+            "Extra line added to the advice when usage is high, e.g. how to hand work "
+            "to another agent. Never printed otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--repeat", type=seconds, default=hook.DEFAULT_REPEAT_S, metavar="SECONDS",
+        help=(
+            "Say the same thing about once per session and event in this many seconds "
+            f"(default {hook.DEFAULT_REPEAT_S:g}; 0 = every time)"
+        ),
+    )
+    parser.add_argument(
+        "--cache-only", action="store_true",
+        help="Never call the usage API; judge from the readings cswap already has",
+    )
+    parser.add_argument("--debug", action="store_true", help="Show errors instead of staying silent")
+    args = parser.parse_args(argv)
+
+    try:
+        hook_input = hook.parse_hook_input(_read_hook_stdin())
+        # Stdout belongs to the hook protocol: anything the store prints while
+        # it opens or migrates goes to stderr instead.
+        with contextlib.redirect_stdout(sys.stderr):
+            switcher = ClaudeAccountSwitcher(debug=args.debug)
+            _guard_root(switcher)
+            # Inside a `cswap run` session the default login's "active account"
+            # is not the one in use: say nothing (the guard raises, we fail open).
+            switcher._refuse_session_shell()
+            payload = switcher.list_accounts(
+                json_output=True, fetch=set() if args.cache_only else None
+            )
+        output = hook.run(
+            payload or {},
+            hook_input,
+            threshold=args.threshold,
+            weekly_threshold=args.weekly_threshold,
+            alternative=args.alternative,
+            repeat_s=args.repeat,
+        )
+        if output is not None:
+            print(json.dumps(output))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:  # noqa: BLE001 -- a hook fails open
+        if args.debug:
+            error(f"cswap hook: {e}")
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1183,9 +1317,9 @@ def main() -> None:
     argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
-        # `run` execs a child that takes over the terminal, and `--json`
-        # must stay machine-readable — never probe (and emit the OSC query)
-        # in either case.
+        # `run` execs a child that takes over the terminal, `hook` is read by
+        # another program, and `--json` must stay machine-readable — never
+        # probe (and emit the OSC query) in any of these cases.
         probe = cli_should_probe(argv, colors_enabled=printer.colors_enabled())
         name = cli_theme(load_ui_settings(paths.get_backup_root()).theme, colors=probe)
         printer.set_theme(name)
@@ -1219,6 +1353,9 @@ def main() -> None:
         return
     if argv and argv[0] == "priority":
         _priority_command(argv[1:])
+        return
+    if argv and argv[0] == "hook":
+        _hook_command(argv[1:])
         return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
@@ -1270,6 +1407,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s hook claude                usage advice for a Claude Code hook
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

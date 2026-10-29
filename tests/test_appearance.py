@@ -293,6 +293,10 @@ class TestCliShouldProbe:
         # `run` execs a child that takes over the terminal.
         assert appearance.cli_should_probe(["run", "2"], colors_enabled=True) is False
 
+    def test_hook_subcommand_never_probes(self):
+        # `hook` output is read by another program, not shown on the terminal.
+        assert appearance.cli_should_probe(["hook", "claude"], colors_enabled=True) is False
+
     def test_json_flag_never_probes(self):
         # --json must stay machine-readable; the OSC query can't precede it.
         assert appearance.cli_should_probe(["list", "--json"], colors_enabled=True) is False
