@@ -91,6 +91,7 @@ cswap auto --weekly-threshold 97   # let the weekly window run higher before swi
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
+cswap auto --install-service   # Linux: keep it running as a systemd user service
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
 cswap auto --strategy priority-consume-first   # your own tiers first, then soonest weekly reset
 ```
@@ -116,6 +117,8 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 ```bash
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
+
+On Linux, `cswap auto --install-service` runs the loop as a systemd user service instead: it starts with your session, restarts if it crashes, and logs to the journal (`journalctl --user -u cswap-auto -f`). It uses the `autoswitch.*` settings, so re-run `--install-service` after `cswap config set` or a cswap upgrade to restart it with both. `--service-status` shows its state and `--uninstall-service` removes it. A user service stops when you log out unless lingering is on (`loginctl enable-linger`). On macOS the [menu bar](#menu-bar-macos) runs the same auto-switching and has its own service (`cswap menubar --install-service`).
 
 Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
 
