@@ -243,6 +243,10 @@ class AccountSnapshot:
     #: Per-account auto-switch overrides. Appended last and defaulted, so every
     #: pre-existing construction site keeps working and yields the default.
     policy: AccountPolicy = AccountPolicy()
+    #: Stored subscription plan record (``subscription.PlanStore`` shape), or
+    #: None for a slot whose plan has never been fetched. Defaulted for the
+    #: same reason as ``policy``.
+    subscription_plan: dict | None = None
 
     @property
     def display_tag(self) -> str:

@@ -15,6 +15,7 @@ from a background thread, never a UI event loop.
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import replace
 
@@ -22,6 +23,8 @@ from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
+
+_logger = logging.getLogger("claude-swap")
 
 
 class SnapshotSource:
@@ -37,6 +40,7 @@ class SnapshotSource:
         self.switcher = switcher
         self._last: AccountsSnapshot | None = None
         self._lock = threading.Lock()
+        self._plans_lock = threading.Lock()
 
     def take(
         self, *, full: bool = False, store_only: bool = False
@@ -48,6 +52,23 @@ class SnapshotSource:
             snap = self._reconcile(snap)
             self._last = snap
             return snap
+
+    def refresh_plans(self) -> None:
+        """Refresh due subscription plans; blocking, so call it from a worker.
+
+        The counterpart of ``take(store_only=True)``, which never reaches the
+        network: a shell whose snapshots are store-only calls this to keep its
+        plan labels current. Overlapping calls collapse into the running one.
+        Display-only, so a failure is logged and goes no further.
+        """
+        if not self._plans_lock.acquire(blocking=False):
+            return
+        try:
+            self.switcher.refresh_subscription_plans()
+        except Exception:
+            _logger.debug("plan refresh failed", exc_info=True)
+        finally:
+            self._plans_lock.release()
 
     def _reconcile(self, snap: AccountsSnapshot) -> AccountsSnapshot:
         if self._last is None:
