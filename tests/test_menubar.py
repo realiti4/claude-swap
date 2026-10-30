@@ -558,6 +558,69 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
         menubar.run(switcher=None)
 
 
+@pytest.mark.parametrize(
+    "identity, takes",
+    [(("a@x.com", "org"), False), (("b@x.com", "org"), True), (None, False)],
+)
+def test_active_change_reads_the_login_on_the_worker_not_the_ui_thread(
+    monkeypatch, tmp_path: Path, identity, takes
+):
+    """`_live_login_identity` does Keychain reads under a pin: never on the 1 s tick."""
+    import threading
+    import types
+    from unittest import mock
+
+    from claude_swap import app_bundle
+
+    apps, spawned = [], []
+
+    class FakeThread:
+        def __init__(self, target, args=(), **_kw):
+            spawned.append((target, args))
+
+        def start(self):
+            pass
+
+    class FakeApp:
+        menu = mock.MagicMock()
+
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def run(self):
+            apps.append(self)
+
+    monkeypatch.setitem(sys.modules, "rumps", mock.MagicMock(App=FakeApp))
+    monkeypatch.setitem(sys.modules, "AppKit", mock.MagicMock())
+    monkeypatch.setattr(app_bundle, "maybe_reexec", lambda *_a, **_k: None)
+    monkeypatch.setattr(app_bundle, "in_bundle", lambda: True)
+    monkeypatch.setattr(
+        menubar, "threading", types.SimpleNamespace(Thread=FakeThread, Lock=threading.Lock)
+    )
+    config = tmp_path / ".claude.json"
+    config.write_text("{}")
+    switcher = mock.MagicMock(backup_dir=tmp_path)
+    switcher._get_claude_config_path.return_value = config
+    switcher._live_login_identity.return_value = identity
+    assert menubar.run(switcher) == 0
+    app = apps[0]
+    app.snapshot = {"active_email": "a@x.com"}
+    app._refreshing = False
+    app._snapshot_source = mock.MagicMock()
+    app._snapshot_source.take.return_value = types.SimpleNamespace(accounts=[])
+    spawned.clear()
+
+    app._detect_active_change()  # the main-thread tick, config mtime changed
+
+    switcher._live_login_identity.assert_not_called()
+    (target, args), = spawned
+    target(*args)  # what the worker thread runs
+    switcher._live_login_identity.assert_called_once()
+    assert app._snapshot_source.take.called is takes
+    assert app._dirty is takes
+    assert app._refreshing is False
+
+
 class TestFrameworkBuildWarning:
     """The menu bar draws nothing from a framework build on macOS 26.
 

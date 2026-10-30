@@ -273,6 +273,64 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 
 </details>
 
+## Cloud pin (Remote Control / Artifacts)
+
+<details>
+<summary>Keep Remote Control and Artifacts on one account while inference follows the swap</summary>
+
+Install the pin with the command in the [cswap-pin README's Install section](https://github.com/codeslake/cswap-pin#install), which pins the claude-swap commit and the cswap-pin version together. A plain `uv tool install 'claude-swap[pin]'` resolves from the index, and a release that predates the extra only warns and installs a cswap without `cswap pin`. Then point the pin at an account:
+
+```bash
+cswap list                           # the numbers come from here
+cswap pin 2
+```
+
+Add this line to `~/.bashrc` or `~/.zshrc` so every `claude` launch first repairs a dead pin daemon:
+
+```bash
+claude() { (cswap pin --ensure >/dev/null 2>&1 &); command claude "$@"; }
+```
+
+Swapping accounts moves *everything*, including two things that are not inference:
+
+- **Remote Control** — a session's owner is fixed at creation by whichever bearer created it, so after a swap the phone/web loses the session and ghosts pile up on the old account.
+- **Artifacts** — owned by the publishing bearer, so a republish 403s and the artifact "disappears" from the account you are logged into.
+
+The pin keeps those on one account of your choosing while `cswap switch` / [`cswap auto`](#automatic-switching) keep steering inference. `/v1/messages` is never touched, so usage still bills the account you swapped onto.
+
+```bash
+cswap pin 2          # Remote Control / artifacts → account 2
+cswap pin            # show the current pin
+cswap pin --clear    # remove it (this host only, if settings.json is shared; see below)
+cswap pin --clear --everywhere  # ...and drop the shared pin record too
+cswap pin --heal     # restart a pin proxy that died, or unwire it
+cswap pin --get_port # the serving port, bare digits (exit 1 if none)
+cswap pin --get_certdir # the cert directory, a bare path
+cswap pin --set_port N   # serve on N from the next start (0 = dynamic)
+cswap pin --desktop on|off  # let the Claude Desktop app's inference follow the swap
+cswap pin --connectors on|off  # let claude.ai MCP connectors follow the pinned account
+cswap pin --ensure   # repair a stale wiring before a launch, for rc hooks
+```
+
+`--get_port` exists so scripts stop reading our files: a pinned session's
+`HTTPS_PROXY` names the pin's own dynamic port, and without a way to ask for it
+the on-disk layout becomes a compatibility surface. It prints bare digits and
+probes the port first, so a stale record cannot report a dead daemon as live.
+
+`pin.desktopFollows` (default off) lets the Claude Desktop app's inference follow the account swap. Three toggles set it: `cswap config set pin.desktopFollows on`, `cswap pin --desktop on|off` (which works without the cswap-pin package), and `d` in the TUI's Auto view. The value takes effect through cswap-pin's reader of `claude_swap.settings.load_pin_settings(backup_dir)`, the one entry point for reading it (do not open the settings files directly), and is read live, so nothing restarts; bare `cswap pin` prints `Desktop follows: on|off`. The `CSWAP_PIN_INFERENCE_FOLLOWS` environment variable, which the pin still honors, overrides the setting for that process.
+
+`pin.connectorsFollowPin` (default off) lets claude.ai MCP connectors follow the pinned account. It is set and read the same way as `pin.desktopFollows`: `cswap config set pin.connectorsFollowPin on`, `cswap pin --connectors on|off` (which works without the cswap-pin package), and `o` in the TUI's Auto view; bare `cswap pin` prints `Connectors follow pin: on|off`. The `CSWAP_PIN_CONNECTORS_FOLLOW_PIN` environment variable, which the pin honors, overrides the setting for that process.
+
+`settings.json` may be a symlink into a repository shared across machines, so the pin record is one file for every host that links it. `cswap pin --clear` then unpins **this host only**: it unwires the host and writes a `pin-cleared` marker beside `settings.json`, leaving the shared record untouched for the other hosts (and for a commit of that repository). `cswap pin --clear --everywhere` drops the shared record and removes the marker; `cswap pin N` on a cleared host pins it again. The marker is per host: another host's `--clear --everywhere` followed by a re-pin leaves it standing here, and this host keeps reading as unpinned until `cswap pin N` runs on it. A `settings.json` that is not a symlink has no other hosts, so `--clear` drops its record as before.
+
+The pinned account is re-read per request, so re-pinning takes effect without restarting anything. The one thing a re-pin cannot move is a Remote Control session that is **already open** — the server fixed its owner when the session was created, so reconnecting inside it (`/rc` → Disconnect → `/rc`) is what moves it.
+
+If the pin's daemon dies, `.claude.json` keeps naming its dead port and every new session inherits it at boot — reach for `--heal` to restart the daemon, or, if it can't come back, remove the wiring so sessions fall back to what they had before the pin.
+
+Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin), which the extra pulls in.
+
+</details>
+
 ## Advanced
 
 ### Configuration
@@ -290,6 +348,8 @@ cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set run.shareHistory true    # every cswap run shares chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
+cswap config set pin.desktopFollows on    # Desktop app inference follows the account swap (see "Cloud pin")
+cswap config set pin.connectorsFollowPin on  # claude.ai MCP connectors follow the pinned account (see "Cloud pin")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

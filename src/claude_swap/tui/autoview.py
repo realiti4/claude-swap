@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     pct_label,
 )
+from claude_swap import pin
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
@@ -70,6 +71,8 @@ class AutoScreen(Screen):
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
+        Binding("d", "toggle_desktop_follows", "Desktop follows"),
+        Binding("o", "toggle_connectors_follow_pin", "Connectors follow pin"),
         Binding("escape,q", "back", "Back"),
     ]
 
@@ -167,6 +170,34 @@ class AutoScreen(Screen):
         value = min(spec.hi, max(spec.lo, self._settings.threshold + delta))
         self._set_threshold(value)
 
+    def action_toggle_desktop_follows(self) -> None:
+        self._toggle_pin_switch("desktop_follows", "pin.desktopFollows", "desktop follows")
+
+    def action_toggle_connectors_follow_pin(self) -> None:
+        self._toggle_pin_switch(
+            "connectors_follow_pin", "pin.connectorsFollowPin", "connectors follow pin"
+        )
+
+    def _toggle_pin_switch(self, field: str, key: str, label: str) -> None:
+        # Persisted, unlike `t`: the pin is another process and reads the saved setting.
+        # Flips the file's value now, not what this screen last saw.
+        from claude_swap.settings import load_pin_settings, set_setting
+
+        backup_dir = self.app.switcher.backup_dir
+        value = not getattr(load_pin_settings(backup_dir), field)
+        try:
+            set_setting(backup_dir, key, "true" if value else "false")
+        except Exception as exc:  # best-effort, like the theme; never crash the UI
+            self.notify(f"Could not save {label}: {exc}", severity="warning")
+            return
+        self._update_summary()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"{label} {'on' if value else 'off'}",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
     def _end_adjust(self) -> None:
         self._adjusting = False
         self._update_summary()
@@ -212,6 +243,11 @@ class AutoScreen(Screen):
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        from claude_swap.settings import load_pin_settings
+
+        follows = load_pin_settings(self.app.switcher.backup_dir)
+        text.append(f" · desktop follows {'on' if follows.desktop_follows else 'off'}")
+        text.append(f" · connectors follow pin {'on' if follows.connectors_follow_pin else 'off'}")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
@@ -321,6 +357,15 @@ class AutoScreen(Screen):
         weekly = settings.weekly_threshold if settings else None
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
         lines: dict[str, Text] = {}
+        # The badge rides on that account's own row rather than the summary
+        # line: naming the pin separately makes you match an email against the
+        # list directly below it instead of just reading the list.
+        pinned_identity = pin.pinned_identity(self.app.switcher)
+        # ONCE PER RENDER, not once per row: this reads the daemon's record off
+        # disk, and the badge below is drawn inside the account loop. The same
+        # mistake was fixed for the pin lookup itself — see the test that pins
+        # its call count.
+        pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -357,6 +402,23 @@ class AutoScreen(Screen):
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
                 ranked.append((-binding.line_headroom, acc.number))
+            # Outside the usage branches on purpose: an account whose usage is
+            # unknown still owns the claude.ai side, so the badge must not hang
+            # off whichever branch happened to run.
+            if pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid):
+                entry.append("  · ", style=palette.muted)
+                # SET IS NOT APPLYING. This badge used to be lit by
+                # the pin's presence alone, so it stayed green while the daemon
+                # could not mint the pinned token and every request went out
+                # unpinned, with the statusline and the coherence check
+                # agreeing with it. `False` is the
+                # only value worth shouting about; `None` means "could not
+                # tell" and must read as healthy here, same rule as
+                # `pin_is_broken`.
+                if pin_applying is False:
+                    entry.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
+                else:
+                    entry.append("○ cloud", style=f"bold {palette.sev_warn}")
             lines[acc.number] = entry
 
         text = Text()

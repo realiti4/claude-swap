@@ -81,12 +81,16 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    # THE ORG AXIS. Without it no snapshot could express two slots sharing one
+    # address across organizations -- the entire subject of
+    # `pin.account_is_pinned` -- so nothing rendered that pair.
+    org_uuid: str = "",
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
         email=email or f"user{number}@example.com",
         org_name="",
-        org_uuid="",
+        org_uuid=org_uuid,
         is_active=active,
         kind=kind,
         switchable=switchable,
@@ -787,7 +791,19 @@ class TestDashboard:
             assert "5h 92%" in mini_part
             assert "7d" not in mini_part
 
-    async def test_menu_is_default_navigation_and_nests(self, tmp_path):
+    async def test_menu_is_default_navigation_and_nests(self, tmp_path, monkeypatch):
+        # SAY WHICH WORLD THIS IS, rather than inherit it. The list below used
+        # to carry the comment "no pin-menu: the extra is not installed in
+        # CI" — an assertion whose expected value was decided by what happened
+        # to be on sys.path. Adding `claude-swap[pin]` to the dev group (so
+        # the peer contract could be tested at all) flipped it, and the
+        # navigation behaviour this test is actually about did not change one
+        # bit. Pinned to the no-pin shape: the pin row's own behaviour is
+        # covered in test_tui_pin.py, and one extra row would only pad the
+        # indices the presses below depend on.
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "is_available", lambda: False)
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
@@ -804,6 +820,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                # No "pin-menu": pinned False above, not left to sys.path.
                 "remove-menu",
                 "theme-menu",
                 "quit",
@@ -1324,6 +1341,13 @@ def fake_engine(monkeypatch):
     return _FakeEngine
 
 
+# (key, settings key, PinSettings field, summary text) of the Auto view's pin switches
+PIN_TOGGLES = [
+    ("d", "desktopFollows", "desktop_follows", "desktop follows"),
+    ("o", "connectorsFollowPin", "connectors_follow_pin", "connectors follow pin"),
+]
+
+
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
@@ -1474,6 +1498,74 @@ class TestAutoScreen:
             screen.action_threshold_step(-60.0)
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
+
+    @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
+    async def test_pin_toggle_flips_the_files_value_and_shows_it(
+        self, tmp_path, fake_engine, key, json_key, field, text
+    ):
+        """Persisted (the pin is another process), and it flips what the FILE
+        holds now, not the value read at mount or the last one this key wrote."""
+        import json as _json
+
+        from claude_swap.settings import load_pin_settings
+        from textual.widgets import RichLog, Static
+
+        path = tmp_path / "settings.json"
+        path.write_text(_json.dumps({"schemaVersion": 1, "pin": {json_key: True}}))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            assert f"{text} on" in summary.render().plain
+            await pilot.press(key)
+            await pilot.pause()
+            assert getattr(load_pin_settings(tmp_path), field) is False
+            assert f"{text} off" in summary.render().plain
+            await pilot.press(key)
+            await pilot.pause()
+            assert getattr(load_pin_settings(tmp_path), field) is True
+            # `cswap pin --desktop off` ran meanwhile: the next press flips THAT.
+            path.write_text(_json.dumps({"schemaVersion": 1, "pin": {json_key: False}}))
+            await pilot.press(key)
+            await pilot.pause()
+            assert getattr(load_pin_settings(tmp_path), field) is True
+            log = screen.query_one("#event-log", RichLog)
+            assert any(f"{text} on" in ln.text for ln in log.lines)
+
+    @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
+    async def test_pin_toggle_reports_a_failed_save_and_keeps_the_old_state(
+        self, tmp_path, fake_engine, monkeypatch, key, json_key, field, text
+    ):
+        import json as _json
+
+        from textual.widgets import Static
+
+        def _boom(*_a, **_k):
+            raise OSError("read-only")
+
+        (tmp_path / "settings.json").write_text(
+            _json.dumps({"schemaVersion": 1, "pin": {json_key: True}})
+        )
+        monkeypatch.setattr("claude_swap.settings.set_setting", _boom)
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            notes = []
+            monkeypatch.setattr(
+                app.screen, "notify", lambda msg, **kw: notes.append(msg)
+            )
+            await pilot.press(key)
+            await pilot.pause()
+            assert len(notes) == 1 and "read-only" in notes[0]
+            summary = app.screen.query_one("#auto-summary", Static)
+            assert f"{text} on" in summary.render().plain
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

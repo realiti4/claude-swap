@@ -600,19 +600,24 @@ def run(switcher) -> int:
                 self._start_engine()
 
         # ---- display refresh plumbing ----------------------------------------
-        def refresh_async(self, full=False):
+        def refresh_async(self, full=False, probe=False):
             if self._refreshing:
                 return  # in-flight guard: one worker at a time (SnapshotSource
                         # pacing state is only touched by this single worker)
             self._refreshing = True
-            threading.Thread(target=self._worker, args=(full,), daemon=True).start()
+            threading.Thread(target=self._worker, args=(full, probe), daemon=True).start()
 
-        def _worker(self, full):
+        def _worker(self, full, probe=False):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. While the engine
             # runs it already paces all fetching, so the display reads store-only.
             try:
                 try:
+                    if probe:  # Keychain reads under a pin: here, not on the UI thread
+                        current = self.switcher._live_login_identity()
+                        email = current[0] if current else None
+                        if not email or email == self.snapshot.get("active_email"):
+                            return
                     raw = self._snapshot_source.take(
                         full=full, store_only=self._engine is not None
                     )
@@ -656,11 +661,10 @@ def run(switcher) -> int:
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
-            # within ~1s. Detecting *which* account is active is a cheap local
-            # read of ~/.claude.json -- no Keychain or usage API -- so we can do
-            # it on every tick. We gate the read on the file's mtime (a cheap
-            # stat) so a large config isn't parsed each second, and only kick a
-            # refresh when the active email actually changed (Claude Code rewrites
+            # within ~1s. The tick itself is one stat of ~/.claude.json, gated on
+            # its mtime, with no Keychain or usage API on the UI thread. A changed
+            # mtime starts a probing worker, which reads the live login and takes
+            # a snapshot only when the active email changed (Claude Code rewrites
             # this file often for unrelated reasons).
             if self._refreshing:
                 return  # a worker is already in-flight; it refreshes the marker
@@ -671,10 +675,11 @@ def run(switcher) -> int:
             if mtime == self._config_mtime:
                 return
             self._config_mtime = mtime
-            current = self.switcher._get_current_account()
-            email = current[0] if current else None
-            if email and email != self.snapshot.get("active_email"):
-                self.refresh_async()
+            # The worker compares the LOGIN, not the identity file: the snapshot's
+            # `active_email` is cswap's own view, and under a pin the file
+            # names the pinned account, so these never agree and the UI
+            # refreshed on every touch of the file.
+            self.refresh_async(probe=True)
 
         # ---- auto-switch engine ----------------------------------------------
         def _start_engine(self):

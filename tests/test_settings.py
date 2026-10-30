@@ -16,10 +16,12 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    PinSettings,
     RunSettings,
     UiSettings,
     UpdateSettings,
     effective_settings,
+    load_pin_settings,
     load_run_settings,
     load_settings,
     load_ui_settings,
@@ -197,6 +199,70 @@ class TestUpdateSettings:
         assert "updates" not in json.loads(settings_path(tmp_path).read_text())
 
 
+@pytest.fixture(
+    params=[
+        ("pin.desktopFollows", "desktopFollows", "desktop_follows"),
+        ("pin.connectorsFollowPin", "connectorsFollowPin", "connectors_follow_pin"),
+    ],
+    ids=lambda p: p[1],
+)
+def pin_switch(request):
+    """(dotted key, JSON key, PinSettings field) of one pin switch."""
+    return request.param
+
+
+class TestPinSettings:
+    def test_missing_file_defaults_off(self, tmp_path: Path, pin_switch):
+        assert load_pin_settings(tmp_path) == PinSettings()
+        assert getattr(PinSettings(), pin_switch[2]) is False
+
+    def test_reads_true(self, tmp_path: Path, pin_switch):
+        _, key, field = pin_switch
+        settings_path(tmp_path).write_text(json.dumps({"pin": {key: True}}))
+        assert getattr(load_pin_settings(tmp_path), field) is True
+
+    def test_non_boolean_falls_back_to_default(self, tmp_path: Path, pin_switch):
+        _, key, field = pin_switch
+        settings_path(tmp_path).write_text(json.dumps({"pin": {key: "yes"}}))
+        assert getattr(load_pin_settings(tmp_path), field) is False
+
+    def test_non_dict_section_loads_as_off(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"pin": True}))
+        assert load_pin_settings(tmp_path) == PinSettings()
+
+    def test_set_and_unset_round_trip_the_on_disk_shape(
+        self, tmp_path: Path, pin_switch
+    ):
+        """The key name round-trips; cswap-pin reads it through load_pin_settings."""
+        from claude_swap.settings import _read_raw
+
+        dotted, key, field = pin_switch
+        assert set_setting(tmp_path, dotted, "on") is True
+        assert _read_raw(settings_path(tmp_path))["pin"] == {key: True}
+        assert getattr(load_pin_settings(tmp_path), field) is True
+        assert set_setting(tmp_path, dotted, "off") is False
+        assert getattr(load_pin_settings(tmp_path), field) is False
+        assert unset_setting(tmp_path, dotted) is True
+        assert "pin" not in _read_raw(settings_path(tmp_path))
+
+    def test_listed_with_its_default_and_set_flag(self, tmp_path: Path, pin_switch):
+        dotted = pin_switch[0]
+        row = {s.dotted: (v, is_set) for s, v, is_set in effective_settings(tmp_path)}
+        assert row[dotted] == (False, False)
+        set_setting(tmp_path, dotted, "true")
+        row = {s.dotted: (v, is_set) for s, v, is_set in effective_settings(tmp_path)}
+        assert row[dotted] == (True, True)
+
+
+def test_a_mistyped_pin_switch_leaves_the_other_as_read(tmp_path: Path):
+    """One bad value must not turn off the switch the owner set."""
+    path = settings_path(tmp_path)
+    path.write_text(json.dumps({"pin": {"desktopFollows": True, "connectorsFollowPin": 1}}))
+    assert load_pin_settings(tmp_path) == PinSettings(desktop_follows=True)
+    path.write_text(json.dumps({"pin": {"desktopFollows": "x", "connectorsFollowPin": True}}))
+    assert load_pin_settings(tmp_path) == PinSettings(connectors_follow_pin=True)
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -214,6 +280,9 @@ class TestSettingSpecs:
         assert by_section["updates"] == {
             f.name for f in UpdateSettings.__dataclass_fields__.values()
         }
+        assert by_section["pin"] == {
+            f.name for f in PinSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
         sources = {
@@ -221,6 +290,7 @@ class TestSettingSpecs:
             "ui": UiSettings(),
             "run": RunSettings(),
             "updates": UpdateSettings(),
+            "pin": PinSettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)

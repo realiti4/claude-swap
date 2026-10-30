@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -444,7 +445,7 @@ class TestRefreshOAuthCredentials:
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             seen_body.update(json.loads(req.data.decode()))
             return mock_response
 
@@ -522,6 +523,44 @@ class TestTryRefreshOAuthCredentials:
         creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
         outcome = oauth.try_refresh_oauth_credentials(creds)
         assert outcome.error == "no_refresh_token"
+
+    def test_condemned_true_refuses_before_any_network_call(self):
+        """The guard's polarity, proven at the chokepoint itself: a CONFIRMED
+        mismatch refuses without a single byte on the wire."""
+        with patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            outcome = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), condemned=lambda fp: True,
+            )
+        mock_urlopen.assert_not_called()
+        assert outcome.error == "foreign-lineage"
+        assert outcome.credentials is None
+
+    def test_CONTROL_condemned_false_or_absent_still_posts(self):
+        """Positive control: without this, the RED test above would pass
+        just as well for a guard that refuses every refresh. Absence of
+        evidence (``condemned`` returning False, or not passed at all) must
+        never refuse — refusing a legitimate refresh is the harm the guard
+        exists to prevent."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            no_condemned = oauth.try_refresh_oauth_credentials(
+                self._make_credentials()
+            )
+            not_condemned = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), condemned=lambda fp: False,
+            )
+        assert no_condemned.error is None
+        assert not_condemned.error is None
 
     def test_invalid_json_is_transient(self):
         # Changed contract (stale-credential robustness): an unparseable blob
@@ -627,7 +666,7 @@ class TestFetchUsageForAccount:
         usage_resp = self._make_usage_response()
         persist_mock = MagicMock()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 return token_resp
             if "oauth/usage" in req.full_url:
@@ -664,7 +703,7 @@ class TestFetchUsageForAccount:
         usage_calls = 0
         persist_mock = MagicMock()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             nonlocal usage_calls
             if "oauth/token" in req.full_url:
                 return token_resp
@@ -699,7 +738,7 @@ class TestFetchUsageForAccount:
 
         usage_resp = self._make_usage_response(h5_pct=10.0, d7_pct=20.0)
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/usage" in req.full_url:
                 assert req.get_header("Authorization") == "Bearer old-access"
                 return usage_resp
@@ -721,7 +760,7 @@ class TestFetchUsageForAccount:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         credentials = self._make_credentials(expires_at=now_ms - 1_000)
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 raise urllib.error.HTTPError(
                     req.full_url, 400, "Bad Request", hdrs=None, fp=None,
@@ -759,7 +798,7 @@ class TestFetchUsageForAccount:
         usage_resp = self._make_usage_response()
         persist_mock = MagicMock()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 body = json.loads(req.data.decode())
                 assert "scope" not in body
@@ -791,7 +830,7 @@ class TestFetchUsageForAccount:
         persist_mock = MagicMock()
         refresh_calls = 0
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             nonlocal refresh_calls
             if "oauth/token" in req.full_url:
                 refresh_calls += 1
@@ -820,7 +859,7 @@ class TestFetchUsageForAccount:
         """Active account that 401s returns None without attempting a refresh."""
         credentials = self._make_credentials()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 raise AssertionError(
                     "Active account must not trigger a refresh POST on 401"
@@ -872,6 +911,99 @@ class TestFetchUsageForAccount:
         assert "failed to save refreshed token" in captured.err
         assert "cswap --add-account" in captured.err
         assert captured.out == ""
+
+
+class TestNativeTlsFallbackIsAudible:
+    """A silent fallback to stdlib ssl is a silent NARROWING OF TRUST.
+
+    ``_use_native_tls`` swallows every exception so the CLI is never blocked
+    over a trust nicety. That part is right. What is wrong is that it leaves no
+    trace, and the two paths do not trust the same roots.
+
+    Measured on macOS, comparing the OS keychains against what stdlib
+    actually loads:
+
+        OS-store unique roots           173   (system 154, admin 4, login 15)
+        stdlib-loaded roots             128
+        trusted by OS, NOT by stdlib     67   <-- lost, with no message
+
+    Four of those live in /Library/Keychains/System.keychain, which is where an
+    administrator puts a corporate MITM CA. So the fallback can take away the
+    exact root the machine was configured with, and the user is then told to
+    "trust the CA in the OS store" by a remedy note pointing at a store that is
+    no longer being read.
+    """
+
+    def test_a_failed_injection_says_so(self, caplog):
+        import logging
+        import builtins
+        from claude_swap import cli
+
+        real_import = builtins.__import__
+
+        def refuse(name, *a, **k):
+            if name == "truststore":
+                raise ImportError("simulated: truststore unavailable")
+            return real_import(name, *a, **k)
+
+        builtins.__import__ = refuse
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+        finally:
+            builtins.__import__ = real_import
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "truststore" in joined.lower() or "native" in joined.lower(), (
+            f"the fallback left no trace; records={[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_a_successful_injection_stays_quiet(self, caplog):
+        """The control: the normal path must not warn, or the warning is noise
+        every run and stops being read.
+
+        AND IT PUTS SSL BACK. `inject_into_ssl` is process-global and has no
+        automatic undo, so without the `finally` below every
+        `ssl.create_default_context()` for the rest of the worker returns a
+        `truststore._api.SSLContext` — a different class with a different API.
+
+        That is not hypothetical: it turned CI red. `truststore`'s context
+        raises `NotImplementedError` from `get_ca_certs()`, so a later test in
+        this file that asked a context what roots it carried died on a call
+        this test had made. It passed locally and failed in CI purely on
+        xdist's scheduling — same worker, poisoned; different workers, both
+        green. A suite whose result depends on which worker drew which test is
+        not reporting on the code.
+
+        The undo belongs HERE rather than in the victim, because the blast
+        radius is every test that touches ssl after this one, not the one that
+        happened to be caught.
+        """
+        import logging
+        from claude_swap import cli
+
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+            assert not [r for r in caplog.records
+                        if r.name == "claude-swap"
+                        and r.levelno == logging.WARNING]
+        finally:
+            try:
+                import truststore
+
+                truststore.extract_from_ssl()
+            except Exception:  # noqa: BLE001 — nothing to undo is a fine outcome
+                pass
+
+        # THE GUARD, not decoration. A cleanup nothing asserts is one the next
+        # edit deletes, and its absence is invisible until some unrelated test
+        # in some unrelated file starts failing on a scheduling coin-flip.
+        import ssl
+
+        assert type(ssl.create_default_context()).__module__ == "ssl", (
+            "this test left truststore injected into ssl — every later test in "
+            "this worker now gets a different SSLContext class")
 
 
 class TestClassifyUsageError:
@@ -930,6 +1062,89 @@ class TestClassifyUsageError:
         assert oauth._classify_usage_error(
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
+
+    def test_tls_cert_failure_is_not_flattened_to_network(self):
+        """A MITM proxy with an untrusted CA must not read as a transport error.
+
+        Measured on one host: every usage poll went through a
+        TLS-terminating proxy whose CA urllib does not trust, so each one raised
+
+            URLError(SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED]
+            certificate verify failed: unable to get local issuer certificate"))
+
+        and was recorded as ``network``. One account sat dead for ten days and
+        "network" is the only word anyone could see; the real cause reaches
+        DEBUG alone, which nothing enables. "Cannot reach the host" and "reached
+        the host and refused its certificate" need opposite fixes, so they may
+        not share a token.
+        """
+        e = urllib.error.URLError(
+            ssl.SSLCertVerificationError(
+                1,
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "unable to get local issuer certificate (_ssl.c:1000)",
+            )
+        )
+        assert oauth._classify_usage_error(e)[0] == "tls-cert"
+
+    def test_a_non_cert_ssl_failure_is_not_a_cert_failure(self):
+        """Pins the PREDICATE, not just the outcome.
+
+        ``ssl.SSLCertVerificationError`` is the narrow choice on purpose, and
+        the obvious loosening -- ``ssl.SSLError`` -- passes every other test in
+        this file. A non-cert TLS failure is a different condition with a
+        different repair: speaking https to a plaintext port raises
+        ``SSLError("record layer failure")``, and calling that ``tls-cert``
+        sends the operator to fix a CA bundle for a wrong-port problem.
+        """
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ssl.SSLEOFError("handshake failed"))
+        )[0] == "network"
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ssl.SSLError("record layer failure"))
+        )[0] == "network"
+
+    def test_tls_cert_carries_a_remedy_note(self):
+        """A kind with no ERROR_NOTES entry renders as the bare identifier.
+
+        The whole point of splitting this out of ``network`` is that the two
+        need different repairs, and that only reaches the operator through the
+        note. Without one the display trades one uninformative word for
+        another. ``test_every_deterministic_kind_has_a_note`` states the same
+        principle but iterates ``_DETERMINISTIC_REFRESH_ERRORS``, which is a
+        refresh-error list -- a usage-fetch kind is outside its loop, so it
+        cannot cover this.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert "tls-cert" in ERROR_NOTES
+        note = ERROR_NOTES["tls-cert"]
+        assert "SSL_CERT_FILE" in note
+
+    def test_a_hostname_mismatch_is_tls_cert_and_its_note_says_so(self):
+        """``SSLCertVerificationError`` is not only an untrusted chain.
+
+        A certificate issued for another host (a captive portal, a proxy that
+        does not re-sign per host) raises the same class with OpenSSL
+        verify_code 62. One kind covers "the certificate check refused this
+        connection", so the note has to name that cause too, or it prescribes
+        a CA fix for a problem no CA fixes.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        err = ssl.SSLCertVerificationError(
+            1,
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "Hostname mismatch, certificate is not valid for 'api.example.com'. "
+            "(_ssl.c:1000)",
+        )
+        err.verify_code = 62
+        err.verify_message = (
+            "Hostname mismatch, certificate is not valid for 'api.example.com'"
+        )
+        e = urllib.error.URLError(err)
+        assert oauth._classify_usage_error(e)[0] == "tls-cert"
+        assert "different host" in ERROR_NOTES["tls-cert"]
 
     def test_bad_response(self):
         try:
@@ -1249,7 +1464,7 @@ class TestFetchOauthProfile:
     def test_resolves_identity(self):
         seen = {}
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             seen["url"] = req.full_url
             seen["auth"] = req.headers.get("Authorization")
             return self._profile_response({
@@ -1270,7 +1485,7 @@ class TestFetchOauthProfile:
         never hang a switch."""
         seen = {}
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             seen["timeout"] = timeout
             return self._profile_response({
                 "account": {"uuid": "acc-uuid", "email": "a@b.c"},
@@ -1389,6 +1604,149 @@ class TestFetchOauthProfile:
         )
 
 
+class TestThePinAwareContextAddsTheCaAndNeverReplacesTheStore:
+    """`_pin_aware_ssl_context` hands back the DEFAULT context with our CA loaded."""
+
+    def test_the_pin_aware_context_trusts_our_own_proxy_without_an_env_var(self):
+        """A python client of the pin must ADD our CA, never REPLACE the store.
+
+        The profile fetch, the usage poll and the policy-limits fetch are
+        plain urllib through whatever proxy the session was wired to. When
+        that proxy is the pin, it MITMs api.anthropic.com, so the default
+        context cannot verify it and every call dies CERTIFICATE_VERIFY_FAILED,
+        swallowed to debug and returning None, which is how a failed fetch
+        stayed invisible for hours with nothing in any log.
+
+        SSL_CERT_FILE WAS THE WRONG TOOL AND THE MEASUREMENTS SAY SO. It
+        REPLACES OpenSSL's file, so it is only safe where the bundle subsumes
+        the store it displaces — measured per machine:
+
+            host-a     ambient 124  bundle 126  safe
+            host-b      ambient 128  bundle 167  NOT (27 missing)
+            host-c  ambient 128  bundle   2  NOT (128 missing)
+
+        so the gate that writes it correctly refuses on two of the three, and
+        the calls stay broken there. Adding the CA to a default context keeps
+        the system roots and needs no variable at all. Measured on
+        host-c, same process, same proxy:
+
+            default ctx                 CERTIFICATE_VERIFY_FAILED
+            default ctx + our CA added  HTTP 200
+
+        This pins that the context builder ADDS: it hands back the DEFAULT
+        context, with our CA loaded into it.
+
+        A CERT COUNT CANNOT ASK THIS QUESTION, and the first version of this
+        test tried. `assert len(ctx.get_ca_certs()) > 20` was wrong twice over:
+
+          - `get_ca_certs()` reports only certs loaded from a *cafile*. Roots
+            that arrive from a *capath* directory load lazily and never appear,
+            so a perfectly healthy store reads 0 on such a machine. Measured on
+            host-a: `get_default_verify_paths().cafile` is None and the
+            count is 0 while verification works fine.
+          - it is a COUNT, and containment is not size. Measured on
+            host-b: a 167-cert bundle was still missing 27 certs of the
+            128-cert store it would have displaced. A bigger number looked like
+            an answer and was not.
+
+        So assert the structure instead: `create_default_context()` is the
+        base — whatever roots this machine and this interpreter give it — and
+        the pin CA goes in through `load_verify_locations`, which ADDS. Both
+        claims are checked without asking any context to enumerate anything,
+        which is also why this survives `truststore.inject_into_ssl()` — its
+        context class raises NotImplementedError from `get_ca_certs()`.
+        """
+        import ssl
+
+        from claude_swap import oauth
+
+        class Recorder:
+            """Stands in for the default context and records what was ADDED."""
+
+            def __init__(self):
+                self.loaded = []
+
+            def load_verify_locations(self, cafile=None, capath=None, cadata=None):
+                self.loaded.append(cafile)
+
+        def build(ca):
+            """Run the builder with `pin.ca_path_for_trust -> ca`.
+
+            AT THE SEAM, not sys.modules: oauth.py asks `claude_swap.pin` now,
+            and the seam already collapses "no extra" and "extra raised" to
+            None, which is the only distinction this builder ever made.
+            """
+            from claude_swap import pin as _pin
+
+            spy = Recorder()
+            # THE CACHE IS PROCESS-WIDE, so a build under a different CA state
+            # would otherwise hand this one a context built for that state.
+            # ONE SLOT now rather than a dict — see `_PIN_CTX_SLOT`, which
+            # replaced an entry-per-CA map that never evicted.
+            oauth._PIN_CTX_SLOT = None
+            real_ctx = ssl.create_default_context
+            real_ca = _pin.ca_path_for_trust
+            _pin.ca_path_for_trust = lambda: ca
+            ssl.create_default_context = lambda *a, **k: spy
+            try:
+                return spy, oauth._pin_aware_ssl_context()
+            finally:
+                ssl.create_default_context = real_ctx
+                _pin.ca_path_for_trust = real_ca
+
+        # A PIN IS INSTALLED AND HAS A CA.
+        spy, ctx = build("/somewhere/pin-proxy/ca.pem")
+        # THE SAME OBJECT BACK. A builder that returned a fresh, narrower
+        # context — which is what SSL_CERT_FILE effectively does — fails here,
+        # because the ambient roots live in the object it was handed.
+        assert ctx is spy, (
+            "the builder did not return the default context — the ambient "
+            "roots were replaced, which is SSL_CERT_FILE's bug rebuilt in code")
+        assert spy.loaded == ["/somewhere/pin-proxy/ca.pem"], spy.loaded
+
+        # THE CONTROL, and it is the case that runs on every machine WITHOUT a
+        # pin — including CI, where `cswap_pin` is not importable at all. The
+        # first version of this test had no control and asserted the CA was
+        # always added, so it failed in CI for the correct behaviour: with no
+        # pin there is nothing to add, and adding nothing is right.
+        spy, ctx = build(None)
+        assert ctx is spy, "no pin must still yield the untouched default context"
+        assert spy.loaded == [], (
+            f"nothing to trust, so nothing may be loaded; got {spy.loaded}")
+
+        # AND IT IS BUILT ONCE PER CA STATE, not once per API call. This runs
+        # on the polling path — once per account per usage poll, plus every
+        # profile fetch and policy-limits fetch, and each build loads the
+        # whole system trust store before parsing ours on top.
+        again = oauth._pin_aware_ssl_context()
+        assert again is ctx, (
+            "the second call rebuilt the context, so every polled request "
+            "reloads ~130 system certificates for an answer that cannot have "
+            "changed")
+
+        # AND A REGENERATED CA INVALIDATES IT, which is the only way a cache
+        # here can be wrong: `cswap pin` can mint a new CA at the SAME path,
+        # and a context still trusting the old one fails every call with
+        # exactly the error this helper exists to prevent.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            ca = os.path.join(d, "ca.pem")
+            with open(ca, "w") as fh:
+                fh.write("first")
+            first_spy, first = build(ca)
+            assert first is first_spy, "precondition: the first build is fresh"
+            with open(ca, "w") as fh:
+                fh.write("regenerated")
+            os.utime(ca, (0, 0))
+            second = oauth._pin_aware_ssl_context()
+            assert second is not first, (
+                "a regenerated CA at the same path kept the context built for "
+                "the old one — every call afterwards dies "
+                "CERTIFICATE_VERIFY_FAILED and the cache is the cause")
+
+
 class TestInvalidGrantTaxonomy:
     """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
     parse — top-level error == "invalid_grant" in the JSON body. Substring
@@ -1488,6 +1846,34 @@ class TestConsumeBusyIsDeterministic:
         assert out.error == "consume-busy", out.error
         usage.assert_not_called()
 
+    def test_a_condemned_lineage_does_not_spend_a_doomed_request_either(self):
+        """The consume-gate path's own refusal (`condemned=` returning True,
+        via `consume_backup_grant` as `refresh_via`) must reach the store as
+        `foreign-lineage`, not the generic `refresh-failed` a fallthrough-then-
+        401-then-retry would produce, and must not re-enter the gate a second
+        time to learn the same thing."""
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        calls = []
+
+        def refusing_gate(*a):
+            calls.append(a)
+            return oauth.RefreshOutcome(None, "foreign-lineage")
+
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=refusing_gate,
+            )
+        assert out.error == "foreign-lineage", out.error
+        usage.assert_not_called()          # no doomed GET with the dead token
+        assert len(calls) == 1             # no second gate round
+
     def test_every_deterministic_kind_has_a_note(self):
         """The reason these kinds stay distinct is the note they carry.
 
@@ -1502,6 +1888,399 @@ class TestConsumeBusyIsDeterministic:
             k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
         ]
         assert not missing, missing
+
+
+# OPTS OUT OF #216's AUTOUSE `block_real_oauth_profile_fetch`, which replaces
+# `fetch_oauth_profile` with a stub so dozens of unrelated tests do not open
+# real 5s HTTPS connections through add_account's identity guard. This class
+# mocks `urlopen` BENEATH that function and asserts the call reaches it, so a
+# stub above makes the assertion unreachable — "fetch_oauth_profile made no
+# request", green on either branch alone and red only on the merged tree.
+#
+# The marker is the escape hatch that fixture's own docstring already names for
+# exactly this shape. Narrowing the fixture instead would trade a hermetic
+# suite for a merge convenience.
+@pytest.mark.no_oauth_profile_fake
+class TestEveryPinRoutedCallCarriesThePinAwareContext:
+    """The helper existing is not the helper being USED.
+
+    `_pin_aware_ssl_context` is covered by a test that proves it ADDS rather
+    than replaces. Nothing proved any call site passes it. That is the shape
+    where a fix ships and changes nothing: the builder is correct, the callers
+    still hand urllib the default context, and every request through the pin
+    keeps dying CERTIFICATE_VERIFY_FAILED exactly as before.
+
+    Measured through the pin on all three machines, each with its own
+    interpreter and its port read from `cswap pin --get_port`:
+
+        host-b      default FAIL -> +pin CA HTTP 429
+        host-c  default FAIL -> +pin CA HTTP 429
+        host-a-docker      default FAIL -> +pin CA HTTP 429
+
+    So every one of these calls needs the context, not just the usage poll
+    that happened to be noticed first.
+
+    THE SENTINEL IS THE POINT. Asserting `context is not None` would pass on a
+    site that built its own bare `ssl.create_default_context()` — which is the
+    unfixed behaviour wearing the right shape. Identity against the sentinel
+    is the only assertion that separates them.
+    """
+
+    SENTINEL = object()
+
+    def _capture(self, monkeypatch):
+        """Record the kwargs of every urlopen this module makes."""
+        seen = []
+
+        class _Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+            def read(self_inner):
+                return b"{}"
+
+        def _fake_urlopen(req, **kwargs):
+            seen.append(kwargs)
+            return _Resp()
+
+        monkeypatch.setattr(oauth, "_pin_aware_ssl_context",
+                            lambda: self.SENTINEL)
+        monkeypatch.setattr(oauth.urllib.request, "urlopen", _fake_urlopen)
+        return seen
+
+    def test_the_usage_request_carries_it(self, monkeypatch):
+        """acct7's call. This is the one the failure was measured on."""
+        seen = self._capture(monkeypatch)
+        oauth.request_usage_data("tok")
+        assert seen, "request_usage_data made no request"
+        assert seen[0].get("context") is self.SENTINEL, (
+            "request_usage_data did not pass the pin-aware context — through "
+            "the pin this call cannot verify api.anthropic.com")
+
+    def test_the_profile_request_carries_it(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        oauth.fetch_oauth_profile("tok")
+        assert seen, "fetch_oauth_profile made no request"
+        assert seen[0].get("context") is self.SENTINEL, (
+            "fetch_oauth_profile did not pass the pin-aware context")
+
+    def test_the_token_refresh_needs_no_pin_ca(self):
+        """THE ONE SITE THAT DOES NOT NEED IT, and the docstring used to name
+        it as though it did.
+
+        The helper is only necessary where the pin MITMs the host. It MITMs
+        `UPSTREAM_HOST` and blind-tunnels everything else, so a call to a
+        different host is verified against the REAL certificate by an ordinary
+        default context. Adding ours there would buy nothing and reload the
+        system CA store on every refresh.
+
+        Pinned as a test rather than a comment because it is a relationship
+        between two packages: the day the pin starts MITMing more than one
+        host, this fails and the refresh call needs the context.
+        """
+        from urllib.parse import urlparse
+
+        mitm = None
+        try:
+            from cswap_pin.proxy import UPSTREAM_HOST as mitm
+        except Exception:  # noqa: BLE001 — optional extra, nothing to check
+            pytest.skip("cswap-pin is not installed")
+
+        assert urlparse(oauth.OAUTH_TOKEN_URL).hostname != mitm, (
+            f"the token endpoint is on {mitm}, which the pin re-signs — that "
+            "call now needs `_pin_aware_ssl_context()` like the other three, "
+            "and without it every refresh dies CERTIFICATE_VERIFY_FAILED and "
+            "is reported as a transient network blip")
+        assert urlparse(oauth._POLICY_LIMITS_URL).hostname == mitm, (
+            "the scan is broken: if the policy-limits endpoint is not on the MITM'd "
+            "host either, this case proves nothing about the split")
+
+
+class TestTheSslContextCacheHasACeiling:
+    """It kept one full trust store per CA REGENERATION, forever.
+
+    Keyed on the CA file's path and mtime, so a re-pin — which regenerates the
+    CA — inserted a new entry while the old `SSLContext`, holding a parsed copy
+    of the system roots (~130 of them), stayed referenced. In `cswap tui`, the
+    menu-bar app or a long-running `cswap auto`, repeated re-pins grew it
+    monotonically. "Bounded by construction: a machine has one pin CA" held
+    only until the CA changed, which is precisely what a re-pin does.
+    """
+
+    def test_a_hundred_regenerations_leave_one_context(self, monkeypatch):
+        from claude_swap import oauth
+
+        oauth._PIN_CTX_SLOT = None
+        made = []
+
+        # A CONTEXT THAT ACCEPTS THE CA, because the fingerprint below says
+        # there is one. A bare `object()` made `load_verify_locations` an
+        # AttributeError, so this walked the no-CA path while claiming to
+        # regenerate a CA a hundred times.
+        class _Ctx:
+            def load_verify_locations(self, cafile=None):
+                pass
+
+        monkeypatch.setattr(
+            oauth.ssl, "create_default_context",
+            lambda *a, **k: made.append(1) or _Ctx())
+        # Each "regeneration" is a new mtime on the same path, which is what
+        # the key is built from.
+        for i in range(100):
+            monkeypatch.setattr(
+                oauth, "_pin_ca_fingerprint", lambda i=i: ("/p/ca.pem", i))
+            oauth._pin_aware_ssl_context()
+
+        held = 0 if oauth._PIN_CTX_SLOT is None else 1
+        assert held == 1, (
+            f"the cache holds {held} contexts after 100 CA regenerations; each "
+            "carries a parsed copy of the system trust store")
+        # CONTROL: it must still be CACHING. A slot that holds one because it
+        # rebuilds every call passes the assertion above and defeats the point.
+        before = len(made)
+        oauth._pin_aware_ssl_context()
+        assert len(made) == before, (
+            "a repeat call with an unchanged CA built a new context, so the "
+            "single slot is not caching at all")
+        oauth._PIN_CTX_SLOT = None
+
+
+@pytest.mark.no_policy_limits_fake
+class TestThePolicyFetchActuallyCarriesItsBudget:
+    """THE ONLY LINE THAT DELIVERS THE BUDGET HAD NO WITNESS.
+
+    `_perform_switch` blocks on this fetch between writing the credential and
+    writing `activeAccountNumber`, so the timeout bounds a window where the
+    two disagree. The seam and the call site are both tested -- but reverting
+    `timeout=timeout_s` to a literal left the whole suite byte-identical,
+    because those tests spy on `fetch_policy_limits` itself and never on what
+    it hands `urlopen`. A seam that passes 2.0 to a function that ignores it
+    is a budget in name only.
+    """
+
+    def _run(self, monkeypatch, timeout_s):
+        import claude_swap.oauth as oauth
+
+        seen = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def _fake_urlopen(req, timeout=None, **_kw):
+            seen["timeout"] = timeout
+            return _Resp()
+
+        monkeypatch.setattr(oauth.urllib.request, "urlopen", _fake_urlopen)
+        monkeypatch.setattr(oauth, "_pin_aware_ssl_context", lambda: None)
+        oauth.fetch_policy_limits("tok", timeout_s=timeout_s)
+        return seen
+
+    def test_the_caller_s_budget_reaches_urlopen(self, monkeypatch):
+        assert self._run(monkeypatch, 0.25)["timeout"] == 0.25, (
+            "the request went out on some other deadline, so the switch can "
+            "block for longer than the budget it was given")
+
+    def test_a_second_value_proves_it_is_not_hardcoded(self, monkeypatch):
+        """THE CONTROL. One value can be matched by a literal that happens to
+        agree; two cannot."""
+        assert self._run(monkeypatch, 3.5)["timeout"] == 3.5
+
+
+class TestAFailedCaLoadIsNotCached:
+    """A transient failure must not outlive itself.
+
+    The cache is keyed on the CA file's path and mtime, and neither moves
+    because a load failed. So caching the fallback context under that key
+    freezes it for the life of the process: every later profile fetch, usage
+    poll and policy-limits fetch goes out on a context that does not trust the
+    pin's CA, dies CERTIFICATE_VERIFY_FAILED, and is swallowed to debug --
+    which is the silent hours this helper exists to end.
+    """
+
+    def _spy_ctx(self, monkeypatch, oauth, ca, fail_load=False, second_ca=...):
+        loaded = []
+
+        class _Ctx:
+            def load_verify_locations(self, cafile=None):
+                if fail_load and not loaded:
+                    loaded.append(None)
+                    raise OSError("CA momentarily unreadable")
+                loaded.append(cafile)
+
+        monkeypatch.setattr(oauth.ssl, "create_default_context", _Ctx)
+        return loaded
+
+    def test_a_transient_load_failure_is_retried(self, tmp_path, monkeypatch):
+        from claude_swap import oauth, pin
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("cert", encoding="utf-8")
+        monkeypatch.setattr(oauth, "_PIN_CTX_SLOT", None)
+        monkeypatch.setattr(pin, "ca_path_for_trust", lambda: ca)
+        loaded = self._spy_ctx(monkeypatch, oauth, ca, fail_load=True)
+
+        oauth._pin_aware_ssl_context()
+        assert loaded == [None], f"the failure did not happen: {loaded}"
+        oauth._pin_aware_ssl_context()
+        assert loaded == [None, str(ca)], (
+            "the context built WITHOUT the pin CA was cached under the CA's "
+            "own path+mtime, so nothing can ever rebuild it: every later "
+            f"request dies CERTIFICATE_VERIFY_FAILED. {loaded}")
+
+    def test_the_ca_is_read_once_per_rebuild(self, tmp_path, monkeypatch):
+        """The key and the file loaded must come from ONE read.
+
+        `ca_path_for_trust` collapses every failure inside the optional
+        package to None, so asking it twice lets the two answers disagree: a
+        None on the second read caches a context with no CA under a key that
+        says one was there, and the key cannot move on its own.
+        """
+        from claude_swap import oauth, pin
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("cert", encoding="utf-8")
+        asked = []
+        monkeypatch.setattr(oauth, "_PIN_CTX_SLOT", None)
+        monkeypatch.setattr(pin, "ca_path_for_trust",
+                            lambda: asked.append(1) or ca)
+        self._spy_ctx(monkeypatch, oauth, ca)
+
+        oauth._pin_aware_ssl_context()
+        assert asked == [1], (
+            f"the CA was read {len(asked)} times to build one context, so the "
+            "key and the file loaded are two separate answers that can "
+            "disagree")
+
+
+class TestDaemonSslContext:
+    """In the pin daemon the egress is a re-signing hop, so the pin's own
+    `_verifying_context` decides what is trusted; everywhere else the
+    roots-plus-ca.pem context is unchanged."""
+
+    DAEMON = "cswap_pin.proxy"
+
+    @pytest.fixture(autouse=True)
+    def _fresh_slot(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr(oauth, "_PIN_CTX_SLOT", None)
+        monkeypatch.setattr(pin, "ca_path_for_trust", lambda: None)
+
+    def _as_main(self, monkeypatch, spec_name, impl):
+        import sys
+        import types
+
+        from claude_swap import pin
+
+        spec = None if spec_name is None else types.SimpleNamespace(name=spec_name)
+        monkeypatch.setitem(sys.modules, "__main__",
+                            types.SimpleNamespace(__spec__=spec))
+        monkeypatch.setattr(pin, "_live_impl", lambda: impl)
+
+    @staticmethod
+    def _impl(verifying):
+        import types
+
+        return types.SimpleNamespace(_DAEMON_MODULE_NAMES=("cswap_pin.proxy",),
+                                     _verifying_context=verifying)
+
+    def test_a_non_daemon_main_keeps_the_cached_pin_context(self, monkeypatch):
+        from claude_swap import pin
+
+        sentinel = ssl.create_default_context()
+        self._as_main(monkeypatch, "claude_swap.__main__",
+                      self._impl(lambda: sentinel))
+
+        assert pin.daemon_ssl_context() is None
+        first = oauth._pin_aware_ssl_context()
+        assert first is not sentinel
+        assert oauth._pin_aware_ssl_context() is first
+
+    def test_the_daemon_gets_the_pins_verifying_context(self, monkeypatch):
+        from claude_swap import pin
+
+        sentinel = ssl.create_default_context()
+        self._as_main(monkeypatch, self.DAEMON, self._impl(lambda: sentinel))
+
+        assert pin.daemon_ssl_context() is sentinel
+        assert oauth._pin_aware_ssl_context() is sentinel
+        assert oauth._PIN_CTX_SLOT is None, (
+            "the daemon context went into the slot keyed on the pin CA alone")
+
+    @pytest.mark.parametrize("case", [
+        "no-spec", "no-impl", "no-names", "no-verifying", "raises"])
+    def test_anything_missing_or_raising_falls_back(self, monkeypatch, case):
+        import types
+
+        from claude_swap import pin
+
+        def boom():
+            raise RuntimeError("pin refactored")
+
+        impl = {
+            "no-impl": None,
+            "no-names": types.SimpleNamespace(_verifying_context=boom),
+            "no-verifying": types.SimpleNamespace(
+                _DAEMON_MODULE_NAMES=(self.DAEMON,)),
+        }.get(case, self._impl(boom))
+        self._as_main(monkeypatch, None if case == "no-spec" else self.DAEMON, impl)
+
+        assert pin.daemon_ssl_context() is None
+        ctx = oauth._pin_aware_ssl_context()
+        assert isinstance(ctx, ssl.SSLContext)
+        assert oauth._pin_aware_ssl_context() is ctx
+
+    def test_a_pin_that_asks_the_host_back_does_not_recurse(self, monkeypatch):
+        """cswap-pin 0.1.309 and 0.1.310 answer `_verifying_context` with the
+        host's own `_pin_aware_ssl_context`, which would be this same call."""
+        asked = []
+
+        def asks_the_host():
+            asked.append(1)
+            return oauth._pin_aware_ssl_context()
+
+        self._as_main(monkeypatch, self.DAEMON, self._impl(asks_the_host))
+
+        ctx = oauth._pin_aware_ssl_context()
+        assert asked == [1], f"the impl was entered {len(asked)} times"
+        assert isinstance(ctx, ssl.SSLContext)
+
+    def test_the_re_entry_guard_is_per_thread(self, monkeypatch):
+        """`_verifying_context` builds a context in milliseconds, so a second
+        `_run_usage_fetches` pool thread arriving meanwhile must not see the
+        first one's guard and fall back to a context that fails `tls-cert`."""
+        import threading
+
+        sentinel = ssl.create_default_context()
+        meet = threading.Barrier(2, timeout=5)
+
+        def verifying():
+            meet.wait()
+            return sentinel
+
+        self._as_main(monkeypatch, self.DAEMON, self._impl(verifying))
+        got = []
+        threads = [threading.Thread(
+            target=lambda: got.append(oauth._pin_aware_ssl_context()))
+            for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+
+        assert [c is sentinel for c in got] == [True, True], (
+            "a concurrent caller was refused the daemon context because "
+            "another thread was inside `_verifying_context`")
 
 
 class TestLoginExpiresAtIso:

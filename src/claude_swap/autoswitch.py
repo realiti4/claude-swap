@@ -1854,7 +1854,7 @@ class AutoSwitchEngine:
                       departure baseline never fires for an account that had
                       nothing to improve on. The `+SPENT_HEADROOM_PCT` on top
                       of the bare ratio is what the bare ratio misses:
-                      measured on this branch's own flap fleet (peer frozen
+                      measured on a live rotation (peer frozen
                       4.0 pts, active burning 98.0% -> 98.4%), it flips
                       true at active=1.8 pts purely because the active kept
                       burning; the same walk with the margin added stays
