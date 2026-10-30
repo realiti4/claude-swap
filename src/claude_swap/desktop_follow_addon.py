@@ -7,7 +7,7 @@ everything else (profile, usage, OAuth, Remote Control) keeps the app's login.
 This is the Windows stand-in for cswap-pin's ``pin.desktopFollows``, which needs
 POSIX file locks and FIFOs.
 
-    mitmdump -p 8899 -s follow_active.py
+    mitmdump -p 8899 -s desktop_follow_addon.py
 
 Read-only: it never refreshes or writes a credential. A token that has expired
 is not substituted, so the app's own login keeps working instead of failing.
@@ -74,6 +74,9 @@ def marker_path() -> Path:
 
     Listing the entrypoint there is how the band knows the Code tab bills the
     active account instead of the app's own login."""
+    override = os.environ.get("CSWAP_DESKTOP_FOLLOW_MARKER")
+    if override:
+        return Path(override)
     return Path.home() / ".claude-swap-backup" / "pin-proxy" / "inference-follows"
 
 

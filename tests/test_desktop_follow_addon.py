@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 
 _SPEC = importlib.util.spec_from_file_location(
-    "follow_active",
-    Path(__file__).parent.parent / "contrib" / "desktop-follow" / "follow_active.py",
+    "desktop_follow_addon",
+    Path(__file__).parent.parent / "src" / "claude_swap" / "desktop_follow_addon.py",
 )
 follow_active = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(follow_active)

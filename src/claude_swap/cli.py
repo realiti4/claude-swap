@@ -1226,6 +1226,10 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "desktop-follow":
+        from claude_swap import desktop_follow
+
+        sys.exit(desktop_follow.run(argv[1:]))
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1279,6 +1283,7 @@ Commands:
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
+  %(prog)s desktop-follow --on        Windows: bill Claude Desktop's Code tab to the active account
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 

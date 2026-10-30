@@ -1,40 +1,44 @@
 # desktop-follow (Windows)
 
-Bills Claude Desktop's Code tab to the account `cswap` has active. The stock
-route, cswap-pin's `pin.desktopFollows`, does not run on Windows (POSIX file
-locks and FIFOs), so this uses a small [mitmproxy](https://mitmproxy.org) addon
-instead. Only `/v1/messages` is rewritten; profile, usage, OAuth and Remote
-Control keep the app's own login.
-
-## Setup
+Bills Claude Desktop's Code tab to the account `cswap` has active. The Code tab
+runs its CLI with the app's own login, so `cswap switch` never reaches it.
+cswap-pin re-bills it on macOS and Linux (`cswap pin`), but needs POSIX file
+locks and FIFOs, so it refuses Windows. This is the Windows route.
 
 ```powershell
 uv tool install mitmproxy
-mitmdump -p 8899 -s <path-to>\follow_active.py
+cswap desktop-follow --on
 ```
 
-Run `mitmdump` once so it creates `%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.pem`, then in
-Claude Desktop's Code tab add a local environment with:
+`--on` does what `cswap pin` does:
 
-```
-HTTPS_PROXY=http://127.0.0.1:8899
-NODE_EXTRA_CA_CERTS=C:\Users\<you>\.mitmproxy\mitmproxy-ca-cert.pem
-```
+- starts a [mitmproxy](https://mitmproxy.org) detached on `127.0.0.1:8899` (`--port N` to change it) with its own CA under `~\.claude-swap-backup\desktop-follow`;
+- writes `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` into the `env` block of Claude Code's global config (`~\.claude.json`), so every new session uses it and no Code tab environment is needed. A variable you already set to something else is left alone;
+- registers a Scheduled Task, `cswap-desktop-follow`, that runs `--ensure` every minute: it starts the proxy after logon and restarts it if it dies.
 
-Start a new Code session; running sessions keep their old proxy. Then
-`cswap switch N` moves new requests of that session to account N.
+Start a new Code session afterwards. Running sessions keep their old connection.
 
-While it runs, the addon lists `claude-desktop` in
-`~/.claude-swap-backup/pin-proxy/inference-follows` (the file cswap-pin writes on
-macOS and Linux) and removes it on a clean exit. The swap-meter band reads that
-file to show the active account as billed in desktop sessions. If the proxy is
-killed rather than stopped, delete the file by hand, or the band keeps saying the
-desktop follows the switch.
+| Command | What it does |
+| --- | --- |
+| `cswap desktop-follow --on` | Turn it on (above). |
+| `cswap desktop-follow --off` | Stop the proxy, remove exactly the variables `--on` wrote, delete the task. |
+| `cswap desktop-follow --state` | Print `OK`, `NOT-OK` or `OFF`; detail on stderr. |
+| `cswap desktop-follow --heal` | Restart a dead proxy. If it cannot be restarted, remove the variables so sessions go direct instead of failing, and say so. |
+| `cswap desktop-follow --ensure` | The same, silently. This is what the task runs. |
+
+## What the proxy changes
+
+Only the bearer on `/v1/messages`, swapped for the active account's access token
+from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR`). Profile, usage, OAuth
+and Remote Control keep the app's own login. It never refreshes or writes a
+credential, and a token that has expired is not substituted, so the app's login
+keeps working. While it runs it lists `claude-desktop` in
+`~\.claude-swap-backup\pin-proxy\inference-follows`, which the swap-meter band
+reads to show the right account as billed.
 
 ## Limits
 
-- It reads `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR`) and never
-  refreshes. An expired token is not substituted, so the app's login is used
-  instead. Run `claude` in a terminal on that account to refresh it.
-- While the proxy is down, Code sessions started with the variables set cannot connect.
-- Not covered: Remote Control and Artifacts (they stay on the app's account).
+- The token is only refreshed when a terminal `claude` runs on the active account.
+- Terminal sessions use the proxy too (the variables are global). They get the same token they would have used anyway.
+- Remote Control and Artifacts stay on the app's account.
+- Every session goes through a local proxy that handles your tokens. It listens on loopback only.
