@@ -79,10 +79,32 @@ def test_ensure_gives_the_wiring_up_when_the_proxy_will_not_start(home, monkeypa
 
     monkeypatch.setattr(df, "proxy_alive", lambda port: False)
     monkeypatch.setattr(df, "start_proxy", fail)
+    # One failed restart (a slow start after sleep) keeps the wiring and tries again.
+    for _ in range(df._GIVE_UP_AFTER - 1):
+        assert df.ensure() == "retry"
+        assert json.loads(config.read_text())["env"] == {**wrote, "A": "1"}
+        assert df.load_state()["enabled"] is True
     assert df.ensure() == "healed"
     assert json.loads(config.read_text()) == {"env": {"A": "1"}}
     assert not df.marker_path().exists()
     assert df.load_state()["enabled"] is False
+
+
+def test_ensure_forgets_earlier_failures_once_the_proxy_is_back(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 9, "failures": 3})
+    monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    assert df.ensure() == "ok"
+    assert "failures" not in df.load_state()
+
+
+def test_ensure_stops_a_wedged_proxy_before_starting_another(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 9})
+    order = []
+    monkeypatch.setattr(df, "proxy_alive", lambda port: False)
+    monkeypatch.setattr(df, "stop_proxy", lambda: order.append("stop"))
+    monkeypatch.setattr(df, "start_proxy", lambda port: order.append("start"))
+    assert df.ensure() == "restarted"
+    assert order == ["stop", "start"]
 
 
 def test_state_word(home, monkeypatch):

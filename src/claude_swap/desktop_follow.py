@@ -34,7 +34,10 @@ DEFAULT_PORT = 8899
 TASK_NAME = "cswap-desktop-follow"
 ENTRYPOINT = "claude-desktop"
 LISTEN_HOST = "127.0.0.1"
-_STARTUP_WAIT_S = 15.0
+_STARTUP_WAIT_S = 30.0
+
+# Failed restarts in a row (one a minute) before the wiring is given up.
+_GIVE_UP_AFTER = 5
 
 # Where mitmproxy's CA lives, relative to the state directory.
 _CONFDIR = "mitmproxy"
@@ -279,19 +282,36 @@ def turn_off() -> None:
 def ensure(*, port: int | None = None) -> str:
     """Bring a wanted proxy back; give the wiring up when it cannot be.
 
-    Returns ``"off"`` (not turned on), ``"ok"``, ``"restarted"`` or ``"healed"``
-    (the variables were taken out so sessions go direct). Never raises.
+    Returns ``"off"`` (not turned on), ``"ok"``, ``"restarted"``, ``"retry"``
+    (a restart failed; the next run tries again) or ``"healed"`` (the variables
+    were taken out so sessions go direct). Never raises.
+
+    The machine wakes from sleep with a dead or wedged proxy and a slow start,
+    so a single failed restart is not a reason to give the wiring up: only
+    ``_GIVE_UP_AFTER`` failed runs in a row are.
     """
     state = load_state()
     if not state.get("enabled"):
         return "off"
     port = port or state.get("port") or DEFAULT_PORT
     if proxy_alive(port):
+        if state.get("failures"):
+            state.pop("failures")
+            save_state(state)
         return "ok"
     try:
+        # A proxy that no longer listens may still be running, wedged; kill it first.
+        stop_proxy()
         start_proxy(port)
+        state = load_state()
+        state.pop("failures", None)
+        save_state(state)
         return "restarted"
     except Exception:
+        state["failures"] = int(state.get("failures") or 0) + 1
+        if state["failures"] < _GIVE_UP_AFTER:
+            save_state(state)
+            return "retry"
         wrote = state.get("wrote") if isinstance(state.get("wrote"), dict) else {}
         try:
             if wrote:
@@ -300,6 +320,7 @@ def ensure(*, port: int | None = None) -> str:
             pass
         marker_path().unlink(missing_ok=True)
         state.update(enabled=False, wrote={})
+        state.pop("failures", None)
         save_state(state)
         return "healed"
 

@@ -23,7 +23,7 @@ Start a new Code session afterwards. Running sessions keep their old connection.
 | `cswap desktop-follow --on` | Turn it on (above). |
 | `cswap desktop-follow --off` | Stop the proxy, remove exactly the variables `--on` wrote, delete the task. |
 | `cswap desktop-follow --state` | Print `OK`, `NOT-OK` or `OFF`; detail on stderr. |
-| `cswap desktop-follow --heal` | Restart a dead proxy. If it cannot be restarted, remove the variables so sessions go direct instead of failing, and say so. |
+| `cswap desktop-follow --heal` | Restart a dead or wedged proxy. After five failed restarts in a row (one a minute, so a slow start after sleep is tolerated) remove the variables so sessions go direct instead of failing, and say so. |
 | `cswap desktop-follow --ensure` | The same, silently. This is what the task runs. |
 
 ## What the proxy changes
