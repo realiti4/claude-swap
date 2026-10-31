@@ -88,6 +88,19 @@ def test_settings_round_trip(tmp_path: Path):
     assert loaded == original
 
 
+def test_settings_save_is_atomic(tmp_path: Path, monkeypatch):
+    # The CLI and the running menu bar share this file, and load() reads a
+    # torn write as defaults (auto-switch off), so save() must not truncate
+    # in place.
+    calls = []
+    monkeypatch.setattr(
+        menubar, "atomic_write_text", lambda path, text, **kw: calls.append((path, kw))
+    )
+    path = tmp_path / "menubar_settings.json"
+    menubar.MenuBarSettings(auto_switch_enabled=True).save(path)
+    assert calls == [(path, {"mode": 0o600})]
+
+
 def test_settings_corrupt_file_falls_back_to_defaults(tmp_path: Path):
     path = tmp_path / "menubar_settings.json"
     path.write_text("{ this is not json", encoding="utf-8")

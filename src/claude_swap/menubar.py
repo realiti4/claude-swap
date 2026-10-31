@@ -30,6 +30,7 @@ from pathlib import Path
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -124,9 +125,14 @@ class MenuBarSettings:
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:
-        """Write settings as pretty JSON, creating parent directories."""
+        """Write settings as pretty JSON, creating parent directories.
+
+        Atomic, because the CLI and the running menu bar both write this file
+        and :meth:`load` reads a torn write as all-defaults, which would turn
+        auto-switch off without anyone touching the menu.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        atomic_write_text(path, json.dumps(asdict(self), indent=2), mode=0o600)
 
 
 # ---- pure display helpers (operate on the usage-window dict shape produced by
