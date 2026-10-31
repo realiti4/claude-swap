@@ -1,11 +1,14 @@
 """Optional priority tiers, strict landing, and a complete multi-tick rotation."""
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
+from claude_swap import autoswitch
 from claude_swap.autoswitch import (
+    OVERLOAD_BACKOFF_S,
     NoSwitchEvent,
     SwitchEvent,
     TickOutcome,
@@ -16,7 +19,9 @@ from claude_swap.settings import load_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
 from tests.test_account_policy_cli import PolicyCliBase
-from tests.test_autoswitch import EngineHarness, _entry_for, _iso_at, _usage7
+from tests.test_autoswitch import (
+    EngineHarness, _entry_for, _iso_at, _trace_line, _usage7,
+)
 
 
 def fleet(temp_home, **settings):
@@ -353,7 +358,7 @@ class TestPriorityCli(PolicyCliBase):
         self._main(["priority"])
         out = capsys.readouterr().out
         assert "account-2@example.test" in out and "100" in out
-        assert load_settings(s.backup_dir).strategy == "best"
+        assert load_settings(s.backup_dir).strategy == "consume-first"  # this branch's default
         self._main(["priority", "2", "--unset"])
         assert "priority" not in self._record(s, "2")
         before = s.sequence_file.read_bytes()
@@ -399,3 +404,71 @@ def test_priority_strategy_uses_existing_configurable_cutoffs(tmp_path):
     assert settings.threshold == 85
     assert settings.weekly_threshold == 99.9
 
+
+@pytest.mark.parametrize("active_pct,expected,landed", [
+    # A priority nudge reads an empty ranking as a correct stay.
+    (10, TickOutcome.NO_ACTION, 1),
+    # Over a line but not at the limit: not an escape, so the bar holds.
+    (95, TickOutcome.BLOCKED, 1),
+    # At the limit with nowhere else to go: the bar releases.
+    (100, TickOutcome.SWITCHED, 2),
+])
+def test_an_account_barred_after_an_api_failure_is_not_a_priority_target(
+    temp_home, active_pct, expected, landed
+):
+    """The overload bar is not anti-flap: the API is failing on that account,
+    so the higher tier waits out the bar, and only an escape releases it."""
+    h = fleet(temp_home)
+    h.switcher.set_account_priority("2", 200)
+    h.engine._overload_backoff["2"] = h.clock.now + OVERLOAD_BACKOFF_S
+    values = usage(h, pcts=(active_pct, 10, 90, 90))
+    assert h.tick_with_usage(values) is expected
+    assert h.active_number() == landed
+
+
+def test_a_refused_higher_tier_is_a_stay_not_a_block(temp_home):
+    """The refusal mark bars the account like an overload escape does; a
+    priority nudge that stays because of it is a correct stay, as for
+    consume-first, so cron wrappers keying on BLOCKED do not see a false one."""
+    h = fleet(temp_home)
+    h.switcher.set_account_priority("2", 200)
+    entries = {n: _entry_for(v, h.clock.now) for n, v in usage(h).items()}
+    entries["2"] = replace(entries["2"], refused_until=h.clock.now + 600)
+    assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+    assert h.active_number() == 1
+    reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+    assert reasons == ["account-refused"]
+
+
+def test_an_overloaded_active_is_moved_off_even_when_it_holds_its_rank(
+    temp_home, tmp_path, monkeypatch
+):
+    """The outage escape outranks priority. A 5xx burst on the active, under
+    its lines and with no higher-ranked peer, used to keep its rank: only a
+    strictly higher-ranked target was admitted, and the tick ended as
+    `already-consuming-priority`, which misnames an outage. An overloaded
+    active has no rank to defend, so the best usable peer takes over.
+    (Upstream 80f07866 has no `overloaded` trigger; the dead escape is the
+    merge of that trigger with the priority strategy.)"""
+    trace = tmp_path / "trace.log"
+    trace.write_bytes(b"")  # armed, empty: the first tick's baseline
+    monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+    h = fleet(temp_home)
+    values = usage(h)  # 1 and 2 share a tier; 1 resets sooner, so it holds
+    assert h.tick_with_usage(values) is TickOutcome.NO_ACTION
+    assert h.active_number() == 1
+    trace.write_bytes(b"".join(_trace_line(s) for s in (529, 529, 529, 200, 200)))
+    h.events.clear()
+    assert h.tick_with_usage(values) is TickOutcome.SWITCHED
+    switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+    assert switch.trigger == "overloaded"
+    assert h.active_number() == 2
+
+
+def test_a_disabled_active_holds_no_rank_to_defend(temp_home):
+    """`disabled-active` leaves as `overloaded` does: the disabled slot is
+    outside `switchable_account_numbers()`, so it is not an eligible active."""
+    h = fleet(temp_home)
+    h.switcher.set_account_disabled("1", True)
+    assert h.tick_with_usage(usage(h)) is TickOutcome.SWITCHED
+    assert h.active_number() == 2

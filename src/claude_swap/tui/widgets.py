@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
@@ -124,6 +124,7 @@ def usage_rows(
     rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
     week's expected usage (issue #125) — never the 5h row.
     """
+    last_good = oauth.display_usage(last_good)
     if not isinstance(last_good, dict):
         return []
     rows: list[tuple[str, float, str, str]] = []
@@ -133,7 +134,7 @@ def usage_rows(
         reset, reset_full = _reset_parts(spend, now)
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
-        rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
+        rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
@@ -202,6 +203,8 @@ def account_card_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if acc.usage.plan:
+        text.append(f"  {acc.usage.plan}", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -270,6 +273,19 @@ def account_card_text(
     return text
 
 
+SPEND_LABEL = "$$"
+
+
+def spend_row(rows: list[tuple]) -> tuple | None:
+    """The pay-as-you-go spend row out of :func:`usage_rows`, or ``None``.
+
+    Both compact surfaces render spend, so the label lives here rather than
+    as a literal in each of them — the same reason `data.window_chip_label`
+    exists for a window.
+    """
+    return next((r for r in rows if r[0] == SPEND_LABEL), None)
+
+
 def mini_account_text(
     acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
 ) -> Text:
@@ -288,6 +304,8 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if acc.usage.plan:
+        text.append(f"  {acc.usage.plan}", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
@@ -300,7 +318,7 @@ def mini_account_text(
         text.append(data.sentinel_label(sentinel), style=style)
         return text
 
-    last_good = acc.usage.last_good
+    last_good = oauth.display_usage(acc.usage.last_good)
     fetched_at = acc.usage.fetched_at
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     parts = 0
@@ -312,13 +330,13 @@ def mini_account_text(
         if parts:
             text.append(" · ", style=palette.track)
         color = palette.severity(pct)
-        text.append(f"{label} ", style=palette.muted)
+        # Same chip the auto view's Next-best rows draw, from the same
+        # helper — one account must not read two ways on two screens.
+        text.append(
+            data.window_chip_label(last_good, key, label, now), style=palette.muted
+        )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
-        if pct >= 100:
-            reset = data.reset_text(window, now)
-            if reset:
-                text.append(f" ({reset})", style=palette.muted)
-        elif key == "seven_day":
+        if key == "seven_day":
             result = pace.compute_pace(window, fetched_at=fetched_at)
             if result and result.ahead:
                 text.append(" (ahead)", style=palette.sev_warn)
@@ -333,8 +351,37 @@ def mini_account_text(
             text.append(" · ", style=palette.track)
         text.append(f"{name} (!)", style=palette.sev_crit)
         parts += 1
+    # Spend is a separate axis from a rate-limit window (never enters the
+    # ranking — see oauth.relevant_windows) so it must show whether or not a
+    # 5h/7d window already rendered above, not only as a last-resort fallback
+    # when nothing else was shown; a budget can be 95% spent behind a window
+    # that still reads perfectly healthy. From `usage_rows`, not a third
+    # spelling of the same amounts.
+    rows = usage_rows(last_good, now, fetched_at)
+    spend = spend_row(rows)
+    if spend is not None:
+        if parts:
+            text.append(" · ", style=palette.track)
+        _label, pct, suffix, _full = spend
+        color = palette.severity(pct)
+        text.append("$$ ", style=palette.muted)
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        text.append(f" · {suffix}", style=palette.muted)
+        parts += 1
     if not parts:
-        text.append("usage unknown", style=palette.muted)
+        # Nothing above rendered — an account whose only window is a
+        # per-model (scoped) limit below its cap (the maxed loop only counts
+        # ones at/over 100) still has something to show via the same helper,
+        # rather than reading as no data at all. `rows` has no spend row
+        # here, or `parts` would already be nonzero.
+        if not rows:
+            text.append("usage unknown", style=palette.muted)
+        for i, (label, pct, _suffix, _full) in enumerate(rows):
+            if i:
+                text.append(" · ", style=palette.track)
+            color = palette.severity(pct)
+            text.append(f"{label} ", style=palette.muted)
+            text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
     return text
 
 

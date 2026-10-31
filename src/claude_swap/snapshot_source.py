@@ -15,38 +15,93 @@ from a background thread, never a UI event loop.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 from dataclasses import replace
 
+from claude_swap import macos_keychain
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.paths import get_credentials_path
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
+
+# ponytail: the floor between two store reads of a store-only poll while no
+# tracked stamp has moved. Every read of a macOS store costs `security` execs that
+# endpoint software scans; raise this to cut them, lower it to notice a change the
+# stamps do not track (the live identity in ~/.claude.json, a badge that flips
+# with the clock) sooner.
+STORE_REREAD_S = 30.0
+
+
+def _stat(path) -> tuple | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 class SnapshotSource:
     """Takes one coherent snapshot per call; the store paces the network.
 
-    ``full=True`` (the user's explicit refresh) is accepted for API
-    stability but is no faster than a normal pass: even an explicit refresh
-    is capped by the store's serve TTL and poll plans. ``store_only=True``
-    reads the store without any network eligibility.
+    ``full=True`` (the user's explicit refresh) is no faster than a normal
+    pass: even an explicit refresh is capped by the store's serve TTL and poll
+    plans. It does make a ``store_only`` poll read. ``store_only=True`` reads
+    the store without any network eligibility.
+
+    On macOS a ``store_only`` poll reads the store again only when the
+    keychain stamp, the plaintext credentials file or the state directories
+    have moved since the last read, or ``STORE_REREAD_S`` has passed, or the
+    caller ``invalidate()``d; otherwise it returns the last snapshot, aged to
+    now. Where there is no keychain stamp every poll reads.
     """
 
-    def __init__(self, switcher: ClaudeAccountSwitcher) -> None:
+    def __init__(
+        self, switcher: ClaudeAccountSwitcher, clock=time.time
+    ) -> None:
         self.switcher = switcher
+        self._clock = clock
         self._last: AccountsSnapshot | None = None
+        self._read_stamp: tuple | None = None  # what the last read started under
+        self._read_at = 0.0
         self._lock = threading.Lock()
+
+    def invalidate(self) -> None:
+        """The next ``take`` reads the store, whatever the stamps say."""
+        with self._lock:
+            self._read_stamp = None
+
+    def _stamp(self) -> tuple | None:
+        kc = macos_keychain.keychain_stamp()
+        if kc is None:
+            return None
+        root = self.switcher.backup_dir
+        paths = (get_credentials_path(), root, root / "cache", root / "credentials")
+        return (kc, *map(_stat, paths))
 
     def take(
         self, *, full: bool = False, store_only: bool = False
     ) -> AccountsSnapshot:
         """Blocking snapshot pass; call from a thread worker."""
+        stamp = self._stamp()  # before the read: a write during it moves the next one
+        now = self._clock()
+        with self._lock:
+            if (
+                store_only and not full and stamp is not None
+                and stamp == self._read_stamp and self._last is not None
+                and 0 <= now - self._read_at < STORE_REREAD_S
+            ):
+                return replace(self._last, taken_at=now, accounts=tuple(
+                    replace(acc, usage=_with_current_age(acc.usage, now))
+                    for acc in self._last.accounts
+                ))
         fetch: set[str] | None = set() if store_only else None
         snap = self.switcher.accounts_snapshot(fetch=fetch)
         with self._lock:
             snap = self._reconcile(snap)
-            self._last = snap
+            self._last, self._read_stamp, self._read_at = snap, stamp, now
             return snap
 
     def _reconcile(self, snap: AccountsSnapshot) -> AccountsSnapshot:
@@ -78,6 +133,8 @@ class SnapshotSource:
         if (
             prev.usage.sentinel == USAGE_TOKEN_EXPIRED
             and fetched == prev_fetched
+            and acc.access_token_fp is not None
+            and acc.access_token_fp == prev.access_token_fp
         ):
             return replace(acc, usage=replace(acc.usage, sentinel=USAGE_TOKEN_EXPIRED))
         return acc
