@@ -234,3 +234,47 @@ class TestValidationAtTheWriteBoundary(PolicyCliBase):
         self._fleet(temp_home)
         self._threshold(["2", good])
         assert self._record(ClaudeAccountSwitcher(), "2")["threshold"] == float(good)
+
+
+class TestWeeklyCapVerb(PolicyCliBase):
+    """`cswap threshold <n> <pct> --weekly-cap` sets the cap, `--unset` clears it."""
+
+    def test_set_list_and_clear(self, temp_home: Path, capsys):
+        self._fleet(temp_home)
+        self._threshold(["2", "85"])
+        self._threshold(["2", "90", "--weekly-cap"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert (record["threshold"], record["weeklyCap"]) == (85.0, 90.0)
+        capsys.readouterr()
+        self._threshold([])
+        assert "Weekly caps:\n  Account-2  90%" in capsys.readouterr().out
+        self._threshold(["2", "--weekly-cap", "--unset"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert "weeklyCap" not in record and record["threshold"] == 85.0
+
+    def test_an_existing_threshold_moves_to_a_cap_in_two_commands(
+        self, temp_home: Path, capsys
+    ):
+        """The deploy step for an account that carries only `threshold`."""
+        self._fleet(temp_home)
+        self._threshold(["2", "90"])
+        self._threshold(["2", "90", "--weekly-cap"])
+        self._threshold(["2", "--unset"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert (record.get("threshold"), record["weeklyCap"]) == (None, 90.0)
+        capsys.readouterr()
+        self._threshold([])
+        out = capsys.readouterr().out
+        assert out.endswith("Weekly caps:\n  Account-2  90%\n")
+        assert "No per-account overrides" not in out
+
+    def test_an_out_of_range_cap_exits_nonzero_and_names_the_range(
+        self, temp_home: Path, capsys
+    ):
+        s = self._fleet(temp_home)
+        before = self._bytes(s)
+        with pytest.raises(SystemExit) as exc:
+            self._threshold(["2", "40", "--weekly-cap"])
+        assert exc.value.code != 0
+        assert "between 50 and 100" in capsys.readouterr().err
+        assert self._bytes(s) == before

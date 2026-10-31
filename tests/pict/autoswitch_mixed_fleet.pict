@@ -1,0 +1,10 @@
+# T3167: pairwise model of the percent alternation step on a mixed fleet.
+# Regenerate: pict tests/pict/autoswitch_mixed_fleet.pict /e:tests/pict/autoswitch_mixed_fleet.seed > tests/pict/autoswitch_mixed_fleet.cases
+# The test (tests/test_alternation_mixed_fleet.py) holds every generated row and the
+# decision the rules give it; the seed rows pin the interactions pairwise may skip.
+Plan: max5x, max20x
+FiveHour: running, idle, removed
+SevenDay: low, mid, near_cap, reset_from_full
+Partner: warm, cold
+Context: small, large
+Pinned: none, open, full

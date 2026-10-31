@@ -58,6 +58,27 @@ ACCOUNT_THRESHOLD_MIN = 50.0
 ACCOUNT_THRESHOLD_MAX = 99.9
 
 
+def _normalize_pct(value: object, name: str, lo: float, hi: float) -> float:
+    """The shared range check behind the per-account percentage validators."""
+    range_text = f"must be between {lo:g} and {hi:g}"
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} {range_text}, got {value!r}")
+    if isinstance(value, str):
+        try:
+            pct = float(value.strip())
+        except ValueError:
+            raise ValueError(f"{name} {range_text}, got {value!r}") from None
+    else:
+        pct = float(value)
+    # NaN fails every comparison and infinity passes the lower bound, so both
+    # are rejected by name rather than left to the range test to catch by luck.
+    if math.isnan(pct) or math.isinf(pct):
+        raise ValueError(f"{name} {range_text}, got {value!r}")
+    if not lo <= pct <= hi:
+        raise ValueError(f"{name} {range_text}, got {pct:g}")
+    return pct
+
+
 def normalize_account_threshold(value: object) -> float:
     """Validate a per-account switch-away threshold; raise ValueError if invalid.
 
@@ -83,25 +104,22 @@ def normalize_account_threshold(value: object) -> float:
         ValueError: If the value is not numeric, is NaN or infinite, or falls
             outside the valid range. The message always names the range.
     """
-    range_text = (
-        f"must be between {ACCOUNT_THRESHOLD_MIN:g} and {ACCOUNT_THRESHOLD_MAX:g}"
+    return _normalize_pct(
+        value, "threshold", ACCOUNT_THRESHOLD_MIN, ACCOUNT_THRESHOLD_MAX
     )
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        raise ValueError(f"threshold {range_text}, got {value!r}")
-    if isinstance(value, str):
-        try:
-            pct = float(value.strip())
-        except ValueError:
-            raise ValueError(f"threshold {range_text}, got {value!r}") from None
-    else:
-        pct = float(value)
-    # NaN fails every comparison and infinity passes the lower bound, so both
-    # are rejected by name rather than left to the range test to catch by luck.
-    if math.isnan(pct) or math.isinf(pct):
-        raise ValueError(f"threshold {range_text}, got {value!r}")
-    if not ACCOUNT_THRESHOLD_MIN <= pct <= ACCOUNT_THRESHOLD_MAX:
-        raise ValueError(f"threshold {range_text}, got {pct:g}")
-    return pct
+
+
+#: Per-account weekly cap bounds, in utilization percent of any weekly window.
+#: 100 means "use to exhaustion": the account is never capped.
+ACCOUNT_WEEKLY_CAP_MIN = 50.0
+ACCOUNT_WEEKLY_CAP_MAX = 100.0
+
+
+def normalize_account_weekly_cap(value: object) -> float:
+    """Validate a per-account weekly cap; raise ValueError if invalid."""
+    return _normalize_pct(
+        value, "weekly cap", ACCOUNT_WEEKLY_CAP_MIN, ACCOUNT_WEEKLY_CAP_MAX
+    )
 
 
 ACCOUNT_PRIORITY_MAX = 1000
@@ -139,12 +157,20 @@ class AccountPolicy:
         on one shared account no longer means taxing the whole fleet with a
         global line set to the strictest member's.
 
+    ``weekly_cap``
+        A ceiling on the weekly-resetting windows (7d and per-model), in
+        percent used. Unlike ``threshold`` it is a veto: auto-switch neither
+        stays on nor lands on the account while a weekly window reads at or
+        past it, even when every other account is walled. ``None`` or 100 is
+        no cap. Stored as ``weeklyCap`` in the same record.
+
     Frozen because ``AccountSnapshot`` is frozen — a mutable member would
     silently break that guarantee for the whole row.
     """
 
     threshold: float | None = None
     priority: int = 0
+    weekly_cap: float | None = None
 
 
 class Platform(Enum):
@@ -239,7 +265,10 @@ class AccountSnapshot:
     switchable: bool
     usage: UsageEntry
     alias: str = ""
-    disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # Held out of auto-rotation. Still an explicit `cswap switch` target, but a
+    # RUNNING engine leaves a disabled ACTIVE on its next tick, so the explicit
+    # switch holds only while auto is stopped.
+    disabled: bool = False
     #: Per-account auto-switch overrides. Appended last and defaulted, so every
     #: pre-existing construction site keeps working and yields the default.
     policy: AccountPolicy = AccountPolicy()

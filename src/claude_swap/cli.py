@@ -9,12 +9,14 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
     ACCOUNT_THRESHOLD_MAX,
     ACCOUNT_THRESHOLD_MIN,
+    ACCOUNT_WEEKLY_CAP_MAX,
+    ACCOUNT_WEEKLY_CAP_MIN,
     Platform,
 )
 from claude_swap.printer import (
@@ -181,9 +183,10 @@ Examples:
         "--require-session",
         action="store_true",
         help=(
-            "Refuse to launch when the account is already the active default "
-            "login, instead of running plain claude on that login (which a "
-            "later switch could pull out from under the session)"
+            "Never run plain claude on the default login (which a later "
+            "switch could pull out from under the session): refuse when the "
+            "account is already that login, and when no account is named and "
+            "this directory maps to none"
         ),
     )
     parser.add_argument(
@@ -222,6 +225,18 @@ Examples:
                 require_session=args.require_session,
             )
             return  # only reachable in tests
+        # BOTH FALLBACKS BELOW REACH `exec_default`, which runs plain claude
+        # on the default login with no session profile and no auth-override
+        # scrubbing -- the outcome --require-session exists to refuse. Here
+        # rather than in `run`, which is never called: no account resolved.
+        if args.require_session:
+            raise SessionError(
+                f"--require-session was given but {os.getcwd()} maps to no "
+                "usable account, so this launch would run plain claude on the "
+                "default login rather than in a session profile. Name an "
+                "account (`cswap run <n>`) or map this directory "
+                "(`cswap map <n>`)."
+            )
         if email is not None:
             warning(
                 f"Mapped account {email} no longer exists — "
@@ -608,7 +623,7 @@ Examples:
 
 
 def _threshold_command(argv: list[str]) -> None:
-    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--weekly-cap] [--unset]`.
 
     With no arguments, prints the global `autoswitch.threshold` and every
     per-account override. Otherwise sets (or, with --unset, removes) one
@@ -633,9 +648,12 @@ Examples:
   cswap threshold 2 85
   cswap threshold user@example.com 99.9
   cswap threshold 2 --unset           # back to the global default
-  cswap threshold                     # list the global default and overrides
+  cswap threshold 2 90 --weekly-cap   # never use account 2 past 90% on a weekly window
+  cswap threshold 2 --weekly-cap --unset
+  cswap threshold                     # list the global default, overrides and caps
 
-Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
+Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used);
+{ACCOUNT_WEEKLY_CAP_MIN:g}-{ACCOUNT_WEEKLY_CAP_MAX:g} with --weekly-cap (100 means no cap).
         """,
     )
     parser.add_argument(
@@ -656,6 +674,14 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
     parser.add_argument(
         "--unset", action="store_true", help="Remove the account's override"
     )
+    parser.add_argument(
+        "--weekly-cap",
+        action="store_true",
+        help=(
+            "Set (or --unset) a weekly cap instead: auto-switch never stays on "
+            "or lands on the account while a weekly window reads at or past PCT."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
@@ -674,11 +700,13 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
             _print_threshold_table(switcher)
             return
 
-        switcher.set_account_threshold(
-            args.account, None if args.unset else args.threshold
+        setter = (
+            switcher.set_account_weekly_cap if args.weekly_cap
+            else switcher.set_account_threshold
         )
+        setter(args.account, None if args.unset else args.threshold)
     except ValueError as e:
-        # normalize_account_threshold's message; it always names the range.
+        # The validator's message; it always names the range.
         error(f"Error: {e}")
         sys.exit(1)
     except ClaudeSwitchError as e:
@@ -701,19 +729,27 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
     print(bolded("Switch-away thresholds:"))
     print(f"  {dimmed('global default')}  {default:g}%")
 
-    rows = sorted(
-        (
-            (num, policy.threshold)
-            for num, policy in switcher.account_policies().items()
-            if policy.threshold is not None
-        ),
-        key=lambda row: (not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0),
-    )
-    if not rows:
-        print(dimmed("  No per-account overrides set"))
-        return
-    for num, value in rows:
+    def rows(field: str) -> list[tuple[str, float]]:
+        return sorted(
+            (
+                (num, getattr(policy, field))
+                for num, policy in switcher.account_policies().items()
+                if getattr(policy, field) is not None
+            ),
+            key=lambda row: (
+                not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0
+            ),
+        )
+
+    thresholds, caps = rows("threshold"), rows("weekly_cap")
+    for num, value in thresholds:
         print(f"  Account-{num}  {value:g}%")
+    if not thresholds and not caps:
+        print(dimmed("  No per-account overrides set"))
+    if caps:
+        print(bolded("Weekly caps:"))
+        for num, value in caps:
+            print(f"  Account-{num}  {value:g}%")
 
 
 def _priority_command(argv: list[str]) -> None:
@@ -820,7 +856,10 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Switch when the active account's 5h window (or any window, "
             "without a weekly line) reaches this utilization (50-99.9; "
-            "default 90)"
+            "default 90). Under --strategy dynamic the real switch point is "
+            "fixed near 97%%; this value still decides the --model "
+            "fleet-wide blackout, poll cadence, and the exhausted-fleet "
+            "recovery hold"
         ),
     )
     parser.add_argument(
@@ -863,10 +902,13 @@ Defaults live in settings.json in the backup root; flags override them.
         choices=AUTOSWITCH_STRATEGIES,
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest), or 'priority-consume-first' (highest account "
-            "priority, then soonest weekly reset; only targets below all switch lines)"
+            "resets soonest; default), 'dynamic' (consume-first's ranking "
+            "plus a re-picked model basis and a landing rule that never lands "
+            "on an account with no room on the window in force), or "
+            "'priority-consume-first' (highest account priority, then soonest "
+            "weekly reset; only targets below all switch lines)"
         ),
     )
     parser.add_argument(
@@ -881,7 +923,12 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
+    from claude_swap.autoswitch import (
+        AutoSwitchEngine,
+        AutoSwitchEvent,
+        pct_label,
+        proactive_switch_bar_pct,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -914,12 +961,45 @@ Defaults live in settings.json in the backup root; flags override them.
             dry_run=args.dry_run,
         )
 
+        # ARMED BEFORE THE `--once` BRANCH, not after. SIGTERM (systemd stop,
+        # a cron wrapper's timeout) and SIGINT (the Ctrl-C the loop banner
+        # promises) must be handled wherever `_perform` can run, and `--once`
+        # runs it. KeyboardInterrupt is a BaseException — neither `except
+        # ClaudeSwitchError` nor `except Exception` in `tick()` catches it — so
+        # it propagates out of `_perform` between `switch_to` and the state
+        # write: the account switched, `lastSwitchAt` never recorded, the LIVE
+        # lock still held. The next engine then sees no cooldown and can
+        # switch again immediately.
+        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+
+        def _interrupt(*_):
+            # ESCALATE. `stop()` is idempotent, so a second Ctrl-C hits its
+            # early return and does nothing — leaving a tick wedged in a
+            # network call with no way out but SIGKILL from another terminal,
+            # under a banner that says Ctrl-C stops it. Restoring the default
+            # makes the second signal raise KeyboardInterrupt.
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            engine.stop()
+
+        signal.signal(signal.SIGINT, _interrupt)
+
         if args.once:
             sys.exit(engine.tick().value)
 
-        # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
-        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            switch_bar = proactive_switch_bar_pct(
+                settings.strategy, settings.threshold
+            )
+            # The lead prints only the bar in force: `threshold <n>%` when
+            # the configured threshold IS that bar (`switch_bar ==
+            # settings.threshold`), else just `switch at <bar>%`.
+            show_threshold = switch_bar == settings.threshold
+            parts = []
+            if show_threshold:
+                parts.append(f"threshold {pct_label(settings.threshold)}%")
+            if switch_bar != settings.threshold:
+                parts.append(f"switch at {pct_label(switch_bar)}%")
+            lead = ", ".join(parts)
             weekly = (
                 f", weekly {pct_label(settings.weekly_threshold)}%"
                 if settings.weekly_threshold is not None
@@ -927,9 +1007,14 @@ Defaults live in settings.json in the backup root; flags override them.
             )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
-                    f"{weekly}, every {settings.interval_seconds:.0f}s"
-                    f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
+                    f"Auto-switch running: {lead}{weekly}, "
+                    f"every {settings.interval_seconds:.0f}s"
+                    # THE ENGINE, NOT THE REQUEST. A demoted engine has
+                    # `dry_run` True while `args.dry_run` is False, and this
+                    # line then announces switching to somebody watching a
+                    # process that will switch nothing. `tui/autoview.py`
+                    # already reads it this way.
+                    f"{' (dry-run)' if engine.dry_run else ''} — Ctrl-C to stop"
                 )
             )
         sys.exit(engine.run_loop())
@@ -1275,7 +1360,7 @@ Commands:
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)
-  %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
+  %(prog)s tui [--auto]               interactive dashboard (--auto: auto-switch view, LIVE)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
@@ -1493,6 +1578,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    # `cswap tui --auto`: open on the auto-switch view with the engine LIVE.
+    # The explicit flag is the consent the interactive path collects via the
+    # go-live modal. Not in the mutually-exclusive group — it modifies --tui.
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        dest="tui_auto",
+        help=argparse.SUPPRESS,
+    )
     group.add_argument(
         "--menubar",
         action="store_true",
@@ -1540,6 +1634,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
+
+    # Only the tui branch consults it, so anywhere else it parsed cleanly and
+    # did nothing — `cswap watch --auto` opened the watch page in silence.
+    if args.tui_auto and not args.tui:
+        parser.error("--auto can only be used with 'tui'")
 
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")
@@ -1656,13 +1755,17 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
+                manual_source="cli",
             )
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                manual_source="cli",
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)
@@ -1683,7 +1786,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher))
+            sys.exit(tui_run(
+                switcher, start="auto" if args.tui_auto else "dashboard"
+            ))
         elif args.watch:
             from claude_swap.tui import run as tui_run
 

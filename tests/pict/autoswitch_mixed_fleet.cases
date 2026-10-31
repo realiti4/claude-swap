@@ -1,0 +1,15 @@
+Plan	FiveHour	SevenDay	Partner	Context	Pinned
+max5x	running	mid	cold	large	none
+max5x	removed	mid	cold	large	open
+max5x	idle	mid	warm	large	none
+max20x	running	near_cap	warm	small	full
+max20x	idle	mid	cold	small	full
+max20x	removed	reset_from_full	warm	small	open
+max5x	running	reset_from_full	cold	large	full
+max5x	idle	reset_from_full	warm	small	none
+max20x	removed	low	cold	large	none
+max5x	idle	low	warm	small	open
+max5x	removed	near_cap	cold	large	open
+max5x	idle	near_cap	warm	large	none
+max5x	removed	low	cold	large	full
+max20x	running	low	cold	small	open

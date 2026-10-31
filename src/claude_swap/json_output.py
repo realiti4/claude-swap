@@ -345,6 +345,8 @@ def account_row(
     # byte-identical to those from before this feature existed.
     if policy.threshold is not None:
         row["threshold"] = policy.threshold
+    if policy.weekly_cap is not None:
+        row["weeklyCap"] = policy.weekly_cap
     # Additive field: when the stored login records the expiry of its refresh
     # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
     # ``relogin_required`` that follows; absent when the login carries none.
