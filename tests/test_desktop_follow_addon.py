@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,23 @@ def test_rewrites_inference_bearer(creds):
     headers = {"authorization": "Bearer app-tok"}
     assert follow_active.rewrite("api.anthropic.com", "/v1/messages?beta=1", headers)
     assert headers["authorization"] == "Bearer active-tok"
+
+
+def test_log_line_has_a_timestamp_the_account_and_no_token(creds, tmp_path, capsys):
+    creds(token="secret-tok")
+    follow_active._EMAIL.update(mtime=None, email=None)
+    (tmp_path / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "me@example.com"}}))
+    follow_active.rewrite("api.anthropic.com", "/v1/messages", {"authorization": "Bearer app-tok"})
+    line = capsys.readouterr().out.strip()
+    assert re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d cswap: bearer swapped to me@example\.com \(token [0-9a-f]{8}\)$", line)
+    assert "secret-tok" not in line
+
+
+def test_log_line_names_an_unreadable_account(creds, capsys):
+    creds()
+    follow_active._EMAIL.update(mtime=None, email=None)
+    follow_active.rewrite("api.anthropic.com", "/v1/messages", {"authorization": "Bearer app-tok"})
+    assert "unknown account" in capsys.readouterr().out
 
 
 def test_leaves_other_routes_and_hosts(creds):

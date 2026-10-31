@@ -36,6 +36,8 @@ keeps working. While it runs it lists `claude-desktop` in
 `~\.claude-swap-backup\pin-proxy\inference-follows`, which the swap-meter band
 reads to show the right account as billed.
 
+The proxy log (`~\.claude-swap-backup\desktop-follow\proxy.log`) gets one line per billed request: `2026-10-31 17:45:12 cswap: bearer swapped to you@example.com (token cab1caac)`. Count the lines per account and time window to see which account the Code tab used.
+
 ## Limits
 
 - The token is only refreshed when a terminal `claude` runs on the active account.

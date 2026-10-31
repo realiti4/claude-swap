@@ -24,11 +24,32 @@ from pathlib import Path
 REWRITE_PREFIX = "/v1/messages"
 API_HOST = "api.anthropic.com"
 _CACHE: dict = {"mtime": None, "token": None}
+_EMAIL: dict = {"mtime": None, "email": None}
 
 
 def credentials_path() -> Path:
     base = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
     return Path(base) / ".credentials.json"
+
+
+def config_path() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base) / ".claude.json" if base else Path.home() / ".claude.json"
+
+
+def active_email(path: Path | None = None) -> str | None:
+    """The email of the account cswap made active, for the log; None when unreadable."""
+    path = path or config_path()
+    try:
+        mtime = path.stat().st_mtime_ns
+        if _EMAIL["mtime"] != mtime:
+            account = json.loads(path.read_text(encoding="utf-8")).get("oauthAccount") or {}
+            _EMAIL["mtime"] = mtime
+            _EMAIL["email"] = account.get("emailAddress")
+    except (OSError, ValueError, AttributeError):
+        return None
+    email = _EMAIL["email"]
+    return email if isinstance(email, str) and email else None
 
 
 def active_token(path: Path | None = None, now_ms: float | None = None) -> str | None:
@@ -61,8 +82,11 @@ def rewrite(host: str, path: str, headers) -> bool:
     if token is None or headers["authorization"] == f"Bearer {token}":
         return False
     headers["authorization"] = f"Bearer {token}"
-    # A short hash, so a switch is visible in the log without exposing the token.
-    print(f"cswap: bearer swapped to token {hashlib.sha256(token.encode()).hexdigest()[:8]}", flush=True)
+    # The account and a short token hash, so each billed request and each switch is visible in the
+    # log without exposing the token.
+    digest = hashlib.sha256(token.encode()).hexdigest()[:8]
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{stamp} cswap: bearer swapped to {active_email() or 'unknown account'} (token {digest})", flush=True)
     return True
 
 
