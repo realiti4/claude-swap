@@ -168,12 +168,16 @@ def start_proxy(port: int) -> None:
         return
     state_dir().mkdir(parents=True, exist_ok=True)
     flags = 0
+    extra: dict = {}
     if sys.platform == "win32":
-        flags = (
-            subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.CREATE_NO_WINDOW
-        )
+        # Not DETACHED_PROCESS: it makes Windows ignore CREATE_NO_WINDOW, and
+        # the mitmdump launcher then starts python.exe in a visible console of
+        # its own. A hidden console that the children inherit keeps them hidden.
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = subprocess.SW_HIDE
+        extra["startupinfo"] = startup
     with open(state_dir() / "proxy.log", "ab") as log:
         proc = subprocess.Popen(
             proxy_command(find_mitmdump(), port),
@@ -183,6 +187,7 @@ def start_proxy(port: int) -> None:
             env={**os.environ, "CSWAP_DESKTOP_FOLLOW_MARKER": str(marker_path())},
             creationflags=flags,
             close_fds=True,
+            **extra,
         )
     state = load_state()
     state["pid"] = proc.pid

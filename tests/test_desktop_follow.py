@@ -116,6 +116,37 @@ def test_task_runs_windowless_and_every_minute(monkeypatch):
     assert "desktop-follow --ensure" in cmd[cmd.index("/TR") + 1]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process flags")
+def test_proxy_starts_without_a_console_window(home, monkeypatch):
+    # DETACHED_PROCESS makes Windows ignore CREATE_NO_WINDOW, and the mitmdump
+    # launcher then opens a visible console for its python child.
+    seen = {}
+
+    class Proc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def popen(cmd, **kw):
+        seen.update(kw)
+        return Proc()
+
+    answers = iter([False, True])
+    monkeypatch.setattr(df.subprocess, "Popen", popen)
+    monkeypatch.setattr(df, "find_mitmdump", lambda: "mitmdump")
+    monkeypatch.setattr(df, "proxy_alive", lambda port: next(answers))
+    ca = home[0] / "ca.pem"
+    ca.parent.mkdir(parents=True, exist_ok=True)
+    ca.write_text("x")
+    monkeypatch.setattr(df, "ca_path", lambda: ca)
+    df.start_proxy(8899)
+    flags = seen["creationflags"]
+    assert flags & df.subprocess.CREATE_NO_WINDOW
+    assert not flags & df.subprocess.DETACHED_PROCESS
+    assert seen["startupinfo"].wShowWindow == df.subprocess.SW_HIDE
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="the refusal is for other platforms")
 def test_other_platforms_are_pointed_at_pin(capsys):
     assert df.run(["--state"]) == 1
