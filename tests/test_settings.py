@@ -16,6 +16,7 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    HistorySettings,
     RunSettings,
     UiSettings,
     UpdateSettings,
@@ -221,6 +222,7 @@ class TestSettingSpecs:
             "ui": UiSettings(),
             "run": RunSettings(),
             "updates": UpdateSettings(),
+            "history": HistorySettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
