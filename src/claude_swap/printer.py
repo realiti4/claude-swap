@@ -64,11 +64,19 @@ def _enable_windows_vt() -> bool:
         return False
 
 
+# stdout's encoding as the environment set it, before force_utf8_output
+# replaced it: what the terminal itself was set up to show. None until then.
+_native_stdout_encoding: str | None = None
+
+
 def force_utf8_output() -> None:
     """Make stdout/stderr encode UTF-8 so ● → ├ ─ └ don't crash on a legacy
     console (cp1252 on Windows, or an ASCII/C locale). errors="replace" keeps
     output flowing on any stream that still can't render a glyph. No-op where
     the stream can't be reconfigured (replaced/captured streams in tests)."""
+    global _native_stdout_encoding
+    if _native_stdout_encoding is None:
+        _native_stdout_encoding = getattr(sys.stdout, "encoding", None) or ""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:
@@ -77,6 +85,25 @@ def force_utf8_output() -> None:
             reconfigure(encoding="utf-8", errors="replace")
         except (ValueError, OSError):
             pass
+
+
+def stdout_can_show(sample: str) -> bool:
+    """Whether stdout's own encoding -- the one the environment chose, not the
+    UTF-8 that force_utf8_output() swaps in -- can encode ``sample``.
+
+    The swap keeps output from crashing, but a C/POSIX locale or a legacy code
+    page still means the terminal draws replacement marks for anything
+    outside it, so views that draw with box or braille characters ask this
+    first and fall back to ASCII.
+    """
+    encoding = _native_stdout_encoding
+    if encoding is None:
+        encoding = getattr(sys.stdout, "encoding", None) or ""
+    try:
+        sample.encode(encoding or "ascii")
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
 
 
 def _detect_color_support() -> bool:

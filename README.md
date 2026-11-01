@@ -173,6 +173,59 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
+### Usage history
+
+cswap keeps a history of the usage readings it fetches, so it can show where your weekly limits are heading:
+
+```bash
+cswap history                 # weekly room left: the last 7 days and the week ahead
+cswap history --days 30       # look further back
+cswap history --json          # the same numbers for scripts
+cswap history --demo          # made-up data for 15 accounts, to see the view before yours builds up
+```
+
+```text
+Weekly room left                                               last 7 days → next 7 days
+7.7 of 15 accounts' worth left
+2.5 more comes back in the next 24 hours as #7, #15 and #4 reset. 1 account has no
+recent reading, so it isn't counted.
+
+                                     now  ahead →
+ 15┤                                     ⠅                                ⢀ ⡀⢀
+   │                                     ⠅                   ⢀ ⡀⢀ ⡀⢀ ⡀⢀ ⡀⠄⠂
+   │                                     ⠅              ⠐ ⠂⠐ ⠂
+   │                                     ⠅    ⡀⢀ ⡀⢀ ⡀⢀⠠⠁⠈
+ 10┤  ⢀⣀⣀⡰⠤⣀⡀        ⢠⣀ ⢀⣀⢀⠦⠤⠤⡀          ⠅ ⣄⠠ ⣄
+   │⠑⠢⡜⢕⢕⠁⢕⢕⠈⠉⠑⢄  ⢠⠤⠋⠃⢕⠓⠊⢕⠉⢕⢕⢕⠈⠢⡀      ⢠⢄⡀⢀⡧⣉ ⡃⠉ ⠢⢄⡀    ⢠⡀⣀
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠑⠜⠃⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠈⠑⠒⠢⣠⡰⢄⡎⠅⠹⡳⡇⡀ ⠏⠂   ⠈ ⠢⠴⠂⠙  ⠉⠒⠘⠒⢄⢀           ⡖  6h 6.7
+  5┤⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠁⠁⢕⢕⠅⠅⠈⡇⢱ ⡀ ⠈⠢⢄              ⠉⠒⠄⢀     ⡦⢄⠃
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅   ⠁⠗    ⠁⠠⡀ ⡀  ⡀          ⠉⠑⠂⢀⡦⠄
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅     ⠑⡄    ⠈⠚⠈⠺⠐⠏ ⣀⢀            ⡀ ⡄⢄ 24h 2.6
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅      ⠘            ⠉⠁⢸⠂⢀⡀       ⣏ ⣧
+  0┤⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅       ⠈⢆⣀ ⣀⣰⡗⢸⠆⠷⡀⢀⣸⣀⣰⢄⣀⣈⢆⣀⣀⣀⣀⣀⡗⡇⠱⡄⠁ 30m 0.56
+   └────────┴─────────┴──────────┴──────┼──┴──────────┴─────────┴──────────┴──
+         Oct 29    Oct 31      Nov 2     Nov 4      Nov 6     Nov 8     Nov 10
+  ── room left   ╌╌ 30m  ╌╌ 6h  ╌╌ 24h  pace   ┈┈ if no more use
+
+  Pace                       A day    More accounts  Next 7 days at that pace
+  ╌ Last 30 minutes            5.8     +27 accounts  Runs out Thu Nov 5, 5:52 AM
+  ╌ Last 6 hours               1.5  0 (sustainable)  Lowest 3.9, Mon Nov 9, 2:00 PM
+  ╌ Last 24 hours              2.9      +7 accounts  Runs out Sun Nov 8, 2:30 PM
+    Sustainable (14 accounts)  2.0                0  Faster than this runs out sooner or
+                                                     later
+  A day = accounts' worth of weekly limit used a day. More accounts = how many more than
+  are counted now it would take to keep up with that pace for good (pace x 7 days, less
+  the accounts counted).
+  Assumes cswap auto keeps its best strategy: use stays on one account until its week is
+  used up, then moves to the one with the most room.
+```
+
+- **Room** is in accounts' worth: 1.0 is one account's whole 7-day limit, so 15 accounts at 40% used have 9.0 left. It counts the accounts auto-switch can rotate onto (not disabled, and with a weekly limit, so not API keys) while their reading is less than 7 hours old.
+- **Dashed lines** show the room ahead if use carries on at the pace of the last 30 minutes, 6 hours or 24 hours, moving between accounts the way your `autoswitch.strategy` does, with each weekly limit resetting on schedule. The **dotted line** is the room that comes back as weekly limits reset if you stop now.
+- **The pace table** gives each pace in accounts' worth a day, how many more accounts it would take to keep up with it for good (`+3 accounts`, or `0 (sustainable)`), and when room runs out at it (or its low point in the week). The sustainable pace is your accounts ÷ 7 a day: the most the weekly limits keep up with in the long run.
+
+The history fills in as cswap checks usage (`cswap auto`, `cswap list`, the dashboard, the menu bar), so it starts when you upgrade and has gaps while none of them run; the 24-hour pace appears after a day of it. It costs no extra requests, stays on your machine in the backup directory's `history/` folder (owner-only, no email addresses), and keeps 400 days by default. In colour the chart is drawn in braille; without colour, or where the terminal can't show braille (`--ascii` forces it), each line gets its own marker. It needs a terminal at least 50 columns wide.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -189,6 +242,7 @@ This will update the stored credentials without creating a duplicate.
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
+cswap history                   # Weekly room left across accounts, with a week's forecast
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
@@ -241,7 +295,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root. Usage history (`cswap history`) is kept in `history/`: monthly JSON Lines files you can delete at any time.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -290,6 +344,8 @@ cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set run.shareHistory true    # every cswap run shares chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
+cswap config set history.enabled false    # stop recording usage history (keeps what's there)
+cswap config set history.retentionDays 90 # keep 90 days of history instead of 400
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
