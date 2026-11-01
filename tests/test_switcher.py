@@ -7083,6 +7083,25 @@ class TestFormatUsageLines:
         lines = _format_usage_lines(usage)
         assert lines == ["Fable: 100%  (!)"]
 
+    def test_window_without_a_figure_renders_as_unknown_not_zero(self):
+        # ``utilization: null`` keeps its row and reset, with ``?`` in the number's
+        # column.
+        usage = {
+            "five_hour": {"pct": None, "clock": "20:39", "countdown": "1h 30m"},
+            "seven_day": {"pct": 72.0},
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0] == "5h:    ?   resets 20:39         in 1h 30m"
+        assert lines[1] == "7d:  72%"
+        assert _format_usage_lines({"seven_day": {"pct": None}}) == ["7d:    ?"]
+        # No figure, no pace: a week-old unknown 7d window gets no marker.
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        weekly = {"pct": None, "resets_at": (now + timedelta(days=1)).isoformat()}
+        line = _format_usage_lines({"seven_day": weekly}, fetched_at=now.timestamp())[0]
+        assert line.startswith("7d:    ?") and "pace" not in line
+
     def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
         # A measurement served from the store hours after its fetch still
         # carries the countdown frozen at fetch time; rendering must derive
