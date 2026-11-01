@@ -34,6 +34,19 @@ def _harness(temp_home, n: int = 3) -> EngineHarness:
     return h
 
 
+def _fleet(temp_home, n: int, lines: dict[str, float] | None = None, **settings):
+    """``n`` accounts under ``settings``, #1 active; ``lines`` sets accounts' own."""
+    settings.setdefault("strategy", "consume-first")
+    h = EngineHarness(temp_home, **settings)
+    for num in range(1, n + 1):
+        h.seed(num, f"{num}@example.com")
+    h.make_live("1@example.com", 1)
+    for num, line in (lines or {}).items():
+        h.switcher.set_account_threshold(num, line)
+    h.engine = h._make_engine()
+    return h
+
+
 class TestConsumeFirstNeedsRoom:
     def test_does_not_move_onto_an_account_a_few_points_under_its_line(self, temp_home):
         # Active #1 plays the log's Account-2 (16%, resets later); #2 plays Account-1
@@ -153,3 +166,82 @@ class TestAtLimitEscapePrefersHealthy:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() in (2, 3)
+
+
+class TestRoomIsCountedInEachWindowsOwnPoints:
+    """``line_headroom - (100 - threshold)`` is the room on the 5h scale: exact on a
+    line equal to the global one, ``threshold / line`` times the real points on any
+    other. It under-reads a higher weekly line and over-reads a lower account line."""
+
+    def test_ten_points_under_a_98_weekly_line_is_room(self, temp_home):
+        # 7d 88% under a 98 line: 10 points, read as 90 * 10 / 98 = 9.18.
+        h = _fleet(temp_home, 2, threshold=90.0, weekly_threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(16, 2, _R_LATEST),
+            "2": _usage7(0, 88, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_nine_points_under_it_is_not(self, temp_home):
+        h = _fleet(temp_home, 2, threshold=90.0, weekly_threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(16, 2, _R_LATEST),
+            "2": _usage7(0, 89, _R_SOON),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_eight_points_under_a_lower_account_line_is_not_room(self, temp_home):
+        # Account 2 keeps its own line at 60 (global 90). At 52% it has 8 points,
+        # read as 90 * 8 / 60 = 12: the opportunistic move lands short of the margin.
+        h = _fleet(temp_home, 2, lines={"2": 60.0}, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(16, 2, _R_LATEST),
+            "2": _usage7(0, 52, _R_SOON),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_ten_points_under_it_is(self, temp_home):
+        h = _fleet(temp_home, 2, lines={"2": 60.0}, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(16, 2, _R_LATEST),
+            "2": _usage7(0, 50, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_forced_move_prefers_real_room(self, temp_home):
+        # Over its line, the active must move. 2 resets soonest with 8 real points
+        # under its own 60 line (read as 12); 3 has 30 points.
+        h = _fleet(temp_home, 3, lines={"2": 60.0}, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(0, 52, _R_SOON),
+            "3": _usage7(60, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
+class TestRoomWithoutAWindow:
+    def test_falls_back_to_the_single_line_against_raw_headroom(self, temp_home):
+        # The ranking takes headroom and usage apart. With no window to read, room is
+        # the account's line against raw headroom, as its line headroom and verdict
+        # are: 2 has 50 points under 90, so a forced move takes it ahead of 3, which
+        # resets sooner but is 5 under its line.
+        h = _fleet(temp_home, 3, threshold=90.0)
+        ordered, _, _ = h.engine._rank_candidates(
+            trigger="proactive",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage={"1": _usage7(95, 50, _R_LATER), "2": None, "3": _usage7(0, 85, _R_SOON)},
+            headroom={"1": 5.0, "2": 60.0, "3": 15.0},
+            current="1",
+            active_headroom=5.0,
+            settings=h.settings,
+            now=h.clock.now,
+        )
+        assert ordered == ["2", "3"]

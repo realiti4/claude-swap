@@ -52,7 +52,7 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.lines import BindingWindow, binding_window, window_line
+from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
 from claude_swap.locking import FileLock
 from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import (
@@ -2220,10 +2220,12 @@ class AutoSwitchEngine:
             # any of them is reached; raw `h` / the single line when it
             # reports no window (a readable headroom rules that out).
             lh = binding.line_headroom if binding is not None else h
-            # Points left before the candidate reaches its own binding line:
-            # line headroom sits at exactly `100 - threshold` on the line
-            # (lines.line_headroom), whatever the account's own line is.
-            room = lh - (100.0 - settings.threshold)
+            # Points left before the candidate reaches the nearest of its own
+            # lines, each window in its own points (`lines.line_room`); the
+            # single line against raw `h` when it reports no window.
+            room = self._room(usage.get(num), settings, thresholds[num])
+            if room is None:
+                room = thresholds[num] - (100.0 - h)
             over = (
                 binding.over
                 if binding is not None
@@ -2576,6 +2578,20 @@ class AutoSwitchEngine:
             line,
             settings.weekly_threshold,
             scale=settings.threshold,
+        )
+
+    def _room(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+    ) -> float | None:
+        """Points left before this account's nearest line under the tick's
+        lines (see ``lines.line_room``), or None when it reports no window.
+        Same inputs as ``_binding``."""
+        return line_room(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ),
+            line,
+            settings.weekly_threshold,
         )
 
     def _in_cooldown(self, state: dict) -> bool:
