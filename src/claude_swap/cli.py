@@ -15,7 +15,9 @@ from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
     ACCOUNT_THRESHOLD_MAX,
     ACCOUNT_THRESHOLD_MIN,
+    AccountPolicy,
     Platform,
+    normalize_account_threshold,
 )
 from claude_swap.printer import (
     accent,
@@ -608,16 +610,19 @@ Examples:
 
 
 def _threshold_command(argv: list[str]) -> None:
-    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--weekly PCT]
+    [--unset] [--unset-weekly]`.
 
-    With no arguments, prints the global `autoswitch.threshold` and every
-    per-account override. Otherwise sets (or, with --unset, removes) one
-    account's own switch-away threshold. Pre-dispatched before the main parser
-    for the same reason as `alias`: the main parser's required
-    mutually-exclusive group cannot hold a positional subcommand.
+    With no arguments, prints the global lines and every per-account
+    override. Otherwise sets (or, with --unset / --unset-weekly, removes) one
+    account's own switch-away threshold and/or its own weekly line.
+    Pre-dispatched before the main parser for the same reason as `alias`:
+    the main parser's required mutually-exclusive group cannot hold a
+    positional subcommand.
 
-    The value is validated inside `set_account_threshold`, before any file is
-    touched, so a rejected value leaves `sequence.json` byte-identical.
+    Both values are validated before either is written, and each is
+    validated again inside its setter before any file is touched, so a
+    rejected value leaves `sequence.json` byte-identical.
     """
     parser = argparse.ArgumentParser(
         prog="cswap threshold",
@@ -625,15 +630,20 @@ def _threshold_command(argv: list[str]) -> None:
             "Set, remove, or list a per-account switch-away threshold. The "
             "per-account value replaces autoswitch.threshold for that account "
             "only, so one shared account can reserve headroom without capping "
-            "the whole fleet."
+            "the whole fleet. Once autoswitch.weeklyThreshold is set, the "
+            "threshold governs the 5-hour window only; --weekly gives the "
+            "account's 7-day and per-model windows a line of their own."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Examples:
   cswap threshold 2 85
   cswap threshold user@example.com 99.9
-  cswap threshold 2 --unset           # back to the global default
-  cswap threshold                     # list the global default and overrides
+  cswap threshold 2 --weekly 90       # its own line for the weekly windows
+  cswap threshold 2 85 --weekly 90    # both at once
+  cswap threshold 2 --unset           # threshold back to the global default
+  cswap threshold 2 --unset-weekly    # weekly line back to the global one
+  cswap threshold                     # list the global lines and overrides
 
 Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
         """,
@@ -654,19 +664,51 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
         ),
     )
     parser.add_argument(
-        "--unset", action="store_true", help="Remove the account's override"
+        "--weekly",
+        metavar="PCT",
+        help=(
+            "The account's own switch line for its 7-day and per-model "
+            "windows, in place of autoswitch.weeklyThreshold."
+        ),
+    )
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's threshold override"
+    )
+    parser.add_argument(
+        "--unset-weekly",
+        action="store_true",
+        help="Remove the account's own weekly line",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
     if args.unset and args.threshold:
         parser.error("--unset does not take a PCT argument")
-    if args.unset and args.account is None:
-        parser.error("NUM|EMAIL is required with --unset")
-    if args.account is not None and not args.unset and args.threshold is None:
-        parser.error("PCT is required (or pass --unset to remove the override)")
+    if args.unset_weekly and args.weekly is not None:
+        parser.error("--unset-weekly cannot be combined with --weekly")
+    changes = (
+        args.threshold is not None or args.weekly is not None
+        or args.unset or args.unset_weekly
+    )
+    if args.account is None and changes:
+        parser.error("NUM|EMAIL is required to set or remove an override")
+    if args.account is not None and not changes:
+        parser.error(
+            "PCT or --weekly PCT is required (or pass --unset / --unset-weekly "
+            "to remove an override)"
+        )
 
     try:
+        if args.weekly is not None:
+            # Both values before either write: `2 85 --weekly 150` must not
+            # leave 85 behind and then fail.
+            try:
+                normalize_account_threshold(args.weekly)
+            except ValueError as e:
+                raise ValueError(f"--weekly: {e}") from None
+        if args.threshold is not None:
+            normalize_account_threshold(args.threshold)
+
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
 
@@ -674,9 +716,16 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
             _print_threshold_table(switcher)
             return
 
-        switcher.set_account_threshold(
-            args.account, None if args.unset else args.threshold
-        )
+        if args.unset or args.threshold is not None:
+            switcher.set_account_threshold(
+                args.account, None if args.unset else args.threshold
+            )
+        if args.unset_weekly or args.weekly is not None:
+            switcher.set_account_weekly_threshold(
+                args.account, None if args.unset_weekly else args.weekly
+            )
+        elif args.threshold is not None:
+            _note_weekly_line(switcher, args.account)
     except ValueError as e:
         # normalize_account_threshold's message; it always names the range.
         error(f"Error: {e}")
@@ -689,31 +738,65 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
         sys.exit(130)
 
 
-def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
-    """Print the global switch-away threshold and every per-account override.
+def _note_weekly_line(switcher: ClaudeAccountSwitcher, identifier: str) -> None:
+    """After a threshold is set, say where the account's weekly windows stop
+    when that is not the line just set.
 
-    The global line is printed unconditionally: an operator reading a list of
-    overrides needs to know what the accounts *without* one are using.
+    Once ``autoswitch.weeklyThreshold`` is configured the threshold moves only
+    the 5h window, and nothing at set time says so: an account set to 90 to
+    reserve the rest of its week for someone else would quietly run to the
+    fleet's weekly line. Silent when there is no weekly line (the threshold
+    is every window's line) or the account already has a weekly line of its
+    own (the user has said where its week stops).
     """
     from claude_swap.settings import load_settings
 
-    default = load_settings(switcher.backup_dir).threshold
+    weekly = load_settings(switcher.backup_dir).weekly_threshold
+    if weekly is None:
+        return
+    account_num, _email, _ = switcher.resolve_account(identifier)
+    policy = switcher.account_policies().get(account_num, AccountPolicy())
+    if policy.weekly_threshold is not None:
+        return
+    print(dimmed(
+        f"Its 7-day and per-model windows stay on autoswitch.weeklyThreshold "
+        f"({weekly:g}%); add --weekly PCT to give them a line of their own."
+    ))
+
+
+def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
+    """Print the global switch-away lines and every per-account override.
+
+    The global lines are printed unconditionally: an operator reading a list
+    of overrides needs to know what the accounts *without* one are using.
+    """
+    from claude_swap.settings import load_settings
+
+    settings = load_settings(switcher.backup_dir)
     print(bolded("Switch-away thresholds:"))
-    print(f"  {dimmed('global default')}  {default:g}%")
+    default = f"{settings.threshold:g}%"
+    if settings.weekly_threshold is not None:
+        default += f", weekly {settings.weekly_threshold:g}%"
+    print(f"  {dimmed('global default')}  {default}")
 
     rows = sorted(
         (
-            (num, policy.threshold)
+            (num, policy)
             for num, policy in switcher.account_policies().items()
-            if policy.threshold is not None
+            if policy.threshold is not None or policy.weekly_threshold is not None
         ),
         key=lambda row: (not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0),
     )
     if not rows:
         print(dimmed("  No per-account overrides set"))
         return
-    for num, value in rows:
-        print(f"  Account-{num}  {value:g}%")
+    for num, policy in rows:
+        parts = []
+        if policy.threshold is not None:
+            parts.append(f"{policy.threshold:g}%")
+        if policy.weekly_threshold is not None:
+            parts.append(f"weekly {policy.weekly_threshold:g}%")
+        print(f"  Account-{num}  {', '.join(parts)}")
 
 
 def _priority_command(argv: list[str]) -> None:
@@ -1255,6 +1338,7 @@ Commands:
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
+  %(prog)s threshold <num|email> --weekly <pct>  its own weekly-window line
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
   %(prog)s threshold                  list the global default and overrides
   %(prog)s priority <num|email> <tier>  set priority (higher first; default 0)
