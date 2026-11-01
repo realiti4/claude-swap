@@ -2019,7 +2019,9 @@ class ClaudeAccountSwitcher:
             ValueError: The value is not a number in range. Raised *before* any
                 write, so a rejected value leaves the store untouched.
         """
-        self._set_account_line(identifier, "threshold", "threshold", threshold)
+        self._set_account_line(
+            identifier, "threshold", "threshold", threshold, "the global default"
+        )
 
     def set_account_weekly_threshold(
         self, identifier: str, threshold: object | None
@@ -2037,15 +2039,30 @@ class ClaudeAccountSwitcher:
         ``weeklyThreshold``), and the same raises as
         :meth:`set_account_threshold`.
         """
+        # What an account without one falls back to, named as the user will
+        # find it: the global weekly line when one is configured, otherwise
+        # its threshold, which then governs every window.
+        weekly = load_settings(self.backup_dir).weekly_threshold
+        fallback = (
+            f"the global weekly line ({weekly:g}%)"
+            if weekly is not None
+            else "its threshold on every window"
+        )
         self._set_account_line(
-            identifier, "weeklyThreshold", "weekly threshold", threshold
+            identifier, "weeklyThreshold", "weekly threshold", threshold, fallback
         )
 
     def _set_account_line(
-        self, identifier: str, key: str, noun: str, threshold: object | None
+        self,
+        identifier: str,
+        key: str,
+        noun: str,
+        threshold: object | None,
+        fallback: str,
     ) -> None:
         """The one write path behind both per-account line setters: validate,
-        resolve, write ``record[key]`` (or pop it for ``None``), report."""
+        resolve, write ``record[key]`` (or pop it for ``None``), report.
+        ``fallback`` names what the account uses without the override."""
         # Validate first: a bad value must never reach the file. Resolution
         # order matters only in that both checks precede the single write.
         normalized = None if threshold is None else normalize_account_threshold(threshold)
@@ -2056,7 +2073,7 @@ class ClaudeAccountSwitcher:
         if normalized is None and key not in record:
             print(dimmed(
                 f"Account-{account_num} ({email}) has no {noun} override "
-                f"— already using the global default."
+                f"— already using {fallback}."
             ))
             return
         if normalized is not None and current == normalized:
@@ -2075,7 +2092,7 @@ class ClaudeAccountSwitcher:
         if normalized is None:
             self._logger.info(f"Cleared {noun} for account {account_num}: {email}")
             print(f"{accent('Cleared')} {noun} for Account-{account_num} ({email}) "
-                  f"— now using the global default.")
+                  f"— now using {fallback}.")
         else:
             self._logger.info(
                 f"Set {noun} {normalized:g} for account {account_num}: {email}"

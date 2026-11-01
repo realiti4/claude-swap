@@ -496,6 +496,29 @@ class TestWeeklyThreshold(PolicyStoreBase):
         assert "weeklyThreshold" not in record
         assert record["threshold"] == pytest.approx(85.0)
 
+    def test_clearing_names_the_threshold_when_there_is_no_global_weekly_line(
+        self, temp_home: Path, capsys
+    ):
+        s = self._fleet(temp_home)
+        s.set_account_weekly_threshold("1", None)
+        assert "already using its threshold on every window" in capsys.readouterr().out
+        s.set_account_weekly_threshold("1", 90.0)
+        s.set_account_weekly_threshold("1", None)
+        out = capsys.readouterr().out
+        assert "now using its threshold on every window" in out
+        assert "global default" not in out
+
+    def test_clearing_names_the_global_weekly_line_when_one_is_set(
+        self, temp_home: Path, capsys
+    ):
+        from claude_swap.settings import set_setting
+
+        s = self._fleet(temp_home)
+        set_setting(s.backup_dir, "autoswitch.weeklyThreshold", "98")
+        s.set_account_weekly_threshold("1", 90.0)
+        s.set_account_weekly_threshold("1", None)
+        assert "now using the global weekly line (98%)" in capsys.readouterr().out
+
     def test_setting_then_unsetting_restores_the_record_exactly(self, temp_home: Path):
         s = self._fleet(temp_home)
         before = self._record(s, "1")
