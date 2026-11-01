@@ -47,6 +47,23 @@ def _fleet(temp_home, n: int, lines: dict[str, float] | None = None, **settings)
     return h
 
 
+def _fable(pct5: float, pct7: float, fable: float, reset7: str) -> dict:
+    """Usage with a per-model weekly window, as ``autoswitch.model Fable`` reads it."""
+    return {
+        "five_hour": {"pct": pct5},
+        "seven_day": {"pct": pct7, "resets_at": reset7},
+        "scoped": [{"name": "Fable", "pct": fable, "resets_at": reset7}],
+    }
+
+
+def _switches(h: EngineHarness) -> list[tuple[str, int]]:
+    return [
+        (e.trigger, (e.to_ref or {}).get("number"))
+        for e in h.events
+        if isinstance(e, SwitchEvent)
+    ]
+
+
 class TestConsumeFirstNeedsRoom:
     def test_does_not_move_onto_an_account_a_few_points_under_its_line(self, temp_home):
         # Active #1 plays the log's Account-2 (16%, resets later); #2 plays Account-1
@@ -166,6 +183,214 @@ class TestAtLimitEscapePrefersHealthy:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() in (2, 3)
+
+
+class TestIssue305:
+    """#305's log (``consume-first``, ``model Fable``, threshold 90, nine accounts)::
+
+        Account-9: usage unknown ... #1: 5h 1% · 7d 3% · Fable 2%,
+                                     #4: 5h 0% · 7d 73% · Fable 94%, ...
+        Switched Account-9 -> Account-4 (failover)
+        Account-4: 94% used (switch at 90%)    no switch: cooldown   [x5 ticks]
+        Switched Account-4 -> Account-8 (proactive)
+
+    Account-4's Fable window is over its line, so nothing is all-above and #473's
+    ranking does not apply: the escape sorted by weekly reset.
+    """
+
+    def test_fails_over_to_the_account_with_room(self, temp_home):
+        # 2 plays Account-1, 3 plays Account-4 (weekly reset soonest).
+        h = _fleet(temp_home, 3, threshold=90.0, model="Fable")
+        usage = {
+            "1": None,
+            "2": _fable(1, 3, 2, _R_LATEST),
+            "3": _fable(0, 73, 94, _R_SOON),
+        }
+        h.tick_with_usage(usage)
+        h.tick_with_usage(usage)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert _switches(h) == [("failover", 2)]
+
+
+class TestASecondLogSamePattern:
+    """A second log (``threshold 98``, consume-first, no weekly line)::
+
+        Switched A -> B (at-limit)   # A's 5h went 93% -> 100% between two checks;
+                                     # B: 7d 98%, the soonest weekly reset
+        Switched B -> C (at-limit)   # B hit 100% three minutes later; C: 7d 98%
+        Switched C -> D (proactive)  # D: 7d 44%, free all along
+    """
+
+    def test_lands_on_the_account_with_room_not_the_soonest_reset(self, temp_home):
+        # 2 and 3 sit at 7d 98% of a 98 line and reset soonest; 4 is at 44%.
+        h = _fleet(temp_home, 4, threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 98, _R_SOON),
+            "3": _usage7(0, 98, _R_SOON),
+            "4": _usage7(0, 44, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert _switches(h) == [("at-limit", 4)]
+
+    def test_a_tenth_under_the_line_is_not_room(self, temp_home):
+        # The same escape a tenth of a point earlier: 7d 97.9% is under the 98 line,
+        # so below-the-line-first still takes it over 44% on reset, and it runs out
+        # within the cooldown.
+        h = _fleet(temp_home, 3, threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 97.9, _R_SOON),
+            "3": _usage7(0, 44, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
+class TestAConsumeFirstEscapeWantsRoom:
+    """Under consume-first an escape target with room to spare (the hysteresis margin
+    under every line) keeps the weekly-reset order; one without ranks by raw headroom,
+    a target under its lines still ahead of one over a line."""
+
+    def test_with_room_to_spare_the_strategy_still_decides(self, temp_home):
+        # Both have the margin: the sooner reset, not the emptier account.
+        h = _fleet(temp_home, 3, threshold=90.0, weekly_threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 80, _R_SOON),
+            "3": _usage7(0, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_room_to_spare_beats_more_raw_headroom_without_it(self, temp_home):
+        # 2 has 12 points under its weekly line (14 raw); 3 has 15 raw but only 5
+        # under its 5h line.
+        h = _fleet(temp_home, 3, threshold=90.0, weekly_threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 86, _R_SOON),
+            "3": _usage7(85, 0, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_without_room_the_most_raw_headroom(self, temp_home):
+        # Neither has the margin: 3 has 6 raw points, 2 resets sooner with 3.
+        h = _fleet(temp_home, 3, threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 97, _R_SOON),
+            "3": _usage7(0, 94, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_under_its_lines_still_beats_over_a_line(self, temp_home):
+        # 90 / weekly 98. 3 has more raw room (10 to 2.1) but sits on its 5h line.
+        h = _fleet(temp_home, 3, threshold=90.0, weekly_threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 97.9, _R_SOON),
+            "3": _usage7(90, 5, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_escape_over_a_line_would_cost_a_second_move(self, temp_home):
+        # The same fleet over five minutes. Landing on 3, over its 5h line, the next
+        # proactive check would leave it for 2 once the cooldown ends.
+        h = _fleet(temp_home, 3, threshold=90.0, weekly_threshold=98.0)
+        first = {
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 97.9, _R_SOON),
+            "3": _usage7(90, 5, _R_LATEST),
+        }
+        later = {**first, "3": _usage7(92, 5, _R_LATEST)}
+        h.tick_with_usage(first)
+        for advance in (60, 301, 60):
+            h.clock.advance(advance)
+            h.tick_with_usage(later)
+        assert _switches(h) == [("at-limit", 2)]
+
+    def test_an_accounts_own_lower_line_is_still_a_line(self, temp_home):
+        # 3 keeps its own line at 60 and is at 62%: more raw room than 2 at 97%, but
+        # escapes prefer a target under its lines.
+        h = _fleet(temp_home, 3, lines={"3": 60.0}, threshold=98.0)
+        h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(0, 97, _R_SOON),
+            "3": _usage7(0, 62, _R_LATEST),
+        })
+        assert h.active_number() == 2
+
+    def test_under_its_own_lower_line_it_is_the_roomier(self, temp_home):
+        h = _fleet(temp_home, 3, lines={"3": 60.0}, threshold=98.0)
+        h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(0, 97, _R_SOON),
+            "3": _usage7(0, 55, _R_LATEST),
+        })
+        assert h.active_number() == 3
+
+    def test_with_no_hysteresis_a_target_at_its_line_is_not_room(self, temp_home):
+        # hysteresisPct 0: 2 sits exactly on its 5h line, zero points to its line.
+        h = _fleet(temp_home, 3, threshold=90.0, hysteresis_pct=0.0)
+        h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(90, 20, _R_SOON),
+            "3": _usage7(0, 60, _R_LATEST),
+        })
+        assert h.active_number() == 3
+
+    def test_still_escapes_when_nothing_has_room(self, temp_home):
+        h = _fleet(temp_home, 3, threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 99.5, _R_SOON),
+            "3": _usage7(0, 97, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_failover_ranks_the_same_way(self, temp_home):
+        # Active unreadable for three ticks: failover is the other escape.
+        h = _fleet(temp_home, 3, threshold=98.0)
+        usage = {
+            "1": None,
+            "2": _usage7(0, 97.9, _R_SOON),
+            "3": _usage7(0, 44, _R_LATEST),
+        }
+        h.tick_with_usage(usage)
+        h.tick_with_usage(usage)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert _switches(h) == [("failover", 3)]
+
+
+class TestABestEscapeKeepsItsKey:
+    def test_line_headroom_not_a_room_bar(self, temp_home):
+        # best already ranks by headroom. 2 has exactly the margin (7d 88% under 98,
+        # 12 raw); 3 is 9.9 under its 5h line with 19.9 raw. A room bar would take 2.
+        h = _fleet(
+            temp_home, 3, threshold=90.0, weekly_threshold=98.0, strategy="best"
+        )
+        h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(0, 88, _R_SOON),
+            "3": _usage7(80.1, 2, _R_LATEST),
+        })
+        assert h.active_number() == 3
+
+    def test_under_its_lines_beats_over_a_line(self, temp_home):
+        h = _fleet(
+            temp_home, 3, threshold=90.0, weekly_threshold=98.0, strategy="best"
+        )
+        h.tick_with_usage({
+            "1": _usage7(100, 74, _R_LATER),
+            "2": _usage7(0, 97.9, _R_SOON),
+            "3": _usage7(90, 5, _R_LATEST),
+        })
+        assert h.active_number() == 2
 
 
 class TestRoomIsCountedInEachWindowsOwnPoints:
