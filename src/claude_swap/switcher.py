@@ -1918,22 +1918,27 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num))
         if not record:
             return AccountPolicy()
-        raw = record.get("threshold")
-        threshold: float | None
-        if raw is None:
-            threshold = None
-        else:
+
+        def line(key: str) -> float | None:
+            raw = record.get(key)
+            if raw is None:
+                return None
             try:
-                threshold = normalize_account_threshold(raw)
+                return normalize_account_threshold(raw)
             except ValueError:
                 # Hand-edited garbage, out-of-range, NaN/inf: inherit the
                 # global default rather than propagate an unusable number.
-                threshold = None
+                return None
+
         try:
             priority = normalize_account_priority(record.get("priority", 0))
         except ValueError:
             priority = 0
-        return AccountPolicy(threshold=threshold, priority=priority)
+        return AccountPolicy(
+            threshold=line("threshold"),
+            weekly_threshold=line("weeklyThreshold"),
+            priority=priority,
+        )
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -1965,7 +1970,7 @@ class ClaudeAccountSwitcher:
     def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
         """Resolve an identifier and fetch its record, ready for a policy write.
 
-        Called by :meth:`set_account_threshold`. Every
+        Called by the per-account policy setters. Every
         raising path here happens **before** any write, so a rejected call
         leaves ``sequence.json`` byte-identical.
 
@@ -2014,42 +2019,69 @@ class ClaudeAccountSwitcher:
             ValueError: The value is not a number in range. Raised *before* any
                 write, so a rejected value leaves the store untouched.
         """
+        self._set_account_line(identifier, "threshold", "threshold", threshold)
+
+    def set_account_weekly_threshold(
+        self, identifier: str, threshold: object | None
+    ) -> None:
+        """Set or clear one account's own weekly switch line.
+
+        The weekly counterpart of :meth:`set_account_threshold`: the value
+        replaces ``autoswitch.weeklyThreshold`` for this account's 7d and
+        per-model windows, on the same two sides of a switch. Without it, once
+        a weekly line is configured an account's ``threshold`` moves only its
+        5h window, so an account kept at 90% for someone outside the rotation
+        would be run to the fleet's weekly line instead.
+
+        Same validation, same omit-when-unset record convention (the key is
+        ``weeklyThreshold``), and the same raises as
+        :meth:`set_account_threshold`.
+        """
+        self._set_account_line(
+            identifier, "weeklyThreshold", "weekly threshold", threshold
+        )
+
+    def _set_account_line(
+        self, identifier: str, key: str, noun: str, threshold: object | None
+    ) -> None:
+        """The one write path behind both per-account line setters: validate,
+        resolve, write ``record[key]`` (or pop it for ``None``), report."""
         # Validate first: a bad value must never reach the file. Resolution
         # order matters only in that both checks precede the single write.
         normalized = None if threshold is None else normalize_account_threshold(threshold)
 
         account_num, email, data, record = self._resolve_for_policy_write(identifier)
 
-        current = record.get("threshold")
-        if normalized is None and "threshold" not in record:
+        current = record.get(key)
+        if normalized is None and key not in record:
             print(dimmed(
-                f"Account-{account_num} ({email}) has no threshold override "
+                f"Account-{account_num} ({email}) has no {noun} override "
                 f"— already using the global default."
             ))
             return
         if normalized is not None and current == normalized:
             print(dimmed(
-                f"Account-{account_num} ({email}) is already at {normalized:g}%."
+                f"Account-{account_num} ({email}) {noun} is already at {normalized:g}%."
             ))
             return
 
         if normalized is None:
-            record.pop("threshold", None)
+            record.pop(key, None)
         else:
-            record["threshold"] = normalized
+            record[key] = normalized
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
 
         if normalized is None:
-            self._logger.info(f"Cleared threshold for account {account_num}: {email}")
-            print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
+            self._logger.info(f"Cleared {noun} for account {account_num}: {email}")
+            print(f"{accent('Cleared')} {noun} for Account-{account_num} ({email}) "
                   f"— now using the global default.")
         else:
             self._logger.info(
-                f"Set threshold {normalized:g} for account {account_num}: {email}"
+                f"Set {noun} {normalized:g} for account {account_num}: {email}"
             )
             print(f"{accent('Set')} Account-{account_num} ({email}) "
-                  f"threshold to {normalized:g}%.")
+                  f"{noun} to {normalized:g}%.")
 
     def set_account_priority(self, identifier: str, priority: object | None) -> None:
         """Set a priority tier, or remove it with None/0. Validate before writing."""

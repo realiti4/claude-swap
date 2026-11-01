@@ -468,3 +468,81 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         payload = self._payload(self._fleet(temp_home))
         for row in payload["accounts"]:
             assert "threshold" not in row
+
+
+class TestWeeklyThreshold(PolicyStoreBase):
+    """`set_account_weekly_threshold`: the weekly counterpart of the threshold
+    setter, on its own `weeklyThreshold` key, through the same write path."""
+
+    def test_writes_its_own_key_and_leaves_the_threshold_alone(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        s.set_account_threshold("2", 85.0)
+        s.set_account_weekly_threshold("2", 90.0)
+        record = self._record(s, "2")
+        assert record["weeklyThreshold"] == pytest.approx(90.0)
+        assert record["threshold"] == pytest.approx(85.0)
+
+    def test_is_read_back_into_the_policy(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        s.set_account_weekly_threshold("2", "90")
+        assert s.account_policies()["2"] == AccountPolicy(weekly_threshold=90.0)
+
+    def test_none_pops_only_the_weekly_key(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        s.set_account_threshold("1", 85.0)
+        s.set_account_weekly_threshold("1", 90.0)
+        s.set_account_weekly_threshold("1", None)
+        record = self._record(s, "1")
+        assert "weeklyThreshold" not in record
+        assert record["threshold"] == pytest.approx(85.0)
+
+    def test_setting_then_unsetting_restores_the_record_exactly(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        before = self._record(s, "1")
+        s.set_account_weekly_threshold("1", 90.0)
+        s.set_account_weekly_threshold("1", None)
+        assert self._record(s, "1") == before
+
+    @pytest.mark.parametrize("bad", [20, 100, "abc", float("nan"), float("inf")])
+    def test_invalid_value_raises_and_writes_nothing(self, temp_home: Path, bad):
+        s = self._fleet(temp_home)
+        before = s.sequence_file.read_bytes()
+        with pytest.raises(ValueError):
+            s.set_account_weekly_threshold("1", bad)
+        assert s.sequence_file.read_bytes() == before
+
+    @pytest.mark.parametrize("garbage", ["garbage", None, True, 20, 100])
+    def test_unreadable_value_degrades_to_none(self, temp_home: Path, garbage):
+        s = self._fleet(temp_home)
+        data = s._get_sequence_data() or {}
+        data["accounts"]["1"]["weeklyThreshold"] = garbage
+        s.sequence_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        reloaded = s._get_sequence_data() or {}
+        assert s._policy_from_data(reloaded, "1") == AccountPolicy()
+
+    def test_swap_carries_it_with_the_record(self, temp_home: Path):
+        s = self._fleet(temp_home, count=3)
+        s.set_account_weekly_threshold("1", 90.0)
+        s.swap_accounts("1", "3")
+        assert s.account_policies()["3"] == AccountPolicy(weekly_threshold=90.0)
+        assert s.account_policies()["1"] == AccountPolicy()
+
+    def test_export_omits_it(self, temp_home: Path):
+        from claude_swap.transfer import export_accounts
+
+        s = self._fleet(temp_home)
+        s.set_account_weekly_threshold("1", 90.0)
+        out_file = temp_home / "backup.cswap"
+        export_accounts(s, str(out_file))
+        envelope = json.loads(out_file.read_text(encoding="utf-8"))
+        for entry in envelope["accounts"]:
+            assert "weeklyThreshold" not in entry
+
+    def test_the_json_list_row_carries_it_only_when_set(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        s.set_account_weekly_threshold("2", 90.0)
+        payload = s.list_accounts(json_output=True, fetch=set())
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert rows[2]["weeklyThreshold"] == pytest.approx(90.0)
+        assert "threshold" not in rows[2]
+        assert "weeklyThreshold" not in rows[1]
