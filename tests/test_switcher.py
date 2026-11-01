@@ -1646,6 +1646,39 @@ class TestListAccountsUsage:
         assert "  2: account2@example.com" in output
         assert "(account2@example.com)" not in output
 
+    def test_list_warns_when_a_login_is_about_to_lapse(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A login's refresh token has a fixed lapse date that refreshing never
+        extends; ``list`` must say so ahead of time, not only after the slot
+        turns into "re-login needed"."""
+        import time as _time
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        soon_ms = int((_time.time() + 2 * 86400) * 1000)
+        far_ms = int((_time.time() + 30 * 86400) * 1000)
+        active_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-active", "refreshTokenExpiresAt": far_ms,
+        }})
+        backup_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-backup", "refreshTokenExpiresAt": soon_ms,
+        }})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        account1, account2 = output.split("  2: ", 1)
+        assert "login lapses" not in account1
+        assert "login lapses" in account2
+        assert "cswap add" in account2
+
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):

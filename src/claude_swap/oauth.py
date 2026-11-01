@@ -110,6 +110,46 @@ def login_expires_at_iso(credentials: str) -> str | None:
     )
 
 
+LOGIN_EXPIRY_WARN_DAYS = 7
+"""How early ``cswap list`` starts warning that a login will lapse.
+
+Refreshing never extends a login, and logins made together lapse together,
+so the warning must leave room to re-log every account before the first goes.
+"""
+
+
+def login_expiry_note(
+    credentials: str,
+    now_utc: datetime | None = None,
+    warn_days: float = LOGIN_EXPIRY_WARN_DAYS,
+) -> str | None:
+    """A warning when the stored login lapses within ``warn_days``, else ``None``.
+
+    Unknown expiries (see ``login_expires_at_iso``) are silent.
+    """
+    iso = login_expires_at_iso(credentials)
+    if iso is None:
+        return None
+    expires = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    now = now_utc or datetime.now(timezone.utc)
+    remaining = (expires - now).total_seconds()
+    if remaining > warn_days * 86400:
+        return None
+    clock = reset_clock_string(expires, now)
+    remedy = "log in with Claude Code, then run: cswap add"
+    if remaining <= 0:
+        return f"login lapsed {clock} — {remedy}"
+    days, rest = divmod(int(remaining), 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        countdown = f"{days}d {hours}h"
+    elif hours:
+        countdown = f"{hours}h {rest // 60}m"
+    else:
+        countdown = f"{rest // 60}m"
+    return f"login lapses {clock} in {countdown} — {remedy}"
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):

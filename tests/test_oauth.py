@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1872,3 +1872,48 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestLoginExpiryNote:
+    """The human ``list`` warns before a login's refresh token lapses.
+
+    A login cannot be renewed by refreshing; only a fresh ``/login`` replaces
+    it. Logins made together lapse together, so the warning has to come early
+    enough to re-log before every account is gone at once.
+    """
+
+    NOW = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _creds(expires: datetime) -> str:
+        ms = int(expires.timestamp() * 1000)
+        return json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": ms}})
+
+    def test_silent_while_the_login_has_more_than_the_warning_window(self):
+        creds = self._creds(self.NOW + timedelta(days=8))
+        assert oauth.login_expiry_note(creds, now_utc=self.NOW) is None
+
+    def test_warns_inside_the_window_with_countdown_and_remedy(self):
+        creds = self._creds(self.NOW + timedelta(days=2, hours=3))
+        note = oauth.login_expiry_note(creds, now_utc=self.NOW)
+        assert note is not None
+        assert note.startswith("login lapses ")
+        assert "in 2d 3h" in note
+        assert "cswap add" in note
+
+    def test_says_lapsed_once_past(self):
+        creds = self._creds(self.NOW - timedelta(hours=1))
+        note = oauth.login_expiry_note(creds, now_utc=self.NOW)
+        assert note is not None
+        assert note.startswith("login lapsed ")
+        assert "cswap add" in note
+
+    def test_window_is_configurable(self):
+        creds = self._creds(self.NOW + timedelta(days=8))
+        assert oauth.login_expiry_note(creds, now_utc=self.NOW, warn_days=10) is not None
+
+    def test_unknown_expiry_is_silent(self):
+        assert oauth.login_expiry_note("", now_utc=self.NOW) is None
+        assert oauth.login_expiry_note(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}}), now_utc=self.NOW
+        ) is None
