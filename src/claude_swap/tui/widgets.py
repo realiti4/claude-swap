@@ -176,6 +176,8 @@ def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
         # ``:g`` so 75.0 reads as "75%" and 82.5 keeps its fraction — the store
         # accepts one decimal place and the row shows back exactly what was set.
         badges.append(f"{gap}th {acc.policy.threshold:g}%")
+    if acc.policy.weekly_threshold is not None:
+        badges.append(f"{gap}wk {acc.policy.weekly_threshold:g}%")
     return badges
 
 
@@ -191,8 +193,16 @@ def account_card_text(
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
     5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
-    per-model rows, which reset weekly."""
+    per-model rows, which reset weekly. Where the account carries a line of
+    its own (``cswap threshold``), that line replaces the one passed in, the
+    way the engine resolves it; with no ``threshold`` no tick is drawn at
+    all, so the account's own lines are not drawn either."""
     now = now if now is not None else time.time()
+    if threshold is not None:
+        if acc.policy.threshold is not None:
+            threshold = acc.policy.threshold
+        if acc.policy.weekly_threshold is not None:
+            weekly_threshold = acc.policy.weekly_threshold
 
     text = Text()
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")

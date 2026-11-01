@@ -6,7 +6,8 @@ to be visible where the operator already looks, on both account render paths:
 * ``account_card_text`` — the expanded card for the selected account.
 * ``mini_account_text`` — the one-line minimized row for every other account.
 
-Both render paths show the threshold override on the account row, and an
+Both render paths show the threshold override (and the weekly line, where
+an account has one of its own) on the account row, and an
 account carrying no policy renders byte-identically to before, on both paths —
 asserted against goldens captured from the pre-change engine. The auto screen's
 "Next best" list ranks each account against its own line, as the engine does.
@@ -218,3 +219,90 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 "user2@example.com"
             )
             assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+
+
+class TestWeeklyLineDisplay:
+    """An account's own weekly line: a `wk` badge on both render paths, the
+    card's weekly ticks, and the "Next best" ranking."""
+
+    def test_both_paths_show_a_weekly_badge(self):
+        acc = with_policy(
+            make_account(2, active=True, alias="dev"),
+            threshold=85.0, weekly_threshold=92.5,
+        )
+        header = card(acc).splitlines()[0]
+        assert "th 85%" in header and "wk 92.5%" in header
+        row = mini(acc)
+        assert "th 85%" in row and "wk 92.5%" in row
+
+    @staticmethod
+    def _ticks(acc, **lines) -> dict[str, int]:
+        from claude_swap.tui.widgets import _BAR_TICK
+
+        plain = account_card_text(acc, 100, now=NOW, **lines).plain
+        return {
+            ln.split()[0]: ln.index(_BAR_TICK)
+            for ln in plain.splitlines()
+            if ln.strip().startswith(("5h", "7d")) and _BAR_TICK in ln
+        }
+
+    def test_the_card_ticks_on_the_accounts_own_lines(self):
+        """Each row ticks where the engine judges it: an account with a 70
+        threshold and a 75 weekly line ticks there, not on the 90/97 the
+        dashboard passes in, and both rows match the global ticks drawn at
+        those values."""
+        base = make_account(2, active=True, entry=make_entry(50.0, 50.0))
+        own = with_policy(base, threshold=70.0, weekly_threshold=75.0)
+        ticks = self._ticks(own, threshold=90.0, weekly_threshold=97.0)
+        assert ticks == self._ticks(base, threshold=70.0, weekly_threshold=75.0)
+        assert ticks != self._ticks(base, threshold=90.0, weekly_threshold=97.0)
+
+    def test_a_weekly_line_alone_splits_the_card_without_a_fleet_weekly_line(self):
+        base = make_account(2, active=True, entry=make_entry(50.0, 50.0))
+        own = with_policy(base, weekly_threshold=75.0)
+        ticks = self._ticks(own, threshold=90.0)
+        assert ticks == self._ticks(base, threshold=90.0, weekly_threshold=75.0)
+
+    def test_no_threshold_still_means_no_ticks(self):
+        acc = with_policy(
+            make_account(2, active=True, entry=make_entry(50.0, 50.0)),
+            threshold=70.0, weekly_threshold=75.0,
+        )
+        assert self._ticks(acc) == {}
+
+    @pytest.mark.asyncio
+    async def test_next_best_ranks_on_the_accounts_own_weekly_line(
+        self, tmp_path, fake_engine
+    ):
+        """Weekly line 98. Account 2 at 7d 91% scores 16.4 points under 98 and
+        would lead account 3 (5h 85%, 15 points), but under its own weekly
+        line of 90 it is over, so 3 leads and 2's row names the 90."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "weeklyThreshold": 98},
+        }))
+        switcher = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(95.0, 0.0)),
+                with_policy(
+                    make_account(2, entry=make_entry(0.0, 91.0)),
+                    weekly_threshold=90.0,
+                ),
+                make_account(3, entry=make_entry(85.0, 0.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(switcher)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+            row = next(ln for ln in plain.splitlines() if "user2@example.com" in ln)
+            assert "7d  91% used (line 90%)" in row

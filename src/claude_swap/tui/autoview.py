@@ -310,10 +310,10 @@ class AutoScreen(Screen):
         (best first) — the engine's own ordering."""
         # Same window set AND the same lines as the engine: autoswitch.model,
         # each account's own line (its policy threshold, else the session
-        # threshold — `_settings` is what `_set_threshold` replaces), the
-        # weekly line, and the session threshold as the ruler every account is
-        # scored on, so the displayed ranking can never disagree with the
-        # account it picks.
+        # threshold — `_settings` is what `_set_threshold` replaces), its own
+        # weekly line (its policy weekly line, else the configured one), and
+        # the session threshold as the ruler every account is scored on, so
+        # the displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
@@ -324,13 +324,15 @@ class AutoScreen(Screen):
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
-            line = (
-                acc.policy.threshold if acc.policy.threshold is not None else threshold
+            policy = acc.policy
+            line = policy.threshold if policy.threshold is not None else threshold
+            weekly_line = (
+                policy.weekly_threshold if policy.weekly_threshold is not None else weekly
             )
             binding = binding_window(
                 oauth.relevant_windows(acc.usage.last_good, models),
                 line,
-                weekly,
+                weekly_line,
                 scale=threshold,
             )
             entry = Text()
@@ -352,7 +354,7 @@ class AutoScreen(Screen):
                     f"  {binding.label} {binding.pct:3.0f}% used",
                     style=palette.severity(binding.pct),
                 )
-                if weekly is not None or acc.policy.threshold is not None:
+                if weekly_line is not None or policy.threshold is not None:
                     entry.append(
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
