@@ -200,6 +200,7 @@ cswap enable 2                  # Return a disabled account to rotation
 cswap threshold 2 85            # Switch away from account 2 at 85%, not the global default
 cswap threshold 2 --weekly 90   # Give account 2's weekly windows their own line (in place of weeklyThreshold)
 cswap threshold 2 --unset       # Return account 2 to the global default
+cswap threshold 2 --unset-weekly  # Return account 2's weekly windows to the global weekly line
 cswap threshold                 # Show the global default and every per-account override
 cswap priority 2 100            # Use account 2 before lower tiers (priority-consume-first strategy)
 cswap priority 2 --unset        # Return account 2 to tier 0

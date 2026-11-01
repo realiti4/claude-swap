@@ -1340,6 +1340,7 @@ Commands:
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
   %(prog)s threshold <num|email> --weekly <pct>  its own weekly-window line
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
+  %(prog)s threshold <num|email> --unset-weekly  clear its own weekly line
   %(prog)s threshold                  list the global default and overrides
   %(prog)s priority <num|email> <tier>  set priority (higher first; default 0)
   %(prog)s priority                   list account priorities

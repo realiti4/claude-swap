@@ -333,17 +333,24 @@ class TestWeeklyLine(PolicyCliBase):
         assert "weeklyThreshold (98%)" in out
         assert "--weekly" in out
 
-    @pytest.mark.parametrize(
-        "argv", [["2", "85", "--weekly", "90"], ["2", "85"]]
-    )
-    def test_the_note_is_silent_when_the_week_is_already_decided(
-        self, temp_home: Path, capsys, argv
+    def test_the_note_is_silent_without_a_fleet_weekly_line(
+        self, temp_home: Path, capsys
     ):
-        """Silent with a weekly line of the account's own, and with no fleet
-        weekly line (the threshold is then every window's line)."""
-        s = self._fleet(temp_home)
-        if "--weekly" in argv:
-            self._fleet_weekly(s)
+        """No `weeklyThreshold`: the threshold is every window's line."""
+        self._fleet(temp_home)
         capsys.readouterr()
-        self._threshold(argv)
+        self._threshold(["2", "85"])
         assert "weeklyThreshold" not in capsys.readouterr().out
+
+    def test_the_note_is_silent_once_the_account_has_its_own_weekly_line(
+        self, temp_home: Path, capsys
+    ):
+        """The user has already said where this account's week stops."""
+        s = self._fleet(temp_home)
+        self._fleet_weekly(s)
+        self._threshold(["2", "--weekly", "90"])
+        capsys.readouterr()
+        self._threshold(["2", "85"])
+        out = capsys.readouterr().out
+        assert "85" in out
+        assert "weeklyThreshold" not in out
