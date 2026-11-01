@@ -387,30 +387,72 @@ def room_at(history: History, fleet: Sequence[int], t: float) -> float | None:
     return room if k > 0 and k >= len(fleet) / 2 else None
 
 
-def room_series(
+def room_samples(
     history: History, fleet: Sequence[int], t0: float, t1: float, samples: int
-) -> list[tuple[float, float | None]]:
-    """``room_at`` at ``samples`` evenly spaced times from ``t0`` to ``t1``
-    (both ends included), without re-scanning every account's rows per
-    sample."""
+) -> list[tuple[float, float | None, float | None, int]]:
+    """``(t, 7-day room, per-model room, accounts reporting)`` at ``samples``
+    evenly spaced times from ``t0`` to ``t1`` (both ends included), on
+    ``room_at``'s rule, without re-scanning every account's rows per sample.
+    The per-model room is the view's model's weekly window (``Reading.model``),
+    counted only where the 7-day total is."""
     samples = max(2, samples)
     times = [t0 + (t1 - t0) * i / (samples - 1) for i in range(samples)]
     cols = {n: (history.readings.get(n) or []) for n in fleet}
     keys = {n: [r.t for r in rows] for n, rows in cols.items()}
     out = []
     for t in times:
-        room, k = 0.0, 0
+        room, k, model, km = 0.0, 0, 0.0, 0
         for n in fleet:
             rows = cols[n]
             if not rows:
                 continue
-            used = _used_at(_fresh_reading(rows, keys[n], t), t)
-            if used is None:
-                continue
-            room += max(0.0, 100.0 - used) / 100.0
-            k += 1
-        out.append((t, room if k > 0 and k >= len(fleet) / 2 else None))
+            r = _fresh_reading(rows, keys[n], t)
+            used = _used_at(r, t)
+            if used is not None:
+                room += max(0.0, 100.0 - used) / 100.0
+                k += 1
+            if r is not None and r.model is not None:
+                model += max(0.0, 100.0 - r.model) / 100.0
+                km += 1
+        enough = k > 0 and k >= len(fleet) / 2
+        out.append((t, room if enough else None, model if enough and km else None, k))
     return out
+
+
+def room_series(
+    history: History, fleet: Sequence[int], t0: float, t1: float, samples: int
+) -> list[tuple[float, float | None]]:
+    """The 7-day room of :func:`room_samples`."""
+    return [(t, room) for t, room, _m, _k in room_samples(history, fleet, t0, t1, samples)]
+
+
+def room_now_of(history: History, fleet: Sequence[int], key: str) -> tuple[float | None, int]:
+    """Room now and accounts counted, for ``key`` ``"d7"`` (the 7-day limit,
+    as ``Analysis.room_now``) or ``"model"`` (the per-model weekly limit)."""
+    now, room, k = history.now, 0.0, 0
+    for n in fleet:
+        c = history.current.get(n)
+        if c is None or c.t is None or now - c.t > GAP_S:
+            continue
+        v, _ = _week_now(getattr(c, key), getattr(c, key + "_reset"), now)
+        if v is not None:
+            room += max(0.0, 100.0 - v) / 100.0
+            k += 1
+    return (room if k else None), k
+
+
+def resets_of(history: History, fleet: Sequence[int], key: str, until: float) -> list[ResetEvent]:
+    """The weekly resets of the counted accounts by ``until``, for ``key`` as
+    in :func:`room_now_of`: when, whose, and how much of a limit each frees."""
+    now, out = history.now, []
+    for n in fleet:
+        c = history.current.get(n)
+        if c is None or c.t is None or now - c.t > GAP_S:
+            continue
+        v, at = _week_now(getattr(c, key), getattr(c, key + "_reset"), now)
+        if v is not None and v > 0 and at is not None and now < at <= until:
+            out.append(ResetEvent(at, n, v / 100.0))
+    return sorted(out, key=lambda e: (e.t, e.number))
 
 
 def rises_of(history: History, fleet: Sequence[int]) -> list[Rise]:

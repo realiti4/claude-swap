@@ -216,7 +216,7 @@ def iter_jsonl(path: Path) -> Iterator[dict]:
         return
 
 
-def _ensure_private_dir(path: Path) -> None:
+def ensure_private_dir(path: Path) -> None:
     """Create the history directory owner-only, like the backup root."""
     path.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
@@ -357,7 +357,7 @@ class UsageHistory:
     def _locked(self) -> Iterator[bool]:
         """Hold the history lock, yielding False (and holding nothing) when
         another writer kept it past ``LOCK_TIMEOUT_S``."""
-        _ensure_private_dir(self.dir)
+        ensure_private_dir(self.dir)
         lock = self._lock()
         got = lock.acquire()
         try:
@@ -502,6 +502,7 @@ class Account:
     # False for an account with no 7-day limit to count (an API key, or one
     # whose readings carry no seven_day window): it has no weekly room.
     weekly: bool = True
+    alias: str | None = None  # ``cswap alias``: the only name a view shows
 
 
 @dataclass
@@ -574,6 +575,7 @@ def load_history(
             disabled=bool(info.get("disabled")),
             priority=prio,
             weekly=info.get("kind") != "api_key",  # API keys bill per token
+            alias=info.get("alias") if isinstance(info.get("alias"), str) else None,
         )
         uuid = info.get("uuid")
         if isinstance(uuid, str) and uuid.strip():

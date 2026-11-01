@@ -182,6 +182,7 @@ cswap history                 # weekly room left: the last 7 days and the week a
 cswap history --days 30       # look further back
 cswap history --json          # the same numbers for scripts
 cswap history --demo          # made-up data for 15 accounts, to see the view before yours builds up
+cswap history --html --open   # the same view as a web page; a running cswap auto keeps it current
 ```
 
 ```text
@@ -225,6 +226,8 @@ recent reading, so it isn't counted.
 - **The pace table** gives each pace in accounts' worth a day, how many more accounts it would take to keep up with it for good (`+3 accounts`, or `0 (sustainable)`), and when room runs out at it (or its low point in the week). The sustainable pace is your accounts ÷ 7 a day: the most the weekly limits keep up with in the long run.
 
 The history fills in as cswap checks usage (`cswap auto`, `cswap list`, the dashboard, the menu bar), so it starts when you upgrade and has gaps while none of them run; the 24-hour pace appears after a day of it. It costs no extra requests, stays on your machine in the backup directory's `history/` folder (owner-only, no email addresses), and keeps 400 days by default. In colour the chart is drawn in braille; without colour, or where the terminal can't show braille (`--ascii` forces it), each line gets its own marker. It needs a terminal at least 50 columns wide.
+
+`cswap history --html` writes the same chart, pace table and account list as a self-contained web page, with hover readouts and a range selector. It goes to `history/report.html` (the last 30 days unless you pass `--days`), which a running `cswap auto` rebuilds between checks, about once a minute, and which reloads itself in an open tab; delete the file to stop that. `--out FILE` writes a one-off copy instead. The page has a Demo data switch, opens offline, and holds no email addresses: an account shows its number and alias.
 
 ### Refresh expired tokens
 

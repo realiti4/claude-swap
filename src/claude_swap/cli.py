@@ -786,14 +786,17 @@ Examples:
   cswap history --days 30       # a longer look back
   cswap history --json          # the same numbers for scripts
   cswap history --demo          # made-up data, to see what the view shows
+  cswap history --html --open   # the same view in your browser; cswap auto keeps it current
+  cswap history --html --out usage.html --days 30   # a one-off copy
 
 Recording: cswap config set history.enabled false   (stops it; keeps what's recorded)
            cswap config set history.retentionDays 90
         """,
     )
     parser.add_argument(
-        "--days", type=float, default=7.0, metavar="N",
-        help="How far back to draw, in days (default 7; fractions work: 0.5)",
+        "--days", type=float, default=None, metavar="N",
+        help="How far back to draw, in days (default 7; with --html 30, or all of it "
+        "with --out; fractions work: 0.5)",
     )
     parser.add_argument(
         "--width", type=int, metavar="COLS",
@@ -810,10 +813,31 @@ Recording: cswap config set history.enabled false   (stops it; keeps what's reco
     parser.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON to stdout",
     )
+    parser.add_argument(
+        "--html", action="store_true",
+        help="Write the view as a web page instead (history/report.html in the backup "
+        "directory, which a running cswap auto then keeps current)",
+    )
+    parser.add_argument(
+        "--out", metavar="FILE",
+        help="With --html: write a one-off copy here instead (it never updates)",
+    )
+    parser.add_argument(
+        "--open", action="store_true", help="With --html: open the report in your browser",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
-    if not 0 < args.days <= 3650:
+    if args.days is not None and not 0 < args.days <= 3650:
         parser.error("--days must be more than 0 and at most 3650")
+    if (args.out or args.open) and not args.html:
+        parser.error("--out and --open go with --html")
+    if args.html and args.json:
+        parser.error("--html and --json are different outputs; pick one")
+    if args.html:
+        _history_html(args)
+        return
+    if args.days is None:
+        args.days = 7.0
     if args.width is not None and args.width < 50:
         parser.error("--width must be at least 50 (the narrowest the chart is laid out for)")
 
@@ -865,6 +889,51 @@ Recording: cswap config set history.enabled false   (stops it; keeps what's reco
             print(json.dumps(error_envelope(e), indent=2))
         else:
             error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def _history_html(args: argparse.Namespace) -> None:
+    """``cswap history --html``: write the HTML report, optionally open it."""
+    import webbrowser
+    from pathlib import Path
+
+    from claude_swap import history_report
+
+    try:
+        if args.demo:
+            if args.out:
+                out = Path(args.out)
+            else:
+                from claude_swap.history import HISTORY_DIRNAME, ensure_private_dir
+
+                directory = paths.get_backup_root() / HISTORY_DIRNAME
+                ensure_private_dir(directory)
+                out = directory / history_report.DEMO_REPORT_FILENAME
+            path = history_report.write_demo_report(out)
+            print(f"Wrote {path} (made-up demo data)")
+        else:
+            switcher = ClaudeAccountSwitcher(debug=args.debug)
+            _guard_root(switcher)
+            path, payload = history_report.write_report(
+                switcher, days=args.days, out=Path(args.out) if args.out else None
+            )
+            days = payload["rangeDays"]
+            print(f"Wrote {path} ({len(payload['board'])} accounts, "
+                  f"{'last ' + format(days, 'g') + ' days' if days else 'all history'})")
+            if payload["live"]:
+                print(dimmed(
+                    "While cswap auto runs it rebuilds this file every minute or so, and an "
+                    "open tab reloads itself. Delete the file to stop that."
+                ))
+        if args.open:
+            webbrowser.open(path.resolve().as_uri())
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except OSError as e:
+        error(f"Error: could not write the report: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
@@ -1040,11 +1109,19 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        def refresh_history_report() -> None:
+            from claude_swap import history_report
+
+            history_report.refresh_live_report(switcher)
+
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            # Only this long-running loop keeps the HTML history report
+            # current; list, switch, the TUI and the menu bar never build it.
+            after_tick=refresh_history_report,
         )
 
         if args.once:
