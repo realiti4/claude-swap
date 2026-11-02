@@ -124,6 +124,52 @@ def _trace(text: str) -> None:
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} trace {text}", flush=True)
 
 
+def ledger_path() -> Path:
+    """One JSON line per billed inference request: when, which account, the API's request id."""
+    return Path.home() / ".claude-swap-backup" / "desktop-follow" / "requests.jsonl"
+
+
+def is_inference(host: str, path: str) -> bool:
+    """A billed model call: not token counting, which costs nothing."""
+    return host == API_HOST and path.startswith(REWRITE_PREFIX) and not path.startswith("/v1/messages/count_tokens")
+
+
+def billed_account(headers) -> str | None:
+    """The email the request is billed to: the active account when its token is on the request,
+    None when the app's own login went through (an expired or missing active token)."""
+    token = active_token()
+    if token is not None and headers.get("authorization", "") == f"Bearer {token}":
+        return active_email()
+    return None
+
+
+def _entrypoint(user_agent: str) -> str:
+    """``claude-desktop`` from ``claude-cli/2.1 (external, claude-desktop)``; '' when absent."""
+    inner = user_agent.rpartition("(")[2].rstrip(")")
+    return inner.split(",")[-1].strip() if "," in inner else ""
+
+
+def record(flow, status: int | str) -> None:
+    """Append the ledger line. Failing to write it must never fail the request."""
+    req = flow.request
+    if not is_inference(req.pretty_host, req.path):
+        return
+    try:
+        line = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(req.timestamp_start)),
+            "account": flow.metadata.get("cswap_account"),
+            "request_id": flow.response.headers.get("request-id", "") if getattr(flow, "response", None) else "",
+            "status": status,
+            "entrypoint": _entrypoint(req.headers.get("user-agent", "")),
+        }
+        path = ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+    except Exception:
+        pass
+
+
 class FollowActive:
     def running(self) -> None:
         publish_marker()
@@ -134,18 +180,24 @@ class FollowActive:
     def request(self, flow) -> None:
         if rewrite(flow.request.pretty_host, flow.request.path, flow.request.headers):
             flow.comment = "cswap: billed to active account"
+        if is_inference(flow.request.pretty_host, flow.request.path):
+            flow.metadata["cswap_account"] = billed_account(flow.request.headers)
         _trace(f"> {flow.request.method} {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]}")
 
     def responseheaders(self, flow) -> None:
         # Only requests are ever changed, so pass every response through as it arrives. Buffered, a
         # long-lived stream (Remote Control's /worker/events/stream) never answers the client.
         flow.response.stream = True
+        # The headers carry the status and request id; the body (still arriving) is not needed.
+        record(flow, flow.response.status_code)
 
     def response(self, flow) -> None:
         r = flow.response
         _trace(f"< {r.status_code} {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]} {r.headers.get('content-type', '-')[:30]}")
 
     def error(self, flow) -> None:
+        if not getattr(flow, "response", None):
+            record(flow, "error")
         _trace(f"! {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]} {flow.error}")
 
     def websocket_start(self, flow) -> None:

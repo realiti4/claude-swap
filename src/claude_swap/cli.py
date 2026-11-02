@@ -1230,6 +1230,10 @@ def main() -> None:
         from claude_swap import desktop_follow
 
         sys.exit(desktop_follow.run(argv[1:]))
+    if argv and argv[0] == "usage-report":
+        from claude_swap import desktop_usage
+
+        sys.exit(desktop_usage.run(argv[1:]))
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1284,8 +1288,9 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s desktop-follow --on        Windows: bill Claude Desktop's Code tab to the active account
+  %(prog)s usage-report               Windows: tokens against weekly percentage per account (HTML)
   %(prog)s upgrade                    self-upgrade to latest
-  %(prog)s purge                      remove all claude-swap data
+  %(prog)s purge                     remove all claude-swap data
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,

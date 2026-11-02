@@ -279,6 +279,16 @@ def turn_off() -> None:
     save_state({"enabled": False})
 
 
+def _sample_usage() -> None:
+    """Record cswap's newest weekly percentages for the usage report; best effort."""
+    try:
+        from claude_swap import desktop_usage
+
+        desktop_usage.sample_usage()
+    except Exception:
+        pass
+
+
 def ensure(*, port: int | None = None) -> str:
     """Bring a wanted proxy back; give the wiring up when it cannot be.
 
@@ -294,6 +304,7 @@ def ensure(*, port: int | None = None) -> str:
     if not state.get("enabled"):
         return "off"
     port = port or state.get("port") or DEFAULT_PORT
+    _sample_usage()
     if proxy_alive(port):
         if state.get("failures"):
             state.pop("failures")
