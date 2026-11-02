@@ -482,17 +482,32 @@ def render_overview(
     tz: tzinfo | None = None,
     color: bool = True,
     settings_note: str | None = None,
+    chart_rows: int | None = None,
+    pace_table: bool = True,
+    pace_notes: bool = True,
+    accounts_now: bool = True,
+    compact: bool = False,
 ) -> list[Text]:
     """The weekly-room chart, the pace table and each account's room now.
 
     ``color`` only decides whether the area under the room line is shaded:
     without colour the shading would be as loud as the lines.
+
+    The TUI's watch screen draws a shorter version above its account cards:
+    ``chart_rows`` sets the chart's height (default: from the width),
+    ``pace_table=False`` drops the pace table, ``pace_notes=False`` only the
+    notes under it, and ``accounts_now=False`` the per-account list the cards
+    already show. ``compact`` also drops the line about resets, the blank
+    line under it and the legend (the right-edge labels still name the
+    paces), for a short terminal.
     """
     # Braille only with colour: in one colour three dashed braille lines are
     # indistinguishable, so without it the chart draws markers (x, o, +).
     chart_unicode = unicode and color
     g = Glyphs(unicode, marks=not chart_unicode)
     width, rows = chart_size(width)
+    if chart_rows is not None:
+        rows = max(4, chart_rows)
     now = a.now
     out: list[Text] = []
     title = Text("Weekly room left", style="bold")
@@ -529,10 +544,11 @@ def render_overview(
             f"{missing} account{' has' if missing == 1 else 's have'} no recent reading, "
             f"so {'it is' if missing == 1 else 'they are'}n't counted"
         )
-    if notes:
+    if notes and not compact:
         for line in _wrap(". ".join(notes) + ".", width):
             out.append(Text(line, style=MUTED))
-    out.append(Text())
+    if not compact:
+        out.append(Text())
 
     # -- the chart --
     fcs = [f for f in a.forecasts if f.ok and f.sim is not None]
@@ -615,13 +631,16 @@ def render_overview(
         paces.append(f" {f.pace.key}  ", style=None if f.ok else MUTED)
     items.append(paces + Text("pace"))
     items.append(Text(g.key("dot", "idle"), style=IDLE) + Text(" if no more use"))
-    out.extend(_pack(items, width, "  ", "   "))
-    out.append(Text())
+    if not compact:
+        out.extend(_pack(items, width, "  ", "   "))
 
     # -- pace table --
-    out.extend(_pace_table(a, g, width, tz))
-    out.append(Text())
-    out.extend(_accounts_now(a, g, width, tz))
+    if pace_table:
+        out.append(Text())
+        out.extend(_pace_table(a, g, width, tz, notes=pace_notes))
+    if accounts_now:
+        out.append(Text())
+        out.extend(_accounts_now(a, g, width, tz))
     if settings_note:
         out.append(Text())
         out.extend(Text(line, style=MUTED) for line in _wrap(settings_note, width))
@@ -661,7 +680,9 @@ def more_accounts_words(n: int | None) -> str:
     return f"+{n} account{'s' if n != 1 else ''}"
 
 
-def _pace_table(a: Analysis, g: Glyphs, width: int, tz: tzinfo | None) -> list[Text]:
+def _pace_table(
+    a: Analysis, g: Glyphs, width: int, tz: tzinfo | None, *, notes: bool = True
+) -> list[Text]:
     # Wide: one row a pace, the outlook in its own column. Narrow (under
     # NARROW_W): the outlook goes on the line under its pace.
     narrow = width < NARROW_W
@@ -692,6 +713,8 @@ def _pace_table(a: Analysis, g: Glyphs, width: int, tz: tzinfo | None) -> list[T
         line.append(f"{worth(sus):>{num_w}}", style="bold")
         line.append(f"{'0':>{more_w}}", style=MUTED)
         out.extend(tail(line, "Faster than this runs out sooner or later", MUTED))
+    if not notes:
+        return out
     out.extend(Text(s, style=MUTED) for s in _wrap(
         "A day = accounts' worth of weekly limit used a day. More accounts = how many "
         "more than are counted now it would take to keep up with that pace for good "

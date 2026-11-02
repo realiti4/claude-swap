@@ -226,6 +226,8 @@ recent reading, so it isn't counted.
 
 The history fills in as cswap checks usage (`cswap auto`, `cswap list`, the dashboard, the menu bar), so it starts when you upgrade and has gaps while none of them run; the 24-hour pace appears after a day of it. It costs no extra requests, stays on your machine in the backup directory's `history/` folder (owner-only, no email addresses), and keeps 400 days by default. In colour the chart is drawn in braille; without colour, or where the terminal can't show braille (`--ascii` forces it), each line gets its own marker. It needs a terminal at least 50 columns wide.
 
+The same chart, without the per-account list, sits above the account cards in `cswap watch` (the dashboard's *Watch accounts*). It takes at most half the window's height: in a shorter window the chart gets shorter, then the pace rows go (they need about 46 to 60 rows, depending on width), then the legend; under 24 rows a one-line note stands in. It redraws when an account's reading changes (at most every 10 seconds), when the window is resized, and every minute so *now* keeps moving. Press `h` to hide or show it.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
