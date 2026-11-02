@@ -518,6 +518,114 @@ Examples:
         sys.exit(130)
 
 
+def _resume_hook_entry(action: str, argv: list[str]) -> None:
+    """Internal entry points: ``arm`` (the StopFailure hook) and ``wait``
+    (the detached waiter it spawns). Never print, never fail loudly — a hook
+    must not disturb the Claude Code session it runs under."""
+    from claude_swap.logging_config import setup_logging
+    from claude_swap.notifications import notify_continue_stopped, notify_session_continued
+    from claude_swap.paths import get_backup_root
+    from claude_swap.resume import Waiter, arm, valid_session_id
+
+    backup_root = get_backup_root()
+    logger = setup_logging(backup_root)
+    try:
+        if action == "arm":
+            raw = sys.stdin.read()
+            try:
+                hook_input = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                hook_input = {}
+            if not isinstance(hook_input, dict):
+                hook_input = {}
+            outcome = arm(backup_root, hook_input, os.environ, on_gave_up=notify_continue_stopped)
+            logger.debug("auto-continue: arm -> %s", outcome)
+        elif argv and valid_session_id(argv[0]):
+            Waiter(
+                backup_root,
+                argv[0],
+                on_resumed=notify_session_continued,
+                on_gave_up=notify_continue_stopped,
+            ).run()
+    except Exception:
+        logger.exception("auto-continue: %s failed", action)
+    sys.exit(0)
+
+
+def _resume_command(argv: list[str]) -> None:
+    """Handle `cswap resume [install|uninstall|status|now]`.
+
+    Auto-continue: when a usage limit stops a Claude Code session, carry it on
+    automatically once there is capacity again (an account switch landed, or
+    the limit reset). Pre-dispatched like `auto` and `config`.
+    """
+    if argv and argv[0] in ("arm", "wait"):
+        _resume_hook_entry(argv[0], argv[1:])
+        return
+
+    parser = argparse.ArgumentParser(
+        prog="cswap resume",
+        description=(
+            "Auto-continue Claude Code sessions that a usage limit stopped, as "
+            "soon as there is capacity again (an account switch landed or the "
+            "limit reset)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+How it works:
+  install adds a StopFailure hook to Claude Code's settings.json. When a turn
+  ends on a usage limit, the hook arms a small background waiter for that
+  session; once capacity is back it sends the session a "continue" message
+  through Claude Code's own cross-session inbox, which starts a new turn.
+  Requires Claude Code 2.1.234+ (cross-session messaging).
+
+Examples:
+  cswap resume install       # enable auto-continue (snapshots settings.json first)
+  cswap resume status        # sessions waiting, resumed, or stopped on a limit
+  cswap resume now --all     # continue every waiting session right away
+  cswap resume uninstall     # remove the hook again
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(dest="action", metavar="{install,uninstall,status,now}")
+    p_install = sub.add_parser("install", help="Add the StopFailure hook (enables auto-continue)")
+    p_install.add_argument(
+        "--command",
+        metavar="CMD",
+        help="Hook command to register (default: this cswap's absolute path + 'resume arm')",
+    )
+    sub.add_parser("uninstall", help="Remove the hook (disables auto-continue)")
+    p_status = sub.add_parser("status", help="Show waiting/resumed sessions (the default)")
+    p_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    p_now = sub.add_parser("now", help="Continue waiting/stopped sessions right away")
+    p_now.add_argument("sessions", nargs="*", metavar="SESSION", help="Session id (prefix) or name")
+    p_now.add_argument("--all", action="store_true", help="Every session stopped on a limit")
+    args = parser.parse_args(argv)
+    action = args.action or "status"
+
+    from claude_swap.resume_cli import resume_install, resume_now, resume_status, resume_uninstall
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        root = switcher.backup_dir
+        if action == "install":
+            resume_install(root, args.command)
+        elif action == "uninstall":
+            resume_uninstall(root)
+        elif action == "status":
+            resume_status(root, json_output=getattr(args, "json", False))
+        elif action == "now":
+            if not args.sessions and not args.all:
+                parser.error("name a SESSION or pass --all")
+            sys.exit(resume_now(root, args.sessions, all_sessions=args.all))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _add_accounts_batch(switcher: ClaudeAccountSwitcher, count: int) -> None:
     """Register `count` accounts in a row, pausing between each one.
 
@@ -584,6 +692,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "resume":
+        _resume_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -612,6 +723,7 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s resume [install|status]    auto-continue sessions a usage limit stopped
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts

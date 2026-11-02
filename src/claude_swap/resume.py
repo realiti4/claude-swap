@@ -1,0 +1,847 @@
+"""Auto-continue: carry on a Claude Code session that a usage limit stopped,
+as soon as there is capacity again.
+
+1. **Arm.** Claude Code's ``StopFailure`` hook (``cswap resume install``) runs
+   ``cswap resume arm`` when a turn ends on a rate limit. ``arm`` records the
+   stop under ``<backup_root>/resume/<session_id>.json`` — reset time and limit
+   type from the transcript, plus the account the session was on — and spawns
+   one detached waiter per session. The hook fires repeatedly for one limit
+   (helper queries, subagents), so ``arm`` is idempotent: a stop it already
+   noted changes nothing, and a live waiter picks up an updated record.
+
+2. **Wait.** The waiter (``cswap resume wait``) is passive by design: it never
+   fetches usage or switches accounts (N waiters polling the usage API at once
+   is the burst pattern behind the 2026-08-03 incident — that stays the single
+   ``cswap auto`` loop's job). It reads only local state — the transcript, the
+   session's status file, the live login, cswap's cached usage and the auto
+   engine's last switch — and resumes when the limit has reset, or when the
+   session's account changed since the stop and the new one isn't known to be
+   exhausted. It gives up when the session closes, moves on by itself, or
+   ``MAX_WAIT_S`` passes.
+
+3. **Deliver.** The message goes into the session's own cross-session inbox,
+   authenticated with the own-child token the hook process inherited, so
+   Claude Code treats it as the session's own hook posting back — delivered
+   even when the session bypasses permission prompts. An idle session starts a
+   new turn with it.
+
+Loop guard: a stop that follows one of our resumes with no real output in
+between counts as consecutive; ``resume.maxConsecutive`` in a row and the
+session is left alone (with a notification) instead of retried forever.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, fields, replace
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from claude_swap import transcript as tx
+from claude_swap.inbox import InboxError, inbox_address, peer_token, post_message
+from claude_swap.locking import FileLock
+from claude_swap.paths import get_claude_config_home, get_global_config_path
+from claude_swap.process_detection import ClaudeSession, list_sessions
+from claude_swap.settings import ResumeSettings, atomic_write_json, load_resume_settings
+
+if TYPE_CHECKING:
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+RESUME_DIRNAME = "resume"
+POLL_S = 30.0  # waiter cadence while capacity isn't back
+SLICE_S = 2.0  # how often a sleeping waiter looks for a `resume now` request
+# Spread resumes that become due together (several sessions stopped on the
+# same limit), so they don't all land on the fresh window in the same second.
+JITTER_S = 20.0
+MAX_WAIT_S = 8 * 24 * 3600.0  # a full weekly window, plus margin
+# Same-account "quota is back" evidence: a usage reading taken this long after
+# the stop, with the limited window at or below this pct. Conservative on
+# purpose — at 99-100% the API is still refusing.
+HEADROOM_EVIDENCE_AFTER_S = 60.0
+HEADROOM_MAX_PCT = 98.0
+RECORD_RETENTION_S = 7 * 24 * 3600.0
+# The hook can run before the stop is flushed to the transcript, which then
+# still ends on earlier output. Only output *after* the stop (or after
+# arming) proves the session moved on; past this grace with no stop showing
+# up at all, the event was about something else (a helper query, a
+# subagent) and the waiter stands down.
+ARM_GRACE_S = 120.0
+# StopFailure also fires for helper queries and subagents while the main
+# turn keeps going; after a waiter saw the session moving, don't spawn
+# another for this long unless the transcript really shows a stop.
+RESPAWN_DAMPING_S = 60.0
+
+WAITING = "waiting"
+RESUMED = "resumed"
+GAVE_UP = "gave-up"
+UNDELIVERED = "undelivered"  # sent, but the session never recorded it (held/refused)
+SESSION_GONE = "session-gone"
+MOVED_ON = "moved-on"  # carried on without us: the user, or a built-in auto-continue
+TIMED_OUT = "timed-out"
+
+# A stopped session is "idle", or "waiting" while a limit dialog is open
+# (terminal UI); delivery additionally requires the transcript to end on the
+# stop itself, so a session waiting on a permission prompt is never poked.
+DELIVERABLE_STATUSES = (None, "idle", "waiting")
+# How long the session gets to record a delivered message before we conclude
+# its inbound controls held or refused it, and the clock tolerance applied.
+CONFIRM_TIMEOUT_S = 60.0
+CONFIRM_POLL_S = 2.0
+CONFIRM_SKEW_S = 5.0
+
+MARKER = "[claude-swap auto-continue]"
+MESSAGE = (
+    MARKER + " The usage limit that stopped this session has "
+    "cleared ({why}). Please continue the task you were working on, picking up "
+    "exactly where you left off. If it was already finished, just say so in one line."
+)
+REASON_TEXT = {
+    "limit-reset": "the limit window reset",
+    "account-switched": "claude-swap switched to an account with quota left",
+    "headroom": "the account has quota again",
+    "forced": "you asked claude-swap to continue it",
+}
+
+_SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,63}$")
+
+_logger = logging.getLogger("claude-swap")
+
+
+# ---------------------------------------------------------------------------
+# Records
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResumeRecord:
+    """Everything known about one session's latest usage-limit stop."""
+
+    session_id: str
+    transcript_path: str
+    config_home: str
+    global_config_path: str
+    # False for a non-default config home (`cswap run` profiles): account
+    # switches never apply there, only the limit's own reset does.
+    default_profile: bool
+    armed_at: float
+    socket_path: str | None = None
+    cwd: str | None = None
+    identity_email: str | None = None  # the account the session was on at the stop
+    identity_org: str | None = None
+    stall_uuid: str | None = None
+    stalled_at: float | None = None
+    resets_at: float | None = None
+    limit_type: str | None = None
+    state: str = WAITING
+    detail: str = ""
+    consecutive: int = 0  # our resumes in a row that hit the limit again
+    last_resume_at: float | None = None
+    resumed_stall_uuid: str | None = None
+    updated_at: float = 0.0
+
+    @property
+    def identity(self) -> tuple[str, str] | None:
+        if not self.identity_email:
+            return None
+        return (self.identity_email, self.identity_org or "")
+
+    def to_json(self) -> dict:
+        return {_camel(f.name): getattr(self, f.name) for f in fields(self)}
+
+    @classmethod
+    def from_json(cls, data: dict) -> ResumeRecord | None:
+        kwargs = {}
+        for f in fields(cls):
+            key = _camel(f.name)
+            if key in data:
+                kwargs[f.name] = data[key]
+        try:
+            return cls(**kwargs)
+        except TypeError:
+            return None
+
+
+def _camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
+
+
+def valid_session_id(session_id: object) -> bool:
+    return isinstance(session_id, str) and bool(_SESSION_ID.match(session_id))
+
+
+def resume_dir(backup_root: Path) -> Path:
+    return backup_root / RESUME_DIRNAME
+
+
+def _record_path(backup_root: Path, session_id: str) -> Path:
+    return resume_dir(backup_root) / f"{session_id}.json"
+
+
+def force_flag(backup_root: Path, session_id: str) -> Path:
+    return resume_dir(backup_root) / f"{session_id}.force"
+
+
+def load_record(backup_root: Path, session_id: str) -> ResumeRecord | None:
+    try:
+        data = json.loads(_record_path(backup_root, session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return ResumeRecord.from_json(data) if isinstance(data, dict) else None
+
+
+def list_records(backup_root: Path) -> list[ResumeRecord]:
+    records = []
+    try:
+        paths = sorted(resume_dir(backup_root).glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        record = load_record(backup_root, path.stem)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _records_lock(backup_root: Path) -> FileLock:
+    return FileLock(resume_dir(backup_root) / ".records.lock")
+
+
+def mutate_record(
+    backup_root: Path,
+    session_id: str,
+    mutator: Callable[[ResumeRecord | None], ResumeRecord | None],
+) -> ResumeRecord | None:
+    """Read-modify-write one record under the records lock (arm and the
+    waiter both update records, possibly at the same moment)."""
+    with _records_lock(backup_root):
+        updated = mutator(load_record(backup_root, session_id))
+        if updated is not None:
+            atomic_write_json(_record_path(backup_root, session_id), updated.to_json())
+        return updated
+
+
+def _waiter_lock(backup_root: Path, session_id: str) -> FileLock:
+    return FileLock(resume_dir(backup_root) / f"{session_id}.waiter.lock")
+
+
+def waiter_alive(backup_root: Path, session_id: str) -> bool:
+    """Whether a waiter process currently holds this session's waiter lock."""
+    lock = _waiter_lock(backup_root, session_id)
+    if lock.acquire(timeout=0):
+        lock.release()
+        return False
+    return True
+
+
+def prune_records(backup_root: Path, now: float) -> None:
+    """Drop finished records (and their lock/flag files) older than the
+    retention window; waiting records are never pruned."""
+    for record in list_records(backup_root):
+        if record.state == WAITING or now - (record.updated_at or 0) < RECORD_RETENTION_S:
+            continue
+        base = resume_dir(backup_root)
+        for name in (
+            f"{record.session_id}.json",
+            f"{record.session_id}.force",
+            f"{record.session_id}.waiter.lock",
+        ):
+            try:
+                (base / name).unlink()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Local state the waiter reads
+# ---------------------------------------------------------------------------
+
+
+def read_identity(global_config: Path | str) -> tuple[str, str] | None:
+    """The live login's (email, organizationUuid) from Claude Code's config."""
+    try:
+        data = json.loads(Path(global_config).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    account = data.get("oauthAccount") if isinstance(data, dict) else None
+    if not isinstance(account, dict):
+        return None
+    email = account.get("emailAddress")
+    if not isinstance(email, str) or not email:
+        return None
+    return (email, account.get("organizationUuid") or "")
+
+
+def read_last_switch_at(backup_root: Path) -> float | None:
+    """When ``cswap auto`` last switched accounts (its persisted state)."""
+    try:
+        state = json.loads((backup_root / "autoswitch_state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = state.get("lastSwitchAt") if isinstance(state, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def cross_session_inbound(settings_path: Path) -> str | None:
+    """The ``crossSessionInbound`` value in a Claude Code settings file."""
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("crossSessionInbound") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def peer_message_held(permission_mode: str | None, config_home: Path | str) -> bool:
+    """Whether a session would hold a message from an outside (peer) sender:
+    sessions that bypass permission prompts do, unless the user opted into
+    ``crossSessionInbound: accept``."""
+    if permission_mode != "bypassPermissions":
+        return False
+    return cross_session_inbound(Path(config_home) / "settings.json") != "accept"
+
+
+def delivery_confirmed(
+    transcript_path: str,
+    since: float,
+    *,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    timeout: float = CONFIRM_TIMEOUT_S,
+) -> bool:
+    """Poll the transcript for our message. A held or refused message leaves
+    no trace at all, so "posted" alone proves nothing."""
+    deadline = clock() + timeout
+    while True:
+        if tx.recorded_since(transcript_path, MARKER, since - CONFIRM_SKEW_S):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(CONFIRM_POLL_S)
+
+
+def is_default_profile(config_home: Path, backup_root: Path) -> bool:
+    """False for a ``cswap run`` session profile (a config home under the
+    backup root's ``sessions/``): those are pinned to one account, so account
+    switches never help them — only the limit's own reset does."""
+    try:
+        return not config_home.resolve().is_relative_to((backup_root / "sessions").resolve())
+    except OSError:
+        return True
+
+
+def find_session(config_home: Path | str, session_id: str) -> ClaudeSession | None:
+    """The live Claude Code process currently running this session, if any."""
+    for session in list_sessions(Path(config_home)):
+        if session.session_id == session_id:
+            return session
+    return None
+
+
+def _reset_ts(window: dict) -> float | None:
+    raw = window.get("resets_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _limited_windows(limit_type: str | None) -> tuple[str, ...]:
+    if limit_type in ("five_hour", "seven_day"):
+        return (limit_type,)
+    return ("five_hour", "seven_day")
+
+
+def window_pct(usage: object, limit_type: str | None, now: float) -> float | None:
+    """Current utilization of the window(s) a stop was about, from cached
+    usage; a reading whose window has since reset counts as 0. ``None`` when
+    unknown."""
+    if not isinstance(usage, dict):
+        return None
+    pcts = []
+    for key in _limited_windows(limit_type):
+        window = usage.get(key)
+        if not isinstance(window, dict):
+            continue
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            continue
+        reset = _reset_ts(window)
+        pcts.append(0.0 if reset is not None and reset <= now else float(pct))
+    return max(pcts) if pcts else None
+
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Readiness:
+    ready: bool
+    reason: str
+    wait_s: float = POLL_S
+
+
+@dataclass(frozen=True)
+class LiveContext:
+    """The local observations one readiness decision runs on."""
+
+    identity: tuple[str, str] | None = None
+    last_switch_at: float | None = None
+    usage: dict | None = None  # cached usage of the live account
+    usage_fetched_at: float | None = None
+
+
+def evaluate(
+    record: ResumeRecord, now: float, live: LiveContext, settings: ResumeSettings
+) -> Readiness:
+    """Is there capacity to continue this session again?"""
+    reset_due = record.resets_at + settings.slack_seconds if record.resets_at else None
+    if reset_due is not None and now >= reset_due:
+        return Readiness(True, "limit-reset", 0.0)
+    stalled_at = record.stalled_at or record.armed_at
+    pct = window_pct(live.usage, record.limit_type, now)
+    if settings.on_switch and record.default_profile:
+        identity_changed = (
+            live.identity is not None
+            and record.identity is not None
+            and live.identity != record.identity
+        )
+        switched_since = live.last_switch_at is not None and live.last_switch_at > stalled_at
+        if identity_changed or switched_since:
+            if pct is not None and pct >= 100.0:
+                return Readiness(False, "switched-account-exhausted")
+            return Readiness(True, "account-switched", 0.0)
+    if (
+        record.default_profile
+        and pct is not None
+        and pct <= HEADROOM_MAX_PCT
+        and live.usage_fetched_at is not None
+        and live.usage_fetched_at >= stalled_at + HEADROOM_EVIDENCE_AFTER_S
+    ):
+        return Readiness(True, "headroom", 0.0)
+    if reset_due is None:
+        return Readiness(False, "waiting-for-capacity")
+    return Readiness(False, "waiting-for-reset", max(1.0, min(POLL_S, reset_due - now)))
+
+
+def note_stall(
+    record: ResumeRecord,
+    stall: tx.Stall,
+    state: tx.TranscriptState,
+    settings: ResumeSettings,
+    identity: tuple[str, str] | None,
+    now: float,
+) -> ResumeRecord:
+    """Fold a newly seen stop into the record, applying the loop guard."""
+    consecutive = record.consecutive
+    if record.last_resume_at is not None and stall.uuid != record.resumed_stall_uuid:
+        # A new stop after one of our resumes: did that resume get work done?
+        # A prompt typed by hand since then also starts the count over.
+        since = record.last_resume_at
+        moved = state.progressed_since(since) or state.prompted_since(since)
+        consecutive = 0 if moved else consecutive + 1
+    updated = replace(
+        record,
+        stall_uuid=stall.uuid,
+        stalled_at=stall.at,
+        resets_at=stall.resets_at,
+        limit_type=stall.limit_type,
+        identity_email=identity[0] if identity else record.identity_email,
+        identity_org=identity[1] if identity else record.identity_org,
+        consecutive=consecutive,
+        updated_at=now,
+    )
+    if consecutive >= settings.max_consecutive:
+        return replace(
+            updated,
+            state=GAVE_UP,
+            detail=f"hit the limit again after {consecutive} automatic continues in a row",
+        )
+    return replace(updated, state=WAITING)
+
+
+# ---------------------------------------------------------------------------
+# Arm (the StopFailure hook)
+# ---------------------------------------------------------------------------
+
+
+def arm(
+    backup_root: Path,
+    hook_input: Mapping,
+    env: Mapping[str, str],
+    *,
+    clock: Callable[[], float] = time.time,
+    spawn: Callable[[str], None] | None = None,
+    on_gave_up: Callable[[str, str], None] | None = None,
+) -> str:
+    """Handle one StopFailure event. Returns an outcome word (for logs and
+    tests); never raises for bad input, so a hook can't break the session."""
+    raw_id = hook_input.get("session_id")
+    transcript_path = hook_input.get("transcript_path")
+    if not valid_session_id(raw_id) or not isinstance(transcript_path, str):
+        return "bad-input"
+    session_id = str(raw_id)
+    now = clock()
+    settings = load_resume_settings(backup_root)
+    prune_records(backup_root, now)
+    state = tx.read_transcript_state(transcript_path)
+    stall = state.stall if state.status == tx.STALLED else None
+    identity = read_identity(get_global_config_path())
+    outcome = "armed"
+
+    config_home = get_claude_config_home()
+
+    def mutator(prev: ResumeRecord | None) -> ResumeRecord | None:
+        nonlocal outcome
+        if prev is not None and stall is not None and stall.uuid == prev.resumed_stall_uuid:
+            outcome = "already-resumed"  # a repeat event for a stop we already handled
+            return None
+        if prev is not None and prev.state == GAVE_UP and stall is not None:
+            if stall.uuid == prev.stall_uuid:
+                outcome = "gave-up"
+                return None
+        if (
+            prev is not None
+            and prev.state == MOVED_ON
+            and stall is None
+            and now - prev.updated_at < RESPAWN_DAMPING_S
+        ):
+            outcome = "recently-moved-on"
+            return None
+        base = prev if prev is not None and prev.state == WAITING else None
+        record = ResumeRecord(
+            session_id=session_id,
+            transcript_path=transcript_path,
+            config_home=str(config_home),
+            global_config_path=str(get_global_config_path()),
+            default_profile=is_default_profile(config_home, backup_root),
+            armed_at=base.armed_at if base else now,
+            socket_path=env.get("CLAUDE_CODE_MESSAGING_SOCKET") or None,
+            cwd=hook_input.get("cwd") if isinstance(hook_input.get("cwd"), str) else None,
+            identity_email=base.identity_email if base else (identity[0] if identity else None),
+            identity_org=base.identity_org if base else (identity[1] if identity else None),
+            stall_uuid=base.stall_uuid if base else None,
+            stalled_at=base.stalled_at if base else None,
+            resets_at=base.resets_at if base else None,
+            limit_type=base.limit_type if base else None,
+            consecutive=prev.consecutive if prev else 0,
+            last_resume_at=prev.last_resume_at if prev else None,
+            resumed_stall_uuid=prev.resumed_stall_uuid if prev else None,
+            updated_at=now,
+        )
+        if stall is not None and stall.uuid != record.stall_uuid:
+            record = note_stall(record, stall, state, settings, identity, now)
+            if record.state == GAVE_UP:
+                outcome = "gave-up-now"
+        return record
+
+    record = mutate_record(backup_root, session_id, mutator)
+    if record is None:
+        return outcome
+    if outcome == "gave-up-now":
+        _logger.warning("auto-continue: session %s %s", session_id[:8], record.detail)
+        if on_gave_up and settings.notify:
+            on_gave_up(_session_label(record), record.detail)
+        return "gave-up"
+    if waiter_alive(backup_root, session_id):
+        return "already-waiting"
+    (spawn or spawn_waiter)(session_id)
+    _logger.info("auto-continue: armed session %s (%s)", session_id[:8], record.limit_type or "?")
+    return outcome
+
+
+def spawn_waiter(session_id: str) -> None:
+    """Start ``cswap resume wait`` fully detached from the hook process.
+
+    Detached so the hook returns at once and the waiter outlives it; no
+    inherited stdio so it never holds Claude Code's hook pipes open. It
+    inherits the environment, which carries the session's own-child inbox
+    token.
+    """
+    cmd = [sys.executable, "-m", "claude_swap", "resume", "wait", session_id]
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform != "win32":
+        subprocess.Popen(cmd, start_new_session=True, **kwargs)
+        return
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        # Out of the hook's job object too, when the job allows it, so
+        # nothing that tears the hook's process tree down takes us along.
+        subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+    except OSError:
+        subprocess.Popen(cmd, creationflags=flags, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Wait + deliver
+# ---------------------------------------------------------------------------
+
+
+def _session_label(record: ResumeRecord, session: ClaudeSession | None = None) -> str:
+    if session is not None and session.name:
+        return session.name
+    if record.cwd:
+        return Path(record.cwd).name or record.cwd
+    return record.session_id[:8]
+
+
+class Waiter:
+    """One session's waiter loop. Every dependency is injectable for tests."""
+
+    def __init__(
+        self,
+        backup_root: Path,
+        session_id: str,
+        *,
+        env: Mapping[str, str] | None = None,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        live_context: Callable[[ResumeRecord], LiveContext] | None = None,
+        on_resumed: Callable[[str, str], None] | None = None,
+        on_gave_up: Callable[[str, str], None] | None = None,
+    ):
+        self.backup_root = backup_root
+        self.session_id = session_id
+        self.env = os.environ if env is None else env
+        self.clock = clock
+        self.sleep = sleep
+        self.live_context = live_context or self._default_live_context
+        self.on_resumed = on_resumed
+        self.on_gave_up = on_gave_up
+        self.settings = load_resume_settings(backup_root)
+        self._switcher: ClaudeAccountSwitcher | None = None
+
+    # -- observations ------------------------------------------------------
+
+    def _default_live_context(self, record: ResumeRecord) -> LiveContext:
+        identity = read_identity(record.global_config_path)
+        if not record.default_profile:
+            return LiveContext(identity=identity)
+        usage = fetched_at = None
+        if identity is not None:
+            try:
+                if self._switcher is None:
+                    from claude_swap.switcher import ClaudeAccountSwitcher
+
+                    self._switcher = ClaudeAccountSwitcher()
+                num = self._switcher.account_number_for_identity(*identity)
+                entry = self._switcher.cached_usage_entry(num) if num else None
+                if entry is not None:
+                    usage, fetched_at = entry.last_good, entry.fetched_at
+            except Exception:  # cached usage is a nicety; never let it stop the wait
+                _logger.debug("auto-continue: cached usage unavailable", exc_info=True)
+        return LiveContext(
+            identity=identity,
+            last_switch_at=read_last_switch_at(self.backup_root),
+            usage=usage,
+            usage_fetched_at=fetched_at,
+        )
+
+    # -- loop ----------------------------------------------------------------
+
+    def run(self) -> str:
+        lock = _waiter_lock(self.backup_root, self.session_id)
+        if not lock.acquire(timeout=0):
+            return "already-waiting"
+        try:
+            return self._loop()
+        finally:
+            lock.release()
+
+    def _finish(self, state: str, detail: str) -> str:
+        def mutator(prev: ResumeRecord | None) -> ResumeRecord | None:
+            if prev is None or prev.state != WAITING:
+                return None
+            return replace(prev, state=state, detail=detail, updated_at=self.clock())
+
+        mutate_record(self.backup_root, self.session_id, mutator)
+        _logger.info("auto-continue: session %s %s: %s", self.session_id[:8], state, detail)
+        return state
+
+    def _loop(self) -> str:
+        last_detail = None
+        while True:
+            record = load_record(self.backup_root, self.session_id)
+            if record is None or record.state != WAITING:
+                return record.state if record else "no-record"
+            now = self.clock()
+            if now - record.armed_at > MAX_WAIT_S:
+                return self._finish(TIMED_OUT, "waited too long; continue it by hand")
+            session = find_session(record.config_home, self.session_id)
+            if session is None:
+                return self._finish(SESSION_GONE, "the session is no longer running")
+            state = tx.read_transcript_state(record.transcript_path)
+            if state.progressed_since(record.stalled_at or record.armed_at):
+                return self._finish(MOVED_ON, "the session carried on without auto-continue")
+            if record.stall_uuid is None and now - record.armed_at > ARM_GRACE_S:
+                if state.status != tx.STALLED:
+                    return self._finish(MOVED_ON, "no usage-limit stop showed up")
+            stall = state.stall if state.status == tx.STALLED else None
+            if stall is not None and stall.uuid == record.resumed_stall_uuid:
+                stall = None  # our message for this stop just hasn't landed yet
+            if stall is not None and stall.uuid != record.stall_uuid:
+                record = self._note(record, stall, state, now)
+                if record.state != WAITING:
+                    if record.state == GAVE_UP and self.on_gave_up and self.settings.notify:
+                        self.on_gave_up(_session_label(record, session), record.detail)
+                    return record.state
+
+            forced = force_flag(self.backup_root, self.session_id).exists()
+            if stall is None:
+                readiness = Readiness(False, "waiting-for-the-stop", SLICE_S * 5)
+            elif forced:
+                readiness = Readiness(True, "forced", 0.0)
+            else:
+                readiness = evaluate(record, now, self.live_context(record), self.settings)
+
+            deliverable = session.status in DELIVERABLE_STATUSES
+            if readiness.ready and stall is not None and deliverable:
+                outcome = self._deliver(record, session, state, readiness.reason, forced)
+                if outcome is not None:
+                    return outcome
+                readiness = Readiness(False, "delivery-failed", POLL_S)
+            elif readiness.ready:
+                readiness = Readiness(False, f"waiting-for-idle ({session.status})", SLICE_S * 2)
+
+            if readiness.reason != last_detail:
+                last_detail = readiness.reason
+                self._set_detail(readiness.reason)
+            self._sleep_watching_flag(readiness.wait_s)
+
+    def _note(
+        self, record: ResumeRecord, stall: tx.Stall, state: tx.TranscriptState, now: float
+    ) -> ResumeRecord:
+        def mutator(prev: ResumeRecord | None) -> ResumeRecord | None:
+            if prev is None:
+                return None
+            # Identity at arm time is the best record of the stop's account;
+            # only a stop with none falls back to the live login now.
+            identity = None if prev.identity else read_identity(prev.global_config_path)
+            return note_stall(prev, stall, state, self.settings, identity, now)
+
+        return mutate_record(self.backup_root, self.session_id, mutator) or record
+
+    def _set_detail(self, detail: str) -> None:
+        def mutator(prev: ResumeRecord | None) -> ResumeRecord | None:
+            if prev is None or prev.state != WAITING or prev.detail == detail:
+                return None
+            return replace(prev, detail=detail, updated_at=self.clock())
+
+        mutate_record(self.backup_root, self.session_id, mutator)
+
+    def _sleep_watching_flag(self, seconds: float) -> None:
+        flag = force_flag(self.backup_root, self.session_id)
+        remaining = max(0.0, seconds)
+        while remaining > 0:
+            step = min(SLICE_S, remaining)
+            self.sleep(step)
+            remaining -= step
+            if flag.exists():
+                return
+
+    def _deliver(
+        self,
+        record: ResumeRecord,
+        session: ClaudeSession,
+        state: tx.TranscriptState,
+        reason: str,
+        forced: bool,
+    ) -> str | None:
+        stall = state.stall
+        if stall is None:  # only called on a stalled transcript
+            return None
+        if not forced:
+            self.sleep(random.uniform(0.0, JITTER_S))
+            # Re-validate after the jitter: the user may have typed meanwhile.
+            fresh = find_session(record.config_home, self.session_id)
+            state = tx.read_transcript_state(record.transcript_path)
+            if fresh is None or state.stall is None or state.stall.uuid != stall.uuid:
+                return None
+            session = fresh
+        address = session.messaging_socket_path or record.socket_path
+        if not address:
+            return self._finish(GAVE_UP, "the session has no cross-session inbox")
+        token, own = self._token_for(address, record, session)
+        if not own and peer_message_held(state.permission_mode, record.config_home):
+            return self._undelivered(
+                record,
+                session,
+                "it bypasses permissions and cswap doesn't have its own token, so Claude "
+                "Code would hold the message; type 'continue' there",
+            )
+        why = REASON_TEXT.get("forced" if forced else reason, reason)
+        posted_at = self.clock()
+        try:
+            post_message(address, MESSAGE.format(why=why), token)
+        except InboxError as e:
+            _logger.warning("auto-continue: delivery to %s failed: %s", self.session_id[:8], e)
+            return None
+        if not delivery_confirmed(
+            record.transcript_path, posted_at, clock=self.clock, sleep=self.sleep
+        ):
+            return self._undelivered(
+                record,
+                session,
+                "the session never recorded the continue message (held or refused by its "
+                "inbound settings); type 'continue' there",
+            )
+        now = self.clock()
+
+        def mutator(prev: ResumeRecord | None) -> ResumeRecord | None:
+            if prev is None:
+                return None
+            return replace(
+                prev,
+                state=RESUMED,
+                detail=why,
+                last_resume_at=now,
+                resumed_stall_uuid=stall.uuid,
+                updated_at=now,
+            )
+
+        mutate_record(self.backup_root, self.session_id, mutator)
+        try:
+            force_flag(self.backup_root, self.session_id).unlink()
+        except OSError:
+            pass
+        _logger.info("auto-continue: resumed session %s (%s)", self.session_id[:8], why)
+        if self.on_resumed and self.settings.notify:
+            self.on_resumed(_session_label(record, session), why)
+        return RESUMED
+
+    def _token_for(
+        self, address: str, record: ResumeRecord, session: ClaudeSession
+    ) -> tuple[str | None, bool]:
+        """``(token, is_own)``: the own-child token when it belongs to this
+        inbox, else the peer token (which a session that bypasses permissions
+        will hold)."""
+        own_socket = self.env.get("CLAUDE_CODE_MESSAGING_SOCKET")
+        own_token = self.env.get("CLAUDE_CODE_MESSAGING_TOKEN")
+        if own_token and own_socket and inbox_address(own_socket) == inbox_address(address):
+            return own_token, True
+        sessions_dir = Path(record.config_home) / "sessions"
+        return peer_token(sessions_dir, session.pid, session.proc_start), False
+
+    def _undelivered(self, record: ResumeRecord, session: ClaudeSession, detail: str) -> str:
+        state = self._finish(UNDELIVERED, detail)
+        if self.on_gave_up and self.settings.notify:
+            self.on_gave_up(_session_label(record, session), detail)
+        return state

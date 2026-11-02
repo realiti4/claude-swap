@@ -170,6 +170,20 @@ def notify_all_exhausted(reset_at: str | None) -> None:
     notify("Claude Swap — No Tokens Left", body, urgency="critical")
 
 
+def notify_session_continued(session: str, why: str) -> None:
+    """Auto-continue told a limit-stopped Claude Code session to carry on."""
+    notify("Claude session continued", f"{session}\n{why}", urgency="normal")
+
+
+def notify_continue_stopped(session: str, detail: str) -> None:
+    """Auto-continue stopped retrying a session (loop guard)."""
+    notify(
+        "Claude auto-continue stopped",
+        f"{session}: {detail}.\nContinue it by hand when you have quota.",
+        urgency="critical",
+    )
+
+
 def notify_quarantined(number: str, email: str, reason: str) -> None:
     """An account was quarantined (dead token)."""
     notify(
