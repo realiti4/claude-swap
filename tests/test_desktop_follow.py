@@ -54,6 +54,7 @@ def test_ensure_does_nothing_when_off(home):
 def test_ensure_leaves_a_live_proxy_alone(home, monkeypatch):
     df.save_state({"enabled": True, "port": 9})
     monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: True)
     assert df.ensure() == "ok"
 
 
@@ -107,6 +108,7 @@ def test_a_start_that_times_out_keeps_the_new_pid(home, monkeypatch):
 def test_ensure_forgets_earlier_failures_once_the_proxy_is_back(home, monkeypatch):
     df.save_state({"enabled": True, "port": 9, "failures": 3})
     monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: True)
     assert df.ensure() == "ok"
     assert "failures" not in df.load_state()
 
@@ -129,6 +131,7 @@ def test_state_word(home, monkeypatch):
     monkeypatch.setattr(df, "proxy_alive", lambda port: False)
     assert df.state_word()[0] == "NOT-OK"
     monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: True)
     config.write_text(json.dumps({"env": {}}))
     word, detail = df.state_word()
     assert word == "NOT-OK" and "HTTPS_PROXY" in detail
@@ -187,3 +190,75 @@ def test_proxy_starts_without_a_console_window(home, monkeypatch):
 def test_other_platforms_are_pointed_at_pin(capsys):
     assert df.run(["--state"]) == 1
     assert "cswap pin" in capsys.readouterr().err
+
+
+def _serve(reply):
+    import socket
+    import threading
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    conns = []
+
+    def run():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            conns.append(conn)
+            if reply:
+                conn.recv(1024)
+                conn.sendall(reply)
+
+    threading.Thread(target=run, daemon=True).start()
+    return server, conns
+
+
+def test_a_proxy_that_answers_is_responsive():
+    server, _ = _serve(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+    try:
+        assert df.proxy_responsive(server.getsockname()[1])
+    finally:
+        server.close()
+
+
+def test_a_proxy_that_accepts_but_never_answers_is_not_responsive():
+    server, conns = _serve(None)
+    try:
+        port = server.getsockname()[1]
+        assert df.proxy_alive(port)  # a plain connect is satisfied
+        assert not df.proxy_responsive(port, timeout=0.3)
+    finally:
+        server.close()
+        for c in conns:
+            c.close()
+
+
+def test_ensure_restarts_a_hung_proxy(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 9})
+    order = []
+    monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: False)
+    monkeypatch.setattr(df, "stop_proxy", lambda: order.append("stop"))
+    monkeypatch.setattr(df, "start_proxy", lambda port: order.append("start"))
+    assert df.ensure() == "restarted"
+    assert order == ["stop", "start"]
+
+
+def test_state_says_not_ok_for_a_hung_proxy(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 9})
+    monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: False)
+    word, detail = df.state_word()
+    assert word == "NOT-OK" and "does not answer" in detail
+
+
+def test_ensure_puts_the_band_marker_back(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 9})
+    monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: True)
+    assert not df.marker_path().exists()
+    assert df.ensure() == "ok"
+    assert "claude-desktop" in df.marker_path().read_text()

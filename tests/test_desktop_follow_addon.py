@@ -11,6 +11,7 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 follow_active = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(follow_active)
+_REAL_SEQUENCE = follow_active.sequence_email
 
 
 @pytest.fixture
@@ -136,3 +137,26 @@ def test_picks_up_a_switch(creds):
     assert follow_active.active_token() == "first"
     creds("second")
     assert follow_active.active_token() == "second"
+
+def test_the_account_comes_from_cswaps_record_not_the_app_config(creds, tmp_path, monkeypatch):
+    # The app rewrites ~/.claude.json with its own login; the live token still belongs to the
+    # account cswap switched to.
+    creds()
+    follow_active._EMAIL.update(mtime=None, email=None)
+    (tmp_path / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "app@example.com"}}))
+    sequence = tmp_path / "sequence.json"
+    sequence.write_text(json.dumps({"activeAccountNumber": 2, "accounts": {"1": {"email": "app@example.com"}, "2": {"email": "cswap@example.com"}}}))
+    monkeypatch.setattr(follow_active, "sequence_email", lambda path=None: _REAL_SEQUENCE(sequence))
+    assert follow_active.active_email() == "cswap@example.com"
+
+
+def test_a_proxy_that_never_published_the_marker_does_not_remove_it(tmp_path, monkeypatch):
+    marker = tmp_path / "inference-follows"
+    monkeypatch.setenv("CSWAP_DESKTOP_FOLLOW_MARKER", str(marker))
+    running = follow_active.FollowActive()
+    running.running()
+    assert marker.exists()
+    follow_active.FollowActive().done()  # a second proxy that failed to bind the port
+    assert marker.exists()
+    running.done()
+    assert not marker.exists()

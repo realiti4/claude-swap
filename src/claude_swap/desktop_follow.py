@@ -86,6 +86,18 @@ def save_state(state: dict) -> None:
     atomic_write_text(_state_file(), json.dumps(state, indent=2) + "\n")
 
 
+def proxy_responsive(port: int, timeout: float = 3.0) -> bool:
+    """The proxy answers a request. A hung proxy still accepts connections (the kernel queues them),
+    so a plain connect says it is up while every request through it stalls."""
+    try:
+        with socket.create_connection((LISTEN_HOST, port), timeout=timeout) as conn:
+            conn.settimeout(timeout)
+            conn.sendall(b"GET http://127.0.0.1:9/ HTTP/1.1\r\nHost: 127.0.0.1:9\r\nConnection: close\r\n\r\n")
+            return conn.recv(8).startswith(b"HTTP/")
+    except OSError:
+        return False
+
+
 def proxy_alive(port: int) -> bool:
     try:
         with socket.create_connection((LISTEN_HOST, port), timeout=0.5):
@@ -279,6 +291,17 @@ def turn_off() -> None:
     save_state({"enabled": False})
 
 
+def _ensure_marker() -> None:
+    """Put the band's marker back if it went missing while the proxy runs."""
+    try:
+        path = marker_path()
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{ENTRYPOINT}  # written by desktop-follow while its proxy runs\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _sample_usage() -> None:
     """Record cswap's newest weekly percentages for the usage report; best effort."""
     try:
@@ -305,7 +328,8 @@ def ensure(*, port: int | None = None) -> str:
         return "off"
     port = port or state.get("port") or DEFAULT_PORT
     _sample_usage()
-    if proxy_alive(port):
+    if proxy_alive(port) and proxy_responsive(port):
+        _ensure_marker()
         if state.get("failures"):
             state.pop("failures")
             save_state(state)
@@ -347,6 +371,8 @@ def state_word() -> tuple[str, str]:
     port = state.get("port") or DEFAULT_PORT
     if not proxy_alive(port):
         return "NOT-OK", f"nothing is listening on {LISTEN_HOST}:{port}"
+    if not proxy_responsive(port):
+        return "NOT-OK", f"the proxy on {LISTEN_HOST}:{port} accepts connections but does not answer"
     try:
         config = json.loads(paths.get_global_config_path().read_text(encoding="utf-8"))
         env = config.get("env") or {}

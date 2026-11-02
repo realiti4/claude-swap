@@ -37,8 +37,22 @@ def config_path() -> Path:
     return Path(base) / ".claude.json" if base else Path.home() / ".claude.json"
 
 
+def sequence_email(path: Path | None = None) -> str | None:
+    """The account cswap last switched to, from its own record. The live credential belongs to that
+    account, while ``~/.claude.json`` can be rewritten by the app with its own login."""
+    path = path or Path.home() / ".claude-swap-backup" / "sequence.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        email = (data.get("accounts") or {}).get(str(data.get("activeAccountNumber")), {}).get("email")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return email if isinstance(email, str) and email else None
+
+
 def active_email(path: Path | None = None) -> str | None:
-    """The email of the account cswap made active, for the log; None when unreadable."""
+    """The email of the account the live credential belongs to, for the log; None when unknown."""
+    if path is None and (email := sequence_email()):
+        return email
     path = path or config_path()
     try:
         mtime = path.stat().st_mtime_ns
@@ -171,11 +185,17 @@ def record(flow, status: int | str) -> None:
 
 
 class FollowActive:
+    published = False
+
     def running(self) -> None:
         publish_marker()
+        self.published = True
 
     def done(self) -> None:
-        withdraw_marker()
+        # Only the instance that published the marker takes it away: a second proxy that fails to
+        # bind the port exits through here and must not remove the running one's marker.
+        if self.published:
+            withdraw_marker()
 
     def request(self, flow) -> None:
         if rewrite(flow.request.pretty_host, flow.request.path, flow.request.headers):
