@@ -142,6 +142,18 @@ cswap auto            # notifications on by default
 cswap auto --no-notify  # suppress notifications
 ```
 
+### Auto-continue sessions after a usage limit (recommended)
+
+If a limit still stops a session mid-task (all accounts exhausted, or a
+burst outran the poll), let claude-swap carry it on by itself once there's
+capacity again:
+
+```bash
+cswap resume install
+```
+
+See [AUTO-CONTINUE.md](./AUTO-CONTINUE.md).
+
 ---
 
 ## Step 5 — Verify it's working

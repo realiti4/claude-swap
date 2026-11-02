@@ -11,6 +11,10 @@ switching, no mid-task interruptions.
 > - **Max-drain defaults** — documented configuration to squeeze 99.9% out of
 >   each account before rotating
 > - **`--notify` / `--no-notify` flag** on `cswap auto`
+> - **Auto-continue** (`cswap resume`): sessions a usage limit stopped carry
+>   on by themselves as soon as an account switch lands or the limit resets
+> - **Pre-warming**: start idle accounts' 5-hour windows early, now including
+>   the active account (`autoswitch.preWarmActive`)
 > - **Setup guides** for Windows, macOS, and Linux in `docs/`
 
 ---
@@ -26,7 +30,7 @@ cswap config apply-preset max-drain
 cswap auto                 # start the loop — notifications on by default
 ```
 
-Full guide: [docs/SETUP.md](./docs/SETUP.md) | Windows-specific: [docs/WINDOWS.md](./docs/WINDOWS.md)
+Full guide: [docs/SETUP.md](./docs/SETUP.md) | Windows-specific: [docs/WINDOWS.md](./docs/WINDOWS.md) | Auto-continue: [docs/AUTO-CONTINUE.md](./docs/AUTO-CONTINUE.md) | Internals (how it all works): [docs/HOW-IT-WORKS.md](./docs/HOW-IT-WORKS.md)
 
 ---
 
@@ -136,6 +140,45 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+<details>
+<summary>Pre-warming: start 5-hour windows early</summary>
+
+A 5-hour window only starts on your first real message, and you can't get
+the quota back until it resets. Pinging an idle account early (one 1-token
+request to the cheapest model) starts its clock while you're not using it,
+so its reset lands sooner once you finally need it.
+
+```bash
+cswap config set autoswitch.preWarmReserves true   # every idle reserve account
+cswap config set autoswitch.preWarmActive true     # the active account too
+```
+
+`cswap auto` pings an account only when it has no window running, at most
+once per window, and backs off when a ping fails. The active account's ping
+uses the live login read-only: it's skipped if that token has expired,
+because only Claude Code may refresh the credential it owns. In practice the
+active account gets pre-warmed after a break, while its token is still valid
+(about 6 hours after Claude Code last refreshed it), not overnight.
+
+</details>
+
+### Auto-continue after usage limits
+
+When a usage limit stops a Claude Code session mid-task, claude-swap can carry
+it on by itself the moment there's capacity again. That's usually seconds
+after `cswap auto` switches accounts, or right after the limit resets. No more
+typing "carry on" in every session:
+
+```bash
+cswap resume install     # adds a StopFailure hook to Claude Code (snapshotted first)
+cswap resume status      # what's waiting, continued, or stopped
+cswap resume now --all   # continue every waiting session right away
+```
+
+Needs Claude Code 2.1.234+ on Windows (2.1.224+ elsewhere). Tested on Windows
+with Claude Code 2.1.314; the terminal UI and macOS/Linux are not tested yet.
+How it works, settings and caveats: [docs/AUTO-CONTINUE.md](./docs/AUTO-CONTINUE.md).
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
@@ -171,6 +214,7 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap resume install            # Auto-continue sessions a usage limit stopped (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap status                    # Show current account

@@ -90,6 +90,24 @@ Get-ScheduledTask -TaskName "Claude Swap Auto" | Get-ScheduledTaskInfo
 .\uninstall-autostart.ps1
 ```
 
+**Restarting it**, for example after updating claude-swap or changing its
+code: stopping the task ends only its hidden PowerShell wrapper. The
+`cswap auto` process itself exits on its next log write, a few seconds
+later. Make sure it's gone before starting again, so two loops never run
+side by side:
+
+```powershell
+Stop-ScheduledTask -TaskName "Claude Swap Auto"
+Get-Process python, cswap -ErrorAction SilentlyContinue | Where-Object SessionId -eq 0   # repeat until empty
+Start-ScheduledTask -TaskName "Claude Swap Auto"
+Get-Content "$env:USERPROFILE\.claude-swap-backup\autostart-task.log" -Tail 5   # fresh lines = running
+```
+
+The task runs with an S4U logon, outside your desktop session. Its log is
+UTF-16 (use `Get-Content`, not tools that expect UTF-8), and its toast
+notifications may not appear. Auto-continue's notifications come from inside
+your session (see below).
+
 **Option B — Task Scheduler by hand**
 
 Same result as the script above, done through the GUI — useful if you'd
@@ -129,6 +147,22 @@ Receive-Job $job
 # Stop it
 Stop-Job $job; Remove-Job $job
 ```
+
+---
+
+## Auto-continue after usage limits
+
+```powershell
+cswap resume install   # once: adds a StopFailure hook to Claude Code (settings.json snapshotted first)
+cswap resume status    # sessions waiting, continued, or stopped on a limit
+```
+
+When a usage limit stops a Claude Code session, VS Code or terminal, a small
+background waiter continues it by itself once an account switch lands or the
+limit resets. It works with sessions in `bypassPermissions`. It needs Claude
+Code 2.1.234+ on native Windows. Details:
+[AUTO-CONTINUE.md](./AUTO-CONTINUE.md). Internals:
+[HOW-IT-WORKS.md](./HOW-IT-WORKS.md).
 
 ---
 
@@ -182,7 +216,8 @@ claude-swap atomically replaces this file on every switch.
 | Feature | Status |
 |---|---|
 | Auto-rotation (`cswap auto`) | Fully supported |
-| Desktop notifications | Fully supported (Windows 10 1903+) |
+| Auto-continue (`cswap resume`) | Supported (Claude Code 2.1.234+) |
+| Desktop notifications | Fully supported (Windows 10 1903+); may not show from the S4U background task |
 | Session mode (`cswap run`) | Not yet supported on Windows |
 | macOS Keychain | N/A |
 
