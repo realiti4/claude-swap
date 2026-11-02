@@ -101,7 +101,7 @@ ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× thi
 
 # A 5h window, once started, always runs its full course — never re-ping an
 # account within this long of our own last successful ping (see
-# AutoSwitchEngine._prewarm_idle_reserves).
+# AutoSwitchEngine._prewarm_idle_accounts).
 PREWARM_GUARD_S = 5 * 3600.0
 
 
@@ -278,12 +278,14 @@ class PreWarmEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "account-prewarmed"
     number: str
     email: str
+    active: bool = False  # the live login (preWarmActive), not a reserve
 
     def _fields(self) -> dict:
-        return {"number": self.number, "email": self.email}
+        return {"number": self.number, "email": self.email, "active": self.active}
 
     def human(self) -> str:
-        return f"pre-warmed Account-{self.number} ({self.email}): 5h window started early"
+        which = "active " if self.active else ""
+        return f"pre-warmed {which}Account-{self.number} ({self.email}): 5h window started early"
 
 
 @dataclass(frozen=True)
@@ -648,8 +650,8 @@ class AutoSwitchEngine:
             )
         )
 
-        if settings.pre_warm_reserves and not self.dry_run:
-            self._prewarm_idle_reserves(current, quarantined, usage)
+        if (settings.pre_warm_reserves or settings.pre_warm_active) and not self.dry_run:
+            self._prewarm_idle_accounts(current, quarantined, usage)
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -1037,7 +1039,7 @@ class AutoSwitchEngine:
         )
         return TickOutcome.SWITCHED
 
-    def _prewarm_idle_reserves(
+    def _prewarm_idle_accounts(
         self, active_number: str, quarantined: set[str], usage: dict
     ) -> None:
         """Opt-in (``settings.pre_warm_reserves``): keep every idle reserve
@@ -1047,6 +1049,14 @@ class AutoSwitchEngine:
         relative to when it's actually needed, the sooner its own reset lands
         once it's finally drained, which is what shrinks the "wait 5h to loop
         back" dead zone at the end of a long session.
+
+        Opt-in (``settings.pre_warm_active``): the active account gets the
+        same treatment when its window has lapsed (back from a break, a
+        session that went quiet). Its credential is Claude Code's live login,
+        so the ping uses it strictly read-only — never refreshed, never
+        persisted. An expired active token never reaches here in practice: an
+        owned one reads as the token-expired sentinel (not idle), and an
+        unowned one was already refreshed by the active usage fetch.
 
         Only acts on ``usage`` already collected this tick — never forces an
         extra fetch — so a candidate whose data happens to be stale here
@@ -1072,8 +1082,14 @@ class AutoSwitchEngine:
         records = state.get("preWarm")
         records = records if isinstance(records, dict) else {}
         now = self.clock()
-        for num in self.switcher.switchable_account_numbers():
-            if num == active_number or num in quarantined:
+        numbers = self.switcher.switchable_account_numbers()
+        if active_number not in numbers:
+            numbers = [active_number, *numbers]  # active but no switchable backup
+        for num in numbers:
+            is_active = num == active_number
+            if is_active and not self.settings.pre_warm_active:
+                continue
+            if not is_active and (not self.settings.pre_warm_reserves or num in quarantined):
                 continue
             if self.switcher.account_kind_for(num) == "api_key":
                 continue
@@ -1090,11 +1106,18 @@ class AutoSwitchEngine:
             email = self.switcher.account_email(num)
             if not email or self.switcher.live_session_pids_for(num, email):
                 continue  # unmanaged slot, or a live `cswap run` owns its token
-            creds = self.switcher.read_account_credentials(num, email)
+            if is_active:
+                creds = self.switcher.read_live_credentials()
+            else:
+                creds = self.switcher.read_account_credentials(num, email)
             if not creds:
                 continue
             outcome = oauth.try_prewarm_account(
-                num, email, creds, persist_credentials=self.switcher.persist_backup_credentials
+                num,
+                email,
+                creds,
+                persist_credentials=None if is_active else self.switcher.persist_backup_credentials,
+                is_active=is_active,
             )
             if outcome.ok:
 
@@ -1102,7 +1125,7 @@ class AutoSwitchEngine:
                     state.setdefault("preWarm", {})[n] = {"lastPingAt": t}
 
                 self._mutate_state(record_success)
-                self._emit(PreWarmEvent(number=num, email=email))
+                self._emit(PreWarmEvent(number=num, email=email, active=is_active))
             else:
                 failures = int(record.get("consecutiveFailures") or 0) + 1
                 until = now + _prewarm_backoff_s(failures, outcome.retry_after_s)

@@ -15,8 +15,10 @@ from claude_swap.settings import (
     PRESETS,
     SETTING_SPECS,
     AutoSwitchSettings,
+    ResumeSettings,
     apply_preset,
     effective_settings,
+    load_resume_settings,
     load_settings,
     merged_with_cli,
     save_settings,
@@ -118,15 +120,23 @@ class TestSaveSettings:
         assert mode == 0o600
 
 
+_SECTIONS = {"autoswitch": AutoSwitchSettings, "resume": ResumeSettings}
+
+
 class TestSettingSpecs:
-    def test_registry_covers_every_dataclass_field(self):
-        spec_fields = {spec.field for spec in SETTING_SPECS.values()}
-        dataclass_fields = {f.name for f in AutoSwitchSettings.__dataclass_fields__.values()}
+    @pytest.mark.parametrize("section", sorted(_SECTIONS))
+    def test_registry_covers_every_dataclass_field(self, section):
+        cls = _SECTIONS[section]
+        spec_fields = {spec.field for spec in SETTING_SPECS.values() if spec.section == section}
+        dataclass_fields = {f.name for f in cls.__dataclass_fields__.values()}
         assert spec_fields == dataclass_fields
 
+    def test_every_spec_belongs_to_a_known_section(self):
+        assert {spec.section for spec in SETTING_SPECS.values()} == set(_SECTIONS)
+
     def test_defaults_match_dataclass(self):
-        defaults = AutoSwitchSettings()
         for spec in SETTING_SPECS.values():
+            defaults = _SECTIONS[spec.section]()
             assert spec.default == getattr(defaults, spec.field)
 
 
@@ -239,3 +249,41 @@ class TestMergedWithCli:
     def test_boolean_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(include_api_key_accounts=True))
         assert merged.include_api_key_accounts is True
+
+
+class TestResumeSection:
+    def test_missing_file_gives_defaults(self, tmp_path: Path):
+        assert load_resume_settings(tmp_path) == ResumeSettings()
+
+    def test_set_and_load_round_trip(self, tmp_path: Path):
+        set_setting(tmp_path, "resume.slackSeconds", "300")
+        set_setting(tmp_path, "resume.onSwitch", "false")
+        set_setting(tmp_path, "resume.maxConsecutive", "5")
+        loaded = load_resume_settings(tmp_path)
+        assert loaded.slack_seconds == 300.0
+        assert loaded.on_switch is False
+        assert loaded.max_consecutive == 5
+        # The autoswitch section is untouched by resume keys.
+        assert load_settings(tmp_path) == AutoSwitchSettings()
+
+    def test_hand_edited_out_of_range_values_clamp(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"resume": {"slackSeconds": -5, "maxConsecutive": 999, "notify": 0}})
+        )
+        loaded = load_resume_settings(tmp_path)
+        assert loaded.slack_seconds == 0.0
+        assert loaded.max_consecutive == 20
+        assert loaded.notify is False
+
+    def test_strict_set_rejects_out_of_range(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between"):
+            set_setting(tmp_path, "resume.maxConsecutive", "0")
+
+    def test_effective_settings_reports_both_sections(self, tmp_path: Path):
+        set_setting(tmp_path, "resume.notify", "false")
+        rows = {
+            spec.dotted: (value, is_set) for spec, value, is_set in effective_settings(tmp_path)
+        }
+        assert rows["resume.notify"] == (False, True)
+        assert rows["resume.slackSeconds"] == (90.0, False)
+        assert rows["autoswitch.preWarmActive"] == (False, False)

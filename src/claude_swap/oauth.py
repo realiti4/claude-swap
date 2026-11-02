@@ -513,15 +513,22 @@ def try_prewarm_account(
     email: str,
     credentials: str,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    is_active: bool = False,
 ) -> PingOutcome:
     """Fire one minimal real request to start an idle account's 5h window early.
 
     A window only starts on a real message-consuming request — the usage
     endpoint (``request_usage_data``) is read-only and never starts one. This
     is that real request, kept to ``max_tokens=1`` on the cheapest model so
-    the actual cost is negligible. Caller guarantees the account is inactive
-    and not owned by a live ``cswap run`` session (pinging under one would
-    duplicate a request the user is about to send for real anyway).
+    the actual cost is negligible. Caller guarantees the account is not owned
+    by a live ``cswap run`` session (pinging under one would duplicate a
+    request the user is about to send for real anyway).
+
+    ``is_active``: the credential is the live login Claude Code owns, so it
+    is used read-only — never refreshed (a refresh would rotate the token
+    family out from under a running Claude Code). An expired active token
+    fails fast with ``token-expired`` instead of making a request that would
+    just 401.
     """
     context = f"for account {account_num}"
     oauth_data = extract_oauth_data(credentials)
@@ -529,7 +536,10 @@ def try_prewarm_account(
     if not access_token:
         return PingOutcome(False, error="no-access-token")
 
-    if oauth_data.get("refreshToken") and is_oauth_token_expired(oauth_data.get("expiresAt")):
+    if is_active:
+        if is_oauth_token_expired(oauth_data.get("expiresAt")):
+            return PingOutcome(False, error="token-expired")
+    elif oauth_data.get("refreshToken") and is_oauth_token_expired(oauth_data.get("expiresAt")):
         refreshed = refresh_oauth_credentials(credentials)
         if refreshed:
             credentials = refreshed

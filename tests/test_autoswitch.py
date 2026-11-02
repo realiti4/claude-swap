@@ -1203,6 +1203,101 @@ class TestPreWarm:
             assert mock_ping.call_count == 2
 
 
+class TestPreWarmActive:
+    """``preWarmActive``: start the live account's 5h window early too, using
+    the live credential strictly read-only."""
+
+    def _harness(self, temp_home, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_reserves_only_setting_never_pings_the_active_account(self, temp_home):
+        h = self._harness(temp_home, pre_warm_reserves=True)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(True),
+        ) as mock_ping:
+            h.tick_with_usage({"1": _usage(0), "2": _usage(30, resets_at="2026-01-01T00:00:00Z")})
+        mock_ping.assert_not_called()
+
+    def test_idle_active_account_is_pinged_with_live_credentials(self, temp_home):
+        h = self._harness(temp_home, pre_warm_active=True)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(True),
+        ) as mock_ping:
+            outcome = h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
+        assert outcome is TickOutcome.NO_ACTION
+        mock_ping.assert_called_once()
+        args, kwargs = mock_ping.call_args
+        assert args[0] == "1"
+        # The live login's credential (make_live), not the slot's backup copy.
+        assert json.loads(args[2])["claudeAiOauth"]["accessToken"] == "sk-live"
+        assert kwargs["is_active"] is True
+        assert kwargs["persist_credentials"] is None  # never persisted anywhere
+        pings = [e for e in h.events if isinstance(e, PreWarmEvent)]
+        assert [(p.number, p.active) for p in pings] == [("1", True)]
+        assert pings[0].to_json()["active"] is True
+        assert h.state()["preWarm"]["1"]["lastPingAt"] == h.clock.now
+
+    def test_active_only_setting_leaves_reserves_alone(self, temp_home):
+        h = self._harness(temp_home, pre_warm_active=True)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(True),
+        ) as mock_ping:
+            h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
+        assert [c.args[0] for c in mock_ping.call_args_list] == ["1"]
+
+    def test_both_settings_ping_active_and_reserves(self, temp_home):
+        h = self._harness(temp_home, pre_warm_active=True, pre_warm_reserves=True)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(True),
+        ) as mock_ping:
+            h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
+        calls = {c.args[0]: c.kwargs["is_active"] for c in mock_ping.call_args_list}
+        assert calls == {"1": True, "2": False}
+
+    def test_active_with_a_running_window_is_not_pinged(self, temp_home):
+        h = self._harness(temp_home, pre_warm_active=True)
+        with patch("claude_swap.autoswitch.oauth.try_prewarm_account") as mock_ping:
+            h.tick_with_usage({"1": _usage(5, resets_at="2026-01-01T00:00:00Z"), "2": _usage(0)})
+        mock_ping.assert_not_called()
+
+    def test_expired_owned_active_token_is_never_pinged(self, temp_home):
+        # Owned + expired reads as the sentinel, not as an idle window — the
+        # engine idles instead of touching Claude Code's credential.
+        h = self._harness(temp_home, pre_warm_active=True)
+        with patch("claude_swap.autoswitch.oauth.try_prewarm_account") as mock_ping:
+            h.tick_with_usage({"1": USAGE_TOKEN_EXPIRED, "2": _usage(0)})
+        mock_ping.assert_not_called()
+
+    def test_guard_applies_to_the_active_account(self, temp_home):
+        h = self._harness(temp_home, pre_warm_active=True)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(True),
+        ) as mock_ping:
+            h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
+            h.clock.advance(60.0)
+            h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
+            assert mock_ping.call_count == 1
+            h.clock.advance(PREWARM_GUARD_S)
+            h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
+            assert mock_ping.call_count == 2
+
+    def test_dry_run_never_pings_the_active_account(self, temp_home):
+        h = self._harness(temp_home, pre_warm_active=True)
+        h.engine = h._make_engine(dry_run=True)
+        with patch("claude_swap.autoswitch.oauth.try_prewarm_account") as mock_ping:
+            h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
+        mock_ping.assert_not_called()
+
+
 class TestQuarantineLifecycle:
     def test_quarantine_persists_across_engine_instances(self, harness):
         harness.engine._quarantine("2", "b@example.com", "invalid_grant")

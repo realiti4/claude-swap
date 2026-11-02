@@ -959,6 +959,37 @@ class TestTryPrewarmAccount:
         assert outcome.error == "no-access-token"
         mock_urlopen.assert_not_called()
 
+    def test_active_expired_token_fails_fast_without_refresh_or_request(self):
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+        persist_mock = MagicMock()
+        with patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            outcome = oauth.try_prewarm_account(
+                "1",
+                "test@example.com",
+                credentials,
+                persist_credentials=persist_mock,
+                is_active=True,
+            )
+        assert outcome.ok is False
+        assert outcome.error == "token-expired"
+        mock_urlopen.assert_not_called()  # no token-endpoint refresh, no ping
+        persist_mock.assert_not_called()
+
+    def test_active_valid_token_pings_read_only(self):
+        credentials = self._make_credentials()
+
+        def mock_urlopen(req, timeout=0):
+            assert "oauth/token" not in req.full_url
+            assert req.get_header("Authorization") == "Bearer old-access"
+            return self._message_response()
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            outcome = oauth.try_prewarm_account(
+                "1", "test@example.com", credentials, is_active=True
+            )
+        assert outcome.ok is True
+
 
 class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""

@@ -1,9 +1,10 @@
 """Tool settings persisted at ``<backup_root>/settings.json``.
 
 One versioned JSON file for user-tunable claude-swap preferences, written
-atomically with the backup dir's 0600/0700 modes. v1 carries only the
-``autoswitch`` section; other sections can be added additively. Unknown keys
-(future fields, other tools' experiments) survive a round trip.
+atomically with the backup dir's 0600/0700 modes. Sections: ``autoswitch``
+(the ``cswap auto`` engine) and ``resume`` (auto-continue after usage
+limits); more can be added additively. Unknown keys (future fields, other
+tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
@@ -48,6 +49,35 @@ class AutoSwitchSettings:
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     pre_warm_reserves: bool = False
+    pre_warm_active: bool = False
+
+
+@dataclass(frozen=True)
+class ResumeSettings:
+    """Policy knobs for auto-continue (``cswap resume``): how a Claude Code
+    session that a usage limit stopped gets told to carry on once capacity is
+    back.
+
+    ``slack_seconds`` waits past the limit's own reset time before resuming:
+    margin for clock skew, and room for Claude Code's built-in auto-continue
+    (terminal sessions) to act first. ``on_switch`` resumes as soon as the
+    session's account changed (an account switch landed) instead of waiting
+    for the reset. ``max_consecutive`` stops after that many resumes in a row
+    that ran straight back into the limit without doing any work.
+    """
+
+    slack_seconds: float = 90.0
+    on_switch: bool = True
+    max_consecutive: int = 3
+    notify: bool = True
+
+
+# Section name → settings dataclass. A SettingSpec's ``field`` names a field
+# of its section's dataclass.
+_SECTION_TYPES: dict[str, type] = {
+    "autoswitch": AutoSwitchSettings,
+    "resume": ResumeSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -59,9 +89,9 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch")
+    section: str  # top-level JSON section ("autoswitch", "resume")
     json_key: str  # camelCase key inside the section
-    field: str  # snake_case AutoSwitchSettings field
+    field: str  # snake_case field of the section's settings dataclass
     kind: str  # "float" | "int" | "bool" | "choice"
     lo: float | None = None
     hi: float | None = None
@@ -74,7 +104,7 @@ class SettingSpec:
 
     @property
     def default(self):
-        return getattr(AutoSwitchSettings(), self.field)
+        return getattr(_SECTION_TYPES[self.section](), self.field)
 
 
 # settings.json uses camelCase (matching the repo's other JSON artifacts);
@@ -147,12 +177,57 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "preWarmReserves",
             "pre_warm_reserves",
             "bool",
-            help="After a proactive switch, ping other idle accounts to start their 5h window",
+            help="Ping idle reserve accounts to start their 5h window early",
+        ),
+        SettingSpec(
+            "autoswitch",
+            "preWarmActive",
+            "pre_warm_active",
+            "bool",
+            help="Also ping the active account when it has no 5h window running",
+        ),
+        SettingSpec(
+            "resume",
+            "slackSeconds",
+            "slack_seconds",
+            "float",
+            0.0,
+            3600.0,
+            help="Wait this long past a limit's reset before auto-continuing",
+        ),
+        SettingSpec(
+            "resume",
+            "onSwitch",
+            "on_switch",
+            "bool",
+            help="Auto-continue as soon as an account switch lands (no reset wait)",
+        ),
+        SettingSpec(
+            "resume",
+            "maxConsecutive",
+            "max_consecutive",
+            "int",
+            1,
+            20,
+            help="Stop after this many resumes in a row that hit the limit again",
+        ),
+        SettingSpec(
+            "resume",
+            "notify",
+            "notify",
+            "bool",
+            help="Desktop notification when a session is auto-continued",
         ),
     )
 }
 
-_AUTOSWITCH_KEYS: dict[str, str] = {spec.field: spec.json_key for spec in SETTING_SPECS.values()}
+
+def _section_keys(section: str) -> dict[str, str]:
+    """``field → json_key`` for every spec in one section, in registry order."""
+    return {spec.field: spec.json_key for spec in SETTING_SPECS.values() if spec.section == section}
+
+
+_AUTOSWITCH_KEYS: dict[str, str] = _section_keys("autoswitch")
 
 
 # Bundles of settings for `cswap config apply-preset NAME`, single source of
@@ -173,16 +248,21 @@ def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
 
 
-def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+def _clamped(settings):
+    """Clamp a section's values into the SETTING_SPECS ranges; bad types → the
+    default. Works on any registered section dataclass and returns the same
+    type."""
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return default
         return float(min(max(value, lo), hi))
 
+    section = next(name for name, cls in _SECTION_TYPES.items() if isinstance(settings, cls))
     kwargs = {}
     for spec in SETTING_SPECS.values():
+        if spec.section != section:
+            continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
             clamped = num(value, spec.default, spec.lo, spec.hi)
@@ -199,7 +279,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 )
                 value = spec.default
             kwargs[spec.field] = value
-    return AutoSwitchSettings(**kwargs)
+    return type(settings)(**kwargs)
 
 
 def _read_raw(path: Path) -> dict:
@@ -216,21 +296,32 @@ def _read_raw(path: Path) -> dict:
     return raw
 
 
-def load_settings(backup_root: Path) -> AutoSwitchSettings:
-    """Load the autoswitch section; missing/corrupt file or fields → defaults."""
+def _load_section(backup_root: Path, section_name: str):
+    """Load one section; missing/corrupt file or fields → defaults."""
+    cls = _SECTION_TYPES[section_name]
     raw = _read_raw(settings_path(backup_root))
-    section = raw.get("autoswitch")
+    section = raw.get(section_name)
     if not isinstance(section, dict):
-        return AutoSwitchSettings()
+        return cls()
     kwargs = {}
-    for field, json_key in _AUTOSWITCH_KEYS.items():
+    for field, json_key in _section_keys(section_name).items():
         if json_key in section:
             kwargs[field] = section[json_key]
     try:
-        settings = AutoSwitchSettings(**kwargs)
+        settings = cls(**kwargs)
     except TypeError:
-        settings = AutoSwitchSettings()
+        settings = cls()
     return _clamped(settings)
+
+
+def load_settings(backup_root: Path) -> AutoSwitchSettings:
+    """Load the autoswitch section; missing/corrupt file or fields → defaults."""
+    return _load_section(backup_root, "autoswitch")
+
+
+def load_resume_settings(backup_root: Path) -> ResumeSettings:
+    """Load the resume section; missing/corrupt file or fields → defaults."""
+    return _load_section(backup_root, "resume")
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -390,12 +481,12 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     reflects the file, not value equality.
     """
     raw = _read_raw(settings_path(backup_root))
-    effective = load_settings(backup_root)
+    effective = {name: _load_section(backup_root, name) for name in _SECTION_TYPES}
     rows = []
     for spec in SETTING_SPECS.values():
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
-        rows.append((spec, getattr(effective, spec.field), is_set))
+        rows.append((spec, getattr(effective[spec.section], spec.field), is_set))
     return rows
 
 

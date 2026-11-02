@@ -50,9 +50,14 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.preWarmReserves",
+            "autoswitch.preWarmActive",
+            "resume.slackSeconds",
+            "resume.onSwitch",
+            "resume.maxConsecutive",
+            "resume.notify",
         ):
             assert key in out
-        assert out.count("(default)") == 8
+        assert out.count("(default)") == 13
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -75,8 +80,9 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 8
+        assert len(by_key) == 13
         assert by_key["autoswitch.threshold"]["value"] == 90.0
+        assert by_key["resume.slackSeconds"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
 
