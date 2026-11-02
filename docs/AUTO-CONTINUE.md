@@ -46,9 +46,53 @@ reset, switches, and the session continues right after.
 The session receives this message (it starts a new turn):
 
 > [claude-swap auto-continue] The usage limit that stopped this session has
-> cleared (claude-swap switched to an account with quota left). Please
-> continue the task you were working on, picking up exactly where you left
-> off. If it was already finished, just say so in one line.
+> cleared (claude-swap switched to an account with quota left). Continue the
+> task you were working on, but first re-check the current state of the files
+> you were changing: time has passed, and they may have been edited since. If
+> the task is already finished, or no longer makes sense given what you find,
+> say so in one line and stop without making further changes. If you were
+> waiting for an answer from the user, ask again briefly instead of guessing.
+
+It is worded that way on purpose (see the next section): if a session didn't
+need continuing, the cost is one short turn that checks and stops, not
+unwanted changes.
+
+**It never continues a session automatically when:**
+- the stop happened more than `resume.maxWaitHours` ago (default 24 h). It is
+  *held* and you get one notification; `cswap resume now` still continues it;
+- you paused auto-continue with `cswap resume off`;
+- you cancelled that session with `cswap resume cancel`;
+- you already typed something in it, closed it, or Claude Code's own
+  auto-continue got there first.
+
+---
+
+## Finished, abandoned, half-done: what it can and can't know
+
+Claude Code records *that* a session stopped on a limit, not whether you still
+want it. To pick the rules, the history on this machine was replayed: 166 stops
+across 49 sessions (October to November 2026), checking what you did next.
+
+| What you did after the stop | Share |
+|---|---|
+| Came back and said "carry on" (typos included) | ~82 % |
+| Never touched that session again | ~8 % |
+| Came back with something else (answers, `/model`, a new instruction) | ~5 % |
+| Unclear, or carried on in another chat in the same folder | ~5 % |
+
+The sessions you never came back to looked exactly like the rest at the moment
+they stopped: same batch sizes, same time since your last prompt. So there is
+no signal to *guess* "abandoned" from. A rule "skip if you started a new chat
+in the same folder" was also measured: it would have wrongly blocked 1 session
+you came back to and correctly held none you didn't, so it isn't used.
+
+That's why the design is:
+- **Act automatically on what is reliable.** It stands down if you type, if
+  the session closes, or if the stop is old.
+- **Make your intent a single command.** `off` when you're done for the day,
+  `cancel` for specific sessions.
+- **Keep a wrong continue cheap.** The message re-checks state first and stops
+  if there's nothing sensible to do.
 
 ---
 
@@ -83,7 +127,12 @@ The waiter stops by itself when:
 - you continue the session yourself;
 - the session closes;
 - the session is handled by Claude Code's own auto-continue;
+- you cancel it (`cswap resume cancel`);
 - it has waited 8 days.
+
+While held (older than `resume.maxWaitHours`) or paused (`cswap resume off`),
+the waiter keeps watching quietly, so `cswap resume now` or `cswap resume on`
+still work, with the session's own token.
 
 **Loop guard:** if a continue runs straight back into the limit without doing
 any work, that counts as consecutive. After `resume.maxConsecutive` (default 3)
@@ -99,6 +148,9 @@ cswap resume status            # sessions waiting / continued / stopped on a lim
 cswap resume status --json     # same, machine-readable
 cswap resume now --all         # continue every waiting session right now
 cswap resume now my-session    # one session, by name or session-id prefix
+cswap resume cancel my-session # don't continue this one (or --all: none of them)
+cswap resume off               # pause auto-continue, e.g. when you're done for the day
+cswap resume on                # turn it back on
 cswap resume uninstall         # remove the hook (also snapshotted first)
 ```
 
@@ -120,7 +172,9 @@ by a waiter.
 | `resume.slackSeconds` | `90` | wait this long past a limit's reset before continuing |
 | `resume.onSwitch` | `true` | continue as soon as an account switch lands |
 | `resume.maxConsecutive` | `3` | stop after this many continues in a row that hit the limit again |
-| `resume.notify` | `true` | desktop notification when a session is continued (or given up on) |
+| `resume.notify` | `true` | desktop notification when a session is continued, held, or given up on |
+| `resume.enabled` | `true` | the master switch; `cswap resume off`/`on` set it |
+| `resume.maxWaitHours` | `24` | hold sessions stopped longer ago than this (0 = no cap) |
 
 ```bash
 cswap config set resume.slackSeconds 300

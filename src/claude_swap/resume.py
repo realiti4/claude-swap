@@ -70,6 +70,9 @@ MAX_WAIT_S = 8 * 24 * 3600.0  # a full weekly window, plus margin
 HEADROOM_EVIDENCE_AFTER_S = 60.0
 HEADROOM_MAX_PCT = 98.0
 RECORD_RETENTION_S = 7 * 24 * 3600.0
+# A held or paused waiter only waits for `resume now`/`on`/`cancel`, the
+# session closing or the user typing: no reason to look more often.
+HELD_POLL_S = 120.0
 # The hook can run before the stop is flushed to the transcript, which then
 # still ends on earlier output. Only output *after* the stop (or after
 # arming) proves the session moved on; past this grace with no stop showing
@@ -88,6 +91,7 @@ UNDELIVERED = "undelivered"  # sent, but the session never recorded it (held/ref
 SESSION_GONE = "session-gone"
 MOVED_ON = "moved-on"  # carried on without us: the user, or a built-in auto-continue
 TIMED_OUT = "timed-out"
+CANCELLED = "cancelled"  # `cswap resume cancel`: the user said not to continue it
 
 # A stopped session is "idle", or "waiting" while a limit dialog is open
 # (terminal UI); delivery additionally requires the transcript to end on the
@@ -100,10 +104,17 @@ CONFIRM_POLL_S = 2.0
 CONFIRM_SKEW_S = 5.0
 
 MARKER = "[claude-swap auto-continue]"
+# Written so that continuing a session nobody wanted continued costs one short
+# turn, not unwanted changes: the user may have finished, abandoned or redone
+# the task while it was stopped (history: ~8% of stops were never returned to).
 MESSAGE = (
-    MARKER + " The usage limit that stopped this session has "
-    "cleared ({why}). Please continue the task you were working on, picking up "
-    "exactly where you left off. If it was already finished, just say so in one line."
+    MARKER + " The usage limit that stopped this session has cleared ({why}). "
+    "Continue the task you were working on, but first re-check the current state "
+    "of the files you were changing: time has passed, and they may have been "
+    "edited since. If the task is already finished, or no longer makes sense given "
+    "what you find, say so in one line and stop without making further changes. "
+    "If you were waiting for an answer from the user, ask again briefly instead of "
+    "guessing."
 )
 REHEARSAL_MESSAGE = (
     MARKER + " TEST: this is a rehearsal started by `cswap resume test`, proving "
@@ -420,10 +431,15 @@ def evaluate(
     record: ResumeRecord, now: float, live: LiveContext, settings: ResumeSettings
 ) -> Readiness:
     """Is there capacity to continue this session again?"""
+    stalled_at = record.stalled_at or record.armed_at
+    if settings.max_wait_hours > 0 and now - stalled_at > settings.max_wait_hours * 3600:
+        # Too long ago to assume the plan still stands: hold for the user.
+        return Readiness(False, "held", HELD_POLL_S)
+    if not settings.enabled:
+        return Readiness(False, "paused", HELD_POLL_S)
     reset_due = record.resets_at + settings.slack_seconds if record.resets_at else None
     if reset_due is not None and now >= reset_due:
         return Readiness(True, "limit-reset", 0.0)
-    stalled_at = record.stalled_at or record.armed_at
     pct = window_pct(live.usage, record.limit_type, now)
     if settings.on_switch and record.default_profile:
         identity_changed = (
@@ -712,6 +728,8 @@ class Waiter:
         on_resumed: Callable[[str, str], None] | None = None,
         on_gave_up: Callable[[str, str], None] | None = None,
     ):
+        # on_gave_up(session, detail) is the "needs you" channel: the loop
+        # guard tripping, a held (stale) session, or an undelivered message.
         self.backup_root = backup_root
         self.session_id = session_id
         self.env = os.environ if env is None else env
@@ -776,6 +794,7 @@ class Waiter:
             record = load_record(self.backup_root, self.session_id)
             if record is None or record.state != WAITING:
                 return record.state if record else "no-record"
+            self.settings = load_resume_settings(self.backup_root)
             now = self.clock()
             if now - record.armed_at > MAX_WAIT_S:
                 return self._finish(TIMED_OUT, "waited too long; continue it by hand")
@@ -817,6 +836,8 @@ class Waiter:
             elif readiness.ready:
                 readiness = Readiness(False, f"waiting-for-idle ({session.status})", SLICE_S * 2)
 
+            if readiness.reason == "held" and last_detail != "held":
+                self._notify_held(record, session)
             if readiness.reason != last_detail:
                 last_detail = readiness.reason
                 self._set_detail(readiness.reason)
@@ -843,6 +864,15 @@ class Waiter:
 
         mutate_record(self.backup_root, self.session_id, mutator)
 
+    def _notify_held(self, record: ResumeRecord, session: ClaudeSession) -> None:
+        if self.on_gave_up and self.settings.notify:
+            hours = (self.clock() - (record.stalled_at or record.armed_at)) / 3600
+            self.on_gave_up(
+                _session_label(record, session),
+                f"held: stopped {hours:.0f}h ago, longer than resume.maxWaitHours; "
+                "run `cswap resume now` to continue it",
+            )
+
     def _sleep_watching_flag(self, seconds: float) -> None:
         flag = force_flag(self.backup_root, self.session_id)
         remaining = max(0.0, seconds)
@@ -867,6 +897,9 @@ class Waiter:
         if not forced and not record.rehearsal:
             self.sleep(random.uniform(0.0, JITTER_S))
             # Re-validate after the jitter: the user may have typed meanwhile.
+            current = load_record(self.backup_root, self.session_id)
+            if current is None or current.state != WAITING:
+                return current.state if current else "no-record"
             fresh = find_session(record.config_home, self.session_id)
             state = tx.read_transcript_state(record.transcript_path)
             if fresh is None or state.stall is None or state.stall.uuid != stall.uuid:

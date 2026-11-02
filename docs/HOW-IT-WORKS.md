@@ -242,6 +242,8 @@ stateDiagram-v2
     waiting --> moved_on: session produced output after the stop (user / built-in continued it)
     waiting --> session_gone: session process ended or /clear'd
     waiting --> timed_out: waited > 8 days
+    waiting --> cancelled: cswap resume cancel
+    note right of waiting: sub-states held (older than maxWaitHours) and paused (resume off) never auto-deliver; resume now / on still work
     resumed --> waiting: next limit stop (new arm)
 ```
 
@@ -292,6 +294,18 @@ The first rule that matches wins:
 | 2 | `resume.onSwitch`, default profile, and the live login differs from the one at the stop **or** `lastSwitchAt` is later than the stop | **ready**: `account-switched`, unless cached usage shows the new account's limited window at ≥ 100% (and not yet reset) |
 | 3 | Default profile; the live account's cached usage, fetched ≥ 60 s after the stop, shows the limited window ≤ 98% | **ready**: `headroom` |
 | 4 | otherwise | wait (≤ 30 s, or until the reset is due) |
+
+Two rules run *before* row 1 and override it:
+
+| # | Condition | Result |
+|---|---|---|
+| 0a | `resume.maxWaitHours` > 0 and the stop is older than that (default 24 h) | **held**: never auto-delivers; one notification; `resume now` (force flag) still works |
+| 0b | `resume.enabled` is false (`cswap resume off`) | **paused**: same, until `cswap resume on` |
+
+Settings are re-read on every pass, so `off`/`on` and config edits apply to
+running waiters within one poll. A `cancelled` record (`cswap resume cancel`)
+ends the waiter. That is also checked right after the pre-send jitter, so
+a cancel that lands in those seconds still wins.
 
 Things to know:
 - The waiter never calls the usage API and never switches. It reads
@@ -442,6 +456,38 @@ Expect a new turn in that chat about 10 s after it goes idle, and `cswap
 resume status` → `resumed`, `auto-continue test passed`. Verified live
 2026-11-02: armed at 22:50:17, delivered and confirmed at 22:50:32.
 
+### 4.11b Review: finished, abandoned and half-done sessions (2026-11-02)
+
+The concern: some sessions are abandoned on purpose, and some stop half-way,
+so continuing *everything* is wrong. The review answered it with data, not
+heuristics. Every `usage_limit_reached` stop in `~/.claude/projects/*/*.jsonl`
+was replayed. The snippet under "Re-measuring the problem" (§7) lists the same
+stops; "what you did next" means the first human-origin prompt after the stop.
+
+- **166 stop episodes** (a stop plus its retries), 49 sessions; 143 five-hour,
+  23 weekly. 147 of them hit mid-task, after the turn had done work.
+- After the stop, the user: came back and said carry on **~82 %**; never touched
+  the session again **~8 %** (14, three of them automated test runs);
+  redirected **~5 %** (answers to questions, `/model`, new instructions);
+  unclear or moved on elsewhere ~5 %.
+- **Abandonment is not predictable at stop time.** Batch size (median 5 vs 3,
+  overlapping ranges), earlier stops (0 for both) and minutes since the last
+  prompt (14 vs 12) don't separate the groups.
+- **Rejected:** "a new chat started after the stop in the same folder" →
+  1 false block of 127 continued, 0 of 15 abandoned caught.
+- **Chosen:**
+  - the 24 h hold (0a), which matches Claude Code's own 24 h line for its
+    built-in auto-continue;
+  - explicit `off` / `cancel`;
+  - a continue message that re-checks state and stops if finished, stale or
+    waiting on the user. A wrong continue therefore costs one short turn.
+
+Not detectable and therefore not modelled:
+- whether a still-open tab is wanted;
+- whether a weekly-limit session days later still matters (the hold covers
+  this);
+- whether the user is at the keyboard.
+
 ### 4.12 Troubleshooting
 
 | Symptom | Check |
@@ -451,6 +497,9 @@ resume status` → `resumed`, `auto-continue test passed`. Verified live
 | Row `waiting-for-idle (busy)` | The session is mid-turn. It continues once the session goes idle. |
 | Row `undelivered` | The session held or refused the message: check `crossSessionInbound`, or it was the peer fallback against a bypass session. Type "continue" there. |
 | Row `gave-up` | The loop guard tripped: continues kept hitting the limit. Wait for a real reset, or raise `resume.maxConsecutive`. |
+| Row `waiting` · `held` | Stopped longer ago than `resume.maxWaitHours`. `cswap resume now <name>` continues it, `cswap resume cancel <name>` drops it. |
+| Row `waiting` · `paused` / header says paused | `cswap resume off` is in effect; `cswap resume on` re-enables. |
+| Row `cancelled` | You cancelled it; it won't continue by itself. Type in the session as usual. |
 | Need details | `grep "auto-continue" <backup dir>/claude-swap.log` |
 | Undo everything | `cswap resume uninstall`. To restore Claude Code's settings exactly, copy the newest file from `resume/snapshots/` back. |
 

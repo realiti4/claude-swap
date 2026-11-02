@@ -117,6 +117,13 @@ class ResumeSettings:
     on_switch: bool = True
     max_consecutive: int = 3
     notify: bool = True
+    # Master switch for automatic continues (`cswap resume off|on`). Off,
+    # stops are still tracked and `cswap resume now` still works.
+    enabled: bool = True
+    # A session stopped longer ago than this is held, not continued
+    # automatically: the plan may have changed (the same 24h line Claude
+    # Code's built-in auto-continue draws). 0 = no cap.
+    max_wait_hours: float = 24.0
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -232,6 +239,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "resume", "notify", "notify", "bool",
             help="Desktop notification when a session is auto-continued",
+        ),
+        SettingSpec(
+            "resume", "enabled", "enabled", "bool",
+            help="Continue stopped sessions automatically (cswap resume off|on)",
+        ),
+        SettingSpec(
+            "resume", "maxWaitHours", "max_wait_hours", "float", 0.0, 720.0,
+            help="Hold (don't auto-continue) sessions stopped longer ago than this; 0 = no cap",
         ),
     )
 }

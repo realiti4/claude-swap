@@ -108,3 +108,37 @@ class TestRehearsalCommand:
         code, out, err = _run(["test"], capsys)
         assert code == 1
         assert "inside a Claude Code session" in (out + err)
+
+
+class TestIntentCommands:
+    def test_off_and_on_flip_the_master_switch(self, temp_home, capsys):
+        code, out, _ = _run(["off"], capsys)
+        assert code == 0 and "paused" in out
+        assert (
+            json.loads((get_backup_root() / "settings.json").read_text())["resume"]["enabled"]
+            is False
+        )
+        code, out, _ = _run(["on"], capsys)
+        assert code == 0 and "is on" in out
+        assert (
+            json.loads((get_backup_root() / "settings.json").read_text())["resume"]["enabled"]
+            is True
+        )
+
+    def test_cancel_requires_a_target(self, temp_home, capsys):
+        code, _, err = _run(["cancel"], capsys)
+        assert code == 2 and "SESSION or pass --all" in err
+
+    def test_cancel_marks_waiting_records(self, temp_home, tmp_path, capsys):
+        transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
+        with patch.object(rs, "spawn_waiter"):
+            _run(
+                ["arm"],
+                capsys,
+                stdin=json.dumps({"session_id": SID, "transcript_path": str(transcript)}),
+            )
+        code, out, _ = _run(["cancel", "--all"], capsys)
+        assert code == 0 and "cancelled" in out
+        assert rs.load_record(get_backup_root(), SID).state == rs.CANCELLED
+        code, out, _ = _run(["cancel", "--all"], capsys)
+        assert code == 1  # nothing left waiting

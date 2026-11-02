@@ -21,6 +21,7 @@ from claude_swap.paths import get_claude_config_home
 from claude_swap.printer import dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
 from claude_swap.resume import (
+    CANCELLED,
     MESSAGE,
     REASON_TEXT,
     RESUMED,
@@ -37,6 +38,7 @@ from claude_swap.resume import (
     resume_dir,
     waiter_alive,
 )
+from claude_swap.settings import load_resume_settings, set_setting
 
 # Cross-session messaging on native Windows arrived in 2.1.234 (2.1.224
 # elsewhere); StopFailure in 2.1.78.
@@ -170,7 +172,9 @@ def resume_status(backup_root: Path, json_output: bool = False) -> None:
         }
         print(json.dumps(payload, indent=2))
         return
-    if command:
+    if command and not load_resume_settings(backup_root).enabled:
+        print(f"Auto-continue: paused {dimmed('- `cswap resume on` to re-enable')}")
+    elif command:
         where = dimmed(f"(StopFailure hook in {claude_settings_path()})")
         print(f"Auto-continue: on {where}")
     else:
@@ -227,6 +231,46 @@ def resume_test(backup_root: Path) -> None:
     print("End the turn now. Within about 10 seconds of the session going idle it")
     print('should receive "[claude-swap auto-continue] TEST ..." and reply by itself.')
     print("Then check: cswap resume status   (expect: resumed / auto-continue test passed)")
+
+
+def resume_set_enabled(backup_root: Path, enabled: bool) -> None:
+    """``cswap resume on|off``: the master switch for automatic continues."""
+    set_setting(backup_root, "resume.enabled", "true" if enabled else "false")
+    if enabled:
+        print("Auto-continue is on: stopped sessions continue once capacity is back.")
+    else:
+        print("Auto-continue is paused. Stops are still tracked, nothing continues")
+        print("by itself until `cswap resume on`. `cswap resume now` still works.")
+
+
+def resume_cancel(backup_root: Path, wanted: list[str], all_sessions: bool = False) -> int:
+    """``cswap resume cancel``: don't continue these sessions (their waiters
+    stand down on their next check, within seconds)."""
+    views = [v for v in collect_views(backup_root) if v.record is not None and v.state == WAITING]
+    if not all_sessions:
+        views = [
+            v
+            for v in views
+            if any(
+                v.session_id.startswith(t) or v.name == t or Path(v.cwd).name == t for t in wanted
+            )
+        ]
+    if not views:
+        print(muted("No session is waiting to auto-continue."))
+        return 1
+    now = time.time()
+    for view in views:
+
+        def mutator(prev: ResumeRecord | None) -> ResumeRecord | None:
+            if prev is None or prev.state != WAITING:
+                return None
+            return replace(
+                prev, state=CANCELLED, detail="cancelled: won't auto-continue", updated_at=now
+            )
+
+        mutate_record(backup_root, view.session_id, mutator)
+        print(f"  {view.name}: cancelled (it won't auto-continue)")
+    return 0
 
 
 def resume_uninstall(backup_root: Path) -> None:

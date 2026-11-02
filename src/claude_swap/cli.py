@@ -1204,12 +1204,16 @@ Examples:
   cswap resume install       # enable auto-continue (snapshots settings.json first)
   cswap resume status        # sessions waiting, resumed, or stopped on a limit
   cswap resume now --all     # continue every waiting session right away
+  cswap resume cancel --all  # don't continue any of them (e.g. done for the day)
+  cswap resume off | on      # pause / re-enable auto-continue entirely
   cswap resume test          # (ask Claude to run it) rehearse on that session
   cswap resume uninstall     # remove the hook again
         """,
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    sub = parser.add_subparsers(dest="action", metavar="{install,uninstall,status,now,test}")
+    sub = parser.add_subparsers(
+        dest="action", metavar="{install,uninstall,status,now,cancel,off,on,test}"
+    )
     p_install = sub.add_parser("install", help="Add the StopFailure hook (enables auto-continue)")
     p_install.add_argument(
         "--command",
@@ -1226,12 +1230,19 @@ Examples:
     p_now = sub.add_parser("now", help="Continue waiting/stopped sessions right away")
     p_now.add_argument("sessions", nargs="*", metavar="SESSION", help="Session id (prefix) or name")
     p_now.add_argument("--all", action="store_true", help="Every session stopped on a limit")
+    p_cancel = sub.add_parser("cancel", help="Don't auto-continue these sessions")
+    p_cancel.add_argument("sessions", nargs="*", metavar="SESSION", help="Session id (prefix) or name")
+    p_cancel.add_argument("--all", action="store_true", help="Every waiting session")
+    sub.add_parser("off", help="Pause auto-continue (stops are still tracked)")
+    sub.add_parser("on", help="Re-enable auto-continue")
     args = parser.parse_args(argv)
     action = args.action or "status"
 
     from claude_swap.resume_cli import (
+        resume_cancel,
         resume_install,
         resume_now,
+        resume_set_enabled,
         resume_status,
         resume_test,
         resume_uninstall,
@@ -1246,6 +1257,12 @@ Examples:
             resume_uninstall(root)
         elif action == "test":
             resume_test(root)
+        elif action in ("off", "on"):
+            resume_set_enabled(root, action == "on")
+        elif action == "cancel":
+            if not args.sessions and not args.all:
+                parser.error("name a SESSION or pass --all")
+            sys.exit(resume_cancel(root, args.sessions, all_sessions=args.all))
         elif action == "status":
             resume_status(root, json_output=getattr(args, "json", False))
         elif action == "now":

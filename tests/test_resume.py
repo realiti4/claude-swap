@@ -398,7 +398,7 @@ class TestWaiter:
         assert h.clock.now >= 1300.0 + SETTINGS.slack_seconds
         [(address, text, token)] = h.posted
         assert address == SOCKET and token == CHILD_TOKEN
-        assert "limit window reset" in text and "continue the task" in text
+        assert "limit window reset" in text and "Continue the task" in text
         record = h.record()
         assert record.state == rs.RESUMED and record.resumed_stall_uuid == "s1"
         assert h.resumed == [("proj-1", rs.REASON_TEXT["limit-reset"])]
@@ -622,3 +622,101 @@ class TestRehearsal:
         assert "TEST" in text and "no task to continue" in text and token == CHILD_TOKEN
         assert h.resumed == [("proj-1", rs.REASON_TEXT["rehearsal"])]
         assert h.record().state == rs.RESUMED
+
+
+# ---------------------------------------------------------------------------
+# Intent controls (review 2026-11-02): held, paused, cancelled
+# ---------------------------------------------------------------------------
+
+
+class TestIntentPolicy:
+    def test_stop_older_than_the_cap_is_held_not_continued(self):
+        settings = ResumeSettings(max_wait_hours=24.0)
+        old = 1000.0 + 24 * 3600 + 1
+        # Even a reset that already passed doesn't override the hold.
+        r = evaluate(_record(resets_at=1300.0), old, LiveContext(identity=B), settings)
+        assert (r.ready, r.reason) == (False, "held")
+
+    def test_zero_cap_means_no_cap(self):
+        settings = ResumeSettings(max_wait_hours=0.0)
+        late = 1000.0 + 30 * 24 * 3600
+        assert evaluate(_record(resets_at=1300.0), late, LiveContext(identity=A), settings).ready
+
+    def test_paused_never_auto_continues(self):
+        settings = ResumeSettings(enabled=False)
+        r = evaluate(_record(resets_at=1300.0), 5000.0, LiveContext(identity=B), settings)
+        assert (r.ready, r.reason) == (False, "paused")
+
+    def test_message_makes_a_wrong_continue_cheap(self):
+        text = rs.MESSAGE.format(why="x")
+        assert "re-check the current state" in text
+        assert "stop without making further changes" in text
+        assert "ask again briefly instead of guessing" in text
+
+
+def _write_settings(backup: Path, **resume: object) -> None:
+    (backup / "settings.json").write_text(json.dumps({"resume": resume}))
+
+
+class TestIntentWaiter:
+    def test_held_session_notifies_once_then_force_continues_it(self, backup, stalled_transcript):
+        _write_settings(backup, maxWaitHours=1)
+        record = _record(armed_at=1000.0, stalled_at=1000.0, resets_at=90_000.0)
+        h = WaiterHarness(backup, stalled_transcript, record, LiveContext(identity=A))
+        h.clock.now = 1000.0 + 2 * 3600  # already past the 1h cap
+        sleeps = {"n": 0}
+        original = h.clock.sleep
+
+        def sleep_then_force(seconds: float) -> None:
+            original(seconds)
+            sleeps["n"] += 1
+            if sleeps["n"] == 3:
+                rs.force_flag(backup, SID).touch()
+
+        h.waiter.sleep = sleep_then_force
+        assert h.run() == rs.RESUMED
+        held = [d for _, d in h.gave_up if d.startswith("held:")]
+        assert len(held) == 1  # notified once, not every poll
+        assert "you asked" in h.posted[0][1]
+
+    def test_paused_waiter_holds_until_turned_back_on(self, backup, stalled_transcript):
+        _write_settings(backup, enabled=False)
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+        sleeps = {"n": 0}
+        original = h.clock.sleep
+
+        def sleep_then_enable(seconds: float) -> None:
+            original(seconds)
+            sleeps["n"] += 1
+            if sleeps["n"] == 2:
+                assert h.posted == []  # nothing sent while paused
+                _write_settings(backup, enabled=True)
+
+        h.waiter.sleep = sleep_then_enable
+        assert h.run() == rs.RESUMED
+        assert len(h.posted) == 1
+
+    def test_cancel_stands_the_waiter_down(self, backup, stalled_transcript):
+        h = WaiterHarness(
+            backup, stalled_transcript, _record(resets_at=90_000.0), LiveContext(identity=A)
+        )
+        original = h.clock.sleep
+
+        def sleep_then_cancel(seconds: float) -> None:
+            original(seconds)
+            rs.mutate_record(backup, SID, lambda prev: replace(prev, state=rs.CANCELLED))
+
+        h.waiter.sleep = sleep_then_cancel
+        assert h.run() == rs.CANCELLED
+        assert h.posted == []
+
+    def test_cancel_during_the_pre_send_jitter_wins(self, backup, stalled_transcript):
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+
+        def jitter_sleep(seconds: float) -> None:
+            h.clock.now += seconds
+            rs.mutate_record(backup, SID, lambda prev: replace(prev, state=rs.CANCELLED))
+
+        h.waiter.sleep = jitter_sleep
+        assert h.run() == rs.CANCELLED
+        assert h.posted == []
