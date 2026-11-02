@@ -9,7 +9,8 @@ account-targeted opens a context of its own:
 - ``w`` / menu "Watch accounts" / ``cswap watch`` → :class:`WatchScreen` —
   the same full cards but read-only: a live monitor. ``s`` arms selection
   (cursor appears on the active account), Enter switches and *stays
-  watching*, Esc disarms.
+  watching*, Esc disarms. The weekly-room chart from ``cswap history`` sits
+  above the cards and stays current; ``h`` hides or shows it.
 - "Remove account" nests into a submenu listing the accounts.
 
 No global command palette: actions live where their context is.
@@ -26,6 +27,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
 from claude_swap.models import AccountsSnapshot
+from claude_swap.tui.history_panel import HistoryPanel
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -342,6 +344,7 @@ class WatchScreen(AccountListScreen):
 
     BINDINGS = [
         Binding("s", "toggle_select", "Switch"),
+        Binding("h", "toggle_chart", "Chart"),
         Binding("enter", "select_highlighted", "Confirm", priority=True),
         Binding("f", "app.refresh_full", "Refresh", show=False),
         Binding("escape,q", "back", "Back"),
@@ -352,6 +355,18 @@ class WatchScreen(AccountListScreen):
     def __init__(self) -> None:
         super().__init__()
         self._selecting = False
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="list-title")
+        yield HistoryPanel(id="history-panel")
+        yield ListView(id="accounts")
+        yield Footer()
+
+    def action_toggle_chart(self) -> None:
+        self.query_one(HistoryPanel).toggle()
+
+    def on_resize(self) -> None:
+        self.query_one(HistoryPanel).check_layout()
 
     def on_mount(self) -> None:
         self.watch(self.app, "refresh_status", self._on_refresh_status)
@@ -371,6 +386,9 @@ class WatchScreen(AccountListScreen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "select_highlighted" and not self._selecting:
             return False  # hidden and inert until selection is armed
+        if action == "toggle_chart":
+            panels = self.query(HistoryPanel)
+            return bool(panels) and panels.first().supported
         return True
 
     def _index_after_build(
