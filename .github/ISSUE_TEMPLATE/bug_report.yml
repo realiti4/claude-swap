@@ -1,0 +1,47 @@
+name: Bug report
+description: Something in cswap isn't working right
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you see, and what did you expect instead?
+      placeholder: Ran `cswap switch 2`, got ... — expected ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: cswap version and install method
+      description: Output of `cswap --version`, and whether you installed with uv, pipx, or from source.
+      placeholder: cswap 0.20.0, installed with uv
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Credentials are stored differently per platform, so this matters a lot.
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - WSL
+    validations:
+      required: true
+  - type: dropdown
+    id: claude-code
+    attributes:
+      label: How do you run Claude Code?
+      multiple: true
+      options:
+        - CLI (terminal)
+        - VS Code extension
+        - Desktop app
+  - type: textarea
+    id: logs
+    attributes:
+      label: Command output or logs
+      description: Paste the failing command's output — `cswap list` for account-state issues, `cswap auto` log lines for auto-switch issues. Formatted automatically, no backticks needed. Please redact emails/account identifiers, and never paste access/refresh tokens, API keys, setup tokens, or credential-file/Keychain contents.
+      render: shell

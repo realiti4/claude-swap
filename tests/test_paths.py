@@ -20,6 +20,7 @@ from claude_swap.paths import (
     get_backup_root,
     get_claude_config_home,
     get_credentials_path,
+    get_default_global_config_path,
     get_global_config_path,
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
@@ -42,7 +43,9 @@ class TestGetClaudeConfigHome:
     def test_default_is_dot_claude_in_home(self, isolated_home: Path):
         assert get_claude_config_home() == isolated_home / ".claude"
 
-    def test_respects_env_var(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_respects_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         custom = tmp_path / "custom-claude"
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
         assert get_claude_config_home() == custom
@@ -53,7 +56,9 @@ class TestGetGlobalConfigPath:
         """Without CCD, claude-code writes .claude.json at $HOME, not inside .claude/."""
         assert get_global_config_path() == isolated_home / ".claude.json"
 
-    def test_ccd_set_returns_ccd_claude_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_ccd_set_returns_ccd_claude_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         custom = tmp_path / "ccd"
         custom.mkdir()
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
@@ -78,6 +83,38 @@ class TestGetGlobalConfigPath:
         assert get_global_config_path() == legacy
 
 
+@pytest.mark.parametrize(
+    "resolver", [get_global_config_path, get_default_global_config_path]
+)
+@pytest.mark.parametrize(
+    "legacy_kind, global_present, expect_legacy",
+    [
+        ("absent", False, False),
+        ("empty", True, False),
+        ("empty", False, True),
+        ("empty_readonly", False, False),
+        ("nonempty", True, True),
+        ("directory", False, False),
+    ],
+)
+def test_legacy_config_rule_matches_claude_code_2_1_299(
+    isolated_home: Path, resolver, legacy_kind, global_present, expect_legacy
+):
+    """An empty .config.json only wins while it is writable and .claude.json is absent."""
+    legacy = isolated_home / ".claude" / ".config.json"
+    legacy.parent.mkdir()
+    if legacy_kind == "directory":
+        legacy.mkdir()
+    elif legacy_kind != "absent":
+        legacy.write_text("{}" if legacy_kind == "nonempty" else "")
+        if legacy_kind == "empty_readonly":
+            legacy.chmod(0o444)
+    global_cfg = isolated_home / ".claude.json"
+    if global_present:
+        global_cfg.write_text("{}")
+    assert resolver() == (legacy if expect_legacy else global_cfg)
+
+
 class TestGetCredentialsPath:
     def test_default_inside_dot_claude(self, isolated_home: Path):
         assert get_credentials_path() == isolated_home / ".claude" / ".credentials.json"
@@ -98,7 +135,9 @@ class TestGetBackupRoot:
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
         assert get_backup_root() == isolated_home / ".local" / "share" / "claude-swap"
 
-    def test_linux_respects_xdg_data_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_linux_respects_xdg_data_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         custom = tmp_path / "xdg"
         monkeypatch.setenv("XDG_DATA_HOME", str(custom))
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
@@ -128,20 +167,28 @@ class TestGetBackupRoot:
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
         assert get_backup_root() == isolated_home / "custom-data" / "claude-swap"
 
-    def test_wsl_uses_xdg_layout(self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_wsl_uses_xdg_layout(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.delenv("XDG_DATA_HOME", raising=False)
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.WSL))
         assert get_backup_root() == isolated_home / ".local" / "share" / "claude-swap"
 
-    def test_macos_uses_legacy_layout(self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_macos_uses_legacy_layout(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.MACOS))
         assert get_backup_root() == isolated_home / LEGACY_BACKUP_DIRNAME
 
-    def test_windows_uses_legacy_layout(self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_windows_uses_legacy_layout(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.WINDOWS))
         assert get_backup_root() == isolated_home / LEGACY_BACKUP_DIRNAME
 
-    def test_legacy_helper_returns_home_dot_claude_swap_backup(self, isolated_home: Path):
+    def test_legacy_helper_returns_home_dot_claude_swap_backup(
+        self, isolated_home: Path
+    ):
         assert get_legacy_backup_root() == isolated_home / LEGACY_BACKUP_DIRNAME
 
 
@@ -213,7 +260,9 @@ class TestMigrateLegacyBackupDir:
         assert not (target / "cache").exists()
         assert not (target / "claude-swap.log").exists()
 
-    def test_target_with_real_data_alongside_artifacts_still_collides(self, isolated_home: Path):
+    def test_target_with_real_data_alongside_artifacts_still_collides(
+        self, isolated_home: Path
+    ):
         """Cache/log next to real data → still a collision, must refuse."""
         legacy = isolated_home / LEGACY_BACKUP_DIRNAME
         legacy.mkdir()

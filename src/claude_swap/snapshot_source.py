@@ -1,16 +1,13 @@
-"""Paced snapshot source — the supported read path for dashboards and GUI shells.
+"""Snapshot source — the supported read path for dashboards and GUI shells.
 
-Anything that displays every account's usage on a timer (the TUI, the menu
-bar, any future shell) must not run a full on-demand fetch pass per refresh:
-the usage store's freshness window dedupes bursts but is not a sustained-rate
-governor, and the usage endpoint rate-limits per account (a full pass per
-minute keeps every token at its sustained-limit edge). ``SnapshotSource``
-owns *when* a pass may hit the network: per refresh, only the active account
-plus — at most once per ``SERVE_TTL_S`` — the stalest due alternate is
-eligible, so an open dashboard costs O(1) requests per TTL window regardless
-of account count. The store's own gates (freshness, backoff/Retry-After,
-claims) apply on top, and this class never writes poll plans — ``cswap
-auto`` stays the cadence learner.
+Pacing is store-governed: the usage store's persisted poll plans plus its
+freshness/backoff/claim gates (decided atomically in ``UsageStore.reserve``)
+cap every surface at the same per-account cadence, so a dashboard repainting
+every few seconds and a one-shot ``cswap list`` produce identical network
+behavior. This class therefore just runs the same on-demand pass as ``cswap
+list`` (``fetch=None``) each take — the store decides which accounts, if
+any, may actually be fetched — and offers ``store_only`` for shells that
+host an auto engine (which already collects on its own schedule).
 
 ``take()`` is blocking (file locks, keychain subprocesses, network): call it
 from a background thread, never a UI event loop.
@@ -18,66 +15,86 @@ from a background thread, never a UI event loop.
 
 from __future__ import annotations
 
-import time
+import threading
+from dataclasses import replace
 
-from claude_swap import usage_store
-from claude_swap.models import AccountsSnapshot
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import UsageEntry
 
 
 class SnapshotSource:
-    """Plans each pass's fetch set and takes one coherent snapshot.
+    """Takes one coherent snapshot per call; the store paces the network.
 
-    The first ``take()`` is a full on-demand pass (``fetch=None``, every
-    stale account eligible — what a user opening a dashboard expects, and
-    exactly what ``cswap list`` does); afterwards the pacing discipline above
-    applies. ``full=True`` (the user's explicit refresh) repeats the full
-    pass; ``store_only=True`` (when an auto-switch engine is running and
-    already paces all fetching) reads the store without any network
-    eligibility.
+    ``full=True`` (the user's explicit refresh) is accepted for API
+    stability but is no faster than a normal pass: even an explicit refresh
+    is capped by the store's serve TTL and poll plans. ``store_only=True``
+    reads the store without any network eligibility.
     """
 
     def __init__(self, switcher: ClaudeAccountSwitcher) -> None:
         self.switcher = switcher
-        self._first_pass = True
-        self._next_alt_mono = 0.0
         self._last: AccountsSnapshot | None = None
+        self._lock = threading.Lock()
 
-    def take(self, *, full: bool = False, store_only: bool = False) -> AccountsSnapshot:
+    def take(
+        self, *, full: bool = False, store_only: bool = False
+    ) -> AccountsSnapshot:
         """Blocking snapshot pass; call from a thread worker."""
-        if store_only:
-            fetch: set[str] | None = set()
-        elif full or self._first_pass:
-            fetch = None
-            self._next_alt_mono = time.monotonic() + usage_store.SERVE_TTL_S
-        else:
-            fetch = self._disciplined_fetch_set()
-        self._first_pass = False
+        fetch: set[str] | None = set() if store_only else None
         snap = self.switcher.accounts_snapshot(fetch=fetch)
-        self._last = snap
-        return snap
+        with self._lock:
+            snap = self._reconcile(snap)
+            self._last = snap
+            return snap
 
-    def _disciplined_fetch_set(self) -> set[str]:
-        """Active account + at most one due alternate per ``SERVE_TTL_S``.
+    def _reconcile(self, snap: AccountsSnapshot) -> AccountsSnapshot:
+        if self._last is None:
+            return snap
+        previous = {acc.number: acc for acc in self._last.accounts}
+        accounts = tuple(
+            self._reconcile_account(acc, previous.get(acc.number), snap.taken_at)
+            for acc in snap.accounts
+        )
+        return replace(snap, accounts=accounts)
 
-        The alternate is picked from the *previous* snapshot's entries — a
-        few-second-stale nomination is harmless: the collector re-checks
-        freshness/backoff/claims before actually fetching, so a bad pick
-        simply fetches nothing.
-        """
-        active = self.switcher.current_account_number()
-        fetch = {active} if active else set()
-        now = time.monotonic()
-        if now >= self._next_alt_mono:
-            self._next_alt_mono = now + usage_store.SERVE_TTL_S
-            if self._last is not None:
-                candidates = [
-                    acc.number
-                    for acc in self._last.accounts
-                    if acc.switchable and acc.number != active
-                ]
-                entries = {acc.number: acc.usage for acc in self._last.accounts}
-                pick = usage_store.due_candidate(candidates, entries, time.time())
-                if pick is not None:
-                    fetch.add(pick)
-        return fetch
+    def _reconcile_account(
+        self,
+        acc: AccountSnapshot,
+        prev: AccountSnapshot | None,
+        taken_at: float,
+    ) -> AccountSnapshot:
+        if prev is None or account_identity(acc) != account_identity(prev):
+            return acc
+
+        prev_fetched = prev.usage.fetched_at
+        fetched = acc.usage.fetched_at
+        if prev_fetched is not None and (fetched is None or fetched < prev_fetched):
+            return replace(acc, usage=_with_current_age(prev.usage, taken_at))
+        if acc.usage.sentinel is not None:
+            return acc
+
+        if (
+            prev.usage.sentinel == USAGE_TOKEN_EXPIRED
+            and fetched == prev_fetched
+        ):
+            return replace(acc, usage=replace(acc.usage, sentinel=USAGE_TOKEN_EXPIRED))
+        return acc
+
+
+def account_identity(acc: AccountSnapshot) -> tuple[str, str, str]:
+    """The identity discriminator for a slot across snapshots.
+
+    The single definition of "same account": snapshot reconciliation here and
+    the TUI's snapshot merge must agree, or an identity change (e.g. a slot
+    re-used by another login) is detected by one and missed by the other.
+    """
+    return (acc.email, acc.org_uuid, acc.kind)
+
+
+def _with_current_age(usage: UsageEntry, taken_at: float) -> UsageEntry:
+    fetched = usage.fetched_at
+    if fetched is None:
+        return usage
+    return replace(usage, age_s=max(0.0, taken_at - fetched))

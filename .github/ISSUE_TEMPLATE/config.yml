@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 Tips & how it works
+    url: https://github.com/realiti4/claude-swap#tips
+    about: Restart-after-switch behavior, macOS Keychain caching, and other common gotchas are covered in the README.

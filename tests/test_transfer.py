@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,8 +14,11 @@ import pytest
 
 from claude_swap.exceptions import TransferError
 from claude_swap.models import Platform
+from claude_swap.oauth import credential_fingerprint
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
+from claude_swap.usage_store import FetchRecord
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,21 +53,18 @@ def _seed_account(
     org_name: str = "",
     creds: dict | None = None,
     config: dict | None = None,
+    alias: str | None = None,
 ) -> None:
     """Write an account to backup + sequence.json."""
     creds_obj = creds if creds is not None else {**SAMPLE_CREDS, "_marker": email}
-    config_obj = (
-        config
-        if config is not None
-        else {
-            "oauthAccount": {
-                "emailAddress": email,
-                "accountUuid": f"acct-{num}",
-                "organizationUuid": org_uuid,
-                "organizationName": org_name,
-            }
+    config_obj = config if config is not None else {
+        "oauthAccount": {
+            "emailAddress": email,
+            "accountUuid": f"acct-{num}",
+            "organizationUuid": org_uuid,
+            "organizationName": org_name,
         }
-    )
+    }
     switcher._write_account_credentials(str(num), email, json.dumps(creds_obj))
     switcher._write_account_config(str(num), email, json.dumps(config_obj))
 
@@ -80,6 +81,8 @@ def _seed_account(
         "organizationName": org_name,
         "added": "2024-01-01T00:00:00Z",
     }
+    if alias:
+        data["accounts"][str(num)]["alias"] = alias
     if num not in data["sequence"]:
         data["sequence"].append(num)
         data["sequence"].sort()
@@ -161,6 +164,114 @@ class TestRoundTrip:
                 assert final["activeAccountNumber"] == 9  # untouched
 
 
+class TestAliasTransfer:
+    """Alias round-trips through export/import, and collisions are handled."""
+
+    def test_alias_round_trips(self, temp_home: Path):
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="dev")
+        _seed_account(src, 2, "bob@example.com")
+
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+        envelope = json.loads(out_file.read_text())
+        by_email = {a["email"]: a for a in envelope["accounts"]}
+        assert by_email["alice@example.com"]["alias"] == "dev"
+        assert "alias" not in by_email["bob@example.com"]
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                import_accounts(dst, str(out_file))
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["1"]["alias"] == "dev"
+                assert "alias" not in seq["accounts"]["2"]
+
+    def test_import_alias_collision_with_local_drops_and_warns(self, temp_home: Path):
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="dev")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 9, "existing@example.com", alias="dev")
+
+                import_accounts(dst, str(out_file))
+
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["9"]["alias"] == "dev"  # local kept
+                imported_num = next(
+                    n for n, acc in seq["accounts"].items()
+                    if acc["email"] == "alice@example.com"
+                )
+                assert "alias" not in seq["accounts"][imported_num]
+
+    def test_import_reexport_of_same_account_keeps_own_alias(self, temp_home: Path):
+        """Re-importing a backup of an account that already carries the same
+        alias locally must not be treated as a collision with itself."""
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="dev")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 1, "alice@example.com", alias="dev")
+
+                import_accounts(dst, str(out_file), force=True)
+
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["1"]["alias"] == "dev"
+
+    def test_import_duplicate_alias_within_export_rejected(self, temp_home: Path):
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="dev")
+        _seed_account(src, 2, "bob@example.com", alias="dev")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+        # Fabricate a duplicate alias in the exported envelope: export itself
+        # can't produce this (uniqueness enforced at set-time), but a
+        # hand-edited or foreign-tool-produced file could.
+        envelope = json.loads(out_file.read_text())
+        for acc in envelope["accounts"]:
+            acc["alias"] = "dev"
+        out_file.write_text(json.dumps(envelope))
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                with pytest.raises(TransferError):
+                    import_accounts(dst, str(out_file))
+
+    def test_import_invalid_alias_format_rejected(self, temp_home: Path):
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+        envelope = json.loads(out_file.read_text())
+        envelope["accounts"][0]["alias"] = "123"  # purely numeric — invalid
+        out_file.write_text(json.dumps(envelope))
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                with pytest.raises(TransferError):
+                    import_accounts(dst, str(out_file))
+
+
 # ---------------------------------------------------------------------------
 # Selective export
 # ---------------------------------------------------------------------------
@@ -201,28 +312,6 @@ class TestSelectiveExport:
             export_accounts(s, str(temp_home / "x.cswap"))
 
 
-class TestExportPlaintextWarning:
-    def test_warns_on_file_destination(self, temp_home: Path, capsys):
-        s = _linux_switcher(temp_home)
-        _seed_account(s, 1, "a@example.com")
-
-        export_accounts(s, str(temp_home / "one.cswap"))
-        err = capsys.readouterr().err
-        assert "unencrypted" in err
-        assert "gpg -c" in err
-
-    def test_warns_on_stdout_destination_via_stderr_not_stdout(self, temp_home: Path, capsys):
-        """Stdout must stay pure JSON (pipeable) — the warning goes to stderr."""
-        s = _linux_switcher(temp_home)
-        _seed_account(s, 1, "a@example.com")
-
-        export_accounts(s, "-")
-        captured = capsys.readouterr()
-        assert "unencrypted" in captured.err
-        assert "unencrypted" not in captured.out
-        json.loads(captured.out)  # stdout is still valid, warning-free JSON
-
-
 # ---------------------------------------------------------------------------
 # Conflict / force semantics
 # ---------------------------------------------------------------------------
@@ -243,7 +332,9 @@ class TestConflictPolicy:
         seq = src._get_sequence_data()
         assert list(seq["accounts"].keys()) == ["1"]
 
-    def test_force_overwrites_existing_slot_in_place(self, temp_home: Path, capsys):
+    def test_force_overwrites_existing_slot_in_place(
+        self, temp_home: Path, capsys
+    ):
         """Critical: --force updates the local matching slot, NOT the exported slot.
 
         Setup: local slot 3 has alice@x.com. Local slot 1 has bob@x.com (different
@@ -285,27 +376,25 @@ class TestConflictPolicy:
         assert seq["accounts"]["1"]["email"] == "bob@example.com"
         assert seq["accounts"]["3"]["email"] == "alice@example.com"
 
-    def test_import_over_live_login_hints_force_activation(self, temp_home: Path, capsys):
+    def test_import_over_live_login_hints_force_activation(
+        self, temp_home: Path, capsys
+    ):
         """Overwriting the stored backup of the current live login prints the
         --switch-to --force activation hint (issue #79 follow-up): a plain
         switch would back the stale live creds up over the fresh import."""
         s = _linux_switcher(temp_home)
         _seed_account(s, 1, "alice@example.com", "org-a", "Org A")
-        (temp_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "alice@example.com",
-                        "accountUuid": "acct-1",
-                        "organizationUuid": "org-a",
-                        "organizationName": "Org A",
-                    }
-                }
-            )
-        )
-        (temp_home / ".claude" / ".credentials.json").write_text(
-            json.dumps({"claudeAiOauth": {"accessToken": "sk-stale-live"}})
-        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "alice@example.com",
+                "accountUuid": "acct-1",
+                "organizationUuid": "org-a",
+                "organizationName": "Org A",
+            }
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-stale-live"}}
+        ))
         out = temp_home / "alice.cswap"
         export_accounts(s, str(out))
 
@@ -315,21 +404,19 @@ class TestConflictPolicy:
         assert "alice@example.com is your current live login" in err
         assert "cswap --switch-to 1 --force" in err
 
-    def test_import_without_matching_live_login_prints_no_hint(self, temp_home: Path, capsys):
+    def test_import_without_matching_live_login_prints_no_hint(
+        self, temp_home: Path, capsys
+    ):
         """No activation hint when the live login isn't among the imported
         accounts (its stored backup was not rewritten)."""
         s = _linux_switcher(temp_home)
         _seed_account(s, 1, "alice@example.com", "org-a", "Org A")
-        (temp_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "bob@example.com",
-                        "accountUuid": "acct-bob",
-                    }
-                }
-            )
-        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "bob@example.com",
+                "accountUuid": "acct-bob",
+            }
+        }))
         out = temp_home / "alice.cswap"
         export_accounts(s, str(out))
 
@@ -391,7 +478,9 @@ class TestCrossPlatform:
                 dst = _linux_switcher(dst_home)
                 import_accounts(dst, str(out))
 
-                cred_file = dst.credentials_dir / ".creds-1-alice@example.com.enc"
+                cred_file = (
+                    dst.credentials_dir / ".creds-1-alice@example.com.enc"
+                )
                 assert cred_file.exists()
 
 
@@ -503,14 +592,14 @@ class TestValidation:
 
     def test_credentials_garbage_string_rejected(self, temp_home: Path):
         # A non-key string credential is interpreted as an API-key account and
-        # rejected because it isn't a valid sk-ant-api… key.
+        # rejected because it isn't a bare sk-ant-… key.
         s = _linux_switcher(temp_home)
         env = self._make_envelope()
         env["accounts"][0]["credentials"] = "a string"
         f = temp_home / "c.cswap"
         f.write_text(json.dumps(env))
 
-        with pytest.raises(TransferError, match="must be a raw sk-ant-api"):
+        with pytest.raises(TransferError, match="must be a raw sk-ant-"):
             import_accounts(s, str(f))
 
     def test_credentials_non_object_non_string_rejected(self, temp_home: Path):
@@ -524,9 +613,13 @@ class TestValidation:
         with pytest.raises(TransferError, match="must be a JSON object"):
             import_accounts(s, str(f))
 
-    @pytest.mark.parametrize("field", ["organizationUuid", "organizationName", "uuid", "added"])
+    @pytest.mark.parametrize(
+        "field", ["organizationUuid", "organizationName", "uuid", "added"]
+    )
     @pytest.mark.parametrize("bad_value", [["a", "b"], {"x": 1}, 42])
-    def test_string_fields_reject_non_string_types(self, temp_home: Path, field: str, bad_value):
+    def test_string_fields_reject_non_string_types(
+        self, temp_home: Path, field: str, bad_value
+    ):
         """Org/uuid/added fields must be strings — a list/dict/int would
         otherwise blow up downstream (unhashable in seen_keys, broken
         composite-key matching, garbage in sequence.json)."""
@@ -647,6 +740,58 @@ class TestFilePermissions:
 
         mode = os.stat(out).st_mode & 0o777
         assert mode == 0o600
+
+    def test_export_onto_a_symlink_replaces_the_link_not_its_target(
+        self, temp_home: Path
+    ):
+        """The destination is user-typed and may sit in a shared directory:
+        a planted link must not redirect the export (refresh tokens) onto
+        another file. The link is replaced; its old target is untouched."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        decoy = temp_home / "decoy.txt"
+        decoy.write_text("decoy", encoding="utf-8")
+        out = temp_home / "x.cswap"
+        out.symlink_to(decoy)
+
+        export_accounts(s, str(out))
+
+        assert not out.is_symlink()
+        assert '"accounts"' in out.read_text(encoding="utf-8")
+        assert decoy.read_text(encoding="utf-8") == "decoy"
+
+    def test_export_temp_file_never_created_world_readable(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The export payload carries a live OAuth refresh token, so the temp
+        file backing it must be 0600 from the instant it is created — never a
+        write-then-chmod sequence that leaves it at the umask-derived default
+        (typically world-readable) for any window. Spies on tempfile.mkstemp
+        (rather than just checking the final path) so this fails loudly if the
+        implementation ever regresses to Path.write_text + a later chmod: a
+        permissive umask that would produce 0o644 under that pattern must
+        still yield 0o600 immediately at creation.
+        """
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        out = temp_home / "x.cswap"
+
+        real_mkstemp = tempfile.mkstemp
+        modes_at_creation = []
+
+        def spying_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            modes_at_creation.append(os.fstat(fd).st_mode & 0o777)
+            return fd, path
+
+        monkeypatch.setattr(tempfile, "mkstemp", spying_mkstemp)
+        old_umask = os.umask(0o022)  # permissive: 0o644 if write_text created it
+        try:
+            export_accounts(s, str(out))
+        finally:
+            os.umask(old_umask)
+
+        assert modes_at_creation == [0o600]
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +944,9 @@ class TestCleanHomeActivation:
                 seq = dst._get_sequence_data()
                 assert seq["activeAccountNumber"] == 1
 
-    def test_switch_rotate_after_import_uses_active_from_envelope(self, temp_home: Path):
+    def test_switch_rotate_after_import_uses_active_from_envelope(
+        self, temp_home: Path
+    ):
         """Import on a clean home should preserve the envelope's
         activeAccountNumber (slot 2 = bob), so a subsequent --switch lands
         on bob without any manual setup."""
@@ -849,7 +996,9 @@ class TestCleanHomeActivation:
         final = dst._get_sequence_data()
         assert final["activeAccountNumber"] == 5
 
-    def test_active_seeded_to_resolved_slot_not_envelope_slot(self, temp_home: Path):
+    def test_active_seeded_to_resolved_slot_not_envelope_slot(
+        self, temp_home: Path
+    ):
         """Mixed-state: destination has unrelated account at the envelope's
         active slot number, but the envelope's active account itself was
         imported into a *different* slot. activeAccountNumber must point
@@ -874,7 +1023,9 @@ class TestCleanHomeActivation:
         assert final["accounts"]["2"]["email"] == "local@example.com"
         # bob was imported elsewhere
         bob_slot = next(
-            num for num, acc in final["accounts"].items() if acc["email"] == "bob@example.com"
+            num
+            for num, acc in final["accounts"].items()
+            if acc["email"] == "bob@example.com"
         )
         assert bob_slot != "2"
         # activeAccountNumber points at bob's resolved slot, NOT at slot 2 (local)
@@ -898,7 +1049,11 @@ class TestCleanHomeActivation:
                 config_path = dst._get_claude_config_path()
                 local_config = {
                     "tipsHistory": {"shown": ["welcome"]},
-                    "projects": {"/path/to/project": {"mcpServers": {"memory": {"type": "stdio"}}}},
+                    "projects": {
+                        "/path/to/project": {
+                            "mcpServers": {"memory": {"type": "stdio"}}
+                        }
+                    },
                     "userID": "local-user-id",
                     "numStartups": 42,
                 }
@@ -944,7 +1099,44 @@ class TestCleanHomeActivation:
                 merged = json.loads(config_path.read_text())
                 assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
 
-    def test_active_seeded_when_envelope_active_was_skipped(self, temp_home: Path):
+    def test_a_valid_empty_config_is_spliced_not_called_unparseable(
+        self, temp_home: Path
+    ):
+        """M-2: `is not None`, not truthiness.
+
+        A valid but EMPTY `{}` config is readable and loses nothing by being
+        spliced. Under a truthiness test it falls to the salvage branch, which
+        copies the file aside and tells the user it "could not be parsed" —
+        the same ""-vs-None conflation this whole PR exists to separate, one
+        level up. The sibling malformed-config test cannot see it: `{not
+        valid json` is genuinely unreadable, so both forms agree there.
+        """
+        src_home = temp_home.parent / "src"
+        src_home.mkdir()
+        export_path = self._seed_and_export(src_home)
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                config_path = dst._get_claude_config_path()
+                config_path.write_text("{}")
+
+                import_accounts(dst, str(export_path))
+                with patch.object(dst, "list_accounts"):
+                    dst.switch_to("1")
+
+                merged = json.loads(config_path.read_text())
+                assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+                assert not list(config_path.parent.glob("*.unreadable-*")), (
+                    "a valid empty config was salvaged and reported as "
+                    "unparseable"
+                )
+
+    def test_active_seeded_when_envelope_active_was_skipped(
+        self, temp_home: Path
+    ):
         """If the envelope's active account already existed locally and was
         skipped (no --force), activeAccountNumber should still seed to the
         existing local slot — that's where the migration intends to land."""
@@ -1025,7 +1217,9 @@ class TestSlimVsFullConfig:
         """If the source config somehow lacks oauthAccount, slim export
         must fail loudly — there's nothing to switch to without it."""
         s = _linux_switcher(temp_home)
-        _seed_account(s, 1, "alice@example.com", config={"projects": {}, "userID": "x"})
+        _seed_account(
+            s, 1, "alice@example.com", config={"projects": {}, "userID": "x"}
+        )
 
         with pytest.raises(TransferError, match="missing oauthAccount"):
             export_accounts(s, str(temp_home / "x.cswap"))
@@ -1039,7 +1233,9 @@ class TestSlimVsFullConfig:
         with patch("pathlib.Path.home", return_value=src_home):
             with patch.dict(os.environ, {"HOME": str(src_home)}):
                 src = _linux_switcher(src_home)
-                _seed_account(src, 1, "alice@example.com", "org-a", config=_BLOATED_CONFIG)
+                _seed_account(
+                    src, 1, "alice@example.com", "org-a", config=_BLOATED_CONFIG
+                )
                 export_path = src_home / "x.cswap"
                 export_accounts(src, str(export_path))
 
@@ -1061,6 +1257,61 @@ class TestSlimVsFullConfig:
                 assert "appleTerminalBackupPath" not in live
 
 
+class TestSlimVsFullCredentials:
+    """#135 follow-up: default exports carry only the account's own login.
+    Machine-shared MCP/plugin OAuth state is owned by whichever machine the
+    export lands on, and the device-bound trustedDeviceToken is meaningless
+    off-device — neither belongs in a cross-machine file."""
+
+    _SIBLINGED_CREDS = {
+        "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        "mcpOAuth": {"linear": {"refreshToken": "mcp-rt"}},
+        "trustedDeviceToken": "device-token-a",
+        "someFutureField": {"value": 1},
+    }
+
+    def test_default_export_keeps_only_claude_ai_oauth(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(
+            s, 1, "alice@example.com", "org-a", creds=self._SIBLINGED_CREDS
+        )
+
+        out = temp_home / "slim.cswap"
+        export_accounts(s, str(out))
+        env = json.loads(out.read_text())
+
+        assert env["accounts"][0]["credentials"] == {
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"}
+        }
+
+    def test_full_export_keeps_entire_credential_object(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(
+            s, 1, "alice@example.com", "org-a", creds=self._SIBLINGED_CREDS
+        )
+
+        out = temp_home / "full.cswap"
+        export_accounts(s, str(out), full=True)
+        env = json.loads(out.read_text())
+
+        assert env["accounts"][0]["credentials"] == self._SIBLINGED_CREDS
+
+    def test_legacy_shape_without_claude_ai_oauth_exports_verbatim(
+        self, temp_home: Path
+    ):
+        # Pre-claudeAiOauth blobs (top-level tokens) have no sibling keys to
+        # strip and must keep round-tripping untouched.
+        legacy = {"accessToken": "tok-legacy", "refreshToken": "rt-legacy"}
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a", creds=legacy)
+
+        out = temp_home / "legacy.cswap"
+        export_accounts(s, str(out))
+        env = json.loads(out.read_text())
+
+        assert env["accounts"][0]["credentials"] == legacy
+
+
 # ---------------------------------------------------------------------------
 # Issue #41: tolerate broken slots in export
 # ---------------------------------------------------------------------------
@@ -1072,12 +1323,16 @@ class TestExportSkipsBrokenSlots:
     with an explicit --account must keep failing for that one slot."""
 
     def _break_credentials(self, switcher: ClaudeAccountSwitcher, num: int, email: str) -> None:
-        cred_file = switcher.credentials_dir / f".creds-{num}-{email}.enc"
+        cred_file = (
+            switcher.credentials_dir / f".creds-{num}-{email}.enc"
+        )
         if cred_file.exists():
             cred_file.unlink()
 
     def _break_config(self, switcher: ClaudeAccountSwitcher, num: int, email: str) -> None:
-        cfg_file = switcher.configs_dir / f".claude-config-{num}-{email}.json"
+        cfg_file = (
+            switcher.configs_dir / f".claude-config-{num}-{email}.json"
+        )
         if cfg_file.exists():
             cfg_file.unlink()
 
@@ -1102,7 +1357,9 @@ class TestExportSkipsBrokenSlots:
         assert "alice@example.com" in captured.err
         assert "Skipping Account-1" not in captured.out
 
-    def test_all_accounts_skips_missing_config_with_stderr_warning(self, temp_home: Path, capsys):
+    def test_all_accounts_skips_missing_config_with_stderr_warning(
+        self, temp_home: Path, capsys
+    ):
         s = _linux_switcher(temp_home)
         _seed_account(s, 1, "alice@example.com")
         _seed_account(s, 2, "bob@example.com")
@@ -1115,7 +1372,9 @@ class TestExportSkipsBrokenSlots:
         assert [a["email"] for a in envelope["accounts"]] == ["bob@example.com"]
         assert "Skipping Account-1" in capsys.readouterr().err
 
-    def test_explicit_account_with_missing_credentials_hard_fails(self, temp_home: Path):
+    def test_explicit_account_with_missing_credentials_hard_fails(
+        self, temp_home: Path
+    ):
         s = _linux_switcher(temp_home)
         _seed_account(s, 1, "alice@example.com")
         _seed_account(s, 2, "bob@example.com")
@@ -1124,9 +1383,13 @@ class TestExportSkipsBrokenSlots:
         from claude_swap.exceptions import CredentialReadError
 
         with pytest.raises(CredentialReadError, match="no backup credentials"):
-            export_accounts(s, str(temp_home / "x.cswap"), account="1")
+            export_accounts(
+                s, str(temp_home / "x.cswap"), account="1"
+            )
 
-    def test_explicit_account_with_missing_config_hard_fails(self, temp_home: Path):
+    def test_explicit_account_with_missing_config_hard_fails(
+        self, temp_home: Path
+    ):
         s = _linux_switcher(temp_home)
         _seed_account(s, 1, "alice@example.com")
         _seed_account(s, 2, "bob@example.com")
@@ -1135,7 +1398,9 @@ class TestExportSkipsBrokenSlots:
         from claude_swap.exceptions import ConfigError
 
         with pytest.raises(ConfigError, match="no backup config"):
-            export_accounts(s, str(temp_home / "x.cswap"), account="1")
+            export_accounts(
+                s, str(temp_home / "x.cswap"), account="1"
+            )
 
     def test_all_slots_broken_raises_transfer_error(self, temp_home: Path):
         s = _linux_switcher(temp_home)
@@ -1147,7 +1412,9 @@ class TestExportSkipsBrokenSlots:
         with pytest.raises(TransferError, match="no exportable accounts"):
             export_accounts(s, str(temp_home / "x.cswap"))
 
-    def test_skipped_active_slot_clears_envelope_active(self, temp_home: Path, capsys):
+    def test_skipped_active_slot_clears_envelope_active(
+        self, temp_home: Path, capsys
+    ):
         """If the recorded activeAccountNumber's backup is missing and there's
         no live session to source it from, the slot is skipped — the envelope
         must not advertise that number as active or import would dangle."""
@@ -1170,7 +1437,9 @@ class TestExportSkipsBrokenSlots:
         assert [a["email"] for a in envelope["accounts"]] == ["bob@example.com"]
         assert envelope["activeAccountNumber"] is None
 
-    def test_stdout_pipe_mode_keeps_stdout_pure_json(self, temp_home: Path, capsys):
+    def test_stdout_pipe_mode_keeps_stdout_pure_json(
+        self, temp_home: Path, capsys
+    ):
         """cswap --export - must produce valid JSON on stdout even when one
         slot is broken — warning must go to stderr."""
         s = _linux_switcher(temp_home)
@@ -1202,7 +1471,9 @@ class TestImportSessionInvalidation:
         out.write_text(json.dumps(env))
         return out
 
-    def test_force_overwrite_invalidates_session_credentials(self, temp_home: Path, capsys):
+    def test_force_overwrite_invalidates_session_credentials(
+        self, temp_home: Path, capsys
+    ):
         from claude_swap.session import session_dir_for
 
         s = _linux_switcher(temp_home)
@@ -1221,7 +1492,9 @@ class TestImportSessionInvalidation:
         assert not (session_dir / ".credentials.json").exists()
         assert (session_dir / ".claude.json").exists()
 
-    def test_force_overwrite_warns_but_keeps_live_session(self, temp_home: Path, capsys):
+    def test_force_overwrite_warns_but_keeps_live_session(
+        self, temp_home: Path, capsys
+    ):
         import os as _os
 
         from claude_swap.session import session_dir_for
@@ -1233,7 +1506,9 @@ class TestImportSessionInvalidation:
         session_dir = session_dir_for(s.backup_dir, "1", "alice@example.com")
         pid_dir = session_dir / "sessions"
         pid_dir.mkdir(parents=True)
-        (pid_dir / f"{_os.getpid()}.json").write_text(json.dumps({"pid": _os.getpid()}))
+        (pid_dir / f"{_os.getpid()}.json").write_text(
+            json.dumps({"pid": _os.getpid()})
+        )
         (session_dir / ".credentials.json").write_text("pre-import creds")
 
         import_accounts(s, str(out), force=True)
@@ -1244,3 +1519,730 @@ class TestImportSessionInvalidation:
         assert (session_dir / ".credentials.json").read_text() == "pre-import creds"
         alice = s._read_account_credentials("1", "alice@example.com")
         assert json.loads(alice)["_marker"] == "NEW"
+
+
+class TestImportClearsDeadTokenQuarantine:
+    """import must lift the persisted dead-token quarantine so an imported
+    credential can be re-tested — issues #136 / #138. Assertions are on the
+    quarantine verdict (token_dead / auth_dead_strikes), never on immediate
+    fetch-eligibility: clear_dead_token keeps lastAttemptAt, so a row can sit
+    inside its claim window right after import and an eligibility check would
+    be flaky."""
+
+    def test_import_force_lifts_quarantine(self, temp_home: Path):
+        """--force over an existing quarantined slot rewrites the creds and
+        lifts the verdict (the reported #138 workflow)."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_NEW"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=True)
+
+        entry = s._usage_store.entries(ident)["2"]
+        assert not entry.token_dead()
+        assert entry.auth_dead_strikes == 0
+        # Credential was actually overwritten.
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "BOB_NEW"
+
+    def test_force_import_of_the_byte_identical_struck_generation_lifts_the_quarantine(
+        self, temp_home: Path
+    ):
+        """Pins issue #218's reporter experiment: the strike is bound to the
+        stored generation's fingerprint (#196 shape) and the forced import
+        carries that exact generation back in, so fingerprint healing can
+        never fire — only transfer.py's explicit clear_dead_token call lifts
+        the verdict. Deleting that call (say, trusting usage_store.py's
+        "heals … without a bespoke clear call" comment) leaves the fp-bound
+        verdict True and fails this test. Pairs with
+        test_import_force_lifts_quarantine, which pins the legacy
+        struckFingerprint-less row shape."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+        entry = s._usage_store.entries(ident)["2"]
+        assert entry.struck_fingerprint == fp, "premise: strike is fp-bound"
+        assert entry.token_dead(stored_fp=fp), "premise: verdict holds"
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        # No envelope mutation: re-import exactly the condemned generation.
+        import_accounts(s, str(out), force=True)
+
+        entry = s._usage_store.entries(ident)["2"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+        assert not entry.token_dead(stored_fp=fp)
+
+    def test_reimport_after_removal_lifts_orphan_quarantine(
+        self, temp_home: Path, capsys
+    ):
+        """The case the overwrite-only fix would miss: `cswap remove` never
+        prunes usage.json, so re-importing a removed identity into the same
+        slot is classified `imported` yet inherits the orphan dead-token row.
+        A plain import (no --force) must still clear it."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+
+        # Simulate `cswap remove 2`: drop the sequence entry, leave the
+        # usage.json row behind (removal doesn't prune the usage store).
+        data = s._get_sequence_data()
+        del data["accounts"]["2"]
+        data["sequence"] = [n for n in data["sequence"] if n != 2]
+        s._write_json(s.sequence_file, data)
+
+        # Prove the orphan dead-token row is still present before re-import.
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        import_accounts(s, str(out), force=False)
+
+        # Re-imported as a fresh slot (not an overwrite), yet un-quarantined.
+        assert "Imported bob@example.com" in capsys.readouterr().err
+        entry = s._usage_store.entries(ident)["2"]
+        assert not entry.token_dead()
+        assert entry.auth_dead_strikes == 0
+
+    def test_plain_import_replaces_quarantined_slot(
+        self, temp_home: Path, capsys
+    ):
+        """Narrow auto-heal (issue #136 follow-up): a plain import (no --force)
+        replaces an existing slot iff its identity-matched row is quarantined
+        as refresh-token-dead — the verdict normally postdates the last
+        credential write, so the heal targets creds that failed after being
+        stored."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_HEALED"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "Replaced bob@example.com (slot 2 was quarantined: refresh token dead)" in err
+        assert "1 replaced (dead token)" in err
+        entry = s._usage_store.entries(ident)["2"]
+        assert not entry.token_dead()
+        assert entry.auth_dead_strikes == 0
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "BOB_HEALED"
+
+    def test_a_healed_strike_does_not_license_a_plain_import_to_replace(
+        self, temp_home: Path, capsys
+    ):
+        """`import_accounts` must consult the helper, not `token_dead()` raw.
+
+        The two new tests in this class both pass against the pre-PR inline
+        expression: one asserts `_slot_token_dead` DIRECTLY without going
+        through `import_accounts`, and in the other the old expression happens
+        to return True as well. So reverting transfer.py's routing to
+        `entries(...)[slot].token_dead()` leaves the suite green and nothing
+        pins that the import asks the collectors' question at all.
+
+        The verdicts differ exactly where the fingerprint binding does its
+        work: a strike bound to a generation the slot no longer stores is
+        HEALED. `entry.token_dead()` with no `stored_fp` still says dead — and
+        a plain import then replaces a healthy slot's credential, which is the
+        whole reason `--force` exists.
+        """
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        # Struck on a generation that is NOT what the slot stores now.
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant",
+                              struck_fp="sha256:someothergeneration")},
+            ident,
+        )
+        # The raw row is dead; the fingerprint-bound question says healed.
+        assert s._usage_store.entries(ident)["2"].token_dead(), (
+            "premise: the unbound verdict, which the pre-PR import used"
+        )
+        stored = s._read_account_credentials("2", "bob@example.com")
+        assert not s._usage_store.entries(ident)["2"].token_dead(
+            stored_fp=oauth.credential_fingerprint(stored)
+        ), "premise: bound to the stored generation, the strike is healed"
+        assert not s._slot_token_dead("2", "bob@example.com")
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_OVERWRITTEN"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "already exists, use --force" in err, (
+            "the import used the unbound verdict, so a slot whose strike the "
+            "fingerprint already healed was replaced without --force"
+        )
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds).get("_marker") != "BOB_OVERWRITTEN", (
+            "a healthy slot's credential was overwritten by a plain import"
+        )
+
+    def test_the_heal_finds_the_row_of_an_org_scoped_account(
+        self, temp_home: Path, capsys
+    ):
+        """Every real account carries an organizationUuid.
+
+        _slot_token_dead looked its usage row up with ident={num: (email, "")}.
+        UsageStore._matches requires organizationUuid to be EQUAL, so for any
+        account whose row carries a real org — which is all of them, checked on
+        the live store: three slots, three non-empty uuids — the lookup returns
+        nothing, token_dead() is False, and the import auto-heal it feeds never
+        fires. The slot the user was told to fix with `cswap import` gets
+        "already exists, use --force" instead.
+
+        The previous shape passed entry["org_uuid"] straight through, so this
+        was introduced by routing the check through the shared helper.
+        """
+        s = _linux_switcher(temp_home)
+        ORG = "org-uuid-1234"
+        _seed_account(s, 2, "bob@example.com", org_uuid=ORG)
+        ident = {"2": ("bob@example.com", ORG)}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        assert s._slot_token_dead("2", "bob@example.com"), (
+            "the row lookup passes an empty organizationUuid, so an "
+            "org-scoped account's quarantine is invisible to the import heal"
+        )
+
+    def test_import_heals_an_active_slot_struck_on_its_live_generation(
+        self, temp_home: Path, capsys
+    ):
+        """The heal must ask the same question the collectors ask.
+
+        _entry_token_dead treats an ACTIVE slot as having TWO stored sources:
+        the live credential and the backup. A strike holds while EITHER still
+        matches the struck generation, because _fetch_active_usage's recovery
+        branch legitimately POSTs the backup while ordinary passes POST the
+        live bytes.
+
+        The import heal compares only against the backup. So when the strike is
+        bound to the LIVE generation and the backup has since moved, the
+        collectors correctly read the slot as quarantined while the import
+        reads it as healthy and refuses to replace it — and `cswap import` is
+        exactly what the "re-login needed" message tells the user to run.
+        """
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 9999999999000}})
+        newer_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 9999999999000}})
+        # Slot 2 is ACTIVE and its live bytes are what got struck; the backup
+        # has since been rewritten to a different lineage.
+        # current_account_number() resolves the active slot from the LIVE
+        # login's identity in .claude.json, not from activeAccountNumber.
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "bob@example.com",
+            "accountUuid": "acct-2",
+            "organizationUuid": "",
+            "organizationName": "",
+        }})
+        s._store._write_active_credentials_file(live)
+        s._write_account_credentials("2", "bob@example.com", newer_backup)
+        s._usage_store.record(
+            {"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(live),
+            )},
+            ident,
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_HEALED"
+        out.write_text(json.dumps(env))
+
+        # Probe the verdict itself before the import, so a failure names
+        # which half is wrong.
+        assert s.current_account_number() == "2"
+        assert s._slot_token_dead("2", "bob@example.com"), (
+            "the strike is bound to the live generation and slot 2 is active, "
+            "so the collectors' rule says dead"
+        )
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "was quarantined: refresh token dead" in err, (
+            "the import compared the strike only against the backup, so an "
+            "active slot struck on its live generation is never healed"
+        )
+
+    def test_plain_import_skips_healthy_slot(self, temp_home: Path, capsys):
+        """The heal is scoped to token_dead() only: a healthy existing account
+        keeps skipping exactly as before, creds untouched, no replaced count."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_NEW"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "Skipped bob@example.com" in err
+        assert "Replaced" not in err
+        assert "replaced (dead token)" not in err
+        # Creds untouched — still the seeded original, not the export's.
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "bob@example.com"
+
+    def test_plain_import_ignores_foreign_dead_row_on_slot(
+        self, temp_home: Path, capsys
+    ):
+        """The heal trigger is identity-guarded: a dead-token row left on the
+        slot by a *different* prior occupant must not fire it. Bob's own view
+        of the slot is clean, so a plain import skips and leaves his creds
+        untouched."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        # Quarantine slot 2 under a prior occupant's identity.
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant")},
+            {"2": ("alice@example.com", "")},
+        )
+        # Sanity: the foreign row is invisible through Bob's identity.
+        assert not s._usage_store.entries(
+            {"2": ("bob@example.com", "")}
+        )["2"].token_dead()
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_NEW"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "Skipped bob@example.com" in err
+        assert "Replaced" not in err
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "bob@example.com"
+
+    def test_plain_import_heal_warns_about_live_session(
+        self, temp_home: Path, capsys
+    ):
+        """The heal path rewrites stored creds like --force does, so it must
+        hit the same live-session warning: a running session-mode instance
+        keeps its own credential copy until restarted via `cswap run`."""
+        import os as _os
+
+        from claude_swap.session import session_dir_for
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+
+        session_dir = session_dir_for(s.backup_dir, "2", "bob@example.com")
+        pid_dir = session_dir / "sessions"
+        pid_dir.mkdir(parents=True)
+        (pid_dir / f"{_os.getpid()}.json").write_text(
+            json.dumps({"pid": _os.getpid()})
+        )
+        (session_dir / ".credentials.json").write_text("pre-import creds")
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "live" in err
+        assert "Replaced bob@example.com" in err
+        # Live session untouched; the heal itself still completed.
+        assert (session_dir / ".credentials.json").read_text() == "pre-import creds"
+        assert not s._usage_store.entries(ident)["2"].token_dead()
+
+    def test_fresh_slot_import_creates_no_quarantine(self, temp_home: Path):
+        """Importing into a brand-new slot clears nothing real (no prior row);
+        the clear call is harmless and never quarantines the newcomer."""
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 2, "bob@example.com")
+        out = temp_home / "bob.cswap"
+        export_accounts(src, str(out), account="2")
+
+        dst_home = temp_home.parent / "dst_fresh"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                import_accounts(dst, str(out))
+
+                seq = dst._get_sequence_data()
+                slot = next(
+                    n for n, a in seq["accounts"].items()
+                    if a["email"] == "bob@example.com"
+                )
+                entry = dst._usage_store.entries(
+                    {slot: ("bob@example.com", "")}
+                )[slot]
+                assert not entry.token_dead()
+                assert entry.auth_dead_strikes == 0
+
+
+class TestForceOverwriteNarratesTheStrikeClear:
+    """A forced overwrite of a slot whose row holds a dead-token strike must
+    say the strike was cleared — and, when the imported bytes carry the very
+    refresh-token generation the strike condemned, say the re-test can
+    honestly re-condemn it. Issue #218: the silent lift → poll → re-strike
+    cycle read exactly like "the clear never happened"."""
+
+    def test_force_overwrite_names_the_same_condemned_generation(
+        self, temp_home: Path, capsys
+    ):
+        """Byte-identical re-import of the struck generation prints both the
+        clear line and the same-generation candor note. Killed mutations:
+        dropping the narration, and fingerprinting the wrong side of the
+        comparison (the omits-test pins the other direction)."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "Overwrote bob@example.com (slot 2)" in err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" in err
+
+    def test_force_overwrite_with_a_newer_generation_omits_the_generation_note(
+        self, temp_home: Path, capsys
+    ):
+        """A rotated refresh token in the envelope is a different generation:
+        the clear line still prints, the candor note must not."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["refreshToken"] = "rtok-2-rotated"
+        out.write_text(json.dumps(env))
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" not in err
+
+    def test_force_overwrite_narrates_only_the_struck_account(
+        self, temp_home: Path, capsys
+    ):
+        """Two accounts forced in one run, only the first struck: exactly one
+        clear line. Kills both an unconditional print and per-iteration state
+        leaking from the struck account into the healthy one."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        _seed_account(s, 3, "carol@example.com")
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant")},
+            {"2": ("bob@example.com", "")},
+        )
+
+        out = temp_home / "both.cswap"
+        export_accounts(s, str(out))
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "Overwrote bob@example.com (slot 2)" in err
+        assert "Overwrote carol@example.com (slot 3)" in err
+        assert err.count("cleared this slot's stored dead-token strike") == 1
+
+    def test_force_overwrite_narrates_a_condemned_generation_without_a_refresh_token(
+        self, temp_home: Path, capsys
+    ):
+        """no_refresh_token strikes are fingerprint-bound too — by content
+        hash, since the condemned blob has no refresh token — so the candor
+        note must not claim a "refresh-token generation" or predict
+        invalid_grant specifically. Pins the generic wording for the
+        non-invalid_grant strike class."""
+        s = _linux_switcher(temp_home)
+        creds = {"accessToken": "tok-1", "expiresAt": 9999}
+        _seed_account(s, 2, "bob@example.com", creds=creds)
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        assert fp is not None and fp.startswith("sha256-full:"), (
+            "premise: a refresh-token-less blob fingerprints by content"
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="no_refresh_token", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" in err
+        assert "invalid_grant" not in err
+        assert "refresh-token generation" not in err
+
+
+# ---------------------------------------------------------------------------
+# import-usage
+# ---------------------------------------------------------------------------
+
+def _live_creds(tag: str) -> dict:
+    """A backup whose token is valid (far-future expiry), so it goes straight
+    to the usage request (patched), never through a refresh. Distinct per
+    account: two slots holding one credential read as a duplicate login."""
+    return {"claudeAiOauth": {
+        "accessToken": f"tok-{tag}",
+        "refreshToken": f"rtok-{tag}",
+        "expiresAt": 4_102_444_800_000,
+    }}
+
+
+def _usage_row(email: str, org_uuid: str = "", pct: float = 42.0, age_s: float = 30.0) -> dict:
+    """An account row as another machine's ``cswap list --json`` prints it.
+
+    Slot 9 on purpose: rows are matched by identity, never by the producer's
+    slot number."""
+    import time
+
+    from claude_swap.json_output import account_row
+
+    return account_row(
+        9, email, "", org_uuid, False,
+        {"five_hour": {"pct": pct, "resets_at": "2099-01-01T00:00:00+00:00"}},
+        usage_fetched_at=time.time() - age_s,
+        usage_age_s=age_s,
+    )
+
+
+def _usage_document(*rows: dict) -> str:
+    return json.dumps(
+        {"schemaVersion": 1, "activeAccountNumber": None, "accounts": list(rows)}
+    )
+
+
+class TestImportUsage:
+    def _import(self, switcher, home: Path, document: str, hold_s: float | None = None):
+        from claude_swap.transfer import import_usage
+
+        path = home / "usage.json"
+        path.write_text(document, encoding="utf-8")
+        import_usage(switcher, str(path), hold_s=hold_s)
+
+    def test_rows_are_matched_by_identity(self, temp_home: Path, capsys):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a")
+        _seed_account(s, 2, "bob@example.com")
+        unavailable = {
+            "email": "alice@example.com", "organizationUuid": "org-a",
+            "usageStatus": "unavailable", "usage": None,
+        }
+        self._import(s, temp_home, _usage_document(
+            _usage_row("bob@example.com", pct=42.0),
+            _usage_row("stranger@example.com"),
+            unavailable,
+        ))
+
+        entries = s._usage_store.entries({
+            "1": ("alice@example.com", "org-a"), "2": ("bob@example.com", ""),
+        })
+        assert entries["2"].last_good["five_hour"]["pct"] == 42.0
+        assert entries["2"].age_s == pytest.approx(30.0, abs=5)
+        assert entries["1"].last_good is None
+        err = capsys.readouterr().err
+        assert "Adopted usage for bob@example.com → slot 2" in err
+        assert "Done: 1 adopted, 0 kept, 2 skipped" in err
+
+    def test_a_held_account_is_not_fetched(self, temp_home: Path):
+        """Through the real collector: after a hand-over with a hold,
+        ``list --json`` serves the adopted reading and sends no request for
+        that account, while an account nobody handed over is fetched as
+        usual."""
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        _seed_account(s, 2, "bob@example.com", creds=_live_creds("bob"))
+        self._import(
+            s, temp_home,
+            _usage_document(_usage_row("bob@example.com", pct=42.0, age_s=400.0)),
+            hold_s=600.0,
+        )
+
+        fetched: list[str] = []
+
+        def fake_fetch(num, email, creds, **kwargs):
+            fetched.append(email)
+            return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=fake_fetch):
+            payload = s.list_accounts(json_output=True)
+
+        assert fetched == ["alice@example.com"], payload
+        bob = next(a for a in payload["accounts"] if a["email"] == "bob@example.com")
+        # 400s is past STALE_OK_S: the hold is what keeps it decision-grade.
+        assert bob["usageStatus"] == "ok"
+        assert bob["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_a_zero_hold_hands_the_account_back(self, temp_home: Path, capsys):
+        """``--hold 0`` lifts the hold an earlier hand-over set, so the next
+        collector fetches the account itself instead of waiting it out."""
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        document = _usage_document(_usage_row("alice@example.com", age_s=400.0))
+        self._import(s, temp_home, document, hold_s=600.0)
+        self._import(s, temp_home, document, hold_s=0.0)
+        assert "holds lifted" in capsys.readouterr().err
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1.0}}),
+        ) as fetch:
+            s.list_accounts(json_output=True)
+        fetch.assert_called_once()
+
+    def test_a_held_active_account_shows_its_reading_not_token_expired(
+        self, temp_home: Path
+    ):
+        """An expired active token reads token_expired until the fetch path
+        refreshes it. A held slot is not waiting on that fetch — the reading
+        it was handed is current — so the row shows the reading."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alice@example.com", "accountUuid": "acct-1"}}
+        ))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok", "refreshToken": "rtok", "expiresAt": 1000}}
+        ))
+        self._import(
+            s, temp_home, _usage_document(_usage_row("alice@example.com", pct=42.0)),
+            hold_s=600.0,
+        )
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            payload = s.list_accounts(json_output=True)
+
+        fetch.assert_not_called()
+        (row,) = payload["accounts"]
+        assert row["active"] is True
+        assert row["usageStatus"] == "ok"
+        assert row["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_reads_stdin(self, temp_home: Path, monkeypatch):
+        from claude_swap.transfer import import_usage
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        monkeypatch.setattr(
+            sys, "stdin", io.StringIO(_usage_document(_usage_row("alice@example.com")))
+        )
+        import_usage(s, "-")
+        entry = s._usage_store.entries({"1": ("alice@example.com", "")})["1"]
+        assert entry.last_good is not None
+
+    @pytest.mark.parametrize("document,message", [
+        ('{"schemaVersion": 2, "accounts": []}', "unsupported usage document schemaVersion"),
+        ('{"schemaVersion": 1}', "no accounts list"),
+        ("[]", "must be a JSON object"),
+    ])
+    def test_malformed_document_is_refused(self, temp_home: Path, document, message):
+        s = _linux_switcher(temp_home)
+        with pytest.raises(TransferError, match=message):
+            self._import(s, temp_home, document)
+
+    def test_a_bad_row_writes_nothing(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        _seed_account(s, 2, "bob@example.com")
+        bad = _usage_row("bob@example.com")
+        bad["usageAgeSeconds"] = -5
+        with pytest.raises(TransferError, match="usageAgeSeconds for bob@example.com"):
+            self._import(
+                s, temp_home, _usage_document(_usage_row("alice@example.com"), bad)
+            )
+        assert not s._usage_store.path.exists()
+
+
+class TestExportPlaintextWarning:
+    def test_warns_on_file_destination(self, temp_home: Path, capsys):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@example.com")
+
+        export_accounts(s, str(temp_home / "one.cswap"))
+        err = capsys.readouterr().err
+        assert "unencrypted" in err
+        assert "gpg -c" in err
+
+    def test_warns_on_stdout_destination_via_stderr_not_stdout(self, temp_home: Path, capsys):
+        """Stdout must stay pure JSON (pipeable) — the warning goes to stderr."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@example.com")
+
+        export_accounts(s, "-")
+        captured = capsys.readouterr()
+        assert "unencrypted" in captured.err
+        assert "unencrypted" not in captured.out
+        json.loads(captured.out)  # stdout is still valid, warning-free JSON

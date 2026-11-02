@@ -64,6 +64,9 @@ Screen {
     background: $panel;
 }
 
+MenuItem Static { color: $foreground; }
+MenuItem Static.menu-item-muted { color: $secondary; }
+
 /* -- switch / watch screens --------------------------------------------------- */
 
 #list-title {

@@ -38,6 +38,8 @@ from __future__ import annotations
 import os
 import subprocess
 
+from claude_swap import spawn
+
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
 # A command line longer than this is truncated mid-argument: it fails to write
 # while leaving any previous entry intact (Claude Code #30337). 64 bytes of
@@ -112,14 +114,16 @@ def get_password(service: str, account: str) -> str | None:
     failure.
     """
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
             capture_output=True,
             text=True,
             timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
-        raise KeychainError(f"security find-generic-password timed out after {_TIMEOUT}s") from e
+        raise KeychainError(
+            f"security find-generic-password timed out after {_TIMEOUT}s"
+        ) from e
     if result.returncode == 0:
         # `-w` prints the value followed by one newline; strip exactly that so
         # values with meaningful leading/trailing whitespace survive intact.
@@ -127,7 +131,8 @@ def get_password(service: str, account: str) -> str | None:
     if result.returncode == _NOT_FOUND_RC:
         return None
     raise KeychainError(
-        f"security find-generic-password failed (rc={result.returncode}): {result.stderr.strip()}"
+        f"security find-generic-password failed (rc={result.returncode}): "
+        f"{result.stderr.strip()}"
     )
 
 
@@ -142,7 +147,7 @@ def item_exists(service: str, account: str) -> bool:
     capability cache (a timeout here means "couldn't tell", not "Keychain works").
     """
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
             capture_output=True,
             text=True,
@@ -162,10 +167,13 @@ def set_password(service: str, account: str, password: str) -> None:
     """
     hex_value = password.encode("utf-8").hex()
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
-    command = f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} -X {hex_value}\n"
+    command = (
+        f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} "
+        f"-X {hex_value}\n"
+    )
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
-            result = subprocess.run(
+            result = spawn.run(
                 [_SECURITY, "-i"],
                 input=command,
                 capture_output=True,
@@ -176,24 +184,19 @@ def set_password(service: str, account: str, password: str) -> None:
             # Overflows the stdin line buffer; fall back to argv. Hex in argv is
             # recoverable by a determined observer but defeats naive plaintext-grep
             # rules, and the alternative — silent corruption — is strictly worse.
-            result = subprocess.run(
+            result = spawn.run(
                 [
-                    _SECURITY,
-                    "add-generic-password",
-                    "-U",
-                    "-a",
-                    account,
-                    "-s",
-                    service,
-                    "-X",
-                    hex_value,
+                    _SECURITY, "add-generic-password", "-U",
+                    "-a", account, "-s", service, "-X", hex_value,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=_TIMEOUT,
             )
     except subprocess.TimeoutExpired as e:
-        raise KeychainError(f"security add-generic-password timed out after {_TIMEOUT}s") from e
+        raise KeychainError(
+            f"security add-generic-password timed out after {_TIMEOUT}s"
+        ) from e
     if result.returncode != 0:
         raise KeychainError(
             f"security add-generic-password failed (rc={result.returncode}): "
@@ -207,16 +210,19 @@ def delete_password(service: str, account: str) -> None:
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
     """
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
             capture_output=True,
             text=True,
             timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
-        raise KeychainError(f"security delete-generic-password timed out after {_TIMEOUT}s") from e
+        raise KeychainError(
+            f"security delete-generic-password timed out after {_TIMEOUT}s"
+        ) from e
     if result.returncode in (0, _NOT_FOUND_RC):
         return
     raise KeychainError(
-        f"security delete-generic-password failed (rc={result.returncode}): {result.stderr.strip()}"
+        f"security delete-generic-password failed (rc={result.returncode}): "
+        f"{result.stderr.strip()}"
     )

@@ -8,20 +8,25 @@ loop never touches file locks, keychain subprocesses, or the network.
 
 from __future__ import annotations
 
+import time
+from dataclasses import replace
 from functools import partial
 
 from textual.app import App
+from textual.binding import Binding
 from textual.reactive import reactive
 from textual.worker import WorkerState
 
+from claude_swap import printer
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import load_settings
+from claude_swap.snapshot_source import account_identity
+from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
-from claude_swap.tui.data import ActionResult, SnapshotSource, run_action
+from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
-from claude_swap.tui.theme import CSWAP_DARK
+from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
 
 class CswapApp(App):
@@ -30,65 +35,176 @@ class CswapApp(App):
     TITLE = "claude-swap"
     CSS_PATH = "cswap.tcss"
     # No command palette: actions live in the dashboard's nested menu, in
-    # their own context — not in a global searchable list. This also drops
-    # Textual's system commands (theme picker included; there is one theme).
+    # their own context — not in a global searchable list.
     ENABLE_COMMAND_PALETTE = False
+    BINDINGS = [Binding("ctrl+t", "toggle_theme", "Theme")]
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
+    # Snapshot age stays hidden while polling is healthy (age never exceeds
+    # ~POLL_INTERVAL_S); past this it surfaces as a staleness alarm. 60s also
+    # keeps format_duration in whole minutes, so the note never ticks per
+    # second.
+    SNAPSHOT_AGE_NOTE_S = 60.0
 
     snapshot: reactive[AccountsSnapshot | None] = reactive(None)
+    refresh_status: reactive[str] = reactive("")
     busy: reactive[bool] = reactive(False)
 
-    def __init__(self, switcher: ClaudeAccountSwitcher, *, start: str = "dashboard") -> None:
+    def __init__(
+        self,
+        switcher: ClaudeAccountSwitcher,
+        *,
+        start: str = "dashboard",
+        detected: str | None = None,
+    ) -> None:
         super().__init__()
         self.switcher = switcher
         self._start = start  # "dashboard" | "watch" (`cswap watch`)
+        self._detected = detected  # terminal background sensed pre-driver, or None
         self.source = SnapshotSource(switcher)
         self._store_only = False
         self._full_next = False
-        self._refreshing = False
+        self._normal_refreshing = False
+        self._store_refreshing = False
+        self._normal_started_at: float | None = None
+        self._refresh_generation = 0
+        self._applied_generation = 0
         self._last_refresh_error = ""
-        # The auto-switch threshold, drawn as a tick on the status strip's
-        # bars everywhere. Missing/invalid settings fall back to the default.
+        # The auto-switch lines, drawn as ticks on the status strip's bars
+        # everywhere: the threshold on the 5h row, the weekly line (when
+        # set) on the 7d and per-model rows. Missing/invalid settings fall
+        # back to the default.
         try:
-            self.threshold_pct: float | None = load_settings(switcher.backup_dir).threshold
+            loaded = load_settings(switcher.backup_dir)
+            self.threshold_pct: float | None = loaded.threshold
+            self.weekly_threshold_pct: float | None = loaded.weekly_threshold
         except Exception:
             self.threshold_pct = None
+            self.weekly_threshold_pct = None
+        try:
+            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+        except Exception:
+            self._theme_name = "auto"
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
-        self.theme = "cswap-dark"
+        self.register_theme(CSWAP_LIGHT)
+        resolved = self._resolved_theme()
+        # We own the theme; $TEXTUAL_THEME is intentionally not honoured.
+        self.theme = f"cswap-{resolved}"
+        printer.set_theme(resolved)
         self.push_screen(DashboardScreen())
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
+        self.set_interval(1.0, self._update_refresh_status)
         self._tick()
 
     # -- snapshot poll loop ---------------------------------------------------
 
     def _tick(self) -> None:
-        """Start a refresh pass unless one is already in flight."""
-        if self._refreshing:
+        """Start one eligible refresh lane.
+
+        Normal mode prefers the fetch-enabled lane. When that lane is blocked,
+        the poll tick may still observe another process's store update through
+        one store-only lane. Auto mode already has an engine fetching, so it
+        launches only store-only snapshots.
+        """
+        if self._store_only:
+            self._start_store_refresh()
+        elif not self._normal_refreshing:
+            full, self._full_next = self._full_next, False
+            self._start_normal_refresh(full=full)
+        else:
+            self._start_store_refresh()
+
+    def _start_normal_refresh(self, *, full: bool) -> None:
+        if self._normal_refreshing:
             return
-        self._refreshing = True
-        full, self._full_next = self._full_next, False
+        self._normal_refreshing = True
+        self._normal_started_at = time.time()
+        generation = self._next_refresh_generation()
+        self._update_refresh_status()
         self.run_worker(
-            partial(self._refresh_blocking, full, self._store_only),
+            partial(self._refresh_blocking, generation, "normal", full, False),
             thread=True,
-            group="refresh",
+            group="refresh-normal",
             exit_on_error=False,
             name="snapshot-refresh",
         )
 
-    def _refresh_blocking(self, full: bool, store_only: bool) -> None:
-        snap = self.source.take(full=full, store_only=store_only)
-        self.call_from_thread(self._apply_snapshot, snap)
+    def _start_store_refresh(self) -> None:
+        if self._store_refreshing:
+            return
+        self._store_refreshing = True
+        generation = self._next_refresh_generation()
+        self._update_refresh_status()
+        self.run_worker(
+            partial(self._refresh_blocking, generation, "store", False, True),
+            thread=True,
+            group="refresh-store",
+            exit_on_error=False,
+            name="snapshot-store-refresh",
+        )
 
-    def _apply_snapshot(self, snap: AccountsSnapshot) -> None:
-        self._refreshing = False
+    def _next_refresh_generation(self) -> int:
+        self._refresh_generation += 1
+        return self._refresh_generation
+
+    def _refresh_blocking(
+        self, generation: int, lane: str, full: bool, store_only: bool
+    ) -> None:
+        snap = self.source.take(full=full, store_only=store_only)
+        self.call_from_thread(self._apply_snapshot, generation, lane, snap)
+
+    def _apply_snapshot(
+        self, generation: int, lane: str, snap: AccountsSnapshot
+    ) -> None:
+        if lane == "normal":
+            self._normal_refreshing = False
+            self._normal_started_at = None
+        else:
+            self._store_refreshing = False
         self._last_refresh_error = ""
-        self.snapshot = snap
+        if generation >= self._applied_generation:
+            self._applied_generation = generation
+            self.snapshot = snap
+        elif self.snapshot is not None:
+            # A later-started store repaint owns account metadata, but the
+            # older worker may have completed a genuinely newer provider fetch.
+            # SnapshotSource has already rejected per-account regressions, so
+            # merge its canonical usage rows without restoring stale metadata.
+            current = self.snapshot
+            incoming = {acc.number: acc for acc in snap.accounts}
+            accounts = tuple(
+                replace(acc, usage=other.usage)
+                if (
+                    (other := incoming.get(acc.number)) is not None
+                    and account_identity(acc) == account_identity(other)
+                )
+                else acc
+                for acc in current.accounts
+            )
+            self.snapshot = replace(
+                current,
+                accounts=accounts,
+                taken_at=max(current.taken_at, snap.taken_at),
+            )
+        self._update_refresh_status()
+
+    def _update_refresh_status(self) -> None:
+        parts: list[str] = []
+        now = time.time()
+        if self.snapshot is not None:
+            age = max(0.0, now - self.snapshot.taken_at)
+            if age >= self.SNAPSHOT_AGE_NOTE_S:
+                parts.append(f"snapshot {format_duration(age)} ago")
+        if self._normal_refreshing and self._normal_started_at is not None:
+            elapsed = now - self._normal_started_at
+            if elapsed >= self.POLL_INTERVAL_S:
+                parts.append(f"refreshing {format_duration(elapsed)}")
+        self.refresh_status = " · ".join(parts)
 
     def request_refresh(self, *, full: bool = False) -> None:
         if full:
@@ -103,12 +219,20 @@ class CswapApp(App):
     def on_worker_state_changed(self, event) -> None:
         if event.state is not WorkerState.ERROR:
             return
-        if event.worker.group == "refresh":
-            self._refreshing = False
+        if event.worker.group in {"refresh-normal", "refresh-store"}:
+            if event.worker.group == "refresh-normal":
+                self._normal_refreshing = False
+                self._normal_started_at = None
+            else:
+                self._store_refreshing = False
+            self._update_refresh_status()
             msg = str(event.worker.error)
             if msg != self._last_refresh_error:
                 self._last_refresh_error = msg
-                self.notify(f"Refresh failed: {msg}", severity="warning", timeout=6)
+                lane = "store refresh" if event.worker.group == "refresh-store" else "refresh"
+                self.notify(
+                    f"{lane.capitalize()} failed: {msg}", severity="warning", timeout=6
+                )
         elif event.worker.group == "action":
             self.busy = False
             self.notify(f"Action failed: {event.worker.error}", severity="error")
@@ -137,7 +261,9 @@ class CswapApp(App):
         result = run_action(fn)
         self.call_from_thread(self._action_done, label, result, show_output)
 
-    def _action_done(self, label: str, result: ActionResult, show_output: bool) -> None:
+    def _action_done(
+        self, label: str, result: ActionResult, show_output: bool
+    ) -> None:
         self.busy = False
         self.request_refresh()
         if not result.ok:
@@ -170,6 +296,22 @@ class CswapApp(App):
         self._start_action(
             "Switch (best)",
             partial(self.switcher.switch, strategy="best", json_output=True),
+        )
+
+    def do_toggle_disabled(self, number: str) -> None:
+        """Hold the account out of auto-rotation, or return it — reads its
+        current state from the live snapshot to pick the direction."""
+        snap = self.snapshot
+        acc = next(
+            (a for a in (snap.accounts if snap else ()) if a.number == number), None
+        )
+        if acc is None:
+            return
+        target = not acc.disabled
+        verb = "Disable" if target else "Enable"
+        self._start_action(
+            f"{verb} account {number}",
+            partial(self.switcher.set_account_disabled, number, target),
         )
 
     def confirm_remove(self, number: str, email: str) -> None:
@@ -264,3 +406,31 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    # -- theme --------------------------------------------------------------
+
+    def _resolved_theme(self) -> str:
+        """Concrete 'dark'/'light' for the current setting; auto → detected → dark."""
+        if self._theme_name == "auto":
+            return self._detected or "dark"
+        return self._theme_name
+
+    def apply_theme(self, name: str) -> None:
+        """Switch the live theme: TUI + captured printer output + persistence.
+
+        ``name`` is the setting; ``auto`` resolves against the pre-driver
+        detection (never re-probes mid-session)."""
+        self._theme_name = name
+        resolved = self._resolved_theme()
+        self.theme = f"cswap-{resolved}"
+        printer.set_theme(resolved)
+        try:
+            set_setting(self.switcher.backup_dir, "ui.theme", name)
+        except Exception as exc:  # persistence is best-effort; never crash the UI
+            self.notify(f"Could not save theme: {exc}", severity="warning")
+
+    def action_toggle_theme(self) -> None:
+        order = ("dark", "light", "auto")
+        nxt = order[(order.index(self._theme_name) + 1) % len(order)]
+        self.apply_theme(nxt)
+        self.notify(f"Theme: {nxt}")

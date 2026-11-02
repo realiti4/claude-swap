@@ -16,14 +16,15 @@ import contextlib
 import io
 import sys
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Callable
 
-from claude_swap import printer, usage_store
+from claude_swap import oauth, printer, usage_store
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.snapshot_source import SnapshotSource
 from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
+
 
 # ---------------------------------------------------------------------------
 # Blocking actions (switch/add/remove) run captured, off the UI thread
@@ -64,11 +65,9 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
     saved_stdin = sys.stdin
     sys.stdin = io.StringIO()
     try:
-        with (
-            printer.force_color(),
-            contextlib.redirect_stdout(buf),
-            contextlib.redirect_stderr(buf),
-        ):
+        with printer.force_color(), contextlib.redirect_stdout(
+            buf
+        ), contextlib.redirect_stderr(buf):
             try:
                 payload = fn()
             except ClaudeSwitchError as e:
@@ -79,13 +78,14 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
                 return ActionResult(False, buf.getvalue())
     finally:
         sys.stdin = saved_stdin
-    return ActionResult(True, buf.getvalue(), payload if isinstance(payload, dict) else None)
+    return ActionResult(
+        True, buf.getvalue(), payload if isinstance(payload, dict) else None
+    )
 
 
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
-
 
 def sentinel_label(sentinel: str) -> str:
     """The same wording ``cswap list`` prints for this sentinel state."""
@@ -122,6 +122,27 @@ def reset_text(window: dict | None, now: float) -> str | None:
     if remaining <= 0:
         return "resets now"
     return f"resets {format_duration(remaining)}"
+
+
+def reset_clock(window: dict | None, now: float) -> str | None:
+    """Absolute local reset time ("20:39" / "Jul 14 09:00"), if known.
+
+    None once the reset has elapsed — "resets now" needs no clock.
+    """
+    if not isinstance(window, dict):
+        return None
+    resets_at = window.get("resets_at")
+    if not resets_at:
+        return None
+    try:
+        reset_utc = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if reset_utc.timestamp() - now <= 0:
+        return None
+    return oauth.reset_clock_string(
+        reset_utc, datetime.fromtimestamp(now, tz=timezone.utc)
+    )
 
 
 def window_reset_text(last_good: dict | None, key: str, now: float) -> str | None:
@@ -163,6 +184,7 @@ __all__ = [
     "format_age",
     "format_duration",
     "last_seen_note",
+    "reset_clock",
     "reset_text",
     "run_action",
     "sentinel_label",

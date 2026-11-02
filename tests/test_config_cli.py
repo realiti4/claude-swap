@@ -18,10 +18,8 @@ def _run(argv: list[str], capsys) -> tuple[int, str, str]:
     Success returns normally from main() (no sys.exit), errors raise
     SystemExit — normalize both to an exit code.
     """
-    with (
-        patch("os.geteuid", return_value=1000, create=True),
-        patch.object(sys, "argv", ["claude-swap", "config", *argv]),
-    ):
+    with patch("os.geteuid", return_value=1000, create=True), \
+         patch.object(sys, "argv", ["claude-swap", "config", *argv]):
         code = 0
         try:
             cli.main()
@@ -43,12 +41,17 @@ class TestConfigList:
         assert code == 0
         for key in (
             "autoswitch.threshold",
+            "autoswitch.weeklyThreshold",
             "autoswitch.intervalSeconds",
             "autoswitch.cooldownSeconds",
             "autoswitch.hysteresisPct",
             "autoswitch.strategy",
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
+            "autoswitch.model",
+            "ui.theme",
+            "run.shareHistory",
+            "updates.check",
             "autoswitch.preWarmReserves",
             "autoswitch.preWarmActive",
             "resume.slackSeconds",
@@ -57,20 +60,24 @@ class TestConfigList:
             "resume.notify",
         ):
             assert key in out
-        assert out.count("(default)") == 13
+        assert out.count("(default)") == 18
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
         code, out, _ = _run([], capsys)
         assert code == 0
-        cooldown_line = next(ln for ln in out.splitlines() if "cooldownSeconds" in ln)
+        cooldown_line = next(
+            ln for ln in out.splitlines() if "cooldownSeconds" in ln
+        )
         assert "600" in cooldown_line
         assert "(default)" not in cooldown_line
 
     def test_set_equal_to_default_still_counts_as_set(self, temp_home, capsys):
         _run(["set", "autoswitch.threshold", "90"], capsys)
         _, out, _ = _run([], capsys)
-        threshold_line = next(ln for ln in out.splitlines() if "threshold" in ln)
+        threshold_line = next(
+            ln for ln in out.splitlines() if "threshold" in ln
+        )
         assert "(default)" not in threshold_line
 
     def test_json_list(self, temp_home, capsys):
@@ -80,11 +87,15 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 13
+        assert len(by_key) == 18
         assert by_key["autoswitch.threshold"]["value"] == 90.0
-        assert by_key["resume.slackSeconds"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
+        # An unset weekly line reports null, not the threshold it falls back
+        # to: a JSON consumer must be able to see that the user never set one.
+        assert by_key["autoswitch.weeklyThreshold"]["value"] is None
+        assert by_key["autoswitch.weeklyThreshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
+        assert by_key["updates.check"]["value"] is True
 
 
 class TestConfigSetGet:
@@ -105,7 +116,9 @@ class TestConfigSetGet:
         assert raw["autoswitch"]["threshold"] == 80.0
 
     def test_set_bool_words(self, temp_home, capsys):
-        code, out, _ = _run(["set", "autoswitch.includeApiKeyAccounts", "no"], capsys)
+        code, out, _ = _run(
+            ["set", "autoswitch.includeApiKeyAccounts", "no"], capsys
+        )
         assert code == 0
         assert "= false" in out
         raw = json.loads(_settings_file(capsys).read_text())
@@ -114,15 +127,11 @@ class TestConfigSetGet:
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "schemaVersion": 1,
-                    "futureSection": {"x": 1},
-                    "autoswitch": {"threshold": 80, "futureKnob": True},
-                }
-            )
-        )
+        path.write_text(json.dumps({
+            "schemaVersion": 1,
+            "futureSection": {"x": 1},
+            "autoswitch": {"threshold": 80, "futureKnob": True},
+        }))
         code, _, _ = _run(["set", "autoswitch.threshold", "70"], capsys)
         assert code == 0
         raw = json.loads(path.read_text())
@@ -147,28 +156,6 @@ class TestConfigSetGet:
             }
 
 
-class TestConfigApplyPreset:
-    def test_max_drain_sets_every_documented_key(self, temp_home, capsys):
-        code, out, _ = _run(["apply-preset", "max-drain"], capsys)
-        assert code == 0
-        for line in (
-            "autoswitch.threshold = 99.9",
-            "autoswitch.hysteresisPct = 0",
-            "autoswitch.cooldownSeconds = 60",
-            "autoswitch.intervalSeconds = 30",
-            "autoswitch.strategy = best",
-        ):
-            assert line in out
-        raw = json.loads(_settings_file(capsys).read_text())
-        assert raw["autoswitch"]["threshold"] == 99.9
-        assert raw["autoswitch"]["strategy"] == "best"
-
-    def test_unknown_preset_exits_1_without_writing(self, temp_home, capsys):
-        code, _, err = _run(["apply-preset", "bogus"], capsys)
-        assert code != 0
-        assert not _settings_file(capsys).exists()
-
-
 class TestConfigValidation:
     def test_out_of_range_exits_1(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.threshold", "30"], capsys)
@@ -182,7 +169,9 @@ class TestConfigValidation:
         assert "autoswitch.threshold" in err
 
     def test_bad_bool_exits_1(self, temp_home, capsys):
-        code, _, err = _run(["set", "autoswitch.includeApiKeyAccounts", "falsy"], capsys)
+        code, _, err = _run(
+            ["set", "autoswitch.includeApiKeyAccounts", "falsy"], capsys
+        )
         assert code == 1
         assert "true or false" in err
 
@@ -208,7 +197,9 @@ class TestConfigValidation:
         assert payload["schemaVersion"] == 1
         assert "unknown setting" in payload["error"]["message"]
 
-    def test_corrupt_file_set_exits_1_and_leaves_file_untouched(self, temp_home, capsys):
+    def test_corrupt_file_set_exits_1_and_leaves_file_untouched(
+        self, temp_home, capsys
+    ):
         path = _settings_file(capsys)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not json")
@@ -226,7 +217,9 @@ class TestConfigValidation:
         assert code == 2
 
     def test_json_with_set_rejected(self, temp_home, capsys):
-        code, _, _ = _run(["--json", "set", "autoswitch.threshold", "80"], capsys)
+        code, _, _ = _run(
+            ["--json", "set", "autoswitch.threshold", "80"], capsys
+        )
         assert code == 2
 
 
@@ -274,9 +267,8 @@ class TestConfigMisc:
         captured = {}
 
         class FakeEngine:
-            def __init__(
-                self, switcher, settings, on_event, *, dry_run=False, state_path=None, clock=None
-            ):
+            def __init__(self, switcher, settings, on_event, *, dry_run=False,
+                         state_path=None, clock=None):
                 captured["settings"] = settings
 
             def tick(self):
@@ -284,11 +276,64 @@ class TestConfigMisc:
 
                 return TickOutcome.NO_ACTION
 
-        with (
-            patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine),
-            patch("os.geteuid", return_value=1000, create=True),
-            patch.object(sys, "argv", ["claude-swap", "auto", "--once"]),
-        ):
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0
+
+
+class TestWeeklyThresholdConfig:
+    """`autoswitch.weeklyThreshold`: an optional float with the threshold's
+    bounds — loud on `set`, clearable with `unset`, null in JSON."""
+
+    def test_out_of_range_and_garbage_exit_1(self, temp_home, capsys):
+        code, _, err = _run(["set", "autoswitch.weeklyThreshold", "970"], capsys)
+        assert code == 1
+        assert "between 50 and 99.9" in err
+        code, _, err = _run(["set", "autoswitch.weeklyThreshold", "banana"], capsys)
+        assert code == 1
+        assert "expects a number" in err
+        # No number spells "unset"; the error names the command that does.
+        assert "cswap config unset autoswitch.weeklyThreshold" in err
+        assert not _settings_file(capsys).exists()
+
+    def test_set_get_unset_round_trip(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.weeklyThreshold", "97"], capsys)
+        assert code == 0
+        code, out, _ = _run(["get", "autoswitch.weeklyThreshold"], capsys)
+        assert code == 0 and "97" in out
+        code, out, _ = _run(["get", "--json", "autoswitch.weeklyThreshold"], capsys)
+        assert json.loads(out)["value"] == 97.0
+        code, out, _ = _run(["unset", "autoswitch.weeklyThreshold"], capsys)
+        assert code == 0
+        assert "(none)" in out
+        code, out, _ = _run(["get", "--json", "autoswitch.weeklyThreshold"], capsys)
+        assert json.loads(out)["value"] is None
+
+    def test_auto_picks_up_configured_weekly_threshold(self, temp_home, capsys):
+        """End-to-end: the configured weekly line reaches the engine's settings
+        object, alongside the threshold."""
+        _run(["set", "autoswitch.threshold", "85"], capsys)
+        _run(["set", "autoswitch.weeklyThreshold", "97"], capsys)
+
+        captured = {}
+
+        class FakeEngine:
+            def __init__(self, switcher, settings, on_event, *, dry_run=False,
+                         state_path=None, clock=None):
+                captured["settings"] = settings
+
+            def tick(self):
+                from claude_swap.autoswitch import TickOutcome
+
+                return TickOutcome.NO_ACTION
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert captured["settings"].threshold == 85.0
+        assert captured["settings"].weekly_threshold == 97.0

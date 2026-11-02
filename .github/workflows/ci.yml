@@ -7,6 +7,8 @@ on:
     branches: [main]
 
 jobs:
+  # Fork addition. Lints and type-checks only the files this fork owns
+  # (pyproject [tool.ruff] include); upstream's code keeps upstream's style.
   lint:
     runs-on: ubuntu-latest
 
@@ -19,7 +21,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Ruff lint
         run: uv run ruff check .
@@ -27,12 +29,8 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
-      - name: mypy
-        # Advisory for now: the codebase predates this config and hasn't been
-        # baselined against it yet. Drop continue-on-error once a clean run
-        # is confirmed, so new mypy violations start failing the build.
-        continue-on-error: true
-        run: uv run mypy src/claude_swap
+      - name: mypy (fork-owned modules)
+        run: uv run mypy src/claude_swap/hooks.py src/claude_swap/inbox.py src/claude_swap/notifications.py src/claude_swap/resume.py src/claude_swap/resume_cli.py src/claude_swap/transcript.py
 
   test:
     runs-on: ubuntu-latest
@@ -49,7 +47,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Run tests
         run: uv run pytest
@@ -66,13 +64,16 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
         run: uv run pytest
 
+  # The id stays `macos-keychain` although the job now runs everything: it is
+  # the name branch protection matches on, and renaming it silently drops the
+  # required check.
   macos-keychain:
     runs-on: macos-latest
 
@@ -85,12 +86,22 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
-      - name: Run macOS Keychain tests (contract + real security wrapper)
-        # faulthandler dumps every thread's stack if a test exceeds 60s — a
-        # `security` call blocking on an invisible SecurityAgent dialog would
-        # otherwise hang the job with no clue where. The step timeout is the
-        # backstop that actually kills it.
-        timeout-minutes: 5
-        run: uv run pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py -v -o faulthandler_timeout=60
+      - name: Run the whole suite (not only the Keychain files)
+        # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
+        # failed on macOS -- one asserting the Linux XDG layout, two because a
+        # usable Keychain takes the write and leaves no `.enc` to chmod --
+        # while every job stayed green, because this job never ran them. A merge that
+        # restores a two-file selection here re-opens that hole invisibly:
+        # those cases pass now, they would simply stop running.
+        #
+        # faulthandler dumps every thread's stack past the budget, the only
+        # clue when a `security` call blocks on an invisible SecurityAgent
+        # dialog. While pyproject sets no faulthandler keys this `-o` is the
+        # only thing setting the budget and the dump does not abort; PR 287
+        # adds them repo-wide at the same 600, after which this is a no-op
+        # and the dump aborts the worker. `timeout-minutes` is the backstop
+        # that holds under either ordering.
+        timeout-minutes: 15
+        run: uv run pytest -o faulthandler_timeout=600

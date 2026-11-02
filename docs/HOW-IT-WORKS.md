@@ -35,6 +35,11 @@ do I use it", see [AUTO-CONTINUE.md](./AUTO-CONTINUE.md),
 | `cli.py` | Argument parsing and dispatch for every command. |
 | `notifications.py` | Desktop notifications (Windows toast, macOS banner, Linux notify-send). |
 | `tui/` | The `cswap` / `cswap watch` dashboard. |
+| `lines.py`, `poll_policy.py` | (upstream) Per-window switch lines; the usage endpoint's polling cadence and budget. |
+| `fsutil.py`, `spawn.py`, `mappings.py`, `launch_agent.py` | (upstream) Atomic writes, process spawning, directory→account mappings, the macOS menu bar service. |
+
+Rows without "(upstream)" either belong to the fork outright or carry fork
+insertions; §6 lists exactly which.
 
 ---
 
@@ -46,7 +51,7 @@ The **backup dir** is `~/.claude-swap-backup` on Windows and macOS, and
 
 | Path | Written by | Contents |
 |---|---|---|
-| `settings.json` | `cswap config` | User settings, in sections `autoswitch` and `resume`. |
+| `settings.json` | `cswap config` | User settings, in sections `autoswitch`, `ui`, `run`, `updates` (upstream) and `resume` (fork). |
 | `autoswitch_state.json` | auto engine | `lastSwitchAt`, `lastSwitchTo`, `quarantine{}`, and `preWarm{<slot>: {lastPingAt, backoffUntil, consecutiveFailures}}`. The legacy `preWarmed{}` key is unused. |
 | `cache/usage.json` | anything that fetches usage | Per-account last good reading, fetch errors, backoff, poll plan. |
 | `claude-swap.log` | everything | Rotating log, 1 MB × 3. Auto-continue lines start with `auto-continue:`. |
@@ -106,19 +111,18 @@ These matter: getting them wrong logs Claude Code out.
 | Reserve | Its backup copy in the backup dir | Yes, then saved back to the backup | Yes (backup only) |
 | Active | The **live** login (`read_live_credentials`) | **Never.** `try_prewarm_account(is_active=True)` returns `token-expired` without making any request | **Never** |
 
-Why the active account is never refreshed: Claude Code owns that credential.
-Refreshing it rotates the refresh-token family, which logs out any running
-Claude Code (upstream PR #70 has the same rule). In practice an expired active
-token never reaches the ping anyway:
+Why the ping never refreshes the active account: Claude Code owns that
+credential, and rotating its refresh-token family outside Claude Code's lock
+protocol can log out a running Claude Code. The ping only *uses* the live
+token, and only while it is valid.
 
-- If Claude Code is running, an expired token reads as the `token expired`
-  sentinel, which isn't "idle".
-- If Claude Code isn't running, the active usage fetch has already refreshed
-  the token safely, under Claude Code's locks.
-
-Consequence: the active account gets pre-warmed after breaks, while its
-token is still valid (about 6 hours after Claude Code last refreshed it,
-measured 2026-11-02). Overnight it isn't.
+Keeping that token fresh is the usage poller's job. Since the 2026-11 upstream
+sync (v0.30), `switcher._fetch_active_usage` refreshes an expired active token
+under Claude Code's own lock protocol (`.oauth_refresh.lock` + `.claude.lock`),
+which Claude Code 2.1.218+ adopts. So while `cswap auto` runs, the active
+token is normally valid, and active pre-warm can fire overnight too. That is
+*inferred from upstream's code and docstring*; not yet observed overnight on
+this machine.
 
 ### The ping
 
@@ -480,7 +484,51 @@ resume status` → `resumed`, `auto-continue test passed`. Verified live
 
 ---
 
-## 6. Research notes and roadmap
+## 6. Syncing with upstream (realiti4/claude-swap)
+
+This fork tracks [realiti4/claude-swap](https://github.com/realiti4/claude-swap)
+through a git remote called `upstream`. The first sync (2026-11-02) brought in
+393 upstream commits, going from v0.19 to v0.30.0b1.
+
+**Keep the fork small.** The fork's own code is the files listed under
+`[tool.ruff] include` in `pyproject.toml` (auto-continue, notifications, their
+tests), plus small, well-marked insertions in upstream files:
+
+| Upstream file | Fork insertion |
+|---|---|
+| `settings.py` | `pre_warm_*` fields, `ResumeSettings`, the `resume` + pre-warm specs, `PRESETS` / `apply_preset`, `load_resume_settings` |
+| `autoswitch.py` | `PREWARM_GUARD_S`, `_prewarm_backoff_s`, `PreWarmEvent`, `_is_truly_idle`, the pre-warm call in `_tick_inner`, `_prewarm_idle_accounts` |
+| `oauth.py` | `op` parameter on `_log_usage_failure`; `PingOutcome` + `try_prewarm_account` at the end |
+| `switcher.py` | `read_live_credentials`, `cached_usage_entry`, `account_number_for_identity` |
+| `process_detection.py` | `messaging_socket_path`, `name`, `proc_start` on `ClaudeSession` |
+| `transfer.py` | plaintext-export warning |
+| `cli.py` | `auto --notify`, `config apply-preset`, the `resume` group, `add --count` |
+
+**Never reformat upstream files.** Upstream doesn't run ruff. The fork's lint
+(CI `lint` job) covers only fork-owned files. Reformatting upstream code was
+what turned the first sync into ~200 conflicts in 29 files.
+
+**Next sync, step by step:**
+
+```bash
+git fetch upstream
+git merge-tree --write-tree --name-only HEAD upstream/main   # preview: conflicted files, nothing written
+git merge upstream/main                                      # usually small now
+uv sync && uv run pytest && uv run ruff check . && uv run ruff format --check .
+```
+
+Resolve any conflict by keeping upstream's code and re-applying the fork
+insertion from the table above.
+
+**Windows quirk.** Here, every *new* checkout of
+`scripts/windows/install-autostart.ps1` (a fresh worktree, a temp copy) is
+blocked immediately after git writes it. The likely cause is
+security software reacting to a script that registers an S4U scheduled task;
+Defender's history showed nothing, so this is unconfirmed. The existing
+checkout is unaffected. Use `git merge-tree` or a plain merge in the main
+checkout rather than `git worktree add`.
+
+## 7. Research notes and roadmap
 
 ### What the research found (2026-11-02)
 

@@ -10,7 +10,7 @@ function bodies run against a fake process.)
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -94,7 +94,7 @@ def test_set_password_small_payload_uses_security_i_stdin():
         assert "short-secret" not in args
         stdin = kwargs["input"]
         assert stdin.startswith("add-generic-password -U")
-        assert "-X " + b"short-secret".hex() in stdin
+        assert "-X " + "short-secret".encode().hex() in stdin
         # -a/-s are quoted in the stdin command line.
         assert '-a "acct"' in stdin and '-s "svc"' in stdin
 
@@ -168,14 +168,11 @@ def test_calls_pass_timeout_to_subprocess():
         assert run.call_args.kwargs.get("timeout") == macos_keychain._TIMEOUT
 
 
-@pytest.mark.parametrize(
-    "fn,args",
-    [
-        ("get_password", ("svc", "acct")),
-        ("set_password", ("svc", "acct", "secret")),
-        ("delete_password", ("svc", "acct")),
-    ],
-)
+@pytest.mark.parametrize("fn,args", [
+    ("get_password", ("svc", "acct")),
+    ("set_password", ("svc", "acct", "secret")),
+    ("delete_password", ("svc", "acct")),
+])
 def test_timeout_becomes_keychain_error(fn, args):
     timeout = subprocess.TimeoutExpired(cmd="security", timeout=5)
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):

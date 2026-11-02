@@ -13,16 +13,38 @@ import sys
 import time
 from pathlib import Path
 
-# ANSI escape codes
+# ANSI escape codes -- structural, theme-independent
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
-_RED = "\033[31m"
-_YELLOW = "\033[33m"
-_ACCENT = "\033[38;5;173m"  # Warm salmon/terracotta
-_MUTED = "\033[38;5;250m"  # Soft gray -- readable, but quieter than normal
+
+_PALETTES: dict[str, dict[str, str]] = {
+    "dark": {
+        "accent": "\033[38;5;173m",  # warm salmon/terracotta (xterm 173)
+        "muted": "\033[38;5;250m",  # soft gray -- readable, but quieter than normal
+        "red": "\033[31m",
+        "yellow": "\033[33m",
+    },
+    "light": {
+        "accent": "\033[38;2;149;76;42m",  # #954c2a burnt sienna
+        "muted": "\033[38;2;99;93;85m",  # #635d55
+        "red": "\033[38;2;173;49;40m",  # #ad3128
+        "yellow": "\033[38;2;121;89;17m",  # #795911 deep ochre
+    },
+}
 
 _colors_enabled: bool | None = None  # lazy-initialized
+_theme: str = "dark"
+
+
+def set_theme(name: str) -> None:
+    """Select the CLI color palette. Unknown names fall back to dark."""
+    global _theme
+    _theme = name if name in _PALETTES else "dark"
+
+
+def _pal(key: str) -> str:
+    return _PALETTES[_theme][key]
 
 
 def _enable_windows_vt() -> bool:
@@ -40,6 +62,21 @@ def _enable_windows_vt() -> bool:
         return True
     except Exception:
         return False
+
+
+def force_utf8_output() -> None:
+    """Make stdout/stderr encode UTF-8 so ● → ├ ─ └ don't crash on a legacy
+    console (cp1252 on Windows, or an ASCII/C locale). errors="replace" keeps
+    output flowing on any stream that still can't render a glyph. No-op where
+    the stream can't be reconfigured (replaced/captured streams in tests)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 def _detect_color_support() -> bool:
@@ -100,12 +137,12 @@ def _style(text: str, *codes: str) -> str:
 
 def accent(text: str) -> str:
     """Warm accent color for important elements."""
-    return _style(text, _ACCENT)
+    return _style(text, _pal("accent"))
 
 
 def muted(text: str) -> str:
     """Slightly dimmer than normal -- for usage stats, org tags."""
-    return _style(text, _MUTED)
+    return _style(text, _pal("muted"))
 
 
 def dimmed(text: str) -> str:
@@ -120,12 +157,12 @@ def bolded(text: str) -> str:
 
 def bold_accent(text: str) -> str:
     """Bold + accent for key markers like (active)."""
-    return _style(text, _BOLD, _ACCENT)
+    return _style(text, _BOLD, _pal("accent"))
 
 
 def yellowed(text: str) -> str:
     """Yellow for warning-toned text (string form; ``warning()`` prints)."""
-    return _style(text, _YELLOW)
+    return _style(text, _pal("yellow"))
 
 
 # --- Line printers (call print() internally) ---
@@ -133,12 +170,17 @@ def yellowed(text: str) -> str:
 
 def error(msg: str) -> None:
     """Print an error message (red) to stderr."""
-    print(_style(msg, _RED), file=sys.stderr)
+    print(_style(msg, _pal("red")), file=sys.stderr)
 
 
-def warning(msg: str) -> None:
-    """Print a warning message (yellow)."""
-    print(_style(msg, _YELLOW))
+def warning(msg: str, *, file=None) -> None:
+    """Print a warning message (yellow).
+
+    ``file`` routes it elsewhere than stdout — stderr for anything a
+    long-running process emits, since stderr stays line-buffered when it is
+    redirected to a file and stdout does not.
+    """
+    print(_style(msg, _pal("yellow")), file=file)
 
 
 # --- Display helpers for process detection ---
@@ -174,7 +216,7 @@ def abbreviate_path(path: str) -> str:
     """Replace the user's home directory prefix with ~."""
     home = str(Path.home())
     if path.startswith(home):
-        return "~" + path[len(home) :]
+        return "~" + path[len(home):]
     return path
 
 

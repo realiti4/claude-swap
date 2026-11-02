@@ -17,9 +17,8 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -52,7 +51,7 @@ class DashboardScreen(Screen):
         Binding("k", "cursor_up", show=False),
     ]
 
-    app: CswapApp
+    app: "CswapApp"
 
     def __init__(self) -> None:
         super().__init__()
@@ -79,7 +78,9 @@ class DashboardScreen(Screen):
             ("Watch accounts", "watch"),
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
+            ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
+            ("Theme…", "theme-menu"),
             ("Quit", "quit"),
         ]
 
@@ -93,8 +94,37 @@ class DashboardScreen(Screen):
     def _remove_entries(self) -> MenuEntries:
         snap = self.app.snapshot
         entries: MenuEntries = [
-            (f"{acc.number}  {acc.email}  [{acc.display_tag}]", f"remove:{acc.number}")
+            (
+                f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
+                f"  [{acc.display_tag}]",
+                f"remove:{acc.number}",
+            )
             for acc in (snap.accounts if snap else ())
+        ]
+        entries.append(_BACK)
+        return entries
+
+    def _disable_entries(self) -> MenuEntries:
+        """One row per account, labelled with its current state and the action
+        selecting it will take (enable a disabled one, disable an active one)."""
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            action = "→ enable" if acc.disabled else "→ disable"
+            state = "  (disabled)" if acc.disabled else ""
+            entries.append(
+                (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
+            )
+        entries.append(_BACK)
+        return entries
+
+    def _theme_entries(self) -> MenuEntries:
+        """dark / light / auto, with the active setting marked."""
+        current = self.app._theme_name
+        entries: MenuEntries = [
+            (f"{'●' if name == current else ' '} {name}", f"theme:{name}")
+            for name in ("dark", "light", "auto")
         ]
         entries.append(_BACK)
         return entries
@@ -115,7 +145,8 @@ class DashboardScreen(Screen):
         menu = self.query_one("#menu", ListView)
         await menu.clear()
         await menu.extend(
-            MenuItem(label, action_id, muted=(action_id == "back")) for label, action_id in entries
+            MenuItem(label, action_id, muted=(action_id == "back"))
+            for label, action_id in entries
         )
         menu.index = 0
 
@@ -148,6 +179,19 @@ class DashboardScreen(Screen):
                 "?",
             )
             app.confirm_remove(number, email)
+        elif action_id == "theme-menu":
+            await self._push_menu("theme", self._theme_entries())
+        elif action_id.startswith("theme:"):
+            name = action_id.split(":", 1)[1]
+            app.apply_theme(name)
+            app.notify(f"Theme: {name}")
+            await self._pop_menu()
+        elif action_id == "disable-menu":
+            await self._push_menu("disable / enable", self._disable_entries())
+        elif action_id.startswith("disable:"):
+            number = action_id.split(":", 1)[1]
+            app.do_toggle_disabled(number)
+            await self._pop_menu()
         else:
             actions[action_id]()
 
@@ -175,7 +219,7 @@ class AccountListScreen(Screen):
     selection on demand.
     """
 
-    app: CswapApp
+    app: "CswapApp"
 
     def __init__(self) -> None:
         super().__init__()
@@ -202,10 +246,12 @@ class AccountListScreen(Screen):
             await listview.extend(AccountItem(acc) for acc in snap.accounts)
             self._numbers = numbers
             listview.index = (
-                self._index_after_build(snap, first_build, previous) if numbers else None
+                self._index_after_build(snap, first_build, previous)
+                if numbers
+                else None
             )
         else:
-            for item, acc in zip(listview.query(AccountItem), snap.accounts, strict=False):
+            for item, acc in zip(listview.query(AccountItem), snap.accounts):
                 item.set_account(acc)
         self._flash_updated(snap, listview)
 
@@ -219,7 +265,11 @@ class AccountListScreen(Screen):
 
     def _active_index(self, snap: AccountsSnapshot) -> int:
         return next(
-            (i for i, acc in enumerate(snap.accounts) if acc.number == snap.active_number),
+            (
+                i
+                for i, acc in enumerate(snap.accounts)
+                if acc.number == snap.active_number
+            ),
             0,
         )
 
@@ -304,8 +354,19 @@ class WatchScreen(AccountListScreen):
         self._selecting = False
 
     def on_mount(self) -> None:
-        self.query_one("#list-title", Static).update(self._WATCH_TITLE)
+        self.watch(self.app, "refresh_status", self._on_refresh_status)
+        self.query_one("#list-title", Static).update(self._title_text())
         super().on_mount()
+
+    def _title_text(self) -> str:
+        if self._selecting:
+            return self._SELECT_TITLE
+        status = self.app.refresh_status
+        return f"{self._WATCH_TITLE} · {status}" if status else self._WATCH_TITLE
+
+    def _on_refresh_status(self, status: str) -> None:
+        if not self._selecting:
+            self.query_one("#list-title", Static).update(self._title_text())
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "select_highlighted" and not self._selecting:
@@ -332,7 +393,7 @@ class WatchScreen(AccountListScreen):
         else:
             listview.index = None
             self.set_focus(None)
-            title.update(self._WATCH_TITLE)
+            title.update(self._title_text())
         self.refresh_bindings()
 
     def action_toggle_select(self) -> None:
