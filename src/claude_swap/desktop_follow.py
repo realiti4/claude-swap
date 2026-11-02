@@ -308,6 +308,9 @@ def ensure(*, port: int | None = None) -> str:
         save_state(state)
         return "restarted"
     except Exception:
+        # start_proxy records the new pid before it waits for the port; reload so a start that
+        # timed out does not write the old pid back, and --off can still find the process.
+        state = load_state()
         state["failures"] = int(state.get("failures") or 0) + 1
         if state["failures"] < _GIVE_UP_AFTER:
             save_state(state)

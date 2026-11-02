@@ -90,6 +90,20 @@ def test_ensure_gives_the_wiring_up_when_the_proxy_will_not_start(home, monkeypa
     assert df.load_state()["enabled"] is False
 
 
+def test_a_start_that_times_out_keeps_the_new_pid(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 9, "pid": 1})
+
+    def slow(port):
+        df.save_state({**df.load_state(), "pid": 2})
+        raise ClaudeSwitchError("did not start listening")
+
+    monkeypatch.setattr(df, "proxy_alive", lambda port: False)
+    monkeypatch.setattr(df, "stop_proxy", lambda: None)
+    monkeypatch.setattr(df, "start_proxy", slow)
+    assert df.ensure() == "retry"
+    assert df.load_state()["pid"] == 2
+
+
 def test_ensure_forgets_earlier_failures_once_the_proxy_is_back(home, monkeypatch):
     df.save_state({"enabled": True, "port": 9, "failures": 3})
     monkeypatch.setattr(df, "proxy_alive", lambda port: True)

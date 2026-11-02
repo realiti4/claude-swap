@@ -114,6 +114,16 @@ def withdraw_marker(path: Path | None = None) -> None:
     (path or marker_path()).unlink(missing_ok=True)
 
 
+def trace_path() -> Path:
+    """While this file exists the proxy logs every request and response (no bodies, no headers)."""
+    return Path.home() / ".claude-swap-backup" / "desktop-follow" / "trace"
+
+
+def _trace(text: str) -> None:
+    if trace_path().exists():
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} trace {text}", flush=True)
+
+
 class FollowActive:
     def running(self) -> None:
         publish_marker()
@@ -124,6 +134,29 @@ class FollowActive:
     def request(self, flow) -> None:
         if rewrite(flow.request.pretty_host, flow.request.path, flow.request.headers):
             flow.comment = "cswap: billed to active account"
+        _trace(f"> {flow.request.method} {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]}")
+
+    def responseheaders(self, flow) -> None:
+        # Only requests are ever changed, so pass every response through as it arrives. Buffered, a
+        # long-lived stream (Remote Control's /worker/events/stream) never answers the client.
+        flow.response.stream = True
+
+    def response(self, flow) -> None:
+        r = flow.response
+        _trace(f"< {r.status_code} {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]} {r.headers.get('content-type', '-')[:30]}")
+
+    def error(self, flow) -> None:
+        _trace(f"! {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]} {flow.error}")
+
+    def websocket_start(self, flow) -> None:
+        _trace(f"ws open {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]}")
+
+    def websocket_message(self, flow) -> None:
+        m = flow.websocket.messages[-1]
+        _trace(f"ws {'from client' if m.from_client else 'from server'} {len(m.content)} bytes {flow.request.pretty_host}")
+
+    def websocket_end(self, flow) -> None:
+        _trace(f"ws closed {flow.request.pretty_host}")
 
 
 addons = [FollowActive()]

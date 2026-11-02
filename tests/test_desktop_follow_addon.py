@@ -50,6 +50,13 @@ def test_log_line_names_an_unreadable_account(creds, capsys):
     assert "unknown account" in capsys.readouterr().out
 
 
+def test_responses_are_streamed_not_buffered():
+    # A buffered long-lived stream (Remote Control's event stream) never reaches the client.
+    flow = type("Flow", (), {"response": type("Resp", (), {"stream": False})()})()
+    follow_active.FollowActive().responseheaders(flow)
+    assert flow.response.stream is True
+
+
 def test_leaves_other_routes_and_hosts(creds):
     creds()
     for host, path in [("api.anthropic.com", "/api/oauth/usage"), ("example.com", "/v1/messages")]:
