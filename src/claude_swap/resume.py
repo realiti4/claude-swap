@@ -42,11 +42,12 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from claude_swap import transcript as tx
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.inbox import InboxError, inbox_address, peer_token, post_message
 from claude_swap.locking import FileLock
 from claude_swap.paths import get_claude_config_home, get_global_config_path
@@ -104,11 +105,17 @@ MESSAGE = (
     "cleared ({why}). Please continue the task you were working on, picking up "
     "exactly where you left off. If it was already finished, just say so in one line."
 )
+REHEARSAL_MESSAGE = (
+    MARKER + " TEST: this is a rehearsal started by `cswap resume test`, proving "
+    "this session can be woken after a usage limit. There is no task to "
+    "continue; just reply with one short line confirming you received it."
+)
 REASON_TEXT = {
     "limit-reset": "the limit window reset",
     "account-switched": "claude-swap switched to an account with quota left",
     "headroom": "the account has quota again",
     "forced": "you asked claude-swap to continue it",
+    "rehearsal": "auto-continue test passed",
 }
 
 _SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,63}$")
@@ -147,6 +154,10 @@ class ResumeRecord:
     last_resume_at: float | None = None
     resumed_stall_uuid: str | None = None
     updated_at: float = 0.0
+    # `cswap resume test`: transcript_path is a stand-in holding a fake
+    # stop, and delivery is confirmed in the session's real transcript.
+    rehearsal: bool = False
+    confirm_path: str | None = None
 
     @property
     def identity(self) -> tuple[str, str] | None:
@@ -254,6 +265,7 @@ def prune_records(backup_root: Path, now: float) -> None:
             f"{record.session_id}.json",
             f"{record.session_id}.force",
             f"{record.session_id}.waiter.lock",
+            f"{record.session_id}.rehearsal.jsonl",
         ):
             try:
                 (base / name).unlink()
@@ -590,6 +602,88 @@ def spawn_waiter(session_id: str) -> None:
         subprocess.Popen(cmd, creationflags=flags, **kwargs)
 
 
+class RehearsalError(ClaudeSwitchError):
+    """``cswap resume test`` can't run here."""
+
+
+def rehearse(
+    backup_root: Path,
+    env: Mapping[str, str],
+    *,
+    clock: Callable[[], float] = time.time,
+    spawn: Callable[[str], None] | None = None,
+) -> tuple[ClaudeSession, ResumeRecord]:
+    """Arm a rehearsal of auto-continue on the Claude Code session this runs
+    inside (``cswap resume test``, run by Claude through its own tool).
+
+    The session's own inbox and own-child token come from the environment,
+    exactly as for a real hook, so the rehearsal exercises the real path:
+    waiter spawn, wait-for-idle, delivery, confirmation. Only the stop is
+    fake: a stand-in transcript with one usage-limit record, so nothing is
+    written to Claude Code's own files.
+    """
+    own_socket = env.get("CLAUDE_CODE_MESSAGING_SOCKET")
+    if not own_socket or not env.get("CLAUDE_CODE_MESSAGING_TOKEN"):
+        raise RehearsalError(
+            "run this from inside a Claude Code session (ask Claude to run "
+            "`cswap resume test`): the test needs that session's own inbox token"
+        )
+    config_home = get_claude_config_home()
+    session = next(
+        (
+            s
+            for s in list_sessions(config_home)
+            if s.messaging_socket_path
+            and inbox_address(s.messaging_socket_path) == inbox_address(own_socket)
+        ),
+        None,
+    )
+    if session is None:
+        raise RehearsalError("couldn't find the Claude Code session that owns this inbox")
+    real = next((config_home / "projects").glob(f"*/{session.session_id}.jsonl"), None)
+    if real is None:
+        raise RehearsalError(f"couldn't find the transcript of session {session.session_id}")
+    if waiter_alive(backup_root, session.session_id):
+        raise RehearsalError("a waiter is already active for this session")
+
+    now = clock()
+    stall_uuid = f"rehearsal-{int(now)}"
+    stand_in = resume_dir(backup_root) / f"{session.session_id}.rehearsal.jsonl"
+    stand_in.parent.mkdir(parents=True, exist_ok=True)
+    stop = {
+        "type": "assistant",
+        "uuid": stall_uuid,
+        "timestamp": datetime.fromtimestamp(now, UTC).isoformat().replace("+00:00", "Z"),
+        "isApiErrorMessage": True,
+        "apiError": "usage_limit_reached",
+        "apiErrorParams": {"rate_limit_info": {"status": "rejected", "resetsAt": int(now) - 1}},
+        "message": {"content": [{"type": "text", "text": "rehearsal stop (cswap resume test)"}]},
+    }
+    stand_in.write_text(json.dumps(stop) + "\n", encoding="utf-8")
+    record = ResumeRecord(
+        session_id=session.session_id,
+        transcript_path=str(stand_in),
+        config_home=str(config_home),
+        global_config_path=str(get_global_config_path()),
+        default_profile=True,
+        armed_at=now,
+        socket_path=own_socket,
+        cwd=session.cwd or None,
+        stall_uuid=stall_uuid,
+        stalled_at=now,
+        resets_at=now - 1,
+        limit_type="five_hour",
+        detail="test armed; end the turn to see it",
+        updated_at=now,
+        rehearsal=True,
+        confirm_path=str(real),
+    )
+    mutate_record(backup_root, session.session_id, lambda _prev: record)
+    (spawn or spawn_waiter)(session.session_id)
+    _logger.info("auto-continue: rehearsal armed for session %s", session.session_id[:8])
+    return session, record
+
+
 # ---------------------------------------------------------------------------
 # Wait + deliver
 # ---------------------------------------------------------------------------
@@ -709,6 +803,8 @@ class Waiter:
                 readiness = Readiness(False, "waiting-for-the-stop", SLICE_S * 5)
             elif forced:
                 readiness = Readiness(True, "forced", 0.0)
+            elif record.rehearsal:
+                readiness = Readiness(True, "rehearsal", 0.0)
             else:
                 readiness = evaluate(record, now, self.live_context(record), self.settings)
 
@@ -768,7 +864,7 @@ class Waiter:
         stall = state.stall
         if stall is None:  # only called on a stalled transcript
             return None
-        if not forced:
+        if not forced and not record.rehearsal:
             self.sleep(random.uniform(0.0, JITTER_S))
             # Re-validate after the jitter: the user may have typed meanwhile.
             fresh = find_session(record.config_home, self.session_id)
@@ -787,16 +883,19 @@ class Waiter:
                 "it bypasses permissions and cswap doesn't have its own token, so Claude "
                 "Code would hold the message; type 'continue' there",
             )
-        why = REASON_TEXT.get("forced" if forced else reason, reason)
+        if record.rehearsal:
+            why, text = REASON_TEXT["rehearsal"], REHEARSAL_MESSAGE
+        else:
+            why = REASON_TEXT.get("forced" if forced else reason, reason)
+            text = MESSAGE.format(why=why)
         posted_at = self.clock()
         try:
-            post_message(address, MESSAGE.format(why=why), token)
+            post_message(address, text, token)
         except InboxError as e:
             _logger.warning("auto-continue: delivery to %s failed: %s", self.session_id[:8], e)
             return None
-        if not delivery_confirmed(
-            record.transcript_path, posted_at, clock=self.clock, sleep=self.sleep
-        ):
+        confirm_path = record.confirm_path or record.transcript_path
+        if not delivery_confirmed(confirm_path, posted_at, clock=self.clock, sleep=self.sleep):
             return self._undelivered(
                 record,
                 session,

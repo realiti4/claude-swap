@@ -335,6 +335,7 @@ class WaiterHarness:
         self.gave_up: list[tuple[str, str]] = []
         self.post_error: Exception | None = None
         self.records_delivery = True
+        self.delivery_log = transcript  # where Claude Code records an accepted message
         rs.mutate_record(backup, SID, lambda _: replace(record, transcript_path=str(transcript)))
         self.waiter = Waiter(
             backup,
@@ -358,7 +359,7 @@ class WaiterHarness:
         if self.records_delivery:
             # What Claude Code writes when it accepts the message: a meta user
             # turn carrying the text (nothing at all when it holds it).
-            with self.transcript.open("a", encoding="utf-8") as fh:
+            with self.delivery_log.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(peer_turn(f"m{len(self.posted)}", self.clock.now, text)) + "\n")
 
     def run(self) -> str:
@@ -565,3 +566,59 @@ class TestDeliveryConfirmation:
         transcript = write(tmp_path / "t.jsonl", peer_turn("m0", 500.0, rs.MARKER + " old"))
         assert tx.recorded_since(transcript, rs.MARKER, 400.0)
         assert not tx.recorded_since(transcript, rs.MARKER, 600.0)
+
+
+class TestRehearsal:
+    def _real_transcript(self, home: Path) -> Path:
+        path = home / ".claude" / "projects" / "c--work-proj" / f"{SID}.jsonl"
+        path.parent.mkdir(parents=True)
+        write(path, human("h1", 900.0), assistant("a1", 950.0))
+        return path
+
+    def test_refuses_outside_a_session(self, env_home, backup):
+        with pytest.raises(rs.RehearsalError, match="inside a Claude Code session"):
+            rs.rehearse(backup, {})
+
+    def test_arms_the_calling_session_without_touching_claude_files(self, env_home, backup):
+        real = self._real_transcript(env_home)
+        before = real.read_bytes()
+        spawned: list[str] = []
+        with patch.object(rs, "list_sessions", return_value=[_session()]):
+            session, record = rs.rehearse(backup, ENV, clock=lambda: 1000.0, spawn=spawned.append)
+        assert session.session_id == SID and spawned == [SID]
+        assert record.rehearsal and record.confirm_path == str(real)
+        assert record.transcript_path != str(real)
+        assert tx.read_transcript_state(record.transcript_path).status == tx.STALLED
+        assert real.read_bytes() == before  # Claude Code's transcript is never written
+        assert rs.load_record(backup, SID).rehearsal is True
+
+    def test_refuses_while_a_waiter_is_active(self, env_home, backup):
+        self._real_transcript(env_home)
+        lock = rs._waiter_lock(backup, SID)
+        assert lock.acquire(timeout=0)
+        try:
+            with (
+                patch.object(rs, "list_sessions", return_value=[_session()]),
+                pytest.raises(rs.RehearsalError, match="already active"),
+            ):
+                rs.rehearse(backup, ENV, spawn=lambda _: None)
+        finally:
+            lock.release()
+
+    def test_waiter_delivers_the_test_message_at_once_and_confirms_in_the_real_transcript(
+        self, env_home, backup
+    ):
+        real = self._real_transcript(env_home)
+        with patch.object(rs, "list_sessions", return_value=[_session()]):
+            _session_obj, record = rs.rehearse(
+                backup, ENV, clock=lambda: 1000.0, spawn=lambda _: None
+            )
+        stand_in = Path(record.transcript_path)
+        h = WaiterHarness(backup, stand_in, record, LiveContext(identity=A))
+        h.delivery_log = real
+        assert h.run() == rs.RESUMED
+        assert h.clock.now == 1000.0  # no reset wait, no jitter
+        [(_address, text, token)] = h.posted
+        assert "TEST" in text and "no task to continue" in text and token == CHILD_TOKEN
+        assert h.resumed == [("proj-1", rs.REASON_TEXT["rehearsal"])]
+        assert h.record().state == rs.RESUMED

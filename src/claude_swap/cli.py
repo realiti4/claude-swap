@@ -583,11 +583,12 @@ Examples:
   cswap resume install       # enable auto-continue (snapshots settings.json first)
   cswap resume status        # sessions waiting, resumed, or stopped on a limit
   cswap resume now --all     # continue every waiting session right away
+  cswap resume test          # (ask Claude to run it) rehearse on that session
   cswap resume uninstall     # remove the hook again
         """,
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    sub = parser.add_subparsers(dest="action", metavar="{install,uninstall,status,now}")
+    sub = parser.add_subparsers(dest="action", metavar="{install,uninstall,status,now,test}")
     p_install = sub.add_parser("install", help="Add the StopFailure hook (enables auto-continue)")
     p_install.add_argument(
         "--command",
@@ -595,6 +596,10 @@ Examples:
         help="Hook command to register (default: this cswap's absolute path + 'resume arm')",
     )
     sub.add_parser("uninstall", help="Remove the hook (disables auto-continue)")
+    sub.add_parser(
+        "test",
+        help="Rehearse auto-continue on this session (ask Claude to run it, then end the turn)",
+    )
     p_status = sub.add_parser("status", help="Show waiting/resumed sessions (the default)")
     p_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     p_now = sub.add_parser("now", help="Continue waiting/stopped sessions right away")
@@ -603,7 +608,13 @@ Examples:
     args = parser.parse_args(argv)
     action = args.action or "status"
 
-    from claude_swap.resume_cli import resume_install, resume_now, resume_status, resume_uninstall
+    from claude_swap.resume_cli import (
+        resume_install,
+        resume_now,
+        resume_status,
+        resume_test,
+        resume_uninstall,
+    )
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -612,6 +623,8 @@ Examples:
             resume_install(root, args.command)
         elif action == "uninstall":
             resume_uninstall(root)
+        elif action == "test":
+            resume_test(root)
         elif action == "status":
             resume_status(root, json_output=getattr(args, "json", False))
         elif action == "now":

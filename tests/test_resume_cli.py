@@ -99,3 +99,12 @@ class TestHookEntryPoints:
     def test_wait_with_an_invalid_id_is_a_quiet_no_op(self, temp_home, capsys):
         code, out, err = _run(["wait", "../../x"], capsys)
         assert (code, out, err) == (0, "", "")
+
+
+class TestRehearsalCommand:
+    def test_outside_a_session_explains_how_to_run_it(self, temp_home, capsys, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_MESSAGING_SOCKET", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_MESSAGING_TOKEN", raising=False)
+        code, out, err = _run(["test"], capsys)
+        assert code == 1
+        assert "inside a Claude Code session" in (out + err)

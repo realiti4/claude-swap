@@ -33,6 +33,7 @@ from claude_swap.resume import (
     load_record,
     mutate_record,
     peer_message_held,
+    rehearse,
     resume_dir,
     waiter_alive,
 )
@@ -217,6 +218,15 @@ def resume_install(backup_root: Path, command: str | None = None) -> None:
     print("When a usage limit stops a session, it now continues by itself as soon as")
     print("an account switch lands or the limit resets. Running sessions pick the")
     print("hook up automatically. See `cswap resume status`.")
+
+
+def resume_test(backup_root: Path) -> None:
+    """``cswap resume test``: rehearse auto-continue on the calling session."""
+    session, _record = rehearse(backup_root, os.environ)
+    print(f"Auto-continue test armed for this session ({session.name or session.session_id[:8]}).")
+    print("End the turn now. Within about 10 seconds of the session going idle it")
+    print('should receive "[claude-swap auto-continue] TEST ..." and reply by itself.')
+    print("Then check: cswap resume status   (expect: resumed / auto-continue test passed)")
 
 
 def resume_uninstall(backup_root: Path) -> None:

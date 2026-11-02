@@ -391,7 +391,7 @@ All on Windows 11 with Claude Code 2.1.314, 2026-11-02:
 | Wire format and pipe | Message posted from a detached process arrived in a live session | `tests/test_inbox.py` posts to a real named pipe / Unix socket |
 | Hook gets both env vars; detached child survives the session exit | Probe hook (async + sync) logged both vars; children's 30 s heartbeats ran after the session ended | Recipe A below |
 | Own-child token reaches a `bypassPermissions` session; peer token is held | Throwaway `claude -p --permission-mode bypassPermissions` run: the child message was delivered and recorded `selfSent: true`; the peer message, posted while the session was alive, never appeared | Recipe B below |
-| Whole production path wakes an idle VS Code session | `cswap resume arm` with a hook-shaped event (synthetic stop) → waiter waited while the session was busy → delivered once idle → new turn, recorded `selfSent` | Recipe C below |
+| Whole production path wakes an idle VS Code session | `cswap resume arm` with a hook-shaped event (synthetic stop), and later `cswap resume test`: waiter waited while the session was busy → delivered once idle → new turn, recorded `selfSent`, confirmed | Recipe C below |
 | Installed hook command runs under Claude Code's real hook runner | 3/3 runs: `armed` → `session-gone` | Recipe A, using the installed command |
 | Policy, loop guard, waiter loop, idempotency | 60+ unit tests | `uv run pytest tests/test_resume.py tests/test_transcript.py tests/test_hooks.py tests/test_resume_cli.py` |
 
@@ -421,16 +421,22 @@ rm ~/.claude-swap-backup/resume/<id>*   # tidy up
 5. Expect only "PROBE child". In its transcript, the child message is an
    attachment with `origin.selfSent: true`, and the peer message is absent.
 
-**Recipe C — wake an idle session through the production path.**
-1. From inside a session (so its own-child token is in the environment),
-   pipe a hook-shaped event into `cswap resume arm`:
-   `{"session_id": "<this session>", "transcript_path": "<file>", "error": "rate_limit"}`.
-   `<file>` holds one usage-limit record whose `resetsAt` is in the past.
-2. End your turn. Within about 30 s the session gets
-   "[claude-swap auto-continue] ..." as a new turn.
-3. The record ends `undelivered` *only* because confirmation reads the
-   synthetic file. The real transcript holds the message.
-4. Delete the test record afterwards.
+**Recipe C — wake an idle session through the production path:
+`cswap resume test`.** In any chat, ask Claude to "run `cswap resume test`,
+then stop". `rehearse()` then:
+- finds the calling session from its own inbox env vars;
+- writes a stand-in transcript holding one fake usage-limit stop, at
+  `resume/<sid>.rehearsal.jsonl`. Claude Code's own files are never written;
+- records `rehearsal: true` and `confirmPath` = the real transcript;
+- spawns the normal waiter.
+
+The waiter treats a rehearsal as ready at once, with no jitter. It waits
+for the turn to end and sends a TEST message ("no task to continue, just
+confirm"). It confirms delivery in the **real** transcript.
+
+Expect a new turn in that chat about 10 s after it goes idle, and `cswap
+resume status` → `resumed`, `auto-continue test passed`. Verified live
+2026-11-02: armed at 22:50:17, delivered and confirmed at 22:50:32.
 
 ### 4.12 Troubleshooting
 

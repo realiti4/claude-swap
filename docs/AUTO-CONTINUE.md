@@ -11,6 +11,21 @@ cswap resume install    # once; snapshots ~/.claude/settings.json first
 That's it. According to Claude Code's hooks docs, running sessions pick up
 hook changes automatically; restart a session if in doubt.
 
+## Test it (2 minutes, no real limit needed)
+
+1. Check that it's on: `cswap resume status` should print `Auto-continue: on`.
+2. In any Claude Code chat, type: **`run cswap resume test, then stop`**.
+3. Claude runs it and finishes its reply. Within about 10 seconds, the chat
+   receives `[claude-swap auto-continue] TEST ...` by itself, and Claude
+   answers it without you typing anything. That's the feature working.
+4. Confirm with `cswap resume status`: that chat shows `resumed`,
+   `auto-continue test passed`.
+
+The test runs through the real path: background waiter, wait for idle,
+delivery into the session's inbox, confirmation. Only the usage-limit stop
+is simulated. It must be run *by Claude inside a chat*, because it uses that
+chat's own inbox token.
+
 ---
 
 ## When does a session continue?

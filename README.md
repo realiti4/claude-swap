@@ -175,6 +175,10 @@ cswap resume status      # what's waiting, continued, or stopped
 cswap resume now --all   # continue every waiting session right away
 ```
 
+To check that it works, type `run cswap resume test, then stop` in any Claude
+Code chat. About 10 seconds after Claude's reply, the chat gets a TEST
+message and answers it by itself.
+
 Needs Claude Code 2.1.234+ on Windows (2.1.224+ elsewhere). Tested on Windows
 with Claude Code 2.1.314; the terminal UI and macOS/Linux are not tested yet.
 How it works, settings and caveats: [docs/AUTO-CONTINUE.md](./docs/AUTO-CONTINUE.md).
