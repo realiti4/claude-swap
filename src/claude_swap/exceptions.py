@@ -37,6 +37,17 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class LiveAccountChanged(SwitchError):
+    """The live account is no longer the one the caller expected to leave.
+
+    Raised under the switch lock before the live login is touched, so the caller's
+    decision -- made against an account that has since been switched away
+    from -- is dropped rather than applied to whoever is live now.
+    """
+
+    pass
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 

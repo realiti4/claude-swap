@@ -29,9 +29,13 @@ whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
 
-Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
-(so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
-read-modify-write under a dedicated file lock.
+Cooldown, quarantine and the last manual pick persist in
+``<backup_root>/autoswitch_state.json`` (so cron-driven ``cswap auto --once``
+ticks behave across processes), mutated read-modify-write under a dedicated
+file lock. With ``manualHoldSeconds`` set, a human's ``cswap switch`` (the CLI
+command only — not the TUI or menu bar) records that pick, and proactive,
+consume-first and priority moves off the picked account are suppressed for
+that long (at-limit and failover still switch).
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, LiveAccountChanged
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
@@ -66,6 +70,35 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+
+
+def _state_lock_for(state_path: Path) -> FileLock:
+    return FileLock(state_path.parent / ".autoswitch_state.lock")
+
+
+def _read_state_file(state_path: Path) -> dict:
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def record_manual_switch(backup_dir: Path, number: str, ts: float) -> None:
+    """Persist a human's ``cswap switch`` pick for the engine's manual hold.
+
+    Lives in the engine's own state file rather than a second store so a
+    resident ``cswap auto`` loop and a cron ``--once`` tick both see it under
+    the same lock as the cooldown bookkeeping. Only the CLI calls this — the
+    engine's own switches never count as a pick.
+    """
+    state_path = backup_dir / STATE_FILENAME
+    with _state_lock_for(state_path):
+        state = _read_state_file(state_path)
+        state["schemaVersion"] = STATE_SCHEMA_VERSION
+        state["manualSwitch"] = {"number": str(number), "at": ts}
+        atomic_write_json(state_path, state)
+
 
 _logger = logging.getLogger("claude-swap")
 
@@ -719,14 +752,10 @@ class AutoSwitchEngine:
     # -- state file ---------------------------------------------------------
 
     def _state_lock(self) -> FileLock:
-        return FileLock(self.state_path.parent / ".autoswitch_state.lock")
+        return _state_lock_for(self.state_path)
 
     def _read_state(self) -> dict:
-        try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
+        return _read_state_file(self.state_path)
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -1258,8 +1287,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
-            self._emit(NoSwitchEvent(reason="cooldown"))
+        if self._voluntary_move_blocked(trigger, state, current):
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
@@ -1595,7 +1623,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, current)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1626,7 +1654,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, current)
 
         if systemic or transient_failure:
             self._emit(
@@ -2451,6 +2479,7 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        evaluated: str,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2472,12 +2501,22 @@ class AutoSwitchEngine:
         # switch path (cswap FileLock + Claude Code locks) never takes the
         # state lock.
         with self._state_lock():
+            # Re-read: a manual pick recorded since the decision must hold
+            # this switch just as the cooldown does.
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
-                self._emit(NoSwitchEvent(reason="cooldown"))
+            if self._voluntary_move_blocked(trigger, state, evaluated):
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            try:
+                result = self.switcher.switch_to(
+                    number, json_output=True, expect_current=evaluated
+                )
+            except LiveAccountChanged as e:
+                # Someone switched after this tick read usage — the decision
+                # was about an account that is no longer live, and the
+                # manual-pick marker may not be written yet.
+                self._emit(NoSwitchEvent(reason="live-account-changed", detail=str(e)))
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -2490,6 +2529,9 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            # The human's pick ends the moment the engine moves off it; a
+            # later engine landing back on that account is not a pick.
+            state.pop("manualSwitch", None)
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present
@@ -2545,6 +2587,44 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _voluntary_move_blocked(self, trigger: str, state: dict, current: str) -> bool:
+        """Whether a manual hold or the cooldown stops this move (emitting
+        why). Only voluntary triggers are held; at-limit and failover escape."""
+        if trigger not in ("proactive", "consume-first", "priority"):
+            return False
+        hold_left = self._manual_hold_remaining(state, current)
+        if hold_left > 0:
+            self._emit(
+                NoSwitchEvent(
+                    reason="manual-hold",
+                    detail=(
+                        f"{math.ceil(hold_left)}s left on manual pick of "
+                        f"account {current}"
+                    ),
+                )
+            )
+            return True
+        if self._in_cooldown(state):
+            self._emit(NoSwitchEvent(reason="cooldown"))
+            return True
+        return False
+
+    def _manual_hold_remaining(self, state: dict, current: str) -> float:
+        """Seconds the active account is still protected by a human's pick.
+
+        0 when the hold is off, no pick is recorded, the pick was for another
+        account (the human's choice has already been left behind), or the
+        window has elapsed.
+        """
+        hold = self.settings.manual_hold_seconds
+        marker = state.get("manualSwitch")
+        if hold <= 0 or not isinstance(marker, dict):
+            return 0.0
+        at = marker.get("at")
+        if str(marker.get("number")) != str(current) or not isinstance(at, (int, float)):
+            return 0.0
+        return max(0.0, hold - (self.clock() - at))
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]
