@@ -69,6 +69,7 @@ class SnapshotSource:
         self._last: AccountsSnapshot | None = None
         self._read_stamp: tuple | None = None  # what the last read started under
         self._read_at = 0.0
+        self._plans_owed = True  # set by a store read, cleared by a plan refresh
         self._lock = threading.Lock()
         self._plans_lock = threading.Lock()
 
@@ -106,6 +107,7 @@ class SnapshotSource:
         with self._lock:
             snap = self._reconcile(snap)
             self._last, self._read_stamp, self._read_at = snap, stamp, now
+            self._plans_owed = True
             return snap
 
     def refresh_plans(self) -> None:
@@ -114,13 +116,19 @@ class SnapshotSource:
         The counterpart of ``take(store_only=True)``, which never reaches the
         network: a shell whose snapshots are store-only calls this to keep its
         plan labels current. Overlapping calls collapse into the running one.
-        Display-only, so a failure is logged and goes no further.
+        It reads every slot's credential, so it runs only after a take that
+        read the store: one that reused the snapshot owes none, and the
+        reread floor still bounds the wait. Display-only, so a failure is
+        logged and goes no further.
         """
         if not self._plans_lock.acquire(blocking=False):
             return
         try:
-            self.switcher.refresh_subscription_plans()
+            if self._plans_owed:
+                self._plans_owed = False
+                self.switcher.refresh_subscription_plans()
         except Exception:
+            self._plans_owed = True
             _logger.debug("plan refresh failed", exc_info=True)
         finally:
             self._plans_lock.release()

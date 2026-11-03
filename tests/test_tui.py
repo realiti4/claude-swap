@@ -462,6 +462,21 @@ class TestSnapshotSource:
         # The reused snapshot is as of now, not of the read.
         assert polled.taken_at == 1027.0 and first.taken_at != polled.taken_at
 
+    def test_plans_refresh_only_after_the_store_was_read(self, tmp_path):
+        """refresh_plans re-reads every slot's credential, so a poll that reused
+        the snapshot owes none: the reread floor would otherwise be moot."""
+        fake, source, clock, handles = self._stamped(tmp_path)
+        for _ in range(5):  # five 3 s polls, all inside 30 s
+            source.take(store_only=True)
+            source.refresh_plans()
+            clock[0] += 3.0
+        assert fake.plan_refreshes == 1
+        _bump(handles["keychain"])
+        source.take(store_only=True)
+        source.refresh_plans()
+        source.refresh_plans()  # nothing was read in between
+        assert fake.plan_refreshes == 2
+
     @pytest.mark.parametrize("move, kwargs", [
         (lambda h, c, s: _bump(h["keychain"]), {"store_only": True}),
         (lambda h, c, s: _bump(h["plaintext"]), {"store_only": True}),
