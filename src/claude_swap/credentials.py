@@ -1277,10 +1277,17 @@ class CredentialStore:
         one a caller that wants "this slot's own key, and nothing found
         under any other slot" reaches for.
         """
-        return self._read_account_credentials_direct(account_num, email, failed)
+        return self._read_account_credentials_direct(
+            account_num, email, failed, cached=cached
+        )
 
     def _read_account_credentials_direct(
-        self, account_num: str, email: str, failed: list | None = None
+        self,
+        account_num: str,
+        email: str,
+        failed: list | None = None,
+        *,
+        cached: bool = False,
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
 
