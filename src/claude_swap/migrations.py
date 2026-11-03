@@ -26,14 +26,13 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import MigrationIncomplete
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.models import Platform, get_timestamp
 from claude_swap.switcher import KEYRING_SERVICE, SECURITY_SERVICE
 
@@ -73,32 +72,16 @@ def _load_applied(switcher: "ClaudeAccountSwitcher") -> dict:
 def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
     """Record ``migration_id`` as applied, written atomically.
 
-    Preserves any previously-recorded migrations. Mirrors the mkstemp +
-    ``os.replace`` pattern used by ``ClaudeAccountSwitcher._write_credentials``.
-    The state file holds no secrets, but we ``chmod 0o600`` on non-Windows to
-    match the other local state files.
+    Preserves any previously-recorded migrations. Published through the shared
+    ``fsutil.atomic_write_text`` (0600 temp beside the target, rename), like
+    every other local state file; this one holds no secrets, the mode simply
+    matches.
     """
     path = _state_path(switcher)
     applied = _load_applied(switcher)
     applied[migration_id] = get_timestamp()
     content = json.dumps({"version": STATE_VERSION, "applied": applied}, indent=2)
-
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        os.write(fd, content.encode("utf-8"))
-        os.close(fd)
-        fd = -1
-        replace_with_retry(tmp_path, str(path))
-        if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, content)
 
 
 # ---------------------------------------------------------------------------
