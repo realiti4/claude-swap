@@ -411,6 +411,11 @@ service-account keys scoped to a single workspace: a multi-workspace key needs a
 `anthropic-workspace-id` header on every request, which Claude Code does not add for
 a stored key.
 
+**Note:** Third-party providers configured through `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` are not managed or switched; those
+exported variables stay in effect after a switch, so unset them to use the
+swapped account.
+
 ## Uninstall
 
 Remove all data:
