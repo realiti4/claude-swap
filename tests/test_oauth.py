@@ -1291,15 +1291,19 @@ class TestSetupTokenHeaderProbe:
         assert "rejected" in line and "account 3" in line
         assert "a@b.c" not in line and self.TOKEN not in line
 
-    def test_probe_429_without_headers_is_a_rejection(self):
-        fake, _ = self._route(
-            self._endpoint_error(), self._probe_429({"Retry-After": "30"})
-        )
+    @pytest.mark.parametrize("values", [
+        {"Retry-After": "30"},
+        # Unified headers but no rejected status: still not a quota refusal.
+        {**_UNIFIED_HEADERS, "Retry-After": "30"},
+    ])
+    def test_bare_429_stays_an_http_429_failure(self, values):
+        """Only ``unified-status: rejected`` proves the quota refuses; a bare
+        429 is a failure with its Retry-After, never zero headroom."""
+        fake, _ = self._route(self._endpoint_error(), self._probe_429(values))
         outcome = self._fetch(fake)
-        assert outcome.error is None
-        assert set(outcome.usage) == {"rejected", "source"}
-        assert outcome.usage["rejected"]["retry_after_s"] == 30.0
-        assert oauth.account_headroom(outcome.usage) == 0.0
+        assert outcome.usage is None
+        assert outcome.error == "http-429"
+        assert outcome.retry_after_s == 30.0
 
     def test_revoked_token_surfaces_the_probe_401(self):
         revoked = urllib.error.HTTPError(

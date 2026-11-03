@@ -529,12 +529,15 @@ def request_usage_via_probe(access_token: str) -> dict:
     request asks for a single Haiku output token. Returns the raw usage API
     shape (possibly empty) from :func:`parse_unified_ratelimit_headers`.
 
-    A 429 is the account refusing inference, whatever the utilization
+    A 429 carrying ``anthropic-ratelimit-unified-status: rejected`` is the
+    account confirming its quota refuses inference, whatever the utilization
     numbers say (a per-model or overage limit can bind below 100% on 5h/7d),
     so it is returned as a reading with a ``rejected`` entry rather than
     raised: ``{"retry_after_s": Retry-After or None, "resets_at": when the
     refusal ends — now + Retry-After, else the unified reset header, else
-    None}``. Any other error re-raises.
+    None}``. A bare 429 (no rejected status) proves no exhaustion and
+    re-raises like any other error, so it stays an ``http-429`` failure
+    with its Retry-After.
     """
     body = json.dumps({
         "model": USAGE_PROBE_MODEL,
@@ -556,11 +559,11 @@ def request_usage_via_probe(access_token: str) -> dict:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
-        if e.code != 429:
-            raise
         data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}
+        if e.code != 429 or "rejected" not in data:
+            raise
         _kind, retry_after = _classify_usage_error(e)
-        rejected = data.get("rejected") or {"resets_at": None}
+        rejected = data["rejected"]
         if retry_after is not None:
             rejected["resets_at"] = (
                 datetime.now(timezone.utc) + timedelta(seconds=retry_after)

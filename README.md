@@ -393,12 +393,14 @@ cswap add-token --email user@example.com     # optional label override
 scope is inference-only), so cswap does not ask it and shows these accounts as
 `usage unavailable`. With `cswap config set usage.headerProbe true`, cswap reads
 their 5h/7d utilization (and Fable's weekly window) from the rate-limit headers of
-a 1-output-token Haiku request instead, sent at the normal poll cadence. Each probe
-is a real (tiny) request on that account's subscription, which is why it is off by
-default. Other per-model windows and extra-usage spend are not in those headers. A
-reading missing the 5h or 7d window (or a window `autoswitch.model` names) is shown
-but not used for auto-switching, and a refused probe marks the account as at its
-limit until the refusal's `Retry-After` passes.
+a 1-output-token Haiku request instead, sent at the normal poll cadence. Each
+probe is a real (tiny) request on that account's subscription, which is why it is
+off by default. Other per-model windows and extra-usage spend are not in those
+headers. A reading missing the 5h or 7d window (or a window `autoswitch.model`
+names) is shown but not used for auto-switching, and a probe the server rejects
+for quota marks the account as at its limit, with no further probe, until the
+refusal's `Retry-After` passes. A bare 429 without that rejection is treated like
+any other failed fetch.
 
 **API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
 (`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses

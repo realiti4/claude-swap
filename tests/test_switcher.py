@@ -1310,6 +1310,79 @@ class TestSetupTokenHeaderProbeWiring:
         assert first.next_poll_at is not None
         assert oauth.account_headroom(second.decision_value()) == 50.0
 
+    def _probe_switcher(self, probe_result):
+        """A switcher with the probe on, its store on a fake clock, and a
+        urlopen fake answering every probe with ``probe_result``."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+        clock = {"now": time.time()}
+        switcher._usage_store.clock = lambda: clock["now"]
+        urls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            urls.append(req.full_url)
+            if isinstance(probe_result, Exception):
+                raise probe_result
+            return probe_result
+
+        return switcher, clock, urls, fake_urlopen
+
+    @staticmethod
+    def _probe_429(headers: dict):
+        import email.message
+        hdrs = email.message.Message()
+        for key, value in headers.items():
+            hdrs[key] = value
+        return urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 429, "Too Many", hdrs=hdrs, fp=None,
+        )
+
+    def test_bare_429_is_a_failure_not_an_exhausted_reading(self, temp_home: Path):
+        switcher, clock, urls, fake = self._probe_switcher(
+            self._probe_429({"Retry-After": "30"})
+        )
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake):
+            entry = switcher._collect_usage_entries([self._info()])["3"]
+        assert urls == [oauth.USAGE_PROBE_URL]
+        assert entry.last_good is None
+        assert entry.last_error == "http-429"
+        assert entry.backoff_until >= clock["now"] + 30
+        # Unknown, not at its limit: nothing for an at-limit switch to read.
+        assert oauth.account_headroom(entry.decision_value()) is None
+
+    @pytest.mark.parametrize("fetch", [None, {"3"}])
+    def test_no_probe_before_a_rejection_retry_deadline(
+        self, temp_home: Path, fetch
+    ):
+        """A confirmed rejection with Retry-After: 3600 blocks every collect,
+        plan-respecting or not, until the deadline passes."""
+        now = int(time.time())
+        rejected = self._probe_429({
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-5h-utilization": "0.2",
+            "anthropic-ratelimit-unified-5h-reset": str(now + 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.3",
+            "anthropic-ratelimit-unified-7d-reset": str(now + 86400),
+            "Retry-After": "3600",
+        })
+        switcher, clock, urls, fake = self._probe_switcher(rejected)
+        start = clock["now"]
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake):
+            first = switcher._collect_usage_entries([self._info()], fetch)["3"]
+            assert urls == [oauth.USAGE_PROBE_URL]
+            assert first.last_good["rejected"]["retry_after_s"] == 3600.0
+            assert first.backoff_until == start + 3600
+            for elapsed in (601, 1800, 3599):
+                clock["now"] = start + elapsed
+                switcher._collect_usage_entries([self._info()], fetch)
+            assert len(urls) == 1
+            clock["now"] = start + 3601
+            switcher._collect_usage_entries([self._info()], fetch)
+        assert len(urls) == 2
+
     def test_probe_off_sends_no_request_and_says_why(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
