@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import sys
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,7 +20,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
 from claude_swap.models import Platform, get_timestamp, normalize_alias
@@ -108,28 +106,20 @@ def _atomic_write_file(path: Path, content: str) -> None:
     the export payload carries live OAuth refresh tokens, and a write-then-
     chmod sequence leaves the temp file at the umask-derived default mode
     (typically world-readable) for the window between creation and the chmod
-    call. Same pattern as ``credentials.py``/``settings.py``/``migrations.py``.
+    call. The shared ``fsutil.atomic_write_text`` is that pattern.
+
+    ``follow_symlinks=False``: the destination is a path the user typed, often
+    under a shared directory such as ``/tmp``, and a symlink planted there by
+    another local user must not redirect an export full of refresh tokens onto
+    a file of their choosing. The rename replaces the link itself (in a sticky
+    directory a foreign entry makes that rename fail, which is the right
+    outcome).
     """
     if path.is_dir():
         raise TransferError(
             f"export destination must be a file path, not a directory: {path}"
         )
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        os.write(fd, content.encode("utf-8"))
-        os.close(fd)
-        fd = -1
-        replace_with_retry(tmp_path, str(path))
-        if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, content, follow_symlinks=False)
 
 
 def _slim_config(config_obj: dict, label: str) -> dict:
@@ -252,7 +242,7 @@ def export_accounts(
         if not full:
             config_obj = _slim_config(config_obj, f"config for {email}")
 
-        # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
+        # API-key accounts store the credential as a raw ``sk-ant-…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
         is_api_key = looks_like_api_key(creds_text)
@@ -392,7 +382,8 @@ def import_accounts(
         if is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
-                    f"API-key credentials for {email} must be a raw sk-ant-api… string"
+                    f"API-key credentials for {email} must be a raw sk-ant-… key "
+                    "(not an OAuth token)"
                 )
             creds_text = creds_obj.strip()
         else:

@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
+from claude_swap import pace, subscription
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
+from claude_swap.oauth import FIVE_HOUR_LABEL
+from claude_swap.printer import format_age
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -133,7 +135,7 @@ def usage_rows(
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
             reset, reset_full = _reset_parts(window, now)
@@ -157,7 +159,52 @@ def usage_rows(
                 suffix = f"{suffix}  {marker}" if suffix else marker
                 suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
         rows.append((window["name"], pct, suffix, suffix_full))
+    rejected = last_good.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe: at its limit until the refusal ends,
+        # whatever the windows above say (auto-switching excludes it).
+        reset, reset_full = _reset_parts(rejected, now)
+        suffix = f"rejected (!)  {reset}" if reset else "rejected (!)"
+        suffix_full = f"rejected (!)  {reset_full}" if reset_full else "rejected (!)"
+        rows.append(("probe", 100.0, suffix, suffix_full))
     return rows
+
+
+def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
+    """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
+    a lapsed subscription is a highlighted ``Free`` rather than an appended
+    "expired", and the age follows once the plan has gone two TTLs without
+    refreshing."""
+    record = acc.subscription_plan
+    if not record:
+        return
+    plan = record["plan"]
+    text.append(f"{gap}· ", style=palette.muted)
+    text.append(
+        subscription.plan_label(plan),
+        style=palette.sev_warn if subscription.is_expired(plan) else palette.muted,
+    )
+    if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
+        age = format_age(int(record["fetchedAt"] * 1000))
+        text.append(f" ({age})", style=palette.muted)
+
+
+def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
+    """Badge strings for the account's per-account policy, in display order.
+
+    Returns an empty list for an account carrying no policy, which is every
+    account in a store that has never used the feature — that is what keeps
+    those rows byte-identical to their pre-policy render.
+
+    ``gap`` is the leading separator each render path already uses for its own
+    badges (three spaces on the card, two on the minimized row).
+    """
+    badges: list[str] = []
+    if acc.policy.threshold is not None:
+        # ``:g`` so 75.0 reads as "75%" and 82.5 keeps its fraction — the store
+        # accepts one decimal place and the row shows back exactly what was set.
+        badges.append(f"{gap}th {acc.policy.threshold:g}%")
+    return badges
 
 
 def account_card_text(
@@ -165,10 +212,14 @@ def account_card_text(
     width: int,
     *,
     threshold: float | None = None,
+    weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
-    """The full account card: header line + per-window bar rows."""
+    """The full account card: header line + per-window bar rows. Each row's
+    tick is the switch line that row is judged against: ``threshold`` on the
+    5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
+    per-model rows, which reset weekly."""
     now = now if now is not None else time.time()
 
     text = Text()
@@ -183,6 +234,9 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    for badge in _policy_badges(acc, "   "):
+        text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "   ", palette)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -225,6 +279,11 @@ def account_card_text(
         # spend row degrading doesn't cost the 5h/7d rows their clocks
         if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
             suffix = suffix_full
+        row_line = (
+            weekly_threshold
+            if weekly_threshold is not None and label not in ("$$", FIVE_HOUR_LABEL)
+            else threshold
+        )
         text.append("\n    ")
         text.append(
             usage_bar(
@@ -233,7 +292,7 @@ def account_card_text(
                 suffix or None,
                 bar_width,
                 stale=stale,
-                threshold=threshold,
+                threshold=row_line,
                 palette=palette,
             )
         )
@@ -260,6 +319,9 @@ def mini_account_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
+    for badge in _policy_badges(acc, "  "):
+        text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "  ", palette)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
@@ -296,6 +358,8 @@ def mini_account_text(
         for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
         if float(w["pct"]) >= 100
     ]
+    if isinstance(last_good, dict) and isinstance(last_good.get("rejected"), dict):
+        maxed.append("rejected")  # a refused setup-token probe
     for name in maxed:
         if parts:
             text.append(" · ", style=palette.track)
@@ -339,7 +403,8 @@ class AccountsPanel(Static):
             if acc.is_active:
                 blocks.append(
                     account_card_text(
-                        acc, width, threshold=app.threshold_pct, now=now,
+                        acc, width, threshold=app.threshold_pct,
+                        weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette,
                     )
                 )

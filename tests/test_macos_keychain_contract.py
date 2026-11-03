@@ -515,6 +515,11 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
 
         store = macos_switcher._store
         real_get = _kc.get_password
+        # Backup reads honour the failure cooldown (#496). This test is about
+        # the per-read verdict, not the backoff: let the deadline lapse at once.
+        monkeypatch.setattr(
+            "claude_swap.credentials.KEYCHAIN_RECHECK_COOLDOWN_S", 0.0
+        )
 
         def locked(*_a, **_kw):
             raise _kc.KeychainError("locked")
@@ -877,6 +882,12 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
 
         store = macos_switcher._store
         store._keychain_usable_cache = True
+        # Backup reads honour the failure cooldown (#496); without this the
+        # first denied read would stop every later read from spawning at all
+        # and the race under test would never run.
+        monkeypatch.setattr(
+            "claude_swap.credentials.KEYCHAIN_RECHECK_COOLDOWN_S", 0.0
+        )
 
         def get_password(service, account):
             time.sleep(0.004)                    # a `security` subprocess

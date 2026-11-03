@@ -41,6 +41,12 @@ from claude_swap.transfer import export_accounts, import_accounts
 
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4  # 53 chars
 OTHER_KEY = "sk-ant-api03-" + "z9y8x7w6v5" * 4
+# The Console also issues identity-backed keys under other family prefixes — a
+# personal key is ``sk-ant-usr-…`` (#465). OAuth material (setup/access token,
+# refresh token) is what must NOT classify as a key.
+PERSONAL_KEY = "sk-ant-usr-" + "u1v2w3x4y5" * 9  # 101 chars
+SETUP_TOKEN = "sk-ant-oat01-" + "o9p8q7r6s5" * 4
+REFRESH_TOKEN = "sk-ant-ort01-" + "r4s3t2u1v0" * 4
 OAUTH_JSON = json.dumps(
     {"claudeAiOauth": {"accessToken": "tok", "refreshToken": "rtok", "expiresAt": 9}}
 )
@@ -72,17 +78,34 @@ def _read_global_config() -> dict:
 
 
 class TestKindDetection:
-    def test_api_key_detected(self):
-        assert looks_like_api_key(API_KEY) is True
+    @pytest.mark.parametrize(
+        "value",
+        [
+            API_KEY,  # legacy workspace key
+            PERSONAL_KEY,  # identity-backed personal key (#465)
+            # A family that doesn't exist yet is still a key: the rule is a
+            # denylist of OAuth prefixes, not an allowlist of key prefixes.
+            "sk-ant-new99-" + "k" * 40,
+            "sk-ant-admin01-" + "d" * 40,  # Admin API key: the wrong key, still a key
+        ],
+    )
+    def test_api_key_detected(self, value):
+        assert looks_like_api_key(value) is True
+        assert looks_like_api_key(f"  {value}\n") is True  # surrounding whitespace
 
     @pytest.mark.parametrize(
         "value",
         [
             "",
             None,
-            "sk-ant-oat01-abcdef",  # setup-token, not a key
+            SETUP_TOKEN,  # setup-token, not a key
+            f"  {SETUP_TOKEN}\n",  # ...whitespace doesn't change that
+            REFRESH_TOKEN,  # a stray refresh token is OAuth material too
+            "sk-ant-oat",  # the bare prefix alone
+            "not-a-key",  # non-sk-ant string: left to the OAuth path, as before
             OAUTH_JSON,  # OAuth JSON blob
             '{"x": "sk-ant-api03-inside-json"}',  # JSON that merely contains a key
+            '{"x": "sk-ant-usr-inside-json"}',
         ],
     )
     def test_non_api_key(self, value):
@@ -112,14 +135,29 @@ class TestAddTokenApiKey:
         out = capsys.readouterr().out
         assert "Added" in out and "API key" in out
 
-    def test_setup_token_stays_oauth(self, temp_home: Path):
+    def test_adds_personal_key_account(self, temp_home: Path, capsys):
+        # #465: a Console personal key (sk-ant-usr…) used to be wrapped as a
+        # setup-token — kindless, labelled setup-token-N, and activated as a fake
+        # claude.ai login. It is an API key: kind, label and raw storage follow.
         s = _linux_switcher()
-        s.add_account_from_token("sk-ant-oat01-abc")
+        s.add_account_from_token(PERSONAL_KEY, slot=4)
+        assert s._account_kind("4") == "api_key"
+        data = s._get_sequence_data()
+        assert data["accounts"]["4"]["email"] == "api-key-4@token.local"
+        assert s._read_account_credentials("4", "api-key-4@token.local") == PERSONAL_KEY
+        assert "API key" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("token", [SETUP_TOKEN, REFRESH_TOKEN])
+    def test_oauth_prefixed_token_stays_oauth(self, temp_home: Path, token):
+        # Only the OAuth token prefixes keep a bare sk-ant-… value off the key
+        # path: a raw/garbled setup-token must never activate as an API key.
+        s = _linux_switcher()
+        s.add_account_from_token(token)
         assert s._account_kind("1") == "oauth"
         email = s._get_sequence_data()["accounts"]["1"]["email"]
         assert email == "setup-token-1@token.local"
         blob = json.loads(s._read_account_credentials("1", email))
-        assert blob["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-abc"
+        assert blob["claudeAiOauth"]["accessToken"] == token
 
     def test_refresh_in_place_same_api_key_account(self, temp_home: Path):
         s = _linux_switcher()
@@ -150,17 +188,18 @@ class TestCrossKindCollision:
 
 
 class TestWriteCredentialsLinux:
-    def test_activate_key_then_oauth(self, temp_home: Path):
+    @pytest.mark.parametrize("key", [API_KEY, PERSONAL_KEY])
+    def test_activate_key_then_oauth(self, temp_home: Path, key):
         s = _linux_switcher()
         cred_file = get_credentials_path()
         cred_file.parent.mkdir(parents=True, exist_ok=True)
         cred_file.write_text(OAUTH_JSON, encoding="utf-8")
 
         # Activate the API key: primaryApiKey + approved set, OAuth file cleared.
-        s._write_credentials(API_KEY)
+        s._write_credentials(key)
         cfg = _read_global_config()
-        assert cfg["primaryApiKey"] == API_KEY
-        assert API_KEY[-20:] in cfg["customApiKeyResponses"]["approved"]
+        assert cfg["primaryApiKey"] == key
+        assert key[-20:] in cfg["customApiKeyResponses"]["approved"]
         assert not cred_file.exists()
 
         # Switch back to OAuth: file restored, primaryApiKey dropped, approved kept.
@@ -168,7 +207,7 @@ class TestWriteCredentialsLinux:
         assert cred_file.read_text(encoding="utf-8") == OAUTH_JSON
         cfg = _read_global_config()
         assert "primaryApiKey" not in cfg
-        assert API_KEY[-20:] in cfg["customApiKeyResponses"]["approved"]
+        assert key[-20:] in cfg["customApiKeyResponses"]["approved"]
 
     def test_read_credentials_returns_active_key(self, temp_home: Path):
         s = _linux_switcher()
@@ -237,17 +276,19 @@ class TestUsageDisplay:
     def test_usage_fields_maps_api_key(self):
         assert usage_fields(USAGE_API_KEY) == ("api_key", None)
 
-    def test_collect_usage_short_circuits(self, temp_home: Path):
+    @pytest.mark.parametrize("key", [API_KEY, PERSONAL_KEY])
+    def test_collect_usage_short_circuits(self, temp_home: Path, key):
         s = _linux_switcher()
-        info = [(2, "api-key-2@token.local", "", "", False, API_KEY, "")]
+        info = [(2, "api-key-2@token.local", "", "", False, key, "")]
         entries = s._collect_usage_entries(info)
         assert entries["2"].sentinel == USAGE_API_KEY
         assert entries["2"].decision_value() == USAGE_API_KEY
 
-    def test_active_account_usage_short_circuits(self, temp_home: Path):
+    @pytest.mark.parametrize("key", [API_KEY, PERSONAL_KEY])
+    def test_active_account_usage_short_circuits(self, temp_home: Path, key):
         s = _linux_switcher()
         get_global_config_path().write_text(
-            json.dumps({"primaryApiKey": API_KEY}), encoding="utf-8"
+            json.dumps({"primaryApiKey": key}), encoding="utf-8"
         )
         entry = s._active_account_usage("2", "api-key-2@token.local", "")
         assert entry.sentinel == USAGE_API_KEY
@@ -288,14 +329,17 @@ class TestStrategyBehaviour:
 
 
 class TestAddAccountGuard:
-    def test_rejects_live_api_key_login(self, temp_home: Path):
+    @pytest.mark.parametrize("key", [API_KEY, PERSONAL_KEY])
+    def test_rejects_live_api_key_login(self, temp_home: Path, key):
         s = _linux_switcher()
-        # Lingering oauthAccount identity + an active managed key in config.
+        # Lingering oauthAccount identity + an active managed key in config. For a
+        # personal key this is the #465 hazard on the capture side: an unrecognised
+        # live key would be snapshotted as a kindless OAuth slot.
         get_global_config_path().write_text(
             json.dumps(
                 {
                     "oauthAccount": {"emailAddress": "stale@example.com"},
-                    "primaryApiKey": API_KEY,
+                    "primaryApiKey": key,
                 }
             ),
             encoding="utf-8",
@@ -333,17 +377,18 @@ class TestSessionGuard:
 
 
 class TestExportImport:
-    def test_round_trip_preserves_key_and_kind(self, tmp_path: Path):
+    @pytest.mark.parametrize("key", [API_KEY, PERSONAL_KEY])
+    def test_round_trip_preserves_key_and_kind(self, tmp_path: Path, key):
         src_home = tmp_path / "src"
         (src_home / ".claude").mkdir(parents=True)
         with _patched_home(src_home):
             src = _linux_switcher()
-            src.add_account_from_token(API_KEY, slot=1)
+            src.add_account_from_token(key, slot=1)
             out = tmp_path / "b.cswap"
             export_accounts(src, str(out))
             payload = json.loads(out.read_text(encoding="utf-8"))
             # exported as a raw string, tagged api_key — not a JSON object.
-            assert payload["accounts"][0]["credentials"] == API_KEY
+            assert payload["accounts"][0]["credentials"] == key
             assert payload["accounts"][0]["kind"] == "api_key"
 
         dst_home = tmp_path / "dst"
@@ -352,7 +397,7 @@ class TestExportImport:
             dst = _linux_switcher()
             import_accounts(dst, str(out))
             assert dst._account_kind("1") == "api_key"
-            assert dst._read_account_credentials("1", "api-key-1@token.local") == API_KEY
+            assert dst._read_account_credentials("1", "api-key-1@token.local") == key
 
 
 class _patched_home:
@@ -825,7 +870,7 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         def no_space(*_a, **_kw):
             raise OSError(28, "No space left on device")
 
-        with patch("claude_swap.switcher.shutil.copy", side_effect=no_space):
+        with patch("claude_swap.switcher.atomic_write_bytes", side_effect=no_space):
             with pytest.raises(SwitchError):
                 s.switch_to("2", json_output=True)
 
