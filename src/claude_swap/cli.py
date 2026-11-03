@@ -877,6 +877,8 @@ Defaults live in settings.json in the backup root; flags override them.
         default=None,
         help=(
             "Target selection: 'best' (most quota left), "
+            "'weekly-first' (switch at the threshold like best, onto the "
+            "account whose weekly window resets soonest), "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest; default), 'dynamic' (consume-first's ranking "
             "plus a re-picked model basis and a landing rule that never lands "

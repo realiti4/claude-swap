@@ -25,11 +25,12 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
 # The header probe: a 1-output-token Haiku request whose response headers
-# carry the account's unified 5h/7d utilization. Pinned to a model snapshot,
-# so it needs updating when that snapshot retires (the probe then fails with
-# http-404 and the account shows its usage as unavailable, as before).
+# carry the account's unified 5h/7d utilization. The undated id names the
+# current Haiku generation rather than a dated snapshot, which retires
+# sooner; once a model is gone the probe fails with http-404 and the account
+# shows its usage as unavailable until the id is updated.
 USAGE_PROBE_URL = "https://api.anthropic.com/v1/messages"
-USAGE_PROBE_MODEL = "claude-haiku-4-5-20251001"
+USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
