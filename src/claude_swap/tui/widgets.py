@@ -163,19 +163,22 @@ def usage_rows(
 
 
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
-    """``· Max 20x`` after the header, ``(expired)`` when lapsed — the same
-    marker ``cswap list`` prints, including the age once the plan has gone two
-    TTLs without refreshing."""
+    """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
+    a lapsed subscription is a highlighted ``Free`` rather than an appended
+    "expired", and the age follows once the plan has gone two TTLs without
+    refreshing."""
     record = acc.subscription_plan
     if not record:
         return
     plan = record["plan"]
-    text.append(f"{gap}· {subscription.plan_label(plan)}", style=palette.muted)
+    text.append(f"{gap}· ", style=palette.muted)
+    text.append(
+        subscription.plan_label(plan),
+        style=palette.sev_warn if subscription.is_expired(plan) else palette.muted,
+    )
     if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
         age = format_age(int(record["fetchedAt"] * 1000))
         text.append(f" ({age})", style=palette.muted)
-    if subscription.is_expired(plan):
-        text.append(" (expired)", style=palette.sev_warn)
 
 
 def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:

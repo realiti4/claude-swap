@@ -709,11 +709,11 @@ class TestListMarker:
         marker = _plan_marker({"plan": TEAM, "fetchedAt": 1000.0}, now=1000.0)
         assert "Team" in marker and "expired" not in marker
 
-    def test_expired(self):
+    def test_lapsed_is_free_without_the_word_expired(self):
         from claude_swap.switcher import _plan_marker
 
         marker = _plan_marker({"plan": LAPSED, "fetchedAt": 1000.0}, now=1000.0)
-        assert "Free" in marker and "(expired)" in marker
+        assert "Free" in marker and "expired" not in marker
 
     def test_age_only_once_stale(self):
         from claude_swap.switcher import _plan_marker
@@ -787,9 +787,20 @@ class TestTuiMarker:
     def test_label(self):
         assert self._render({"plan": TEAM, "fetchedAt": time.time()}) == "  · Team"
 
-    def test_expired(self):
-        rendered = self._render({"plan": LAPSED, "fetchedAt": time.time()})
-        assert "Free" in rendered and "(expired)" in rendered
+    def test_lapsed_is_a_highlighted_free_with_no_extra_words(self):
+        from rich.text import Text
+
+        from claude_swap.tui.widgets import _append_plan
+
+        text = Text()
+        record = {"plan": LAPSED, "fetchedAt": time.time()}
+        _append_plan(text, _snap(subscription_plan=record), "  ", _Palette())
+        assert text.plain == "  · Free"
+        assert any(
+            span.style == _Palette.sev_warn
+            and text.plain[span.start : span.end] == "Free"
+            for span in text.spans
+        )
 
     def test_stale_age_uses_the_same_wording_as_list(self):
         """12h old is the first stale moment — it must not read as "0d ago"."""

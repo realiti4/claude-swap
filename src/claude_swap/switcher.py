@@ -231,7 +231,10 @@ def last_seen_note(entry: UsageEntry) -> str | None:
 
 
 def _plan_marker(record: dict | None, now: float) -> str:
-    """`` · Max 20x`` after a slot's header, plus ``(expired)`` when lapsed.
+    """`` · Max 20x`` after a slot's header; a lapsed subscription is a
+    highlighted ``Free``. No words: a bare "expired" beside an account reads
+    as the OAuth token, which this tool also calls expired, the row is long
+    already, and ``--json`` carries ``expired``/``subscriptionStatus``.
 
     A plan that has not refreshed in two TTLs carries its age, so a label kept
     alive by a slot whose profile calls keep failing reads as old rather than
@@ -240,11 +243,10 @@ def _plan_marker(record: dict | None, now: float) -> str:
     if not record:
         return ""
     plan = record["plan"]
-    marker = f" {muted('· ' + subscription.plan_label(plan))}"
+    paint = yellowed if subscription.is_expired(plan) else muted
+    marker = f" {muted('·')} {paint(subscription.plan_label(plan))}"
     if now - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
         marker += f" {dimmed('(' + format_age(int(record['fetchedAt'] * 1000)) + ')')}"
-    if subscription.is_expired(plan):
-        marker += f" {yellowed('(expired)')}"
     return marker
 
 
