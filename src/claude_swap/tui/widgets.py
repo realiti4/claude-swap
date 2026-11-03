@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
+from claude_swap import pace, subscription
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
+from claude_swap.printer import format_age
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -161,6 +162,22 @@ def usage_rows(
     return rows
 
 
+def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
+    """``· Max 20x`` after the header, ``(expired)`` when lapsed — the same
+    marker ``cswap list`` prints, including the age once the plan has gone two
+    TTLs without refreshing."""
+    record = acc.subscription_plan
+    if not record:
+        return
+    plan = record["plan"]
+    text.append(f"{gap}· {subscription.plan_label(plan)}", style=palette.muted)
+    if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
+        age = format_age(int(record["fetchedAt"] * 1000))
+        text.append(f" ({age})", style=palette.muted)
+    if subscription.is_expired(plan):
+        text.append(" (expired)", style=palette.sev_warn)
+
+
 def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
     """Badge strings for the account's per-account policy, in display order.
 
@@ -208,6 +225,7 @@ def account_card_text(
         text.append("   (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "   "):
         text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "   ", palette)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -292,6 +310,7 @@ def mini_account_text(
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
         text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "  ", palette)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
