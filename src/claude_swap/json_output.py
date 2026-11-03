@@ -131,6 +131,16 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    # A setup-token header-probe reading: its completeness and any refusal
+    # decide whether it may gate auto-switching, so both survive export.
+    if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        out["source"] = oauth.USAGE_SOURCE_HEADERS
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        out["rejected"] = {
+            "retryAfterS": rejected.get("retry_after_s"),
+            "resetsAt": rejected.get("resets_at"),
+        }
     return out
 
 
@@ -203,8 +213,21 @@ def usage_from_json(usage: object) -> dict:
                 raise ValueError(f"{label}.name must be a non-empty string")
             scoped.append({"name": name, **entry})
         out["scoped"] = scoped
+    if "rejected" in usage:
+        rejected = usage["rejected"]
+        if not isinstance(rejected, dict):
+            raise ValueError("rejected must be an object")
+        retry_after = rejected.get("retryAfterS")
+        if retry_after is not None and not _is_number(retry_after):
+            raise ValueError("rejected.retryAfterS must be a number or null")
+        resets_at = rejected.get("resetsAt")
+        if resets_at is not None and not isinstance(resets_at, str):
+            raise ValueError("rejected.resetsAt must be an ISO-8601 string or null")
+        out["rejected"] = {"retry_after_s": retry_after, "resets_at": resets_at}
     if not out:
         raise ValueError("usage carries no windows")
+    if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        out["source"] = oauth.USAGE_SOURCE_HEADERS
     return out
 
 
