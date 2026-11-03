@@ -7,7 +7,10 @@ not under test.
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import patch
+
+import pytest
 
 from claude_swap.notifications import notify_quarantined
 
@@ -22,3 +25,14 @@ class TestNotifyQuarantined:
         assert "cswap add --slot 2" in body
         assert "cswap add --slot N" not in body
         assert kwargs.get("urgency") == "normal"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows toast path")
+def test_windows_toast_never_opens_a_console_window():
+    import subprocess
+
+    from claude_swap.notifications import _notify_windows
+
+    with patch("claude_swap.notifications.subprocess.run") as run:
+        _notify_windows("t", "m")
+    assert run.call_args.kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW

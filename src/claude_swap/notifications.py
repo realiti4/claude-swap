@@ -73,6 +73,8 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
 
 
 def _notify_windows(title: str, message: str, *, urgency: str = "normal") -> None:
+    if sys.platform != "win32":  # CREATE_NO_WINDOW is Windows-only
+        return
     sound = "Alarm2" if urgency == "critical" else "Default"
     subprocess.run(
         [
@@ -93,6 +95,11 @@ def _notify_windows(title: str, message: str, *, urgency: str = "normal") -> Non
         timeout=10,
         capture_output=True,
         check=False,
+        # Never a window: from a background process with no visible console
+        # (the auto-continue waiter), a console program would otherwise get
+        # a fresh terminal window; -WindowStyle Hidden only hides it after it
+        # opens, and not at all when Windows Terminal hosts consoles.
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
 

@@ -349,8 +349,16 @@ After posting, the waiter polls the transcript for up to 60 s for our marker
 `[claude-swap auto-continue]`. It only counts a **user turn's text**, or a
 **queued-command attachment's prompt** (a mid-turn delivery). Assistant
 output and tool results don't count: a session that edits cswap itself
-quotes the marker in its own tool calls (found live, 20 false matches). If no
-match shows up, the state becomes `undelivered` and you're notified.
+quotes the marker in its own tool calls (found live, 20 false matches). A
+queued prompt is stored as content blocks, so their text is joined first.
+
+A message that lands while the session is busy (say you typed at the same
+moment) is queued, and Claude Code records it only when the turn consumes
+it, which can be minutes later. So past 60 s the waiter keeps polling while
+the session is `busy` or `waiting`, for up to 30 minutes. Once the session is
+idle again with no match, the state becomes `undelivered` and you're notified.
+(Found live: a message queued behind a typed "carry on" was recorded after
+~70 s and was wrongly flagged `undelivered`.)
 
 ### 4.9 Idempotency and concurrency
 
@@ -367,10 +375,16 @@ match shows up, the state becomes `undelivered` and you're notified.
   second waiter exits at once.
 - **Record writes:** `arm` and the waiter both read-modify-write under
   `.records.lock`.
-- **The waiter process** is spawned detached and fully disowned:
-  - Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+- **The waiter process** is spawned in the background and fully disowned:
+  - Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
     CREATE_BREAKAWAY_FROM_JOB`, falling back to no breakaway if the job
-    refuses.
+    refuses. Not `DETACHED_PROCESS`: a venv's `Scripts\python.exe` (pipx
+    installs) is a launcher that starts the real interpreter as a child, and
+    a console program started by a process with *no* console gets a new,
+    visible one. That was one empty terminal window per waiting session.
+    `CREATE_NO_WINDOW` gives the waiter a console without a window, which the
+    interpreter and the toast-notification PowerShell inherit. Toasts also
+    pass `CREATE_NO_WINDOW` themselves.
   - POSIX: `start_new_session`.
   - In both cases there's no inherited stdio, so it never holds Claude Code's
     hook pipes open.

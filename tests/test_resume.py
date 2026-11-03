@@ -5,6 +5,7 @@ session, inbox and clock faked out."""
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -720,3 +721,110 @@ class TestIntentWaiter:
         h.waiter.sleep = jitter_sleep
         assert h.run() == rs.CANCELLED
         assert h.posted == []
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the 2026-11-03 episode: waiter windows, queued deliveries
+# ---------------------------------------------------------------------------
+
+
+class TestWaiterSpawnHasNoWindow:
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows creation flags")
+    def test_no_window_and_never_detached(self):
+        import subprocess
+
+        with patch.object(rs.subprocess, "Popen") as popen:
+            rs.spawn_waiter(SID)
+        flags = popen.call_args.kwargs["creationflags"]
+        assert flags & subprocess.CREATE_NO_WINDOW
+        # DETACHED_PROCESS leaves the pipx launcher's child to open a visible console.
+        assert not flags & subprocess.DETACHED_PROCESS
+        assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows creation flags")
+    def test_falls_back_without_breakaway_still_windowless(self):
+        import subprocess
+
+        calls = []
+
+        def popen(cmd, **kwargs):
+            calls.append(kwargs["creationflags"])
+            if len(calls) == 1:
+                raise OSError("job does not allow breakaway")
+
+        with patch.object(rs.subprocess, "Popen", side_effect=popen):
+            rs.spawn_waiter(SID)
+        assert len(calls) == 2
+        assert calls[1] & subprocess.CREATE_NO_WINDOW
+        assert not calls[1] & subprocess.CREATE_BREAKAWAY_FROM_JOB
+
+    def test_flags_are_zero_off_windows(self):
+        with patch.object(rs.sys, "platform", "linux"):
+            assert rs.windows_spawn_flags() == 0
+
+
+class TestQueuedDeliveryConfirmation:
+    def test_marker_recorded_late_while_busy_is_confirmed(self, tmp_path):
+        transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
+        clock = FakeClock(1000.0)
+
+        def sleep(seconds: float) -> None:
+            clock.sleep(seconds)
+            if clock.now >= 1000.0 + 75 and not getattr(sleep, "done", False):
+                sleep.done = True  # type: ignore[attr-defined]
+                with transcript.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(peer_turn("m1", clock.now, rs.MARKER + " x")) + "\n")
+
+        assert rs.delivery_confirmed(
+            str(transcript), 1000.0, clock=clock, sleep=sleep, still_busy=lambda: True
+        )
+        assert clock.now >= 1075.0  # it waited past the 60 s base timeout
+
+    def test_idle_with_no_trace_is_still_undelivered(self, tmp_path):
+        transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
+        clock = FakeClock(1000.0)
+        assert not rs.delivery_confirmed(
+            str(transcript), 1000.0, clock=clock, sleep=clock.sleep, still_busy=lambda: False
+        )
+        assert clock.now < 1000.0 + rs.CONFIRM_TIMEOUT_S + 5
+
+    def test_busy_forever_gives_up_at_the_cap(self, tmp_path):
+        transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
+        clock = FakeClock(1000.0)
+        assert not rs.delivery_confirmed(
+            str(transcript), 1000.0, clock=clock, sleep=clock.sleep, still_busy=lambda: True
+        )
+        assert clock.now >= 1000.0 + rs.CONFIRM_BUSY_MAX_S
+
+    def test_waiter_counts_a_message_queued_behind_the_users_prompt(
+        self, backup, stalled_transcript
+    ):
+        # The 2026-11-03 saas-template case: the user typed as we posted, so
+        # our message was queued and only recorded ~70 s later.
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+        h.records_delivery = False
+        h.sessions = [_session("idle"), _session("idle"), _session("busy")]
+        original = h.clock.sleep
+        posted = {"at": None}
+        real_post = h._post
+
+        def post(address, text, token, timeout=5.0):
+            real_post(address, text, token, timeout)
+            posted["at"] = h.clock.now
+
+        h._post = post  # type: ignore[method-assign]
+
+        def sleep(seconds: float) -> None:
+            original(seconds)
+            if (
+                posted["at"] is not None
+                and h.clock.now >= posted["at"] + 70
+                and h.records_delivery is False
+            ):
+                h.records_delivery = None  # write once
+                with stalled_transcript.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(peer_turn("q1", h.clock.now, rs.MARKER + " queued")) + "\n")
+
+        h.waiter.sleep = sleep
+        assert h.run() == rs.RESUMED
+        assert h.gave_up == []  # no false "undelivered" alarm

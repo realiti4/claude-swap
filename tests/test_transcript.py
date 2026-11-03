@@ -230,3 +230,16 @@ class TestRecordedSince:
         }
         path = write(tmp_path / "t.jsonl", quoted, tool_result)
         assert not tx.recorded_since(path, self.NEEDLE, 400.0)
+
+
+def test_queued_prompt_stored_as_content_blocks_is_recognized(tmp_path: Path):
+    record = {
+        "type": "attachment",
+        "timestamp": _ts(500.0),
+        "attachment": {
+            "type": "queued_command",
+            "prompt": [{"type": "text", "text": "[claude-swap auto-continue] go"}],
+        },
+    }
+    path = write(tmp_path / "t.jsonl", record)
+    assert tx.recorded_since(path, "[claude-swap auto-continue]", 400.0)

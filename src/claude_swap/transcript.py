@@ -172,7 +172,14 @@ def _inbound_text(record: dict) -> str:
     attachment = record.get("attachment")
     if record.get("type") == "attachment" and isinstance(attachment, dict):
         prompt = attachment.get("prompt")
-        return prompt if isinstance(prompt, str) else ""
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, list):  # content blocks, as typed prompts are queued
+            return " ".join(
+                b.get("text", "")
+                for b in prompt
+                if isinstance(b, dict) and isinstance(b.get("text"), str)
+            )
     return ""
 
 

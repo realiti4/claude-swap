@@ -120,7 +120,10 @@ That's why the design is:
 5. It then checks that the session recorded the message. A message Claude
    Code holds or refuses leaves no trace. If nothing shows up within a
    minute, the session is marked `undelivered` and you get a notification
-   instead of a false "continued".
+   instead of a false "continued". If the session is busy at that point (you
+   typed something at the same moment, so the message is queued behind your
+   prompt), it keeps checking until the session goes idle, for up to 30
+   minutes.
 
 The waiter stops by itself when:
 

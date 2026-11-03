@@ -100,6 +100,11 @@ DELIVERABLE_STATUSES = (None, "idle", "waiting")
 # How long the session gets to record a delivered message before we conclude
 # its inbound controls held or refused it, and the clock tolerance applied.
 CONFIRM_TIMEOUT_S = 60.0
+# A message that lands while the session is busy (say the user typed at the
+# same moment) is queued, and Claude Code records it only when the turn
+# consumes it - minutes later on a long turn. Keep waiting while it's busy.
+CONFIRM_BUSY_MAX_S = 30 * 60.0
+BUSY_STATUSES = ("busy", "waiting")
 CONFIRM_POLL_S = 2.0
 CONFIRM_SKEW_S = 5.0
 
@@ -340,15 +345,24 @@ def delivery_confirmed(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     timeout: float = CONFIRM_TIMEOUT_S,
+    still_busy: Callable[[], bool] | None = None,
+    busy_max: float = CONFIRM_BUSY_MAX_S,
 ) -> bool:
     """Poll the transcript for our message. A held or refused message leaves
-    no trace at all, so "posted" alone proves nothing."""
-    deadline = clock() + timeout
+    no trace at all, so "posted" alone proves nothing.
+
+    Past ``timeout``, keep waiting (up to ``busy_max``) while ``still_busy()``
+    says the session is in a turn: a queued message is recorded only when
+    that turn consumes it. Once it's idle again with no trace, it wasn't
+    delivered."""
+    start = clock()
     while True:
         if tx.recorded_since(transcript_path, MARKER, since - CONFIRM_SKEW_S):
             return True
-        if clock() >= deadline:
-            return False
+        elapsed = clock() - start
+        if elapsed >= timeout:
+            if not (still_busy is not None and elapsed < busy_max and still_busy()):
+                return False
         sleep(CONFIRM_POLL_S)
 
 
@@ -591,13 +605,35 @@ def arm(
     return outcome
 
 
-def spawn_waiter(session_id: str) -> None:
-    """Start ``cswap resume wait`` fully detached from the hook process.
+def windows_spawn_flags(breakaway: bool = True) -> int:
+    """Creation flags for a background process on Windows that never shows a
+    window, its children included.
 
-    Detached so the hook returns at once and the waiter outlives it; no
-    inherited stdio so it never holds Claude Code's hook pipes open. It
-    inherits the environment, which carries the session's own-child inbox
-    token.
+    Not DETACHED_PROCESS: a venv's ``Scripts\\python.exe`` (pipx installs) is a
+    launcher that starts the real interpreter as a child, and a console
+    program started by a process with *no* console gets a brand-new, visible
+    console - an empty terminal window per waiter (seen 2026-11-03: three
+    stopped sessions, three windows). CREATE_NO_WINDOW gives the process a
+    console without a window instead, which the launcher's child and any
+    tool it runs (toast notifications) inherit.
+    """
+    if sys.platform != "win32":
+        return 0
+    flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    if breakaway:
+        flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
+    return flags
+
+
+def spawn_waiter(session_id: str) -> None:
+    """Start ``cswap resume wait`` in the background, outliving the hook.
+
+    Its own process group (and, when the job allows it, out of the hook's job
+    object), so the hook returns at once and nothing that tears the hook's
+    process tree down takes the waiter along; no inherited stdio so it never
+    holds Claude Code's hook pipes open; never a visible window
+    (:func:`windows_spawn_flags`). It inherits the environment, which carries
+    the session's own-child inbox token.
     """
     cmd = [sys.executable, "-m", "claude_swap", "resume", "wait", session_id]
     kwargs: dict = {
@@ -609,13 +645,10 @@ def spawn_waiter(session_id: str) -> None:
     if sys.platform != "win32":
         subprocess.Popen(cmd, start_new_session=True, **kwargs)
         return
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     try:
-        # Out of the hook's job object too, when the job allows it, so
-        # nothing that tears the hook's process tree down takes us along.
-        subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kwargs)
-    except OSError:
-        subprocess.Popen(cmd, creationflags=flags, **kwargs)
+        subprocess.Popen(cmd, creationflags=windows_spawn_flags(), **kwargs)
+    except OSError:  # the hook's job object doesn't allow breakaway
+        subprocess.Popen(cmd, creationflags=windows_spawn_flags(breakaway=False), **kwargs)
 
 
 class RehearsalError(ClaudeSwitchError):
@@ -928,7 +961,14 @@ class Waiter:
             _logger.warning("auto-continue: delivery to %s failed: %s", self.session_id[:8], e)
             return None
         confirm_path = record.confirm_path or record.transcript_path
-        if not delivery_confirmed(confirm_path, posted_at, clock=self.clock, sleep=self.sleep):
+
+        def still_busy() -> bool:
+            current = find_session(record.config_home, self.session_id)
+            return current is not None and current.status in BUSY_STATUSES
+
+        if not delivery_confirmed(
+            confirm_path, posted_at, clock=self.clock, sleep=self.sleep, still_busy=still_busy
+        ):
             return self._undelivered(
                 record,
                 session,
