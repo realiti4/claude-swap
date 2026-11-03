@@ -333,6 +333,42 @@ class TestPlanStore:
         assert record["fetchedAt"] == 100.0
         assert record["retryAt"] == 900.0
 
+    def test_an_older_failure_cannot_shorten_a_newer_retry(self, tmp_path: Path):
+        """Two failures landing out of order: the later attempt's wait stands,
+        so a slow timeout cannot cut an hour-long Retry-After to the floor."""
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"retryAt": 200.0 + 3600.0, "attemptedAt": 200.0}})
+        store.save({"k": {"retryAt": 100.0 + 900.0, "attemptedAt": 100.0}})
+        assert store.load()["k"] == {"retryAt": 3800.0, "attemptedAt": 200.0}
+
+    def test_a_future_stamped_plan_yields_to_a_fresh_reading(self, tmp_path: Path):
+        """The clock was set back after a save, so the stored stamp is ahead
+        of ``now``. ``is_due`` asks for a fresh read; the merge must let it
+        land, or the old label stands while the endpoint is asked every pass."""
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"plan": ACTIVE_MAX, "fetchedAt": 5000.0}})
+        store.save({"k": {"plan": LAPSED, "fetchedAt": 1000.0}})
+        assert store.load()["k"] == {"plan": LAPSED, "fetchedAt": 1000.0}
+
+    def test_a_future_stamped_plan_still_takes_a_failures_backoff(
+        self, tmp_path: Path
+    ):
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"plan": ACTIVE_MAX, "fetchedAt": 5000.0}})
+        store.save({"k": {"retryAt": 1900.0, "attemptedAt": 1000.0}})
+        record = store.load()["k"]
+        assert record["plan"] == ACTIVE_MAX
+        assert record["retryAt"] == 1900.0
+        assert not subscription.is_due(record, 1000.0)
+
+    def test_a_future_stamped_failure_does_not_hold_a_fresh_reading(
+        self, tmp_path: Path
+    ):
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"retryAt": 9000.0, "attemptedAt": 5000.0}})
+        store.save({"k": {"plan": TEAM, "fetchedAt": 1000.0}})
+        assert store.load()["k"] == {"plan": TEAM, "fetchedAt": 1000.0}
+
     def test_writers_cannot_interleave_a_read_merge_write(self, tmp_path: Path):
         import threading
 
@@ -412,6 +448,28 @@ class TestCollector:
         plans = switcher._collect_subscription_plans(info)
         assert calls == []
         assert plans["1"]["plan"] == TEAM
+
+    def test_a_clock_set_back_does_not_pin_the_old_plan(self, switcher, monkeypatch):
+        """A record stamped ahead of the clock is due. The fresh reading must
+        replace it, and the next pass must not ask again — the alternative is
+        a refused reading that stays due: one request per pass, old label."""
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: _ok(ACTIVE_MAX)
+        )
+        switcher._collect_subscription_plans(info)
+        switcher._usage_store.clock.now -= 3600  # the clock is set back an hour
+
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(LAPSED)
+        )
+        plans = switcher._collect_subscription_plans(info)
+        assert calls == ["live"]
+        assert plans["1"]["plan"] == LAPSED
+        plans = switcher._collect_subscription_plans(info)
+        assert calls == ["live"], "a reading that landed is not due again"
+        assert plans["1"]["plan"] == LAPSED
 
     def test_a_failed_fetch_keeps_the_reading_and_backs_off(
         self, switcher, monkeypatch

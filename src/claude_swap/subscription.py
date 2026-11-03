@@ -242,26 +242,43 @@ def is_due(record: object, now: float, ttl: float = PLAN_TTL_S) -> bool:
     return fetched_at > now or now - fetched_at >= ttl
 
 
-def _merge(existing: object, update: dict) -> dict:
+def _past_stamp(record: dict, key: str, now: float) -> float | None:
+    """A stored stamp that may take part in ordering: a number no later than
+    ``now``. A stamp ahead of the clock was written before the clock was set
+    back; it says nothing about recency, so it is treated as absent."""
+    value = record.get(key)
+    if _is_number(value) and value <= now:
+        return value
+    return None
+
+
+def _merge(existing: object, update: dict, now: float) -> dict:
     """One key of a save. The newer reading wins, whichever process lands last.
 
     ``update`` is a success (``plan``, ``fetchedAt``) or a failure (``retryAt``,
     ``attemptedAt``). Both are stamped before their request went out, so an
-    answer that was slow to arrive cannot pass for a newer one.
+    answer that was slow to arrive cannot pass for a newer one, and an older
+    failure cannot shorten the wait a newer one set. A stored stamp ahead of
+    ``now`` is clock skew and never outranks the update: ``is_due`` asks for a
+    fresh read of such a record, and that read has to be allowed to land, or
+    the old label would stand while the endpoint was asked on every pass.
     """
     current = existing if isinstance(existing, dict) else {}
+    fetched = _past_stamp(current, "fetchedAt", now) if valid_record(current) else None
+    attempted = _past_stamp(current, "attemptedAt", now)
     if "plan" in update:
-        if valid_record(current) and current["fetchedAt"] > update["fetchedAt"]:
+        if fetched is not None and fetched > update["fetchedAt"]:
             return current
-        attempted_at = current.get("attemptedAt")
-        if _is_number(attempted_at) and attempted_at > update["fetchedAt"]:
+        if attempted is not None and attempted > update["fetchedAt"]:
             return {
                 **update,
                 "retryAt": current.get("retryAt"),
-                "attemptedAt": attempted_at,
+                "attemptedAt": attempted,
             }
         return update
-    if valid_record(current) and current["fetchedAt"] >= update["attemptedAt"]:
+    if fetched is not None and fetched >= update["attemptedAt"]:
+        return current
+    if attempted is not None and attempted > update["attemptedAt"]:
         return current
     return {**current, **update}
 
@@ -287,8 +304,9 @@ class PlanStore:
 
     def save(self, updates: dict[str, dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        now = self.clock()
         with FileLock(self.path.with_name(self.path.name + ".lock")):
             merged = self.load()
             for key, update in updates.items():
-                merged[key] = _merge(merged.get(key), update)
+                merged[key] = _merge(merged.get(key), update, now)
             atomic_write_json(self.path, merged)
