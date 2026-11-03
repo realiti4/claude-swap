@@ -210,7 +210,10 @@ def atomic_write_bytes(
             if written == 0:
                 raise OSError(errno.EIO, "write made no progress", tmp)
             view = view[written:]
-        if sys.platform != "win32":
+        # Windows before 3.13 has no fchmod; the attribute check (not only the
+        # platform string) keeps this safe under tests that patch sys.platform
+        # to darwin process-wide, as the launch agent tests do.
+        if sys.platform != "win32" and hasattr(os, "fchmod"):
             os.fchmod(fd, mode)
         try:
             os.fsync(fd)
