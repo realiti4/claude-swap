@@ -11,6 +11,7 @@ baseline (nonzero on some Pythons) by interpreter exit.
 """
 from __future__ import annotations
 
+import getpass
 import os
 import subprocess
 import sys
@@ -57,14 +58,25 @@ def _child_pytest(tmp_path, worker, *opts):
     }
     env["HOME"] = str(tmp_path / "home")
     (tmp_path / "home").mkdir()
+    # Old unlocked numbered dirs in the temp root the child would otherwise use,
+    # as another run leaves them: its exit evicts them (an rmtree of seconds on a
+    # big leftover) unless it has a --basetemp of its own.
+    root = tmp_path / "tmp" / f"pytest-of-{getpass.getuser()}"
+    old = [root / f"pytest-{n}" for n in range(1, 6)]
+    for d in old:
+        d.mkdir(parents=True)
+    env["TMPDIR"] = str(root.parent)
     if worker:
         env["PYTEST_XDIST_WORKER"] = "gw0"
     done = subprocess.run(
         [sys.executable, "-c", CHILD, "-q", "-p", "no:cacheprovider",
-         "-p", "tests.conftest", f"--rootdir={tmp_path}", str(tmp_path), *opts],
+         "-p", "tests.conftest", f"--rootdir={tmp_path}",
+         f"--basetemp={tmp_path / 'base'}", str(tmp_path), *opts],
         cwd=ROOT, env=env, capture_output=True, text=True,
     )
-    return done.returncode, done.stdout.splitlines()[-1], done.stdout + done.stderr
+    out = done.stdout + done.stderr
+    assert all(d.is_dir() for d in old), out
+    return done.returncode, done.stdout.splitlines()[-1], out
 
 
 def test_a_non_worker_does_not_freeze_its_heap_at_exit(tmp_path):
