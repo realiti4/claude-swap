@@ -20,9 +20,15 @@ CLAUDE.md
 AGENTS.md
 MASTERAI.md
 .masterai
+__masterai/
 .masterai-applied.json
 .masterai-live/
+.masterai-coordinate/
+masterai/
 .mcp.json
 context/
 CLAUDE.local.md
+.playwright-mcp/
+.serena/
+.taskmaster/
 # <<< MASTER AI (managed by: masterai git) <<<
