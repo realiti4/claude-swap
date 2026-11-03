@@ -34,7 +34,9 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
 LOCAL_SETTINGS_FILENAME = "settings.local.json"
-AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first")
+AUTOSWITCH_STRATEGIES = (
+    "best", "weekly-first", "consume-first", "priority-consume-first",
+)
 
 _logger = logging.getLogger("claude-swap")
 
