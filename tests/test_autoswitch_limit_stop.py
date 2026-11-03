@@ -18,7 +18,7 @@ from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent, TickOutcome
 from claude_swap.settings import settings_path
 from claude_swap.usage_store import UsageEntry
 from tests.test_autoswitch import EngineHarness, _entry_for, _iso_at, _usage
-from tests.test_transcript import limit_stop, write
+from tests.test_transcript import assistant, limit_stop, write
 
 SID = "0123abcd-0000-4000-8000-000000000000"
 SID2 = "4567efab-0000-4000-8000-000000000000"
@@ -311,6 +311,15 @@ class TestStopsThatDoNotCount:
             encoding="utf-8",
         )
         _stop(h, "a@example.com")
+        self._assert_ignored(h)
+
+    def test_a_waiting_record_whose_session_carried_on(self, h, tmp_path):
+        # Its waiter died (sign-out, reboot) before it could say so.
+        now = h.clock.now
+        transcript = write(
+            tmp_path / "t.jsonl", limit_stop("s1", now - 300.0), assistant("a1", now - 60.0)
+        )
+        _stop(h, "a@example.com", ago=300.0, transcript_path=str(transcript))
         self._assert_ignored(h)
 
     def test_unreadable_records_never_break_a_tick(self, h):

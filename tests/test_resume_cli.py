@@ -131,14 +131,15 @@ class TestIntentCommands:
 
     def test_cancel_marks_waiting_records(self, temp_home, tmp_path, capsys):
         transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
-        with patch.object(rs, "spawn_waiter"):
+        # The session is still running (stopped), so its record stays waiting.
+        with patch.object(rs, "spawn_waiter"), patch.object(rs, "find_session"):
             _run(
                 ["arm"],
                 capsys,
                 stdin=json.dumps({"session_id": SID, "transcript_path": str(transcript)}),
             )
-        code, out, _ = _run(["cancel", "--all"], capsys)
-        assert code == 0 and "cancelled" in out
-        assert rs.load_record(get_backup_root(), SID).state == rs.CANCELLED
-        code, out, _ = _run(["cancel", "--all"], capsys)
-        assert code == 1  # nothing left waiting
+            code, out, _ = _run(["cancel", "--all"], capsys)
+            assert code == 0 and "cancelled" in out
+            assert rs.load_record(get_backup_root(), SID).state == rs.CANCELLED
+            code, out, _ = _run(["cancel", "--all"], capsys)
+            assert code == 1  # nothing left waiting

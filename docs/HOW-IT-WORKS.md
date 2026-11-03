@@ -23,7 +23,7 @@ do I use it", see [AUTO-CONTINUE.md](./AUTO-CONTINUE.md),
 | `oauth.py` | Token refresh, the usage API, and the pre-warm ping. |
 | `usage_store.py` | Cached usage per account (`cache/usage.json`): last good reading, failure backoff, poll schedule. |
 | `autoswitch.py` | The `cswap auto` engine: adaptive polling, when and where to switch, quarantine, pre-warm. |
-| `settings.py` | `settings.json`, with sections `autoswitch.*` and `resume.*`, validated through `SETTING_SPECS`. |
+| `settings.py` | `settings.json`, with sections `autoswitch.*`, `ui.*`, `run.*`, `updates.*`, `usage.*` and `resume.*`, validated through `SETTING_SPECS`. |
 | `claude_locks.py`, `locking.py` | Claude Code's own lock protocol (respected while swapping credentials), and cswap's file locks. |
 | `process_detection.py` | Running Claude Code sessions, read from `~/.claude/sessions/<pid>.json`. |
 | `session.py` | `cswap run` profiles (one account per terminal). |
@@ -332,6 +332,7 @@ collection:
 | `state == waiting` only | a session that carried on, or was continued, says nothing about the account now |
 | not `rehearsal`, default profile only | rehearsal stops are fakes; `cswap run` profiles are pinned to one account |
 | `resetsAt` still in the future (5 h trust when it isn't recorded) | the limit lifts at its own reset |
+| the transcript shows no work since the stop (`moved_on_since_stop`) | the record's state can lie: a waiter killed by a sign-out leaves it `waiting` |
 
 The engine (`_active_limit_stop`) then takes the newest stop whose identity is
 the active account and whose `stalledAt` is later than `lastSwitchAt`. An
@@ -459,6 +460,17 @@ idle again with no match, the state becomes `undelivered` and you're notified.
     hook pipes open.
 - **Pruning:** finished records older than 7 days are removed. Waiting
   records never are.
+- **Orphans** (`reconcile_orphans`, run by every `arm` and by `resume
+  status`): a sign-out or reboot kills waiters mid-wait. On 2026-11-03 a
+  Fast Startup "shut down" at 10:18 left two records `waiting` with no
+  waiter, for sessions that later carried on. A waiting record with no live
+  waiter is finished the way its waiter would have: `moved-on` when the
+  transcript shows work after the stop, `session-gone` when no process runs
+  it. Those two checks run first, and only then is the waiter lock probed.
+  So a waiter that is just starting (its session is live and stopped) never
+  loses its lock to the probe. A restored session that is still stopped
+  stays `waiting`. Nothing can continue it without a fresh hook, because its
+  new process has a new inbox and token.
 
 ### 4.10 Claude Code behaviours this relies on
 
@@ -627,14 +639,22 @@ This fork tracks [realiti4/claude-swap](https://github.com/realiti4/claude-swap)
 through a git remote called `upstream`. The first sync (2026-11-02) brought in
 393 upstream commits, going from v0.19 to v0.30.0b1.
 
+The second sync (2026-11-03) took 10 commits, up to `b14dfb9`: subscription
+plans in `cswap list`, setup-token header probes. All four conflicts were the
+same shape. Both sides added a settings section (upstream `usage`, the fork
+`resume`), so the fix is to keep both: the dataclass, the
+`_SECTION_DEFAULT_SOURCES` entry, the specs, the `effective_settings` loader,
+plus the key counts in `test_config_cli.py` (now 22) and the tail of
+`test_autoswitch.py`. Expect the same the next time upstream adds a section.
+
 **Keep the fork small.** The fork's own code is the files listed under
 `[tool.ruff] include` in `pyproject.toml` (auto-continue, notifications, their
 tests), plus small, well-marked insertions in upstream files:
 
 | Upstream file | Fork insertion |
 |---|---|
-| `settings.py` | `pre_warm_*` fields, `ResumeSettings`, the `resume` + pre-warm specs, `PRESETS` / `apply_preset`, `load_resume_settings` |
-| `autoswitch.py` | `PREWARM_GUARD_S`, `_prewarm_backoff_s`, `PreWarmEvent`, `_is_truly_idle`, the pre-warm call in `_tick_inner`, `_prewarm_idle_accounts` |
+| `settings.py` | `pre_warm_*` fields, `ResumeSettings` (incl. `switch_on_stop`), the `resume` + pre-warm specs, `PRESETS` / `apply_preset`, `load_resume_settings`, the `resume` entries in `_SECTION_DEFAULT_SOURCES` and `effective_settings` |
+| `autoswitch.py` | `PREWARM_GUARD_S`, `_prewarm_backoff_s`, `PreWarmEvent`, `_is_truly_idle`, the pre-warm call in `_tick_inner`, `_prewarm_idle_accounts`; limit stops (§4.6b): the `resume` import, `SLOW_TICK_S` / `SAME_RESET_TOLERANCE_S`, `_logged_stop`, the timing in `tick()`, the stop check before usage collection and the `limit_stop` branch in `_tick_inner` (plus its `left_snapshot` override and `_unmeasured_escape` call), `_limit_stops` / `_active_limit_stop` / `_known_spent` / `_unmeasured_escape` |
 | `oauth.py` | `op` parameter on `_log_usage_failure`; `PingOutcome` + `try_prewarm_account` at the end |
 | `switcher.py` | `read_live_credentials`, `cached_usage_entry`, `account_number_for_identity` |
 | `process_detection.py` | `messaging_socket_path`, `name`, `proc_start` on `ClaudeSession` |

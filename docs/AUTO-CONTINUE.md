@@ -236,6 +236,13 @@ cswap config set resume.slackSeconds 300
   permission you haven't granted will stop at the prompt, as usual.
 - **`cswap run` sessions** are pinned to one account, so for them only the
   limit's own reset counts, not account switches.
+- **Signing out, rebooting or "Shut down" ends the waiters.** Waiters run in
+  your Windows session. Fast Startup's "Shut down" signs you out too. A
+  session that was stopped then isn't continued automatically after it's
+  restored: type "continue" in it. Its stale `waiting` row clears itself the
+  next time any session hits a limit, or when you run `cswap resume status`
+  (`moved-on` if it carried on, `session-gone` if it isn't running). If it's
+  restored and still stopped, the row shows "waiter not running".
 - **Logs** go to `claude-swap.log` in the backup dir. Search for
   `auto-continue`.
 

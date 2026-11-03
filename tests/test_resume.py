@@ -521,6 +521,74 @@ def test_waiting_records_are_never_pruned(backup):
     assert rs.load_record(backup, SID) is not None
 
 
+class TestOrphanedWaitingRecords:
+    """A sign-out or reboot kills waiters mid-wait (2026-11-03: Windows'
+    Fast Startup "shut down" at 10:18 left two records `waiting` for good)."""
+
+    def _orphan(self, backup, tmp_path, *records: dict, **fields) -> None:
+        transcript = write(tmp_path / "t.jsonl", human("h1", 900.0), *records)
+        record = _record(transcript_path=str(transcript), **fields)
+        rs.mutate_record(backup, SID, lambda _: record)
+
+    def _reconcile(self, backup, sessions=()) -> ResumeRecord:
+        with patch.object(rs, "list_sessions", return_value=list(sessions)):
+            rs.reconcile_orphans(backup, 9000.0)
+        record = rs.load_record(backup, SID)
+        assert record is not None
+        return record
+
+    def test_a_session_that_carried_on_is_finished_as_moved_on(self, backup, tmp_path):
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0))
+        record = self._reconcile(backup, [_session("busy")])
+        assert record.state == rs.MOVED_ON
+        assert record.updated_at == 9000.0
+
+    def test_a_session_no_longer_running_is_finished_as_gone(self, backup, tmp_path):
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0))
+        assert self._reconcile(backup, []).state == rs.SESSION_GONE
+
+    def test_a_running_session_still_stopped_keeps_waiting(self, backup, tmp_path):
+        # Nothing to conclude: `resume status` flags the missing waiter.
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0))
+        assert self._reconcile(backup, [_session()]).state == rs.WAITING
+
+    def test_a_live_waiter_keeps_its_record(self, backup, tmp_path):
+        # Mid-delivery: our own continue moved the session on; the waiter
+        # records `resumed` once it confirms.
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0))
+        lock = rs._waiter_lock(backup, SID)
+        assert lock.acquire(timeout=0)
+        try:
+            assert self._reconcile(backup, [_session("busy")]).state == rs.WAITING
+        finally:
+            lock.release()
+
+    def test_a_live_stopped_session_never_has_its_waiter_lock_probed(self, backup, tmp_path):
+        # A waiter just starting must never lose its lock to the probe.
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0))
+        with (
+            patch.object(rs, "list_sessions", return_value=[_session()]),
+            patch.object(rs, "waiter_alive", side_effect=AssertionError("probed")),
+        ):
+            rs.reconcile_orphans(backup, 9000.0)
+
+    def test_rehearsals_are_left_to_their_waiter(self, backup, tmp_path):
+        self._orphan(
+            backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0), rehearsal=True
+        )
+        assert self._reconcile(backup, []).state == rs.WAITING
+
+    def test_any_sessions_hook_finishes_another_sessions_orphan(self, backup, env_home, tmp_path):
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0))
+        other = "0000aaaa-1111-4222-8333-444455556666"
+        stopped = write(tmp_path / "other.jsonl", human("h9", 5000.0), limit_stop("s9", 6000.0))
+        hook = {**_hook_input(stopped), "session_id": other}
+        with patch.object(rs, "list_sessions", return_value=[_session("busy")]):
+            assert arm(backup, hook, ENV, clock=lambda: 6001.0, spawn=lambda _sid: None) == "armed"
+        assert rs.load_record(backup, SID).state == rs.MOVED_ON
+        assert rs.load_record(backup, other).state == rs.WAITING
+
+
 class TestDeliveryConfirmation:
     def test_unrecorded_message_is_reported_undelivered(self, backup, stalled_transcript):
         h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))

@@ -267,6 +267,10 @@ def limit_stops(backup_root: Path, clock: Callable[[], float] = time.time) -> li
     only until the limit's own reset. Rehearsal stops are fakes. Empty when
     ``resume.switchOnStop`` is off.
 
+    "Still stopped" is read from the transcript, not the record's state: a
+    sign-out or reboot kills waiters, which leaves their records ``waiting``
+    after the session has long carried on (found 2026-11-03).
+
     ``clock`` is read only when there is a stop to judge, so an engine tick
     with none reads its clock exactly as it would without this check.
     """
@@ -291,6 +295,8 @@ def limit_stops(backup_root: Path, clock: Callable[[], float] = time.time) -> li
                 continue
         elif now - record.stalled_at > UNTIMED_STOP_TRUST_S:
             continue
+        if moved_on_since_stop(record):
+            continue
         stops.append(
             LimitStop(
                 session_id=record.session_id,
@@ -302,6 +308,57 @@ def limit_stops(backup_root: Path, clock: Callable[[], float] = time.time) -> li
         )
     stops.sort(key=lambda stop: stop.stalled_at, reverse=True)
     return stops
+
+
+def moved_on_since_stop(record: ResumeRecord) -> bool:
+    """Whether the session did real work after its stop (the waiter's own
+    "carried on" test)."""
+    state = tx.read_transcript_state(record.transcript_path)
+    return state.progressed_since(record.stalled_at or record.armed_at)
+
+
+def reconcile_orphans(backup_root: Path, now: float) -> None:
+    """Finish ``waiting`` records whose waiter died without finishing them.
+
+    Waiters live in the user's session, so a sign-out or reboot (Windows'
+    Fast Startup "shut down" signs out too) kills them mid-wait, and their
+    records stayed ``waiting`` forever: never pruned, and shown as waiting
+    long after the session carried on. A record is finished the way its
+    waiter would have: ``moved-on`` when the transcript shows work after the
+    stop, ``session-gone`` when no process runs the session.
+
+    The waiter lock is probed only after one of those checks passed, so a
+    waiter that is just starting (its session is live and stopped) is never
+    raced for its lock. A live waiter keeps its record: it is mid-delivery,
+    or about to reach the same conclusion itself.
+    """
+    for record in list_records(backup_root):
+        if record.state != WAITING or record.rehearsal:
+            continue
+        if moved_on_since_stop(record):
+            outcome = (MOVED_ON, "the session carried on without auto-continue")
+        elif find_session(record.config_home, record.session_id) is None:
+            outcome = (SESSION_GONE, "the session is no longer running")
+        else:
+            continue
+        if waiter_alive(backup_root, record.session_id):
+            continue
+        state, detail = outcome
+
+        def finish(
+            prev: ResumeRecord | None, state: str = state, detail: str = detail
+        ) -> ResumeRecord | None:
+            if prev is None or prev.state != WAITING:
+                return None
+            return replace(prev, state=state, detail=detail, updated_at=now)
+
+        if mutate_record(backup_root, record.session_id, finish) is not None:
+            _logger.info(
+                "auto-continue: session %s %s: %s (its waiter had stopped)",
+                record.session_id[:8],
+                state,
+                detail,
+            )
 
 
 def _records_lock(backup_root: Path) -> FileLock:
@@ -603,6 +660,7 @@ def arm(
     session_id = str(raw_id)
     now = clock()
     settings = load_resume_settings(backup_root)
+    reconcile_orphans(backup_root, now)
     prune_records(backup_root, now)
     state = tx.read_transcript_state(transcript_path)
     stall = state.stall if state.status == tx.STALLED else None

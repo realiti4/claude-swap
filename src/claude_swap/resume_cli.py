@@ -34,6 +34,7 @@ from claude_swap.resume import (
     load_record,
     mutate_record,
     peer_message_held,
+    reconcile_orphans,
     rehearse,
     resume_dir,
     waiter_alive,
@@ -103,6 +104,7 @@ def collect_views(backup_root: Path) -> list[SessionView]:
     """Records joined with live sessions, plus live sessions stopped on a
     limit that nothing is waiting on yet (e.g. stopped before install)."""
     config_home = get_claude_config_home()
+    reconcile_orphans(backup_root, time.time())
     live = {s.session_id: s for s in list_sessions(config_home)}
     records = {r.session_id: r for r in list_records(backup_root)}
     views = []
