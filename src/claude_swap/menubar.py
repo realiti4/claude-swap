@@ -239,6 +239,15 @@ def usage_summary(
         now = time.time()
     usage = oauth.display_usage(usage)  # no 5h segment without a running 5h window
     parts: list[str] = []
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe leads the row: the account is at its
+        # limit until the refusal ends, however low the windows below read.
+        seg = "rejected (!)"
+        countdown = _live_countdown(rejected, now)
+        if countdown:
+            seg += f" ({countdown})"
+        parts.append(seg)
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         pace_result = None
@@ -328,6 +337,8 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
+    if isinstance(active_usage, dict) and isinstance(active_usage.get("rejected"), dict):
+        segments.append("rejected (!)")
     active_usage = oauth.display_usage(active_usage)  # no running 5h window shows no 5h
     # Both numbers are labelled: with the 5h window gone the one left would
     # otherwise be a 7d figure sitting where the 5h one used to be.

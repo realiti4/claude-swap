@@ -849,6 +849,21 @@ def _walled_decision_value(
     return value
 
 
+def _rejection_backoff_until(usage: dict | None, now: float) -> float | None:
+    """When a reading from a refused setup-token header probe (``rejected``
+    with a Retry-After, see ``oauth.request_usage_via_probe``) allows the
+    next request, or None. Stored as ``backoffUntil``, which every fetch
+    path's eligibility (``_row_eligible``, ``due_candidate``) already honors,
+    so no collect probes the account again before the server's deadline.
+    Bounded by the same park cap as a 429's ask, so an absurd value cannot
+    wedge the row."""
+    rejected = usage.get("rejected") if isinstance(usage, dict) else None
+    retry_after = rejected.get("retry_after_s") if isinstance(rejected, dict) else None
+    if not isinstance(retry_after, (int, float)) or not retry_after > 0:
+        return None
+    return now + min(float(retry_after), RETRY_AFTER_FLOOR_CAP_S)
+
+
 def _failure_backoff_s(
     consecutive_failures: int,
     retry_after_s: float | None,
@@ -1504,7 +1519,9 @@ class UsageStore:
                     row["nextPollAt"], row["pollIntervalS"] = plan
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
-                row["backoffUntil"] = None
+                # A confirmed probe rejection's Retry-After is a deadline no
+                # collector may fetch before (see _rejection_backoff_until).
+                row["backoffUntil"] = _rejection_backoff_until(rec.usage, now)
                 row["rejectedFingerprint"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
                 row["struckAt"] = None
