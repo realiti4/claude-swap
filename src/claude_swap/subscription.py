@@ -304,8 +304,11 @@ class PlanStore:
 
     def save(self, updates: dict[str, dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        now = self.clock()
         with FileLock(self.path.with_name(self.path.name + ".lock")):
+            # Read the clock under the lock: a record another writer landed
+            # while this one waited carries a stamp later than a clock read
+            # before the wait, and would be mistaken for skew and overwritten.
+            now = self.clock()
             merged = self.load()
             for key, update in updates.items():
                 merged[key] = _merge(merged.get(key), update, now)

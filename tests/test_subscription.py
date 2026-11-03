@@ -369,6 +369,31 @@ class TestPlanStore:
         store.save({"k": {"plan": TEAM, "fetchedAt": 1000.0}})
         assert store.load()["k"] == {"plan": TEAM, "fetchedAt": 1000.0}
 
+    def test_a_record_landing_during_the_lock_wait_is_not_skew(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Another writer saves a newer plan while this save waits for the
+        lock. The skew check must use a clock read under the lock, or that
+        record reads as ahead of ``now`` and older data overwrites it."""
+        from claude_swap.settings import atomic_write_json
+
+        path = tmp_path / "p.json"
+        now = [1000.0]
+        store = subscription.PlanStore(path, clock=lambda: now[0])
+        real_enter = subscription.FileLock.__enter__
+        landed = []
+
+        def enter(lock):
+            if not landed:  # the other writer lands while this one waits
+                landed.append(True)
+                atomic_write_json(path, {"k": {"plan": LAPSED, "fetchedAt": 1005.0}})
+                now[0] = 1010.0
+            return real_enter(lock)
+
+        monkeypatch.setattr(subscription.FileLock, "__enter__", enter)
+        store.save({"k": {"plan": ACTIVE_MAX, "fetchedAt": 990.0}})
+        assert store.load()["k"] == {"plan": LAPSED, "fetchedAt": 1005.0}
+
     def test_writers_cannot_interleave_a_read_merge_write(self, tmp_path: Path):
         import threading
 
