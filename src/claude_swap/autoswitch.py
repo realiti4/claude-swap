@@ -2899,6 +2899,11 @@ class AutoSwitchEngine:
         the second kept the ordinary cadence through a window it had already
         measured.
         """
+        # weekly-first is `best` with consume-first's ranking: the same
+        # departure line, landing gates, hysteresis and escapes as `best`, but
+        # a proactive move picks the eligible account whose weekly window
+        # resets soonest, since its unused weekly quota is lost first.
+        weekly_first = settings.strategy == "weekly-first"
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -3121,7 +3126,9 @@ class AutoSwitchEngine:
                 else (100.0 - h) >= thresholds[num]
             )
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(usage.get(num), now)
+                if consume_first or weekly_first
+                else None
             )
             if (
                 by_recovery_axis
@@ -3269,6 +3276,12 @@ class AutoSwitchEngine:
                     weekly_threshold=settings.weekly_threshold,
                     scale=settings.threshold,
                 )
+            elif weekly_first and trigger == "proactive":
+                # weekly-first: soonest weekly reset first (unknown resets
+                # sort last), most policy headroom breaking ties. Its at-limit
+                # and failover escapes may land on accounts over their lines,
+                # so they fall through to `best`'s headroom order below.
+                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
                 # back to `-lh` when the label is unknown (usage without window
