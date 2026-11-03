@@ -3277,10 +3277,9 @@ class AutoSwitchEngine:
                     scale=settings.threshold,
                 )
             elif weekly_first and trigger == "proactive":
-                # weekly-first: soonest weekly reset first (unknown resets
-                # sort last), most policy headroom breaking ties. Its at-limit
-                # and failover escapes may land on accounts over their lines,
-                # so they fall through to `best`'s headroom order below.
+                # Soonest weekly reset first, most policy headroom breaks ties.
+                # weekly-first keeps `best`'s headroom order for the at-limit and
+                # failover escapes, which may land on accounts over their lines.
                 key = (reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
