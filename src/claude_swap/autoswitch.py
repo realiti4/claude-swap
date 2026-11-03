@@ -727,11 +727,15 @@ def _window_pcts(
     ``models`` filter): showing an unconfigured scoped window at 100% next
     to a switch onto that account would look like a bug, when the engine
     correctly ignored it. Full per-model usage lives in ``cswap list``. A 5h
-    window that is not running is left out, as on every other screen.
+    window that is not running is left out, as on every other screen, but only
+    after ``relevant_windows``: a header reading counts as complete only with
+    its 5h window present.
     """
+    live = oauth.five_hour_live(usage)
     return {
         name: pct
-        for name, pct, _ in oauth.relevant_windows(oauth.display_usage(usage), models)
+        for name, pct, _ in oauth.relevant_windows(usage, models)
+        if live or name != oauth.FIVE_HOUR_LABEL
     }
 
 

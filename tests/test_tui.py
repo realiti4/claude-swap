@@ -778,7 +778,7 @@ class TestMiniAccountText:
             age_s=0.0,
         )
         text = mini_account_text(make_account(1, entry=entry), now).plain
-        assert text.endswith("5h 20% · 7d 30% · rejected (!)")
+        assert text.endswith("5h:20% · 7d:30% · rejected (!)")
 
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text

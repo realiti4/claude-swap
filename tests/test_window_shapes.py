@@ -328,6 +328,18 @@ def test_a_reply_without_a_5h_header_carries_no_5h_window(store):
     assert last_good["scoped"] == scoped
 
 
+def test_an_idle_5h_header_reading_still_shows_its_7d_beside_the_switch():
+    # relevant_windows reads a header reading as complete only with both
+    # windows, so the idle 5h is left out of the display AFTER that check.
+    usage = {
+        "source": oauth.USAGE_SOURCE_HEADERS,
+        "five_hour": {"pct": 0.0, "resets_at": None},
+        "seven_day": {"pct": 5.0, "resets_at": _iso(3600)},
+    }
+    assert oauth.account_headroom(usage) == pytest.approx(95.0)
+    assert _window_pcts(usage) == {"7d": 5.0}
+
+
 # -- the plan reaches the screens ----------------------------------------------
 
 
