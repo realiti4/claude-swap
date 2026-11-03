@@ -240,10 +240,6 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
-    # Stored refresh token's expiry (epoch seconds), or None when missing/
-    # unreadable — see oauth.login_expires_at_epoch. Feeds the "login Xd Yh"
-    # countdown every account view shows.
-    login_expires_at: float | None = None
     #: Per-account auto-switch overrides. Appended last and defaulted, so every
     #: pre-existing construction site keeps working and yields the default.
     policy: AccountPolicy = AccountPolicy()
@@ -251,6 +247,10 @@ class AccountSnapshot:
     #: None for a slot whose plan has never been fetched. Defaulted for the
     #: same reason as ``policy``.
     subscription_plan: dict | None = None
+    # Stored refresh token's expiry (epoch seconds), or None when missing/
+    # unreadable; see oauth.login_expires_at_epoch. Feeds the "login Xd Yh"
+    # countdown every account view shows.
+    login_expires_at: float | None = None
 
     @property
     def display_tag(self) -> str:
