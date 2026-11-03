@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -138,6 +139,29 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 # short enough that a transient `security` timeout self-heals within a minute
 # instead of disabling the Keychain for the whole process lifetime.
 KEYCHAIN_RECHECK_COOLDOWN_S = 60.0
+
+# Display/eligibility reads of per-account BACKUP credentials may be served
+# from a short-lived per-slot cache (`_kc_read_backup(cached=True)`): a
+# dashboard repainting every few seconds must not spawn `security` for every
+# slot on every pass (#496: ~8 spawns/s at 11 accounts, and a stream of killed
+# unlock dialogs once the login keychain locks). Below the usage store's fetch
+# floor (poll_policy.SERVE_TTL_S, 180 s), so a slot's next fetch always
+# re-reads after a rotation that happened inside another process's fetch —
+# and the consume gate re-reads under its lock regardless. Bounds the
+# display's lag behind an external rotation to a minute.
+BACKUP_READ_CACHE_TTL_S = 60.0
+
+
+class KeychainBackedOff(macos_keychain.KeychainError):
+    """A backup read skipped inside the failure cooldown — not a new failure.
+
+    Raised by ``_kc_read_backup`` instead of spawning ``security``. Still a
+    ``KeychainError``, so every existing handler keeps treating it as
+    "unreadable" (the verdict must not change); distinct, so the normal reader
+    can stay quiet about it — logging each skip as a failure meant 31 warnings
+    per snapshot at 11 accounts, ~600 a minute on the TUI's 3 s tick. The
+    cooldown announces itself once, when the first read skips.
+    """
 
 
 class ActiveCredentials(NamedTuple):
@@ -301,6 +325,9 @@ class _StoreHost(Protocol):
 
     platform: Platform
     credentials_dir: Path
+    # The account registry (``sequence.json``): its stat is the "did the
+    # account set change?" signal the backup read cache is keyed on.
+    sequence_file: Path
     _logger: logging.Logger
 
 
@@ -349,6 +376,18 @@ class CredentialStore:
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
+        # Per-slot cache for DISPLAY reads of backup Keychain items (see
+        # `_kc_read_backup`): (num, email) -> (value or "", monotonic read_at).
+        # The lock guards dict and epoch; the epoch voids fills that raced a
+        # drop; the generation is sequence.json's (inode, mtime_ns, size) the
+        # entries were read under.
+        self._backup_read_cache: dict[tuple[str, str], tuple[str, float]] = {}
+        self._backup_read_cache_lock = threading.Lock()
+        self._backup_read_cache_epoch = 0
+        self._backup_read_cache_gen: tuple[int, int, int] | None = None
+        # The cooldown deadline already announced in the log (see
+        # KeychainBackedOff): one line per cooldown, not one per skipped read.
+        self._backoff_announced_until: float = 0.0
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -1046,36 +1085,136 @@ class CredentialStore:
     def _backup_username(self, account_num: str, email: str) -> str:
         return f"account-{account_num}-{email}"
 
-    def _kc_read_backup(self, account_num: str, email: str) -> str:
+    def _registry_generation(self) -> tuple[int, int, int] | None:
+        """``sequence.json``'s (inode, mtime_ns, size), or ``None`` when it
+        cannot be stat'ed.
+
+        The cheap "did the account set change?" signal: every registry write
+        (add/remove/swap/move/switch/import, from any process) replaces the
+        file. The display read cache is keyed on it — the same device as the
+        switcher's ``_poll_policy_inputs`` settings stat. The mtime alone can
+        repeat across two writes in one coarse timestamp tick; the atomic
+        write's new inode and the size tell those apart.
+        """
+        try:
+            st = self._host.sequence_file.stat()
+            return st.st_ino, st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def _drop_backup_read_cache(self) -> None:
+        """Forget every cached backup read (see ``_kc_read_backup``).
+
+        Runs after each own backup write/delete. The epoch bump also voids a
+        fill that was mid-``security`` when the drop landed: its value may
+        predate the mutation, so it must not be stored.
+        """
+        with self._backup_read_cache_lock:
+            self._backup_read_cache.clear()
+            self._backup_read_cache_epoch += 1
+
+    def _kc_read_backup(
+        self, account_num: str, email: str, *, cached: bool = False
+    ) -> str:
         """Read a per-account backup from the Keychain only (no file fallback).
 
         Routes through ``_kc_call`` (so a failure flips the capability cache).
         Returns ``""`` when the item is absent; raises on a Keychain failure so
         the caller decides (normal reads swallow it; the migration defers).
+
+        Honours the failure cooldown: within ``KEYCHAIN_RECHECK_COOLDOWN_S`` of
+        the last Keychain failure it raises WITHOUT spawning ``security``. The
+        active read and writes already stay off the Keychain then
+        (``_use_keychain``); backup reads were the one path that kept probing
+        — 31 spawns per 3 s TUI tick against a locked login keychain, each a
+        killed unlock dialog (#496). A pinned file mode zeroes the deadline,
+        so it never blocks backup reads (the backup is Keychain-only by
+        design; see ``_pin_file_mode`` and ``_read_account_credentials_ex``).
+        Several workers may pass the deadline together, so a recovery is a
+        bounded burst, not exactly one probe.
+
+        ``cached=True`` serves the value from a per-slot cache for up to
+        ``BACKUP_READ_CACHE_TTL_S``. For DISPLAY and ELIGIBILITY reads only —
+        sentinels, the snapshot's ``switchable`` flag, token-status lines.
+        Anything whose bytes are POSTed, written, activated or compared to
+        decide a write reads fresh (the default): the consume gate, the switch
+        path, resync/adopt, session bootstrap, export, migrations, and the
+        strike binding before a heal. Successes only (an absent item caches as
+        ``""``); a failure is never cached — the cooldown is what stops
+        re-probing it. Dropped after every own write/delete of a backup item
+        and whenever ``sequence.json`` changes (any process). A rotation
+        another process performs without touching the registry is the one
+        event only the TTL bounds; ≤TTL staleness there only lags the display
+        — the fetch path re-reads (``_consume_backup_grant_locked`` adopts a
+        moved generation rather than consuming a stale snapshot).
         """
+        key = (str(account_num), email)
+        if cached:
+            generation = self._registry_generation()
+            now = time.monotonic()
+            with self._backup_read_cache_lock:
+                if generation != self._backup_read_cache_gen:
+                    # The account registry changed: any entry may describe a
+                    # slot that moved or was re-added. Drop them all.
+                    self._backup_read_cache.clear()
+                    self._backup_read_cache_epoch += 1
+                    self._backup_read_cache_gen = generation
+                hit = self._backup_read_cache.get(key)
+                if hit is not None and now - hit[1] < BACKUP_READ_CACHE_TTL_S:
+                    return hit[0]
+                epoch = self._backup_read_cache_epoch
+        deadline = self._keychain_disabled_until
+        if deadline and time.monotonic() < deadline:
+            if self._backoff_announced_until != deadline:
+                self._backoff_announced_until = deadline
+                self._host._logger.info(
+                    "Keychain backed off after a failure: backup reads report "
+                    "unreadable for up to %.0f s instead of probing",
+                    deadline - time.monotonic(),
+                )
+            raise KeychainBackedOff(
+                "backup read skipped: the Keychain is backed off after a "
+                "recent failure"
+            )
         creds = self._kc_call(
             macos_keychain.get_password,
             SECURITY_SERVICE,
             self._backup_username(account_num, email),
         )
-        return creds or ""
+        value = creds or ""
+        if cached:
+            with self._backup_read_cache_lock:
+                # Store only if nothing was dropped while `security` ran.
+                if epoch == self._backup_read_cache_epoch:
+                    self._backup_read_cache[key] = (value, now)
+        return value
 
     def _kc_write_backup(self, account_num: str, email: str, credentials: str) -> None:
         """Write a per-account backup to the Keychain only. Raises on failure."""
-        self._kc_call(
-            macos_keychain.set_password,
-            SECURITY_SERVICE,
-            self._backup_username(account_num, email),
-            credentials,
-        )
+        try:
+            self._kc_call(
+                macos_keychain.set_password,
+                SECURITY_SERVICE,
+                self._backup_username(account_num, email),
+                credentials,
+            )
+        finally:
+            # AFTER the op, never before: dropping first leaves "drop -> a
+            # cached miss reads the old item and stores it -> the write
+            # lands", which the epoch cannot see. `finally`: a failed op may
+            # still have changed the item.
+            self._drop_backup_read_cache()
 
     def _kc_delete_backup(self, account_num: str, email: str) -> None:
         """Delete a per-account backup Keychain item only. Raises on failure."""
-        self._kc_call(
-            macos_keychain.delete_password,
-            SECURITY_SERVICE,
-            self._backup_username(account_num, email),
-        )
+        try:
+            self._kc_call(
+                macos_keychain.delete_password,
+                SECURITY_SERVICE,
+                self._backup_username(account_num, email),
+            )
+        finally:
+            self._drop_backup_read_cache()  # after, not before — see the write
 
     def _kc_delete_backup_prev(self, account_num: str, email: str) -> None:
         """Delete a slot's retained ``.prev`` Keychain item. Raises on failure."""
@@ -1125,13 +1264,20 @@ class CredentialStore:
         self._write_backup_enc(account_num, email, credentials)
 
     def _read_account_credentials(
-        self, account_num: str, email: str, failed: list | None = None
+        self,
+        account_num: str,
+        email: str,
+        failed: list | None = None,
+        *,
+        cached: bool = False,
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
 
         macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
         copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
-        Linux/WSL/Windows read the ``.enc`` only.
+        Linux/WSL/Windows read the ``.enc`` only. ``cached`` lets the Keychain
+        half be served from the display read cache (see ``_kc_read_backup``:
+        display/eligibility sites only); the ``.enc`` half is always live.
         """
         enc_file = self._backup_enc_path(account_num, email)
         try:
@@ -1189,7 +1335,13 @@ class CredentialStore:
                     # Empty/whitespace .enc is not a real backup → try the Keychain.
         if self._host.platform == Platform.MACOS:
             try:
-                return self._kc_read_backup(account_num, email)
+                return self._kc_read_backup(account_num, email, cached=cached)
+            except KeychainBackedOff:
+                # An expected skip inside the cooldown, announced once when
+                # it began — unreadable, but not a new failure to warn about
+                # on every lookup.
+                if failed is not None:
+                    failed.append(True)
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # Reported through the caller's list, not an instance flag:
                 # that flag was shared by every thread and its window spans a
@@ -1202,7 +1354,7 @@ class CredentialStore:
         return ""
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self, account_num: str, email: str, *, cached: bool = False
     ) -> tuple[str, bool]:
         """Backup read with an unreadable-vs-absent verdict.
 
@@ -1219,7 +1371,9 @@ class CredentialStore:
         there too, not only on macOS.
         """
         failed: list = []
-        value = self._read_account_credentials(account_num, email, failed)
+        value = self._read_account_credentials(
+            account_num, email, failed, cached=cached
+        )
         if value:
             return value, False
         if self._host.platform != Platform.MACOS:

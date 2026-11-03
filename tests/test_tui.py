@@ -123,8 +123,12 @@ class FakeSwitcher:
         )
         self.calls: list[tuple] = []
         self.fetch_sets: list[set[str] | None] = []
+        self.plan_refreshes = 0
 
     # -- surface the TUI consumes ------------------------------------------
+
+    def refresh_subscription_plans(self) -> None:
+        self.plan_refreshes += 1
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         self.fetch_sets.append(fetch)
@@ -899,6 +903,25 @@ class TestDashboard:
             if "5h " in ln:
                 assert not ln[ln.index("]") + 1 : ln.index("5h ")].strip()
         assert [ln for ln in rows if ln.endswith("(disabled)")] == rows[3:]
+        # the subscription plan (#499) is the marker field's last item, so it
+        # ends the row and shares the one marker column, whole or cut
+        plans = {
+            "2": {"tier": "default_claude_max_20x"},
+            "3": {"tier": "default_claude_max_5x", "organizationType": "claude_team"},
+            "9": {"tier": "default_claude_ai", "subscriptionStatus": "canceled"},
+        }
+        tails = {"2": "(ahead) · Max 20x", "3": "· Team",
+                 "9": "(ahead) (disabled) · Free (expired)"}
+        planned = [dataclasses.replace(a, subscription_plan={"plan": plans[a.number],
+                                                             "fetchedAt": now})
+                   for a in accs if a.number in plans]
+        widths = mini_widths(planned, now)
+        edge = max(len(mini_account_text(a, now, widths=widths).plain) for a in planned) - 1
+        for cap in (None, edge):
+            out = {a.number: mini_account_text(a, now, widths=widths, width=cap).plain
+                   for a in planned}
+            assert all(out[n].endswith(t) for n, t in tails.items()), out
+            assert len({len(out[n]) - len(t) for n, t in tails.items()}) == 1, out
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
@@ -1366,6 +1389,16 @@ class TestWatchScreen:
             app.set_store_only(True)
             await settle(pilot)
             assert fake.fetch_sets == [set()]
+
+    async def test_auto_mode_refreshes_plans_outside_the_snapshot(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert fake.plan_refreshes == 0
+            app.set_store_only(True)
+            await settle(pilot)
+            assert fake.plan_refreshes >= 1
 
     async def test_watch_title_shows_snapshot_age_and_long_refresh(self, tmp_path):
         app = make_app(self._fake(tmp_path))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import gc
 import json
 import os
 import shutil
@@ -570,6 +572,14 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
         yield
         return
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    # Same endpoint, same rule: the plan collector runs on every `list` and
+    # TUI snapshot, and test credentials carry an access token with no
+    # `expiresAt`, which reads as valid — so it would otherwise go live too.
+    from claude_swap import subscription
+
+    monkeypatch.setattr(
+        subscription, "fetch_plan", lambda token, *a, **k: subscription.PlanFetch()
+    )
     yield
 
 
@@ -721,6 +731,13 @@ def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_fsync(monkeypatch):
+    """Durability is not under test, and one real fsync per atomic write is
+    most of the suite's I/O. Tests that inject at fsync patch over this."""
+    monkeypatch.setattr(os, "fsync", lambda fd: None)
 
 
 @pytest.fixture(autouse=True)
@@ -878,3 +895,11 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+def pytest_configure():
+    # A disposable xdist worker skips the exit-time collection of the heap the
+    # session built. atexit runs after pytest's whole cleanup stack, the final
+    # unraisable-exception sweep included; the controller and -n 0 never freeze.
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        atexit.register(gc.freeze)

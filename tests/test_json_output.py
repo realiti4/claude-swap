@@ -501,12 +501,12 @@ def _two_account_stores(temp_home: Path, sample_sequence_data: dict):
 def _install_patches(switcher, creds_store, configs_store, live_state):
     patches = [
         patch.object(switcher, "_read_account_credentials",
-                     side_effect=lambda n, e: creds_store.get((str(n), e), "")),
+                     side_effect=lambda n, e, **_kw: creds_store.get((str(n), e), "")),
         # The strict reader must answer from the same double: a caller that
         # asks absent-vs-unreadable would otherwise bypass it entirely and
         # read the real (empty) store.
         patch.object(switcher, "_read_account_credentials_ex",
-                     side_effect=lambda n, e: (creds_store.get((str(n), e), ""), False)),
+                     side_effect=lambda n, e, **_kw: (creds_store.get((str(n), e), ""), False)),
         patch.object(switcher, "_write_account_credentials",
                      side_effect=lambda n, e, c: creds_store.__setitem__((str(n), e), c)),
         patch.object(switcher, "_read_account_config",

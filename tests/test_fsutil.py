@@ -17,6 +17,9 @@ from claude_swap.fsutil import (
     replace_with_retry,
 )
 
+# Captured at import, before conftest's autouse fixture stubs os.fsync per test.
+_REAL_FSYNC = os.fsync
+
 
 class TestReplaceWithRetry:
     """os.replace is not reliably available on Windows: antivirus and the
@@ -390,6 +393,19 @@ class TestAtomicWrite:
             atomic_write_text(target, "newer")
         assert target.read_text(encoding="utf-8") == "new"
         assert list(tmp_path.iterdir()) == [target]
+
+    def test_suite_runs_with_fsync_stubbed(self):
+        """conftest stubs ``os.fsync``; the real one rejects a bad descriptor."""
+        os.fsync(-1)
+
+    def test_atomic_write_with_real_fsync(self, tmp_path, monkeypatch):
+        """The stub leaves no other test a real fsync: one on a closed fd
+        (EBADF) would pass the whole suite."""
+        with pytest.raises(ValueError):
+            _REAL_FSYNC(-1)  # the capture is the real function, not the stub
+        monkeypatch.setattr(os, "fsync", _REAL_FSYNC)
+        atomic_write_text(tmp_path / "x.json", "new")
+        assert (tmp_path / "x.json").read_text(encoding="utf-8") == "new"
 
     def test_missing_parent_is_not_created(self, tmp_path):
         with pytest.raises(FileNotFoundError):
