@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -31,6 +32,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
+from claude_swap.settings import set_setting, settings_path
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -39,6 +41,7 @@ from claude_swap.switcher import (
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
     switch_off_at_limit_account,
+    _usage_entry_lines,
 )
 from claude_swap import macos_keychain as _kc
 from claude_swap.exceptions import ClaudeSwitchError
@@ -1248,6 +1251,170 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
 
 
+class TestSetupTokenHeaderProbeWiring:
+    """``usage.headerProbe`` reaches every fetch, and a probed setup-token
+    account is paced by the store like any other fetch."""
+
+    CREDS = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-x", "scopes": ["user:inference"],
+    }})
+
+    def _info(self) -> tuple:
+        return (3, "setup-token-3@token.local", "", "", False, self.CREDS, "")
+
+    def test_setting_reaches_the_fetch_and_reloads_on_change(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None, error="http-429")) as mock_fetch:
+            switcher._fetch_account_usage(self._info())
+            # Opt-in: each probe is a real request on the subscription.
+            assert mock_fetch.call_args.kwargs["header_probe"] is False
+            set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+            # A same-second rewrite can keep the mtime; force a visible change.
+            path = settings_path(switcher.backup_dir)
+            os.utime(path, (time.time() + 5, time.time() + 5))
+            switcher._fetch_account_usage(self._info())
+            assert mock_fetch.call_args.kwargs["header_probe"] is True
+
+    def test_probe_is_paced_by_the_store(self, temp_home: Path):
+        """One collect pass sends one probe; a second pass inside the serve
+        TTL re-serves the stored reading without any request."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+        endpoint = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 429, "Too Many",
+            hdrs=None, fp=None,
+        )
+        probe = MagicMock()
+        probe.headers = {
+            "anthropic-ratelimit-unified-5h-utilization": "0.25",
+            "anthropic-ratelimit-unified-5h-reset": str(int(time.time()) + 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.5",
+            "anthropic-ratelimit-unified-7d-reset": str(int(time.time()) + 86400),
+        }
+        probe.__enter__ = lambda s: s
+        probe.__exit__ = MagicMock(return_value=False)
+        urls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            urls.append(req.full_url)
+            if req.full_url == oauth.USAGE_PROBE_URL:
+                return probe
+            raise endpoint
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            first = switcher._collect_usage_entries([self._info()])["3"]
+            second = switcher._collect_usage_entries([self._info()])["3"]
+
+        # The usage endpoint is never asked: it cannot read a setup-token.
+        assert urls == [oauth.USAGE_PROBE_URL]
+        assert first.last_error is None
+        assert first.last_good["five_hour"]["pct"] == 25.0
+        assert first.last_good["seven_day"]["pct"] == 50.0
+        assert first.next_poll_at is not None
+        assert oauth.account_headroom(second.decision_value()) == 50.0
+
+    def _probe_switcher(self, probe_result):
+        """A switcher with the probe on, its store on a fake clock, and a
+        urlopen fake answering every probe with ``probe_result``."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+        clock = {"now": time.time()}
+        switcher._usage_store.clock = lambda: clock["now"]
+        urls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            urls.append(req.full_url)
+            if isinstance(probe_result, Exception):
+                raise probe_result
+            return probe_result
+
+        return switcher, clock, urls, fake_urlopen
+
+    @staticmethod
+    def _probe_429(headers: dict):
+        import email.message
+        hdrs = email.message.Message()
+        for key, value in headers.items():
+            hdrs[key] = value
+        return urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 429, "Too Many", hdrs=hdrs, fp=None,
+        )
+
+    def test_bare_429_is_a_failure_not_an_exhausted_reading(self, temp_home: Path):
+        switcher, clock, urls, fake = self._probe_switcher(
+            self._probe_429({"Retry-After": "30"})
+        )
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake):
+            entry = switcher._collect_usage_entries([self._info()])["3"]
+        assert urls == [oauth.USAGE_PROBE_URL]
+        assert entry.last_good is None
+        assert entry.last_error == "http-429"
+        assert entry.backoff_until >= clock["now"] + 30
+        # Unknown, not at its limit: nothing for an at-limit switch to read.
+        assert oauth.account_headroom(entry.decision_value()) is None
+
+    @pytest.mark.parametrize("fetch", [None, {"3"}])
+    def test_no_probe_before_a_rejection_retry_deadline(
+        self, temp_home: Path, fetch
+    ):
+        """A confirmed rejection with Retry-After: 3600 blocks every collect,
+        plan-respecting or not, until the deadline passes."""
+        now = int(time.time())
+        rejected = self._probe_429({
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-5h-utilization": "0.2",
+            "anthropic-ratelimit-unified-5h-reset": str(now + 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.3",
+            "anthropic-ratelimit-unified-7d-reset": str(now + 86400),
+            "Retry-After": "3600",
+        })
+        switcher, clock, urls, fake = self._probe_switcher(rejected)
+        start = clock["now"]
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake):
+            first = switcher._collect_usage_entries([self._info()], fetch)["3"]
+            assert urls == [oauth.USAGE_PROBE_URL]
+            assert first.last_good["rejected"]["retry_after_s"] == 3600.0
+            assert first.backoff_until == start + 3600
+            for elapsed in (601, 1800, 3599):
+                clock["now"] = start + elapsed
+                switcher._collect_usage_entries([self._info()], fetch)
+            assert len(urls) == 1
+            clock["now"] = start + 3601
+            switcher._collect_usage_entries([self._info()], fetch)
+        assert len(urls) == 2
+
+    def test_probe_off_sends_no_request_and_says_why(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            entry = switcher._collect_usage_entries([self._info()])["3"]
+        urlopen.assert_not_called()
+        assert entry.last_good is None
+        assert entry.last_error == "setup-token"
+        lines = _usage_entry_lines(entry)
+        assert "usage.headerProbe true" in lines[0]
+
+    def test_partial_and_rejected_readings_stay_visible(self):
+        partial = {"five_hour": {"pct": 5.0}, "source": oauth.USAGE_SOURCE_HEADERS}
+        assert _format_usage_lines(partial) == ["5h:   5%"]
+        rejected = {
+            "five_hour": {"pct": 34.0},
+            "seven_day": {"pct": 60.0},
+            "rejected": {"retry_after_s": None, "resets_at": None},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        assert _format_usage_lines(rejected)[-1] == "probe: rejected"
+
+
 class TestAdoptSessionCredential:
     """An exited session's profile holds the slot's newest generation; the
     backup only learns about it through adoption."""
@@ -2150,7 +2317,7 @@ class TestActiveAccountRefresh:
             locks_held_during_post["config"] = config_lock_dir().is_dir()
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             from claude_swap.claude_locks import config_lock_dir
             assert is_active is True
             assert credentials == self._REFRESHED  # rotated token used for usage
@@ -2220,7 +2387,7 @@ class TestActiveAccountRefresh:
             }
         })
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             assert credentials == cc_rotated
             return oauth.UsageOutcome({"five_hour": {"pct": 7}})
 
@@ -2633,7 +2800,7 @@ class TestActiveAccountRefresh:
         })
         fetch_calls = []
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             fetch_calls.append(credentials)
             if credentials == valid_but_revoked:
                 return oauth.UsageOutcome(None, error="http-401")
@@ -11051,7 +11218,7 @@ class TestActiveRefreshProvenance:
             "expiresAt": 9_999_999_999_000,
         }})
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             assert is_active is True
             assert credentials == refreshed  # rotated under the locks
             return oauth.UsageOutcome({"five_hour": {"pct": 10}})

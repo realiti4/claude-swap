@@ -26,7 +26,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -83,6 +83,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -94,7 +95,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_usage_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -112,7 +118,7 @@ KEYRING_SERVICE = "claude-code"
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
-SETUP_TOKEN_SCOPES = ("user:inference",)
+SETUP_TOKEN_SCOPES = oauth.SETUP_TOKEN_SCOPES
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -165,6 +171,12 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
             rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
         else:
             rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused header probe (setup-tokens): at its limit until it ends.
+        cell = oauth.fresh_reset_strings(rejected)
+        body = f"rejected   until {cell[1]:<12}  in {cell[0]}" if cell else "rejected"
+        rows.append(("probe", body))
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
     return [f"{label + ':':<{width}} {body}" for label, body in rows]
 
@@ -202,6 +214,10 @@ ERROR_NOTES = {
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+    "setup-token": (
+        "setup-tokens cannot read the usage endpoint — "
+        "`cswap config set usage.headerProbe true` reads it from a 1-token request"
     ),
 }
 
@@ -244,6 +260,26 @@ def last_seen_note(entry: UsageEntry) -> str | None:
         f"last seen {100 - headroom:.0f}% used · "
         f"{format_age(int(entry.fetched_at * 1000))}"
     )
+
+
+def _plan_marker(record: dict | None, now: float) -> str:
+    """`` · Max 20x`` after a slot's header; a lapsed subscription is a
+    highlighted ``Free``. No words: a bare "expired" beside an account reads
+    as the OAuth token, which this tool also calls expired, the row is long
+    already, and ``--json`` carries ``expired``/``subscriptionStatus``.
+
+    A plan that has not refreshed in two TTLs carries its age, so a label kept
+    alive by a slot whose profile calls keep failing reads as old rather than
+    current — the stuck-label case the independent pacing exists to avoid.
+    """
+    if not record:
+        return ""
+    plan = record["plan"]
+    paint = yellowed if subscription.is_expired(plan) else muted
+    marker = f" {muted('·')} {paint(subscription.plan_label(plan))}"
+    if now - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
+        marker += f" {dimmed('(' + format_age(int(record['fetchedAt'] * 1000)) + ')')}"
+    return marker
 
 
 def _usage_entry_lines(entry: UsageEntry) -> list[str]:
@@ -385,6 +421,8 @@ class ClaudeAccountSwitcher:
             float | None, tuple[float, float | None, tuple[str, ...]]
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
+        # (settings mtime, usage.headerProbe) — see _header_probe_enabled.
+        self._header_probe_cache: tuple[float | None, bool] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1825,6 +1863,93 @@ class ClaudeAccountSwitcher:
             accounts_info, fetch=fetch, scheduled=scheduled
         )
 
+    def _subscription_store(self) -> subscription.PlanStore:
+        return subscription.PlanStore(
+            self.backup_dir / "cache" / subscription.PLAN_FILENAME,
+            clock=self._usage_store.clock,
+        )
+
+    def _stored_subscription_plans(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+    ) -> dict[str, dict]:
+        """Per-slot plan records as stored. Touches no credential or network."""
+        records = self._subscription_store().load()
+        plans: dict[str, dict] = {}
+        for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info:
+            record = records.get(subscription.identity_key(email, org_uuid))
+            if subscription.valid_record(record):
+                plans[str(num)] = record
+        return plans
+
+    def _plans_for_pass(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        fetch: set[str] | None,
+    ) -> dict[str, dict]:
+        """An empty ``fetch`` set means no network eligibility, for plans too."""
+        if fetch is not None and not fetch:
+            return self._stored_subscription_plans(accounts_info)
+        return self._collect_subscription_plans(accounts_info)
+
+    def refresh_subscription_plans(self) -> None:
+        """Refresh due plans for surfaces whose snapshots are store-only."""
+        self._collect_subscription_plans(self._build_accounts_info())
+
+    def _collect_subscription_plans(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+    ) -> dict[str, dict]:
+        """Per-slot subscription plan record, refreshed on its own clock (#350).
+
+        Independent of the usage collector by construction: its own file, its
+        own TTL, and attempted whether or not that slot's usage call just
+        succeeded — a slot in usage backoff is exactly the slot whose plan may
+        have changed. Only an already-valid access token is used; a due slot
+        without one keeps its last record and is retried on the next pass.
+
+        A read that fails, or that belongs to some other account, records when
+        it may be repeated and changes nothing else. Network happens here with
+        no lock held. Returns only slots that have a usable record, so a slot
+        never fetched is simply absent.
+        """
+        store = self._subscription_store()
+        records = store.load()
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        updates: dict[str, dict] = {}
+        for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
+            key = subscription.identity_key(email, org_uuid)
+            if not subscription.is_due(records.get(key), store.clock()):
+                continue
+            token = subscription.usable_access_token(creds)
+            if token is None and not is_active:
+                # accounts_info was read before the usage pass, which may have
+                # refreshed this slot since; its backup write invalidates the
+                # display cache, so the cached read still sees that token.
+                token = subscription.usable_access_token(
+                    self._read_account_credentials(str(num), email, cached=True)
+                )
+            if token is None:
+                continue
+            started_at = store.clock()
+            fetched = subscription.fetch_plan(token)
+            slot_uuid = (accounts.get(str(num), {}).get("uuid") or "").strip()
+            if fetched.plan is not None and subscription.matches_slot(
+                fetched, slot_uuid, org_uuid
+            ):
+                updates[key] = {"plan": fetched.plan, "fetchedAt": started_at}
+            else:
+                updates[key] = {
+                    "retryAt": subscription.next_retry_at(
+                        started_at, fetched.retry_after_s
+                    ),
+                    "attemptedAt": started_at,
+                }
+        if updates:
+            try:
+                store.save(updates)
+            except (OSError, LockError) as e:
+                self._logger.debug("Could not save subscription plans: %r", e)
+        return self._stored_subscription_plans(accounts_info)
+
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 
@@ -1838,6 +1963,7 @@ class ClaudeAccountSwitcher:
         """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        plans = self._plans_for_pass(accounts_info, fetch)
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -1858,6 +1984,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
+                    subscription_plan=plans.get(n),
                 )
             )
         return AccountsSnapshot(
@@ -1922,6 +2049,21 @@ class ClaudeAccountSwitcher:
         )
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def _header_probe_enabled(self) -> bool:
+        """``usage.headerProbe`` from the settings file (reloaded only when it
+        changes — one stat per fetch)."""
+        path = settings_path(self.backup_dir)
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        cache = getattr(self, "_header_probe_cache", None)
+        if cache is not None and cache[0] == mtime:
+            return cache[1]
+        enabled = load_usage_settings(self.backup_dir).header_probe
+        self._header_probe_cache = (mtime, enabled)
+        return enabled
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -4732,6 +4874,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                header_probe=self._header_probe_enabled(),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -5258,6 +5401,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            header_probe=self._header_probe_enabled(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5567,6 +5711,7 @@ class ClaudeAccountSwitcher:
             str(num), email, creds,
             is_active=False,
             refresh_via=self.consume_backup_grant,
+            header_probe=self._header_probe_enabled(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5588,7 +5733,10 @@ class ClaudeAccountSwitcher:
         stamp = oauth.access_token_fingerprint(creds)
         if stamp is not None and stamp == rejected_fp:
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        outcome = oauth.try_fetch_usage_for_account(num, email, creds, is_active=True)
+        outcome = oauth.try_fetch_usage_for_account(
+            num, email, creds, is_active=True,
+            header_probe=self._header_probe_enabled(),
+        )
         if outcome.error == "http-401":
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
         return FetchRecord(
@@ -6605,6 +6753,7 @@ class ClaudeAccountSwitcher:
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry],
+        plans: dict[str, dict] | None = None,
     ) -> dict:
         """Build the ``--list --json`` payload from gathered account + usage data."""
         active_num: int | None = None
@@ -6643,6 +6792,7 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    subscription_plan=(plans or {}).get(str(num)),
                 )
             )
         payload = {
@@ -6693,9 +6843,10 @@ class ClaudeAccountSwitcher:
 
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        plans = self._plans_for_pass(accounts_info, fetch)
 
         if json_output:
-            return self._build_list_payload(accounts_info, entries)
+            return self._build_list_payload(accounts_info, entries, plans)
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
@@ -6707,6 +6858,7 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
