@@ -580,16 +580,32 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
     The result is marked ``source: headers`` and keeps the probe's
     ``rejected`` entry, so a refused probe is stored (and decided on) as an
     account at its limit until the refusal ends, never as a healthy reading.
+    That rejection outranks a window that fails to normalise: the reading
+    then keeps only ``rejected`` (readable windows go with the unreadable
+    one) instead of failing as ``bad-response``.
     """
     try:
         data = request_usage_via_probe(access_token)
-        usage = build_usage_result(data) or {}
     except Exception as e:
         kind, retry_after = _classify_usage_error(e)
         cause = kind if retry_after is None else f"{kind}, retry-after {retry_after:.0f}s"
         _logger.warning("Usage header probe failed %s: %s", context, cause)
         _logger.debug("Usage header probe failure detail %s: %r", context, e)
         return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+    try:
+        usage = build_usage_result(data) or {}
+    except Exception as e:
+        kind, _ = _classify_usage_error(e)
+        _logger.debug("Usage header probe failure detail %s: %r", context, e)
+        if not (isinstance(e, _InvalidUsageResponse) and "rejected" in data):
+            _logger.warning("Usage header probe failed %s: %s", context, kind)
+            return UsageOutcome(None, error=kind)
+        # A rejection outranks its unreadable windows: the refusal and its
+        # Retry-After are kept, so the account stays at its limit.
+        _logger.warning(
+            "Usage header probe %s: %s, keeping the rejection", context, kind
+        )
+        usage = {}
     if "rejected" in data:
         usage["rejected"] = data["rejected"]
         _logger.warning(
@@ -721,7 +737,8 @@ def build_usage_result(data: dict) -> dict | None:
     ``five_hour``/``seven_day`` go through :func:`_reported_window` and
     :func:`_window_entry`: an absent window stays absent, ``utilization:
     null`` keeps the window with ``pct`` None, and a malformed one fails
-    the whole fetch as ``bad-response``.
+    the whole fetch as ``bad-response`` (a refused header probe keeps its
+    rejection instead, see :func:`_usage_from_probe`).
     """
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
 

@@ -5,8 +5,9 @@ with ``five_hour: null``. Keep that response connected to the displays and
 the switch decision: an absent window is not a zero reading, a window
 reported without a utilization figure (``utilization: null``, which Claude
 Code's usage schema allows) is unknown rather than zero or absent, an
-unreadable window is a failed measurement, and a failed fetch is not
-headroom. No network call is made.
+unreadable window is a failed measurement unless a refused probe carries it
+(the refusal is kept), and a failed fetch is not headroom. No network call
+is made.
 """
 
 from __future__ import annotations
@@ -153,8 +154,8 @@ def test_an_unreadable_window_fails_the_whole_reading(fetch_outcome, window, bro
 
 
 def test_an_unreadable_window_from_the_header_probe_is_classified(monkeypatch):
-    # The probe path normalises after its request; a rejected window must still classify
-    # as bad-response.
+    # The probe path normalises after its request; a window the validator rejects
+    # must still classify as bad-response (no rejection to keep here).
     data = oauth.parse_unified_ratelimit_headers(
         {"anthropic-ratelimit-unified-5h-utilization": "1e308"}
     )
@@ -162,6 +163,66 @@ def test_an_unreadable_window_from_the_header_probe_is_classified(monkeypatch):
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.usage is None
     assert outcome.error == "bad-response"
+
+
+def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
+    monkeypatch, tmp_path,
+):
+    # A 429 rejection outranks its unreadable utilization header: the refusal
+    # and its Retry-After are kept, so a healthy cached reading cannot leave the
+    # refused account eligible for a switch.
+    import email.message
+    import time
+
+    now = time.time()
+    store = UsageStore(tmp_path / "cache", clock=lambda: now)
+    identities = {"3": ("setup@example.com", "")}
+    healthy = {
+        "five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0},
+        "source": oauth.USAGE_SOURCE_HEADERS,
+    }
+    store.record({"3": FetchRecord(usage=healthy)}, identities)
+    cached = store.entries(identities)["3"].decision_value()
+    assert oauth.account_headroom(cached) == 90.0
+
+    headers = email.message.Message()
+    for key, value in {
+        "anthropic-ratelimit-unified-status": "rejected",
+        "anthropic-ratelimit-unified-5h-utilization": "1e308",
+        "anthropic-ratelimit-unified-7d-utilization": "0.6",
+        "anthropic-ratelimit-unified-reset": str(int(now + 1800)),
+        "Retry-After": "600",
+    }.items():
+        headers[key] = value
+
+    def urlopen(request, timeout):
+        assert request.full_url == oauth.USAGE_PROBE_URL
+        raise urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 429, "Too Many", hdrs=headers, fp=None,
+        )
+
+    monkeypatch.setattr(oauth.urllib.request, "urlopen", urlopen)
+    setup_token = json.dumps({"claudeAiOauth": {
+        "accessToken": "setup-access", "scopes": ["user:inference"],
+    }})
+    outcome = oauth.try_fetch_usage_for_account(
+        "3", "setup@example.com", setup_token, is_active=False, header_probe=True,
+    )
+
+    assert outcome.error is None
+    assert outcome.usage["rejected"]["retry_after_s"] == 600.0
+    assert outcome.usage["source"] == oauth.USAGE_SOURCE_HEADERS
+    assert "five_hour" not in outcome.usage and "seven_day" not in outcome.usage
+    assert oauth.relevant_windows(outcome.usage) == [
+        ("rejected", 100.0, outcome.usage["rejected"]["resets_at"]),
+    ]
+
+    store.record({"3": FetchRecord(usage=outcome.usage)}, identities)
+    entry = store.entries(identities)["3"]
+    assert entry.last_error is None
+    assert entry.last_good == outcome.usage
+    assert oauth.account_headroom(entry.decision_value()) == 0.0
+    assert entry.backoff_until == pytest.approx(now + 600.0)
 
 
 def test_an_unreadable_window_keeps_the_last_good_reading(fetch_outcome, tmp_path):
