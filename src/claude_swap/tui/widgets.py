@@ -159,23 +159,34 @@ def usage_rows(
                 suffix = f"{suffix}  {marker}" if suffix else marker
                 suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
         rows.append((window["name"], pct, suffix, suffix_full))
+    rejected = last_good.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe: at its limit until the refusal ends,
+        # whatever the windows above say (auto-switching excludes it).
+        reset, reset_full = _reset_parts(rejected, now)
+        suffix = f"rejected (!)  {reset}" if reset else "rejected (!)"
+        suffix_full = f"rejected (!)  {reset_full}" if reset_full else "rejected (!)"
+        rows.append(("probe", 100.0, suffix, suffix_full))
     return rows
 
 
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
-    """``· Max 20x`` after the header, ``(expired)`` when lapsed — the same
-    marker ``cswap list`` prints, including the age once the plan has gone two
-    TTLs without refreshing."""
+    """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
+    a lapsed subscription is a highlighted ``Free`` rather than an appended
+    "expired", and the age follows once the plan has gone two TTLs without
+    refreshing."""
     record = acc.subscription_plan
     if not record:
         return
     plan = record["plan"]
-    text.append(f"{gap}· {subscription.plan_label(plan)}", style=palette.muted)
+    text.append(f"{gap}· ", style=palette.muted)
+    text.append(
+        subscription.plan_label(plan),
+        style=palette.sev_warn if subscription.is_expired(plan) else palette.muted,
+    )
     if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
         age = format_age(int(record["fetchedAt"] * 1000))
         text.append(f" ({age})", style=palette.muted)
-    if subscription.is_expired(plan):
-        text.append(" (expired)", style=palette.sev_warn)
 
 
 def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
@@ -378,6 +389,8 @@ def _mini_body(
         if float(window["pct"]) >= 100:
             name = window["name"]
             cells[name] = Text(f"{name} (!)", style=palette.sev_crit)
+    if isinstance(last_good.get("rejected"), dict):  # a refused setup-token probe
+        cells["rejected"] = Text("rejected (!)", style=palette.sev_crit)
     return cells, None if cells else Text("usage unknown", style=palette.muted), ahead
 
 
@@ -414,7 +427,8 @@ def mini_account_text(
     ``th 75%`` (a per-account threshold) and ``· Max 20x`` (the subscription
     plan), any of them together.
     Pcts only, severity colored; a window at/over 100% brings its reset
-    countdown along, and a maxed per-model window shows as ``Fable (!)``. A
+    countdown along, a maxed per-model window shows as ``Fable (!)`` and a
+    refused setup-token probe as ``rejected (!)``. A
     window the account lacks is a blank cell, and a sentinel state shows its
     label in place of the cells (ellipsized past ``_MINI_NOTE_CAP`` and the
     cells' width; the expanded card and the CLI carry the full text). Every

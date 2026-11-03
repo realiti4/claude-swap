@@ -592,6 +592,20 @@ class TestUsageRows:
         assert "(!)" in row[2]
         assert "ahead of pace" not in row[2]
 
+    def test_rejected_probe_shows_a_maxed_row(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 30.0},
+            "rejected": {"retry_after_s": 3600.0, "resets_at": _iso_in(3600)},
+            "source": "headers",
+        }
+        label, pct, suffix, _full = usage_rows(last_good, now, now)[-1]
+        assert (label, pct) == ("probe", 100.0)
+        assert suffix.startswith("rejected (!)") and "resets" in suffix
+
     def test_no_pace_marker_without_fetched_at(self):
         from claude_swap.tui.widgets import usage_rows
 
@@ -632,6 +646,22 @@ class TestUsageRows:
 
 
 class TestMiniAccountText:
+    def test_rejected_probe_is_flagged(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 20.0},
+                "seven_day": {"pct": 30.0},
+                "rejected": {"retry_after_s": None, "resets_at": None},
+            },
+            fetched_at=now,
+            age_s=0.0,
+        )
+        text = mini_account_text(make_account(1, entry=entry), now).plain
+        assert text.endswith("5h  20%  7d  30%  rejected (!)")
+
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
@@ -830,6 +860,7 @@ class TestDashboard:
         app = make_app(FakeSwitcher(accs, tmp_path))
         async with app.run_test(size=(140, 40)) as pilot:
             await settle(pilot)
+            from claude_swap.tui.theme import Palette
             from claude_swap.tui.widgets import (
                 AccountsPanel, mini_account_text, mini_widths)
 
@@ -911,7 +942,7 @@ class TestDashboard:
             "9": {"tier": "default_claude_ai", "subscriptionStatus": "canceled"},
         }
         tails = {"2": "(ahead) · Max 20x", "3": "· Team",
-                 "9": "(ahead) (disabled) · Free (expired)"}
+                 "9": "(ahead) (disabled) · Free"}
         planned = [dataclasses.replace(a, subscription_plan={"plan": plans[a.number],
                                                              "fetchedAt": now})
                    for a in accs if a.number in plans]
@@ -922,6 +953,13 @@ class TestDashboard:
                    for a in planned}
             assert all(out[n].endswith(t) for n, t in tails.items()), out
             assert len({len(out[n]) - len(t) for n, t in tails.items()}) == 1, out
+            if cap:
+                assert all(len(v) <= edge for v in out.values()), out
+        # a lapsed plan is the highlighted `Free`, with no appended "(expired)"
+        lapsed = mini_account_text(next(a for a in planned if a.number == "9"), now)
+        assert "expired" not in lapsed.plain
+        assert any(lapsed.plain[s.start:s.end] == "Free" and s.style == Palette.DARK.sev_warn
+                   for s in lapsed.spans)
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
