@@ -104,13 +104,34 @@ def normalize_account_threshold(value: object) -> float:
     return pct
 
 
+ACCOUNT_PRIORITY_MAX = 1000
+
+
+def normalize_account_priority(value: object) -> int:
+    """Validate a priority tier. Higher numbers are preferred; zero is default."""
+    message = f"priority must be an integer between 0 and {ACCOUNT_PRIORITY_MAX}"
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError(message)
+        # Avoid converting an arbitrarily long hand-edited integer.
+        value = value.lstrip("0") or "0"
+        if len(value) > len(str(ACCOUNT_PRIORITY_MAX)):
+            raise ValueError(message)
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(message)
+    if not 0 <= value <= ACCOUNT_PRIORITY_MAX:
+        raise ValueError(message)
+    return value
+
+
 @dataclass(frozen=True)
 class AccountPolicy:
     """Per-account auto-switch overrides, stored in the sequence record.
 
-    Its one knob is unset by default, so a fleet with no policy set behaves
-    exactly as it did before this existed — the default-identity property
-    the acceptance criteria assert throughout.
+    Defaults preserve existing behavior. Priority is read only by the
+    opt-in ``priority-consume-first`` strategy.
 
     ``threshold``
         This account's own switch-away line, in binding-window utilization
@@ -123,6 +144,7 @@ class AccountPolicy:
     """
 
     threshold: float | None = None
+    priority: int = 0
 
 
 class Platform(Enum):
@@ -225,6 +247,10 @@ class AccountSnapshot:
     #: Per-account auto-switch overrides. Appended last and defaulted, so every
     #: pre-existing construction site keeps working and yields the default.
     policy: AccountPolicy = AccountPolicy()
+    #: Stored subscription plan record (``subscription.PlanStore`` shape), or
+    #: None for a slot whose plan has never been fetched. Defaulted for the
+    #: same reason as ``policy``.
+    subscription_plan: dict | None = None
 
     @property
     def display_tag(self) -> str:

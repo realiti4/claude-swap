@@ -2,8 +2,10 @@
 
 ``cswap menubar`` blocks the terminal that started it, so the status item dies
 with that terminal — and never comes back after a logout or reboot. launchd is
-the native macOS answer: a per-user LaunchAgent starts the menu bar at login,
-restarts it if it crashes, and needs no ``.app`` bundle.
+the native macOS answer: a per-user LaunchAgent starts the menu bar at login and
+restarts it if it crashes. (The wrapper ``.app`` the menu bar runs inside is
+``claude_swap.app_bundle``'s business: ``cswap menubar`` builds it and execs
+into it itself, so launchd only ever needs the console script.)
 
 Two decisions here are worth stating, because both differ from the obvious
 approach:
@@ -32,9 +34,11 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.fsutil import atomic_write_bytes
 
 LABEL = "com.cswap.menubar"
 
@@ -43,6 +47,17 @@ LABEL = "com.cswap.menubar"
 # menu bar shells out to detect running sessions, so seed a PATH that finds it.
 _EXTRA_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 _BASE_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+# launchd does not inherit the installing shell's environment, so a user behind
+# a proxy would get an agent that dials direct. Forward only these, never all.
+# A key that is set but empty is forwarded too: urllib reads an empty lowercase
+# name as cancelling its uppercase twin (`https_proxy=` switches off an
+# `HTTPS_PROXY`), so dropping it would hand the agent a proxy the shell had
+# turned off. launchd sets an empty string as an empty variable.
+_FORWARDED_ENV_KEYS = (
+    "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
+    "no_proxy", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
 
 # `launchctl bootout` can return before launchd has finished tearing the
 # job down, and a `bootstrap` inside that window fails with "Operation
@@ -123,6 +138,7 @@ def build_plist(
     program: list[str] | None = None,
     label: str = LABEL,
     home: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> bytes:
     """Serialize the LaunchAgent plist.
 
@@ -131,6 +147,8 @@ def build_plist(
     """
     program = program or resolve_program()
     out_log, err_log = log_paths(label, home)
+    env = os.environ if env is None else env
+    forwarded = {k: env[k] for k in _FORWARDED_ENV_KEYS if k in env}
     return plistlib.dumps(
         {
             "Label": label,
@@ -144,7 +162,7 @@ def build_plist(
             # A menu bar owner is a UI process; Background would have launchd
             # apply throttled I/O and CPU bands to it.
             "ProcessType": "Interactive",
-            "EnvironmentVariables": {"PATH": _path_env(program)},
+            "EnvironmentVariables": {"PATH": _path_env(program), **forwarded},
             "StandardOutPath": str(out_log),
             "StandardErrorPath": str(err_log),
         }
@@ -233,7 +251,10 @@ def install(
 
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
-    target_plist.write_bytes(build_plist(program, label, home))
+    # Owner-only and atomic, not the umask's 0644 via write_bytes: a forwarded
+    # proxy URL can carry credentials, and a write cut short by Ctrl-C must
+    # not leave a truncated plist for the next login to choke on.
+    atomic_write_bytes(target_plist, build_plist(program, label, home))
 
     settled = True
     if is_loaded(label, uid):

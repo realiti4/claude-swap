@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, subscription
 from claude_swap.models import AccountPolicy
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
@@ -303,6 +303,26 @@ def last_good_usage_fields(
     return out
 
 
+def subscription_plan_fields(record: dict) -> dict:
+    """JSON for a stored plan record: label, raw fields, expiry, and age.
+
+    ``fetchedAt`` is always present, so a script can tell a plan fetched this
+    morning from one that has not refreshed in days and decide for itself how
+    far to trust ``expired``.
+    """
+    plan = record["plan"]
+    fields = {
+        "label": subscription.plan_label(plan),
+        "tier": plan["tier"],
+    }
+    for key in ("organizationType", "billingType", "subscriptionStatus"):
+        if key in plan:
+            fields[key] = plan[key]
+    fields["expired"] = subscription.is_expired(plan)
+    fields["fetchedAt"] = _timestamp(record["fetchedAt"])
+    return fields
+
+
 def account_row(
     number: int,
     email: str,
@@ -320,6 +340,7 @@ def account_row(
     disabled: bool = False,
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
+    subscription_plan: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -350,6 +371,10 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive field: the slot's subscription plan once one has been fetched
+    # (see ``subscription``); a slot never fetched emits no key at all.
+    if subscription_plan:
+        row["plan"] = subscription_plan_fields(subscription_plan)
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

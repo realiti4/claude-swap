@@ -209,6 +209,53 @@ class TestDashboardMiniRowAlignment:
             assert len(offsets) == 1
 
 
+class TestPlanMarkerAndLoginTogether:
+    """A slot carrying both a subscription plan and a login expiry shows both."""
+
+    PLAN = {"plan": {"tier": "default_claude_max_20x"}, "fetchedAt": time.time()}
+
+    def _account(self) -> AccountSnapshot:
+        acc = make_account(2, email="a@example.com")
+        return dataclasses.replace(
+            acc, login_expires_at=time.time() + 5 * 3600 + 7 * 60, subscription_plan=self.PLAN
+        )
+
+    def test_dashboard_card_and_mini_row(self):
+        acc = self._account()
+        card = widgets.account_card_text(acc, 100).plain
+        mini = widgets.mini_account_text(acc, time.time()).plain
+        assert "· Max 20x" in card.splitlines()[0]
+        assert any(line.lstrip().startswith("login") for line in card.splitlines()[1:])
+        assert "login" in mini and "· Max 20x" in mini
+
+    def test_cli_header_and_login_row(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        creds = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-x",
+                    "refreshTokenExpiresAt": int((time.time() + 5 * 3600) * 1000),
+                }
+            }
+        )
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        plans = {str(n): self.PLAN for n in (1, 2)}
+
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=creds), \
+             patch.object(switcher, "_plans_for_pass", return_value=plans), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=OSError):
+            switcher.list_accounts()
+
+        lines = capsys.readouterr().out.splitlines()
+        assert any("· Max 20x" in line for line in lines if line.startswith("  1:"))
+        assert any("login:" in line and "?" not in line for line in lines)
+
+
 # ---------------------------------------------------------------------------
 # TUI auto-view Next-best rows: `AutoScreen._candidates_text`
 # ---------------------------------------------------------------------------

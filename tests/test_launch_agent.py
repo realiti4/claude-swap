@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -107,6 +108,46 @@ def test_build_plist_path_env_keeps_the_launchd_defaults(tmp_path):
     assert {"/usr/bin", "/bin", "/usr/sbin", "/sbin"} <= set(entries)
 
 
+def test_build_plist_forwards_only_the_proxy_and_cert_allowlist(tmp_path):
+    # launchd does not inherit the installing shell's environment, so a proxy
+    # set there never reaches the agent. Copy a fixed allowlist, not everything.
+    env = {
+        "HTTPS_PROXY": "http://proxy.example:3128",
+        "https_proxy": "http://proxy.example:3128",
+        "NO_PROXY": "",
+        "SSL_CERT_FILE": "/etc/ssl/corp.pem",
+        "ALL_PROXY": "socks5://proxy.example:1080",
+        "AWS_SECRET_ACCESS_KEY": "hunter2",
+    }
+    parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path, env=env))
+    forwarded = dict(parsed["EnvironmentVariables"])
+    forwarded.pop("PATH")
+    assert forwarded == {
+        "HTTPS_PROXY": "http://proxy.example:3128",
+        "https_proxy": "http://proxy.example:3128",
+        "NO_PROXY": "",
+        "SSL_CERT_FILE": "/etc/ssl/corp.pem",
+    }
+
+
+def test_build_plist_keeps_an_empty_value_that_cancels_its_uppercase_twin(tmp_path):
+    # urllib reads an empty lowercase name as switching the uppercase one off,
+    # so `https_proxy=` next to HTTPS_PROXY means "no proxy" in the shell.
+    # Dropping the empty value would hand the agent the proxy the shell turned
+    # off; launchd sets an empty string as an empty variable, so the agent's
+    # urllib then sees exactly what the shell's did.
+    env = {"HTTPS_PROXY": "http://proxy.example:3128", "https_proxy": ""}
+    parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path, env=env))
+    assert parsed["EnvironmentVariables"]["https_proxy"] == ""
+
+
+def test_build_plist_env_without_allowlisted_keys_is_just_path(tmp_path):
+    parsed = plistlib.loads(
+        launch_agent.build_plist(PROGRAM, home=tmp_path, env={"HOME": "/Users/x"})
+    )
+    assert list(parsed["EnvironmentVariables"]) == ["PATH"]
+
+
 # --- program resolution ----------------------------------------------------
 
 
@@ -183,6 +224,16 @@ def test_install_creates_the_log_directory(tmp_path):
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
     assert Path(result["stderr_log"]).parent.is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts a POSIX file mode")
+def test_install_writes_the_plist_owner_only(tmp_path):
+    # A forwarded proxy URL can carry credentials, so the plist gets 0600
+    # rather than whatever the umask leaves write_bytes with.
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+    assert stat.S_IMODE(Path(result["plist"]).stat().st_mode) == 0o600
 
 
 def test_install_boots_out_first_when_already_loaded(tmp_path):
