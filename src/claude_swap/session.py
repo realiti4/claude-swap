@@ -1083,12 +1083,15 @@ class SessionManager:
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
         is set in the invoking environment. File/dir sharing is lock-free on
         the reuse path — concurrent runs with different flags are last-writer-
-        wins and self-heal on the next launch; only the MCP mirror takes
-        Claude's config lock, and only when it needs to write.
+        wins and self-heal on the next launch; only the MCP mirror and the
+        folder-trust mirror take Claude's config lock, and only when they
+        need to write.
         """
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
+        if share:
+            self._sync_folder_trust(session_dir)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
@@ -1299,6 +1302,86 @@ class SessionManager:
             self._logger.warning(
                 f"Could not sync MCP servers ({e}) — skipping this launch."
             )
+
+    def _sync_folder_trust(self, session_dir: Path) -> None:
+        """Carry folders the user already trusted into the profile.
+
+        Claude Code asks "Do you trust the files in this folder?" once per
+        config dir, keyed by path in ``.claude.json``'s ``projects`` map, so
+        every session profile asked again for folders the user had long
+        trusted in their default profile, and a wrapper that launches claude
+        unattended stalled on the prompt. Only ``hasTrustDialogAccepted:
+        true`` entries are copied, under the same path keys Claude wrote
+        (so parent-folder trust carries the same way it does in the default
+        profile); nothing is ever untrusted, and no other per-project state
+        is touched. Additive and fail-open like the MCP mirror: an
+        unreadable side, a symlinked target or a contended lock leaves the
+        profile as it is, and the steady state takes no lock and writes
+        nothing.
+        """
+        config_path = session_dir / ".claude.json"
+        if config_path.is_symlink() or not config_path.is_file():
+            return  # bootstrap/validation owns a missing config
+        trusted = self._read_trusted_folders()
+        if not trusted:
+            return
+        existing = self._load_json_object(config_path)
+        if existing is None or not self._missing_trust(existing, trusted):
+            return
+        lock_dir = config_path.parent / (config_path.name + ".lock")
+        try:
+            with proper_lockfile(lock_dir):
+                # Re-read under the lock: claude may have written meanwhile.
+                if config_path.is_symlink() or not config_path.is_file():
+                    return
+                existing = self._load_json_object(config_path)
+                if existing is None:
+                    return
+                missing = self._missing_trust(existing, trusted)
+                if not missing:
+                    return
+                projects = existing.setdefault("projects", {})
+                for key in missing:
+                    entry = projects.get(key)
+                    if not isinstance(entry, dict):
+                        entry = projects[key] = {}
+                    entry["hasTrustDialogAccepted"] = True
+                try:
+                    atomic_write_json(config_path, existing)
+                except OSError as e:
+                    self._logger.warning(f"Could not sync folder trust: {e}")
+        except (ClaudeCodeLockTimeout, OSError) as e:
+            self._logger.warning(
+                f"Could not sync folder trust ({e}) — skipping this launch."
+            )
+
+    @staticmethod
+    def _read_trusted_folders() -> list[str]:
+        """Path keys the default profile has accepted the trust dialog for."""
+        config = SessionManager._load_json_object(get_default_global_config_path())
+        projects = config.get("projects") if config else None
+        if not isinstance(projects, dict):
+            return []
+        return [
+            key
+            for key, entry in projects.items()
+            if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True
+        ]
+
+    @staticmethod
+    def _missing_trust(config: dict, trusted: list[str]) -> list[str]:
+        projects = config.get("projects", {})
+        if not isinstance(projects, dict):
+            return []  # malformed: leave it to claude rather than overwrite
+        return [
+            key
+            for key in trusted
+            if not (
+                isinstance(projects.get(key), dict)
+                and projects[key].get("hasTrustDialogAccepted") is True
+            )
+            and (key not in projects or isinstance(projects[key], dict))
+        ]
 
     @staticmethod
     def _read_mcp_source() -> dict | None:
