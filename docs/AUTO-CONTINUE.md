@@ -154,16 +154,25 @@ the account:
   change, unreadable usage meant three "usage unknown" ticks and then waiting
   for a candidate to become readable again (found live on 2026-11-03: the
   switch landed 80 s after three sessions stopped).
-- It picks the best account it can measure. If none is measurable, it picks
-  the first account in rotation that no session has reported limited. A
-  wrong guess costs one more stop, which names that account in turn.
+- It picks the best account it can measure. If none is measurable, it lands
+  "blind" on the account whose last reading was lowest. Usage only rises
+  within a window, so an old reading is a floor. It skips accounts:
+  - that never had a reading;
+  - that the usage endpoint refuses (401/403, like a broken slot);
+  - whose last reading is already at a limit that hasn't reset;
+  - that a stopped session, or the account it just left, shows is spent.
+- If it guesses wrong, the session stops again when the waiter continues it
+  on that account. That stop names the account, and `cswap auto` moves on
+  again without going back. It can tell that stop from a late one on the old
+  account because Claude Code reports a different reset time for it.
 - Then the waiters continue the stopped sessions as usual (`account-switched`).
 
 It ignores stops from sessions that already carried on, from `cswap run`
-profiles, from rehearsals, and stops logged up to 60 s after `cswap auto`'s
-own last switch (a running session can still be on the old account's token
-that long). This needs the `cswap auto` loop and the auto-continue hook.
-Turn it off with `cswap config set resume.switchOnStop false`.
+profiles and from rehearsals. In the first 60 s after its own switch it also
+ignores stops that report the old account's reset time: a running session can
+still be on the old account's token that long. This needs the `cswap auto`
+loop and the auto-continue hook. If the loop itself is stuck, nothing
+switches. Turn it off with `cswap config set resume.switchOnStop false`.
 
 ---
 

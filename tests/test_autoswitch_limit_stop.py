@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -15,9 +17,26 @@ from claude_swap import resume as rs
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent, TickOutcome
 from claude_swap.settings import settings_path
 from claude_swap.usage_store import UsageEntry
-from tests.test_autoswitch import EngineHarness, _entry_for, _usage
+from tests.test_autoswitch import EngineHarness, _entry_for, _iso_at, _usage
+from tests.test_transcript import limit_stop, write
 
 SID = "0123abcd-0000-4000-8000-000000000000"
+SID2 = "4567efab-0000-4000-8000-000000000000"
+STALE_S = 7200.0  # past every trust window: the reading no longer decides
+
+
+def _unreadable(
+    pct: float, *, error: str = "network", resets_in: float = 3600.0, now: float = 1_000_000.0
+) -> UsageEntry:
+    """An account the endpoint can't read now, with a stale reading from
+    before: what a network glitch leaves in the store."""
+    window = {"pct": pct, "resets_at": _iso_at(now + resets_in)}
+    return UsageEntry(
+        last_good={"five_hour": window, "seven_day": {"pct": 0.0}},
+        fetched_at=now - STALE_S,
+        age_s=STALE_S,
+        last_error=error,
+    )
 
 
 def _stop(
@@ -52,7 +71,10 @@ def _stop(
 
 def _tick_stored_only(h: EngineHarness, usage: dict) -> TickOutcome:
     """Tick with the store holding ``usage``; fail if anything fetches."""
-    entries = {num: _entry_for(value, h.clock.now) for num, value in usage.items()}
+    entries = {
+        num: value if isinstance(value, UsageEntry) else _entry_for(value, h.clock.now)
+        for num, value in usage.items()
+    }
 
     def stored(fetch=None, *, scheduled=False) -> dict[str, UsageEntry]:
         assert fetch == set(), f"the stop path fetched usage (fetch={fetch!r})"
@@ -127,23 +149,114 @@ class TestAStopOnTheActiveAccountSwitchesAtOnce:
 
 
 class TestWhenNothingIsMeasurable:
-    def test_lands_on_an_unmeasured_account_in_sequence_order(self, h):
+    def _land(self, h, fleet: dict) -> int | None:
         _stop(h, "a@example.com")
-        assert _tick_stored_only(h, {"1": None, "2": None, "3": None}) is TickOutcome.SWITCHED
-        assert h.active_number() == 2
+        assert _tick_stored_only(h, {"1": None, **fleet}) is TickOutcome.SWITCHED
         assert _switch(h).trigger == "at-limit"
+        return h.active_number()
+
+    def test_lands_on_the_lowest_stale_reading_first(self, h):
+        # Usage only rises within a window: a stale reading is a floor.
+        assert self._land(h, {"2": _unreadable(80), "3": _unreadable(20)}) == 3
+
+    def test_equal_floors_keep_sequence_order(self, h):
+        assert self._land(h, {"2": _unreadable(30), "3": _unreadable(30)}) == 2
+
+    def test_never_lands_on_a_stale_reading_already_at_its_limit(self, h):
+        # Even as the only unreadable account left: it is still spent.
+        _stop(h, "a@example.com")
+        fleet = {"1": None, "2": _unreadable(100), "3": _unreadable(5, error="http-403")}
+        assert _tick_stored_only(h, fleet) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_a_limit_whose_window_reset_since_is_room_again(self, h):
+        fleet = {"2": _unreadable(100, resets_in=-60.0), "3": _unreadable(60)}
+        assert self._land(h, fleet) == 2
+
+    def test_never_lands_on_an_account_that_never_read(self, h):
+        assert self._land(h, {"2": UsageEntry(last_error="network"), "3": _unreadable(60)}) == 3
+
+    @pytest.mark.parametrize("error", ["http-401", "http-403"])
+    def test_never_lands_on_an_account_the_endpoint_refuses(self, h, error):
+        # Slot 4 on the machine this was built for: a 403 on every fetch.
+        assert self._land(h, {"2": _unreadable(5, error=error), "3": _unreadable(60)}) == 3
 
     def test_skips_an_account_another_session_reported_limited(self, h):
+        _stop(h, "b@example.com", sid=SID2, ago=600.0)
+        assert self._land(h, {"2": _unreadable(5), "3": _unreadable(60)}) == 3
+
+    def test_with_nothing_eligible_it_stays_and_says_so(self, h):
         _stop(h, "a@example.com")
-        _stop(h, "b@example.com", sid="4567efab-0000-4000-8000-000000000000", ago=600.0)
-        assert _tick_stored_only(h, {"1": None, "2": None, "3": None}) is TickOutcome.SWITCHED
-        assert h.active_number() == 3
+        fleet = {"1": None, "2": UsageEntry(), "3": _unreadable(10, error="http-403")}
+        assert _tick_stored_only(h, fleet) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-comparison"]
 
     def test_without_a_stop_the_unmeasured_fleet_still_waits(self, h):
         # The blind landing is only for first-hand proof; unknown usage alone
         # keeps the ordinary failover counting.
         assert h.tick_with_usage({"1": None, "2": None, "3": None}) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+
+class TestALandingOnASpentAccountCorrectsItself:
+    """The waiter continues the session 0-50 s after the switch, so when the
+    new account is spent too, its stop lands inside the settle window."""
+
+    def _land_then_continue(self, h) -> rs.ResumeRecord:
+        first = _stop(h, "a@example.com")
+        fleet = {"1": None, "2": _unreadable(10), "3": _unreadable(40)}
+        assert _tick_stored_only(h, fleet) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        # The waiter delivers and exits; the session then runs on account 2.
+        rs.mutate_record(
+            h.switcher.backup_dir,
+            SID,
+            lambda r: replace(
+                r,
+                state=rs.RESUMED,
+                last_resume_at=h.clock.now,
+                resumed_stall_uuid=r.stall_uuid,
+            ),
+        )
+        h.clock.advance(25.0)
+        h.events.clear()
+        return first
+
+    def _restop_through_the_hook(self, h, tmp_path: Path, resets_at: float) -> None:
+        record = limit_stop("s2", h.clock.now - 1.0)
+        record["apiErrorParams"]["rate_limit_info"]["resetsAt"] = resets_at
+        transcript = write(tmp_path / "t.jsonl", record)
+        outcome = rs.arm(
+            h.switcher.backup_dir,
+            {"session_id": SID, "transcript_path": str(transcript)},
+            {},
+            clock=h.clock,
+            spawn=lambda _sid: None,
+        )
+        assert outcome == "armed"
+
+    def test_moves_on_and_never_back_to_the_account_it_left(self, h, tmp_path):
+        self._land_then_continue(h)
+        self._restop_through_the_hook(h, tmp_path, resets_at=h.clock.now + 7200.0)
+        # The hook read the live login: the stop names account 2.
+        assert rs.load_record(h.switcher.backup_dir, SID).identity_email == "b@example.com"
+        # Account 1 now looks best on paper; it is spent until its reset.
+        fleet = {"1": _unreadable(5), "2": None, "3": _unreadable(40)}
+        assert _tick_stored_only(h, fleet) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_stop_carrying_the_left_accounts_reset_is_the_old_token(self, h, tmp_path):
+        first = self._land_then_continue(h)
+        assert first.resets_at is not None
+        self._restop_through_the_hook(h, tmp_path, resets_at=first.resets_at)
+        # Ignored, so the ordinary path runs (and fetches) as it would anyway.
+        outcome = h.tick_with_usage({"1": _usage(5), "2": _usage(50), "3": _usage(40)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
 
 
 class TestStopsThatDoNotCount:

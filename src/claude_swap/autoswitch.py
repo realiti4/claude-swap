@@ -60,7 +60,7 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.resume import SWITCH_SETTLE_S, LimitStop, limit_stops
+from claude_swap.resume import SWITCH_SETTLE_S, LimitStop, limit_stops, window_pct
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import (
@@ -123,6 +123,10 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # 2026-11-03 the daemon printed nothing for 22 minutes while the machine was
 # awake, and the console log alone could not say why.
 SLOW_TICK_S = 120.0
+
+# Two reported resets this close are the same limit (clock rounding). See
+# `_active_limit_stop`.
+SAME_RESET_TOLERANCE_S = 120.0
 
 # Margin on the reset axis for the no-return bar's release
 # (`_left_account_recovered`): the account we left counts as recovered only
@@ -1559,7 +1563,9 @@ class AutoSwitchEngine:
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
         if not ordered and limit_stop is not None:
-            ordered = self._unmeasured_escape(oauth_candidates, headroom, stops)
+            ordered = self._unmeasured_escape(
+                oauth_candidates, headroom, entries, self._known_spent(state, stops)
+            )
         if (
             not ordered and api_key_candidates
             and trigger not in ("consume-first", "priority")
@@ -2768,32 +2774,85 @@ class AutoSwitchEngine:
         self, current: str, state: dict, stops: list[LimitStop]
     ) -> LimitStop | None:
         """The newest stop reported for the active account since our last
-        switch settled, if any. Older ones were the account we already left;
-        ones inside the settle window may be a session still on its token."""
+        switch, if any. Older ones were the account we already left.
+
+        Within ``SWITCH_SETTLE_S`` of the switch a stop may come from a
+        session still on the old account's token, so it counts only when its
+        reported reset differs from the one the departure recorded: then it
+        is another account's limit. That is the usual timing for a waiter
+        continuing a session onto a spent account, so without it a wrong
+        landing would stick."""
         last = state.get("lastSwitchAt")
-        settled = (float(last) if isinstance(last, (int, float)) else 0.0) + SWITCH_SETTLE_S
+        switched_at = float(last) if isinstance(last, (int, float)) else 0.0
+        left_reset = state.get("leftRecoveryAt")
         for stop in stops:
-            if stop.stalled_at <= settled:
+            if stop.stalled_at <= switched_at:
+                continue
+            if stop.stalled_at <= switched_at + SWITCH_SETTLE_S and not (
+                stop.resets_at is not None
+                and isinstance(left_reset, (int, float))
+                and abs(stop.resets_at - left_reset) > SAME_RESET_TOLERANCE_S
+            ):
                 continue
             if self.switcher.account_number_for_identity(*stop.identity) == current:
                 return stop
         return None
 
+    def _known_spent(self, state: dict, stops: list[LimitStop]) -> set[str]:
+        """Accounts known to be at a limit right now: named by a live stop,
+        or the account we last left at its limit, until the reset recorded
+        on departure (its stop's record stops counting once the session is
+        continued elsewhere)."""
+        spent = {
+            num
+            for stop in stops
+            if (num := self.switcher.account_number_for_identity(*stop.identity))
+        }
+        left, headroom, recovery = (
+            state.get("lastSwitchFrom"),
+            state.get("leftHeadroom"),
+            state.get("leftRecoveryAt"),
+        )
+        if (
+            left is not None
+            and isinstance(headroom, (int, float))
+            and headroom <= 0
+            and isinstance(recovery, (int, float))
+            and recovery > self.clock()
+        ):
+            spent.add(str(left))
+        return spent
+
     def _unmeasured_escape(
         self,
         candidates: list[str],
         headroom: dict[str, float | None],
-        stops: list[LimitStop],
+        entries: dict,
+        spent: set[str],
     ) -> list[str]:
-        """Candidates whose usage can't be read and that no session reported
-        limited, in sequence order. With the active account known spent and
-        nothing measurable (the endpoint is down), an account that may have
-        room beats one that has none. A wrong guess costs one more stop,
-        which names that account in turn."""
-        limited = {
-            self.switcher.account_number_for_identity(*stop.identity) for stop in stops
-        }
-        return [n for n in candidates if headroom.get(n) is None and n not in limited]
+        """Unreadable candidates worth landing on blind, most room first.
+
+        With the active account known spent and nothing measurable (the
+        endpoint is down), an account that may have room beats one that has
+        none, but only one that worked before: it needs a past reading and no
+        auth refusal (a 401/403 slot may not work at all). Usage only rises
+        within a window, so that reading is a floor until the window resets:
+        one already at a limit is skipped, and the lowest floor goes first. A
+        wrong guess costs one more stop, which names that account in turn."""
+        now = self.clock()
+        floors: list[tuple[float, str]] = []
+        for num in candidates:
+            entry = entries.get(num)
+            if headroom.get(num) is not None or num in spent or entry is None:
+                continue
+            if entry.last_good is None or entry.last_error in ("http-401", "http-403"):
+                continue
+            floor = window_pct(entry.last_good, None, now)
+            if floor is not None and floor >= 100.0:
+                continue
+            floors.append((floor if floor is not None else 0.0, num))
+        floors.sort(key=lambda pair: pair[0])
+        return [num for _, num in floors]
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

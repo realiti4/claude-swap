@@ -334,11 +334,24 @@ collection:
 | `resetsAt` still in the future (5 h trust when it isn't recorded) | the limit lifts at its own reset |
 
 The engine (`_active_limit_stop`) then takes the newest stop whose identity is
-the active account and whose `stalledAt` is later than `lastSwitchAt + 60 s`
-(`SWITCH_SETTLE_S`). An earlier stop belongs to the account it already left.
-One inside the window may come from a session still on the old token: Windows
-and Linux sessions re-read the credentials file on change, and macOS caches
-the Keychain for ~30 s. Given such a stop:
+the active account and whose `stalledAt` is later than `lastSwitchAt`. An
+earlier stop belongs to the account it already left.
+
+Within `SWITCH_SETTLE_S` (60 s) of the switch, a stop may come from a session
+still on the old token: Windows and Linux sessions re-read the credentials
+file on change, and macOS caches the Keychain for ~30 s. So inside that window
+a stop counts only if its `resetsAt` differs from the departure's
+`leftRecoveryAt` by more than `SAME_RESET_TOLERANCE_S` (120 s), which makes it
+a different account's limit.
+
+Without this, a wrong landing would stick. The waiter continues sessions 0-50
+s after a switch (30 s poll plus 0-20 s jitter), so a spent landing account's
+stop lands inside the window, and its `stalledAt` never changes again.
+
+A re-stop's identity is right: the waiter exits once it delivers, so the next
+stop goes through `arm`, which reads the live login. A waiter still waiting
+keeps the arm-time identity for a new stall (`Waiter._note`), and that costs
+at most one extra cycle. Given a stop that counts:
 
 - It skips usage collection and pre-warm. It decides on
   `usage_entries_by_account(fetch=set())`, the store as it stands, with no
@@ -346,10 +359,19 @@ the Keychain for ~30 s. Given such a stop:
 - The trigger is `at-limit`, whatever the stale reading says: no cooldown, no
   unhealthy-tick counting, and escape ranking.
 - If ranking finds nothing (no candidate readable), `_unmeasured_escape`
-  returns unreadable candidates in sequence order, minus any account another
-  live stop names. This comes before API-key fallback, since those cost
-  money. `priority-consume-first` keeps its own freshness rule, so there the
-  blind landing usually holds.
+  lands blind. This comes before API-key fallback, since those cost money.
+  - **Who qualifies:** unreadable candidates that have a `last_good` reading
+    and no `http-401`/`http-403` `last_error`.
+  - **Who is skipped:** accounts in `_known_spent`. That covers every account
+    a live stop names, plus `lastSwitchFrom` when it was left at
+    `leftHeadroom ≤ 0` before its `leftRecoveryAt`. A stop's own record stops
+    counting once its session is continued elsewhere.
+  - **Order:** usage is monotone within a window, so `last_good` is a floor
+    until its reset (`resume.window_pct`, which counts reset windows as 0).
+    Floors of 100% or more are skipped; the lowest goes first, with sequence
+    order breaking ties.
+  - `priority-consume-first` keeps its own freshness rule, so there the blind
+    landing usually holds.
 - The departure is recorded as `leftHeadroom: 0` and
   `leftRecoveryAt: <reported resetsAt>`, so the no-return bar releases at the
   real reset.
