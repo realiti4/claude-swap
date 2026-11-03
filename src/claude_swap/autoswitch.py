@@ -784,6 +784,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # The limit stop last written to claude-swap.log: a blocked switch
+        # retries every tick, and the line should appear once per stop.
+        self._logged_stop: LimitStop | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -1268,12 +1271,16 @@ class AutoSwitchEngine:
         active_binding: BindingWindow | None = None
         if limit_stop is not None:
             # Whatever the endpoint reads (stale, lagging or unreachable).
-            _logger.info(
-                "Session %s stopped on account %s's %s limit; leaving it now",
-                limit_stop.session_id[:8],
-                current,
-                limit_stop.limit_type or "usage",
-            )
+            # Logged once per stop, and never by a dry-run engine (`cswap
+            # watch` runs one by default; it leaves nothing).
+            if not self.dry_run and limit_stop != self._logged_stop:
+                self._logged_stop = limit_stop
+                _logger.info(
+                    "Session %s stopped on account %s's %s limit; leaving it now",
+                    limit_stop.session_id[:8],
+                    current,
+                    limit_stop.limit_type or "usage",
+                )
             trigger = "at-limit"
         elif active_headroom is not None:
             self._unhealthy_ticks = 0

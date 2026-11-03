@@ -225,6 +225,29 @@ class TestLimitStops:
         assert rs.limit_stops(h.switcher.backup_dir, no_clock) == []
 
 
+class TestTheDecisionIsLoggedOnce:
+    def _lines(self, caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if "leaving it now" in r.getMessage()]
+
+    def test_a_blocked_switch_logs_its_stop_once(self, h, caplog):
+        _stop(h, "a@example.com")
+        with caplog.at_level(logging.INFO):
+            for _ in range(3):  # every candidate exhausted: blocked each tick
+                _tick_stored_only(h, {"1": None, "2": _usage(100), "3": _usage(100)})
+        assert h.active_number() == 1
+        assert self._lines(caplog) == [
+            f"Session {SID[:8]} stopped on account 1's five_hour limit; leaving it now"
+        ]
+
+    def test_a_dry_run_engine_logs_nothing(self, h, caplog):
+        _stop(h, "a@example.com")
+        h.engine = h._make_engine(dry_run=True)
+        with caplog.at_level(logging.INFO):
+            _tick_stored_only(h, {"1": None, "2": _usage(30)})
+        assert self._lines(caplog) == []
+        assert _switch(h).dry_run
+
+
 def test_a_slow_tick_is_logged(h, caplog):
     with patch.object(autoswitch, "SLOW_TICK_S", -1.0), caplog.at_level(logging.WARNING):
         h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
