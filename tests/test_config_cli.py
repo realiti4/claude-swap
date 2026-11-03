@@ -54,6 +54,7 @@ class TestConfigList:
             "updates.check",
             "pin.desktopFollows",
             "pin.connectorsFollowPin",
+            "usage.headerProbe",
         ):
             assert key in out
         # From the schema, not a literal: a bare count drifts every time a

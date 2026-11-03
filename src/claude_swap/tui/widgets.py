@@ -164,6 +164,14 @@ def usage_rows(
                 suffix = f"{suffix}  {marker}" if suffix else marker
                 suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
         rows.append((window["name"], pct, suffix, suffix_full))
+    rejected = last_good.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe: at its limit until the refusal ends,
+        # whatever the windows above say (auto-switching excludes it).
+        reset, reset_full = _reset_parts(rejected, now)
+        suffix = f"rejected (!)  {reset}" if reset else "rejected (!)"
+        suffix_full = f"rejected (!)  {reset_full}" if reset_full else "rejected (!)"
+        rows.append(("probe", 100.0, suffix, suffix_full))
     return rows
 
 
@@ -192,19 +200,22 @@ def pin_is_broken(acc: AccountSnapshot) -> bool:
 
 
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
-    """``· Max 20x`` after the header, ``(expired)`` when lapsed — the same
-    marker ``cswap list`` prints, including the age once the plan has gone two
-    TTLs without refreshing."""
+    """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
+    a lapsed subscription is a highlighted ``Free`` rather than an appended
+    "expired", and the age follows once the plan has gone two TTLs without
+    refreshing."""
     record = acc.subscription_plan
     if not record:
         return
     plan = record["plan"]
-    text.append(f"{gap}· {subscription.plan_label(plan)}", style=palette.muted)
+    text.append(f"{gap}· ", style=palette.muted)
+    text.append(
+        subscription.plan_label(plan),
+        style=palette.sev_warn if subscription.is_expired(plan) else palette.muted,
+    )
     if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
         age = format_age(int(record["fetchedAt"] * 1000))
         text.append(f" ({age})", style=palette.muted)
-    if subscription.is_expired(plan):
-        text.append(" (expired)", style=palette.sev_warn)
 
 
 def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
@@ -406,6 +417,8 @@ def mini_account_text(
         for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
         if float(w["pct"]) >= 100
     ]
+    if isinstance(last_good, dict) and isinstance(last_good.get("rejected"), dict):
+        maxed.append("rejected")  # a refused setup-token probe
     for name in maxed:
         if parts:
             text.append(" · ", style=palette.track)

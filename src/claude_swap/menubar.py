@@ -238,6 +238,15 @@ def usage_summary(
     if now is None:
         now = time.time()
     parts: list[str] = []
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe leads the row: the account is at its
+        # limit until the refusal ends, however low the windows below read.
+        seg = "rejected (!)"
+        countdown = _live_countdown(rejected, now)
+        if countdown:
+            seg += f" ({countdown})"
+        parts.append(seg)
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         pace_result = None
@@ -315,6 +324,8 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
+    if isinstance(active_usage, dict) and isinstance(active_usage.get("rejected"), dict):
+        segments.append("rejected (!)")
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:

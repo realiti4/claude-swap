@@ -20,12 +20,14 @@ from claude_swap.settings import (
     RunSettings,
     UiSettings,
     UpdateSettings,
+    UsageSettings,
     effective_settings,
     load_pin_settings,
     load_run_settings,
     load_settings,
     load_ui_settings,
     load_update_settings,
+    load_usage_settings,
     merged_with_cli,
     save_settings,
     set_setting,
@@ -263,6 +265,33 @@ def test_a_mistyped_pin_switch_leaves_the_other_as_read(tmp_path: Path):
     assert load_pin_settings(tmp_path) == PinSettings(connectors_follow_pin=True)
 
 
+class TestUsageSettings:
+    def test_missing_file_leaves_header_probe_off(self, tmp_path: Path):
+        # Opt-in: each probe is a real inference request on the subscription.
+        assert load_usage_settings(tmp_path) == UsageSettings(header_probe=False)
+
+    def test_reads_true(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": True}})
+        )
+        assert load_usage_settings(tmp_path).header_probe is True
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        # A string "true" is not True: never bool(str).
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": "true"}})
+        )
+        assert load_usage_settings(tmp_path).header_probe is False
+
+    def test_set_and_unset_header_probe(self, tmp_path: Path):
+        assert set_setting(tmp_path, "usage.headerProbe", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "usage": {"headerProbe": True}}
+        assert load_usage_settings(tmp_path).header_probe is True
+        assert unset_setting(tmp_path, "usage.headerProbe") is True
+        assert load_usage_settings(tmp_path).header_probe is False
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -283,6 +312,9 @@ class TestSettingSpecs:
         assert by_section["pin"] == {
             f.name for f in PinSettings.__dataclass_fields__.values()
         }
+        assert by_section["usage"] == {
+            f.name for f in UsageSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
         sources = {
@@ -291,6 +323,7 @@ class TestSettingSpecs:
             "run": RunSettings(),
             "updates": UpdateSettings(),
             "pin": PinSettings(),
+            "usage": UsageSettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
