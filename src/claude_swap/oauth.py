@@ -583,9 +583,8 @@ def request_usage_via_probe(access_token: str) -> dict:
         USAGE_PROBE_URL, data=body, headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(
-            req, timeout=10, context=_pin_aware_ssl_context()
-        ) as resp:
+        # shortcut: no pin-aware context: through the pin this POST reaches the pin's wall logic and moves live sessions' state; add it once the pin relays cswap's own probe untouched.
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
         data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}

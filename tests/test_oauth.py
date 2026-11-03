@@ -2279,8 +2279,6 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         seen = []
 
         class _Resp:
-            headers: dict = {}
-
             def __enter__(self_inner):
                 return self_inner
 
@@ -2314,13 +2312,6 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         assert seen, "fetch_oauth_profile made no request"
         assert seen[0].get("context") is self.SENTINEL, (
             "fetch_oauth_profile did not pass the pin-aware context")
-
-    def test_the_usage_header_probe_carries_it(self, monkeypatch):
-        seen = self._capture(monkeypatch)
-        oauth.request_usage_via_probe("tok")
-        assert seen, "request_usage_via_probe made no request"
-        assert seen[0].get("context") is self.SENTINEL, (
-            "request_usage_via_probe did not pass the pin-aware context")
 
     def test_the_plan_profile_request_carries_it(self, monkeypatch):
         from claude_swap import subscription
