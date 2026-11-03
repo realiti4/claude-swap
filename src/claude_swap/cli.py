@@ -15,6 +15,8 @@ from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
     ACCOUNT_THRESHOLD_MAX,
     ACCOUNT_THRESHOLD_MIN,
+    ACCOUNT_WEEKLY_CAP_MAX,
+    ACCOUNT_WEEKLY_CAP_MIN,
     Platform,
 )
 from claude_swap.printer import (
@@ -621,7 +623,7 @@ Examples:
 
 
 def _threshold_command(argv: list[str]) -> None:
-    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--weekly-cap] [--unset]`.
 
     With no arguments, prints the global `autoswitch.threshold` and every
     per-account override. Otherwise sets (or, with --unset, removes) one
@@ -646,9 +648,12 @@ Examples:
   cswap threshold 2 85
   cswap threshold user@example.com 99.9
   cswap threshold 2 --unset           # back to the global default
-  cswap threshold                     # list the global default and overrides
+  cswap threshold 2 90 --weekly-cap   # never use account 2 past 90% on a weekly window
+  cswap threshold 2 --weekly-cap --unset
+  cswap threshold                     # list the global default, overrides and caps
 
-Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
+Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used);
+{ACCOUNT_WEEKLY_CAP_MIN:g}-{ACCOUNT_WEEKLY_CAP_MAX:g} with --weekly-cap (100 means no cap).
         """,
     )
     parser.add_argument(
@@ -669,6 +674,14 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
     parser.add_argument(
         "--unset", action="store_true", help="Remove the account's override"
     )
+    parser.add_argument(
+        "--weekly-cap",
+        action="store_true",
+        help=(
+            "Set (or --unset) a weekly cap instead: auto-switch never stays on "
+            "or lands on the account while a weekly window reads at or past PCT."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
@@ -687,11 +700,13 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
             _print_threshold_table(switcher)
             return
 
-        switcher.set_account_threshold(
-            args.account, None if args.unset else args.threshold
+        setter = (
+            switcher.set_account_weekly_cap if args.weekly_cap
+            else switcher.set_account_threshold
         )
+        setter(args.account, None if args.unset else args.threshold)
     except ValueError as e:
-        # normalize_account_threshold's message; it always names the range.
+        # The validator's message; it always names the range.
         error(f"Error: {e}")
         sys.exit(1)
     except ClaudeSwitchError as e:
@@ -714,19 +729,27 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
     print(bolded("Switch-away thresholds:"))
     print(f"  {dimmed('global default')}  {default:g}%")
 
-    rows = sorted(
-        (
-            (num, policy.threshold)
-            for num, policy in switcher.account_policies().items()
-            if policy.threshold is not None
-        ),
-        key=lambda row: (not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0),
-    )
-    if not rows:
-        print(dimmed("  No per-account overrides set"))
-        return
-    for num, value in rows:
+    def rows(field: str) -> list[tuple[str, float]]:
+        return sorted(
+            (
+                (num, getattr(policy, field))
+                for num, policy in switcher.account_policies().items()
+                if getattr(policy, field) is not None
+            ),
+            key=lambda row: (
+                not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0
+            ),
+        )
+
+    thresholds, caps = rows("threshold"), rows("weekly_cap")
+    for num, value in thresholds:
         print(f"  Account-{num}  {value:g}%")
+    if not thresholds and not caps:
+        print(dimmed("  No per-account overrides set"))
+    if caps:
+        print(bolded("Weekly caps:"))
+        for num, value in caps:
+            print(f"  Account-{num}  {value:g}%")
 
 
 def _priority_command(argv: list[str]) -> None:

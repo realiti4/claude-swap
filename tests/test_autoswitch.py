@@ -1239,9 +1239,13 @@ class TestDecisionTable:
         usage = {"1": None, "2": _usage(10), "3": _usage(50)}
         assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
+        harness.engine.stop()  # free LIVE, as a real --once exit does
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert harness.active_number() == 2
 
@@ -1249,7 +1253,9 @@ class TestDecisionTable:
         held = {"1": USAGE_TOKEN_EXPIRED, "2": _usage(10), "3": _usage(20)}
         harness.tick_with_usage(held)
         harness.clock.advance(IDLE_HOLD_MAX_S + 1)
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(held) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
         assert not any(
@@ -1263,11 +1269,15 @@ class TestDecisionTable:
         harness.tick_with_usage(unknown)
         assert harness.state()["unhealthyTicks"] == 2
         harness.clock.advance(2 * IDLE_HOLD_MAX_S + 1)
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
         harness.engine._mutate_state(lambda s: s.update(healthAccount="2"))
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
 
@@ -1282,7 +1292,9 @@ class TestDecisionTable:
         state = harness.state()
         assert state["healthAccount"] == "2"
         assert state["unhealthyTicks"] == 1
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 2
 
@@ -5391,6 +5403,40 @@ class TestAModelWindowIsNotABlackout:
             [("5h", 95.0), ("7d", 92.0), ("Fable", 10.0)], 90.0
         ) == ("full", "5h")
 
+    def test_classify_a_rejected_probe_is_a_full_block_not_a_model_wall(self):
+        """A refused setup-token probe adds a 100% ``"rejected"`` window
+        (``oauth.REJECTED_LABEL``): the account is at its limit, so no
+        model choice escapes it. Reading it as ``"model"`` made the panel
+        and the decision log claim dropping a model would open the account."""
+        assert classify_candidate_block(
+            [("5h", 10.0), ("7d", 5.0), ("Fable", 20.0), ("rejected", 100.0)],
+            90.0,
+        ) == ("full", "rejected")
+
+    def test_a_rejected_probe_is_not_a_model_only_wall_to_the_predicate(self):
+        """The same blocker through ``_model_window_binds_everywhere``: an
+        account whose only blocker is the refusal is not "blocked ONLY by
+        the model window", so it cannot arm the fleet-wide model drop."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = {"1": {
+            "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+            "scoped": [{"name": "Fable", "pct": 20.0}],
+            "rejected": {"resets_at": None},
+        }}
+        assert _model_window_binds_everywhere(usage, ("Fable",), 90.0) is False
+
+    def test_the_decision_log_reads_a_rejected_probe_as_full(self):
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "2": 0.0},
+            threshold=90.0,
+            windows={"2": {"5h": 10.0, "7d": 5.0, "Fable": 20.0, "rejected": 100.0}},
+        )
+        text = event.human()
+        assert "(rejected full)" in text, text
+        assert "rejected-walled" not in text, text
+
     def test_the_decision_log_names_what_blocked_each_candidate(self):
         event = PollEvent(
             active={"number": 6, "email": "a@example.com"},
@@ -6257,6 +6303,7 @@ class TestDynamicStrategy:
     def _owner_harness(self, temp_home, *, active_num: int) -> EngineHarness:
         h = EngineHarness(
             temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+            alternation_chunk_pct=0.0,  # the time-only dwell this class pins
         )
         order = [active_num] + [n for n in (1, 2, 3, 4, 5, 6) if n != active_num]
         for num in order:
@@ -6610,6 +6657,9 @@ class TestWarmthAndAlternation375:
     """
 
     def _harness(self, temp_home, **kwargs):
+        # The percent step (T3167, tests/test_alternation_step.py) is off here:
+        # this class pins the time-only alternation `alternationChunkPct` 0 keeps.
+        kwargs.setdefault("alternation_chunk_pct", 0.0)
         h = EngineHarness(temp_home, strategy="dynamic", **kwargs)
         h.seed(1, "acct1@example.invalid")
         h.seed(2, "acct2@example.invalid")
@@ -16416,17 +16466,25 @@ class TestPerAccountSwitchThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
-    def test_the_soonest_reset_ordering_is_unchanged(self, temp_home, strategy):
+    @pytest.mark.parametrize(
+        "strategy, third_resets_in, expect",
+        [
+            ("consume-first", 2 * 86400, 3),  # the sooner weekly reset wins
+            # dynamic (T3167): a reset within a day first, the rest by room
+            ("dynamic", 2 * 86400, 2),
+            ("dynamic", 20 * 3600, 3),
+        ],
+    )
+    def test_the_soonest_reset_ordering(self, temp_home, strategy, third_resets_in, expect):
         h = self._harness(temp_home, strategy)
         self._set(h, 1, 80.0)
         outcome = h.tick_with_usage({
             "1": self._use(h, 85, 9 * 86400),
             "2": self._use(h, 40, 5 * 86400),
-            "3": self._use(h, 60, 2 * 86400),
+            "3": self._use(h, 60, third_resets_in),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3, "the sooner weekly reset still wins"
+        assert h.active_number() == expect
 
     def test_an_own_threshold_above_the_strategys_keeps_the_account_landable(
         self, temp_home

@@ -115,6 +115,34 @@ class TestThresholdBadge:
         assert "60%" in row
 
 
+class TestWeeklyCapBadge:
+    """`cap N%` names the cap; `CAPPED` appears once a weekly window reaches it."""
+
+    @pytest.mark.parametrize(
+        ("cap", "pct7", "shown"),
+        [
+            (90.0, 85.0, "cap 90%"),
+            (90.0, 92.0, "cap 90% CAPPED"),
+            (100.0, 99.0, "cap 100%"),
+        ],
+    )
+    def test_the_badge_follows_the_window(self, cap, pct7, shown):
+        acc = with_policy(
+            make_account(2, active=True, alias="dev", entry=make_entry(pct7=pct7)),
+            weekly_cap=cap,
+        )
+        for text in (card(acc).splitlines()[0], mini(acc)):
+            assert shown in text
+            assert ("CAPPED" in text) is shown.endswith("CAPPED")
+
+    def test_a_busy_five_hour_window_never_marks_it(self):
+        acc = with_policy(
+            make_account(2, alias="dev", entry=make_entry(pct5=99.0, pct7=10.0)),
+            weekly_cap=50.0,
+        )
+        assert "CAPPED" not in mini(acc)
+
+
 class TestUnpolicedAccountsRenderExactlyAsBefore:
     """The negative half, and the reason this file has goldens.
 
@@ -206,6 +234,26 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             )
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
             assert "(line" not in self._row(plain, "user3@example.com")
+
+    async def test_a_capped_candidate_is_marked_and_ranked_last(
+        self, tmp_path, fake_engine
+    ):
+        """Account 2 has the most room (48 points against 45) but is past its
+        weekly cap: the engine never lands there, so the panel names the cap
+        and lists it last."""
+        fleet = self._fleet(tmp_path)
+        fleet._accounts[1] = with_policy(
+            make_account(2, entry=make_entry(10.0, 52.0)), weekly_cap=50.0
+        )
+        app = make_app(fleet)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            assert "capped 7d 52% >= 50%" in self._row(plain, "user2@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
         self, tmp_path, fake_engine

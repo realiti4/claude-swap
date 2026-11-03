@@ -81,7 +81,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
-            ("Switch threshold…", "threshold-menu"),
+            ("Weekly cap…", "cap-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -122,23 +122,24 @@ class DashboardScreen(Screen):
         entries.append(_BACK)
         return entries
 
-    def _threshold_entries(self) -> MenuEntries:
-        """One row per account with the threshold it switches at."""
+    def _cap_entries(self) -> MenuEntries:
+        """One row per account with the weekly cap auto-switch holds it to."""
         snap = self.app.snapshot
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
             name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
-            own = acc.policy.threshold
-            state = "strategy's" if own is None else f"{own:g}%"
-            entries.append((f"{acc.number}  {name}   {state}", f"threshold:{acc.number}"))
+            own = acc.policy.weekly_cap
+            state = "none" if own is None else f"{own:g}%"
+            entries.append((f"{acc.number}  {name}   {state}", f"cap:{acc.number}"))
         entries.append(_BACK)
         return entries
 
     @staticmethod
-    def _threshold_value_entries(number: str) -> MenuEntries:
-        entries: MenuEntries = [("strategy's threshold", f"set-threshold:{number}:default")]
+    def _cap_value_entries(number: str) -> MenuEntries:
+        """100 is "use to exhaustion": never capped."""
+        entries: MenuEntries = [("no cap (strategy's threshold)", f"set-cap:{number}:default")]
         entries += [
-            (f"{pct}%", f"set-threshold:{number}:{pct}") for pct in (80, 85, 90, 95, 98)
+            (f"{pct}%", f"set-cap:{number}:{pct}") for pct in (80, 85, 90, 95, 98, 100)
         ]
         entries.append(_BACK)
         return entries
@@ -220,14 +221,14 @@ class DashboardScreen(Screen):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
             await self._pop_menu()
-        elif action_id == "threshold-menu":
-            await self._push_menu("switch threshold", self._threshold_entries())
-        elif action_id.startswith("threshold:"):
+        elif action_id == "cap-menu":
+            await self._push_menu("weekly cap", self._cap_entries())
+        elif action_id.startswith("cap:"):
             number = action_id.split(":", 1)[1]
-            await self._push_menu(f"account {number}", self._threshold_value_entries(number))
-        elif action_id.startswith("set-threshold:"):
+            await self._push_menu(f"account {number}", self._cap_value_entries(number))
+        elif action_id.startswith("set-cap:"):
             _, number, value = action_id.split(":")
-            app.do_set_account_threshold(number, None if value == "default" else float(value))
+            app.do_set_account_weekly_cap(number, None if value == "default" else float(value))
             await self._pop_menu()
             await self._pop_menu()
         else:

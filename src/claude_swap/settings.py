@@ -79,11 +79,20 @@ class AutoSwitchSettings:
     cache_ttl_seconds: float = 3600.0
     # `dynamic` only: the least headroom a COLD candidate needs to be worth
     # the re-write cost (measured: one cold landing cost ~19 5h-points on a
-    # 19-session fleet).
+    # 19-session fleet). The Ultra (Max 20x) figure; a Max 5x account pays 4x it.
     cold_switch_cost_pct: float = 20.0
     # `dynamic` only: how long a healthy active is held before rotating to a
     # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.
+    # With `alternation_chunk_pct` > 0 it applies only when the percent step
+    # cannot be measured (traffic ran and the reading did not move).
     alternation_chunk_seconds: float = 600.0
+    # `dynamic` only: the percent step. A healthy active is rotated to the best
+    # admissible account (warm or cold) once its binding window has risen this
+    # many points since the landing; `alternation_chunk_seconds` then applies
+    # only when that rise cannot be measured. 0 turns the step off (time-only
+    # alternation). 20 is the replay's winner (alternation-replay.md); the
+    # proposed 3 never passed its acceptance rule.
+    alternation_chunk_pct: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -214,12 +223,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "coldSwitchCostPct", "cold_switch_cost_pct", "float", 0.0, 100.0,
-            help="dynamic: headroom a cold candidate needs to be admitted",
+            help="dynamic: headroom a cold candidate needs to be admitted (Ultra figure, x4 on Max 5x)",
         ),
         SettingSpec(
             "autoswitch", "alternationChunkSeconds", "alternation_chunk_seconds",
             "float", 60.0, 3600.0,
             help="dynamic: how long to sit before rotating to a warm partner",
+        ),
+        SettingSpec(
+            "autoswitch", "alternationChunkPct", "alternation_chunk_pct", "float", 0.0, 100.0,
+            help="dynamic: points the active's binding window rises before rotating (0 = by time only)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

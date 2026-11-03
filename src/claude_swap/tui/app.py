@@ -354,18 +354,20 @@ class CswapApp(App):
             partial(self.switcher.set_account_disabled, number, target),
         )
 
-    def do_set_account_threshold(self, number: str, pct: float | None) -> None:
-        """Give the account its own switch threshold (``None``: the strategy's)."""
+    def do_set_account_weekly_cap(self, number: str, pct: float | None) -> None:
+        """Cap the account's weekly windows at ``pct`` (``None``: no cap) and
+        clear its own switch line, so its 5h window follows the global one."""
 
-        def set_threshold() -> None:
+        def set_cap() -> None:
             # The setter rejects an out-of-range value with ValueError;
             # `run_action` reports only `ClaudeSwitchError`.
             try:
-                self.switcher.set_account_threshold(number, pct)
+                self.switcher.set_account_weekly_cap(number, pct)
+                self.switcher.set_account_threshold(number, None)
             except ValueError as e:
                 raise ClaudeSwitchError(str(e)) from e
 
-        self._start_action(f"Set switch threshold of account {number}", set_threshold)
+        self._start_action(f"Set weekly cap of account {number}", set_cap)
 
     def confirm_remove(self, number: str, email: str) -> None:
         self.push_screen(

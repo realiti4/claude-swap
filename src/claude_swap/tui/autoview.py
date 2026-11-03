@@ -36,6 +36,7 @@ from claude_swap.autoswitch import (
     proactive_switch_bar_pct,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
+from claude_swap.lines import weekly_capped
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -658,6 +659,15 @@ class AutoScreen(Screen):
                         bars.get(acc.number, settings.threshold),
                     )
                 )
+                capped = weekly_capped(acc.policy.weekly_cap, acc.usage.last_good)
+                if capped:
+                    # A veto, not a rank: the engine never lands here.
+                    entry.append(
+                        f"  capped {capped[0]} {capped[1]:.0f}% >= "
+                        f"{acc.policy.weekly_cap:g}%",
+                        style=palette.sev_warn,
+                    )
+                    key = (997.0,)
                 ranked.append((key, acc.number))
             lines[acc.number] = entry
 

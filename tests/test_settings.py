@@ -534,3 +534,26 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+class TestAlternationChunkPct:
+    """T3167: `autoswitch.alternationChunkPct`, the percent step `dynamic`
+    alternates on. 20 by default (the replay's winner; the order's 3 never
+    passed the acceptance), 0 turns the step off (time-only alternation)."""
+
+    def test_default_and_zero_disables(self, tmp_path: Path):
+        assert AutoSwitchSettings().alternation_chunk_pct == 20.0
+        assert load_settings(tmp_path).alternation_chunk_pct == 20.0
+        assert set_setting(tmp_path, "autoswitch.alternationChunkPct", "0") == 0.0
+        assert load_settings(tmp_path).alternation_chunk_pct == 0.0
+
+    def test_load_clamps_and_drops_garbage(self, tmp_path: Path):
+        for raw, expected in ((150, 100.0), (-5, 0.0), ("big", 20.0), (None, 20.0)):
+            settings_path(tmp_path).write_text(
+                json.dumps({"autoswitch": {"alternationChunkPct": raw}})
+            )
+            assert load_settings(tmp_path).alternation_chunk_pct == expected, raw
+
+    def test_set_rejects_out_of_range(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between 0 and 100"):
+            set_setting(tmp_path, "autoswitch.alternationChunkPct", "101")

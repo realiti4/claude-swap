@@ -199,15 +199,18 @@ class FakeSwitcher:
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
 
-    def set_account_threshold(self, identifier: str, pct: float | None) -> None:
-        self.calls.append(("set_threshold", str(identifier), pct))
+    def set_account_weekly_cap(self, identifier: str, pct: float | None) -> None:
+        self.calls.append(("set_cap", str(identifier), pct))
         self._accounts = [
-            dataclasses.replace(a, policy=AccountPolicy(threshold=pct))
+            dataclasses.replace(a, policy=AccountPolicy(weekly_cap=pct))
             if a.number == str(identifier)
             else a
             for a in self._accounts
         ]
-        print(f"Set Account-{identifier} switch threshold")
+        print(f"Set Account-{identifier} weekly cap")
+
+    def set_account_threshold(self, identifier: str, pct: float | None) -> None:
+        self.calls.append(("set_threshold", str(identifier), pct))
 
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
@@ -1053,7 +1056,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
-                "threshold-menu",
+                "cap-menu",
                 # No "pin-menu": the cloud pin row appears only when the
                 # optional extra is installed, which it is not in CI.
                 "remove-menu",
@@ -1265,11 +1268,9 @@ class TestDashboard:
             await settle(pilot)
             assert ("set_disabled", "2", False) in fake.calls
 
-    async def test_threshold_menu_sets_and_clears_an_accounts_own_threshold(
-        self, tmp_path
-    ):
+    async def test_cap_menu_sets_and_clears_an_accounts_weekly_cap(self, tmp_path):
         fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2, policy=AccountPolicy(threshold=85.0))],
+            [make_account(1, active=True), make_account(2, policy=AccountPolicy(weekly_cap=85.0))],
             tmp_path,
         )
         app = make_app(fake)
@@ -1286,44 +1287,48 @@ class TestDashboard:
                     for item in menu.query(MenuItem)
                 ]
 
-            await menu_select(pilot, "threshold-menu")
+            await menu_select(pilot, "cap-menu")
             rows = labels()
             assert any("2" in r and "85%" in r for r in rows), rows
-            assert any("1" in r and "strategy" in r for r in rows), rows
-            await menu_select(pilot, "threshold:1")
-            await menu_select(pilot, "set-threshold:1:80")
+            assert any("1" in r and "none" in r for r in rows), rows
+            await menu_select(pilot, "cap:1")
+            assert "100%" in labels()  # 100 is "use to exhaustion"
+            await menu_select(pilot, "set-cap:1:80")
             await settle(pilot)
-            assert ("set_threshold", "1", 80.0) in fake.calls
+            assert ("set_cap", "1", 80.0) in fake.calls
+            # A cap hands the 5h window to the global line: the old own line goes.
+            assert ("set_threshold", "1", None) in fake.calls
             # back at the root, not stranded in the submenu
             menu = app.screen.query_one("#menu", ListView)
             assert [i.action_id for i in menu.query(MenuItem)][0] == "switch"
 
-            await menu_select(pilot, "threshold-menu")
-            await menu_select(pilot, "threshold:2")
-            await menu_select(pilot, "set-threshold:2:default")
+            await menu_select(pilot, "cap-menu")
+            await menu_select(pilot, "cap:2")
+            await menu_select(pilot, "set-cap:2:default")
             await settle(pilot)
+            assert ("set_cap", "2", None) in fake.calls
             assert ("set_threshold", "2", None) in fake.calls
 
-    async def test_a_rejected_threshold_is_reported_not_raised(self, tmp_path):
-        """`set_account_threshold` rejects a value out of range with
+    async def test_a_rejected_cap_is_reported_not_raised(self, tmp_path):
+        """`set_account_weekly_cap` rejects a value out of range with
         `ValueError`; the action reports it like any switcher error."""
 
         class Rejecting(FakeSwitcher):
-            def set_account_threshold(self, identifier, pct):
-                raise ValueError("threshold must be between 50 and 99.9")
+            def set_account_weekly_cap(self, identifier, pct):
+                raise ValueError("weekly cap must be between 50 and 100")
 
         app = make_app(Rejecting([make_account(1, active=True)], tmp_path))
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
-            await menu_select(pilot, "threshold-menu")
-            await menu_select(pilot, "threshold:1")
-            await menu_select(pilot, "set-threshold:1:80")
+            await menu_select(pilot, "cap-menu")
+            await menu_select(pilot, "cap:1")
+            await menu_select(pilot, "set-cap:1:80")
             await settle(pilot)
             from claude_swap.tui.modals import OutputModal
 
             assert isinstance(app.screen, OutputModal)
             assert not app.busy
-            assert "between 50 and 99.9" in app.screen._output
+            assert "between 50 and 100" in app.screen._output
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
         fake = FakeSwitcher(
@@ -4408,6 +4413,24 @@ class TestUnswitchableRowsAreListed:
         assert out.index("noplan@x.com") < out.index("full@x.com"), out
         row = next(r for r in out.splitlines() if "noplan@x.com" in r)
         assert "5h" in row and row.endswith("no plan (subscription inactive)"), out
+
+    def test_the_panel_reads_a_rejected_probe_as_full_not_model_walled(self):
+        """A refused probe puts the account at its limit (a 100% `rejected`
+        window): no model choice escapes it, so the row must not read
+        `rejected-walled` (dropping a model would open it)."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "refused@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 20.0}],
+                "rejected": {"retry_after_s": 3600.0, "resets_at": None},
+            }),
+        ), active="1", settings=settings)
+        assert "rejected-walled" not in out, out
+        assert "  rejected full" in out, out
 
     @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
     def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):

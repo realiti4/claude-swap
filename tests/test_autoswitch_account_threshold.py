@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth
+from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     HORIZON_HEADROOM_RATIO,
     SPENT_HEADROOM_PCT,
@@ -39,8 +39,9 @@ from claude_swap.autoswitch import (
     _parse_reset_ts,
     pct_label,
 )
-from claude_swap.lines import binding_window
+from claude_swap.lines import binding_window, weekly_capped
 from claude_swap.settings import AutoSwitchSettings
+from claude_swap.usage_store import FetchRecord, UsageEntry
 
 # The module, not its Test class: a class imported by name is collected here too.
 import tests.test_autoswitch as test_autoswitch
@@ -1486,3 +1487,169 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
             outcome, _ = _tick(h, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.ERROR
         assert any(isinstance(e, ErrorEvent) for e in h.events)
+
+
+_usage57 = test_autoswitch._usage57
+
+
+def _switch_trigger(h: EngineHarness) -> str | None:
+    return next((e.trigger for e in h.events if isinstance(e, SwitchEvent)), None)
+
+
+class TestWeeklyCap:
+    """`weeklyCap` is an eligibility veto on the weekly-resetting windows."""
+
+    @pytest.mark.parametrize(
+        "strategy", ["best", "consume-first", "dynamic", "priority-consume-first"]
+    )
+    def test_a_capped_active_leaves_for_the_walled_peer_that_returns_soonest(
+        self, temp_home, strategy
+    ):
+        h = _fleet(temp_home, strategy=strategy)
+        h.switcher.set_account_weekly_cap("1", 90)
+        outcome = h.tick_with_usage({
+            "1": _usage57(10, None, 92, _R_LATEST),
+            "2": _usage57(100, _R_LATEST, 0),
+            "3": _usage57(100, _R_SOON, 0),
+        })
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 3
+        assert _switch_trigger(h) == "weekly-capped"
+
+    def test_a_capped_active_with_no_eligible_peer_stays_and_reports_blocked(
+        self, temp_home
+    ):
+        h = _fleet(temp_home)
+        h.switcher.set_account_disabled("3", True)
+        for n in ("1", "2"):
+            h.switcher.set_account_weekly_cap(n, 80)
+        outcome = h.tick_with_usage({"1": _usage7(10, 85), "2": _usage7(10, 85)})
+        assert outcome is TickOutcome.BLOCKED and h.active_number() == 1
+        assert "no-candidates" in _reasons(h)
+        assert "weekly cap (7d 85%)" in _details(h)[-1]
+
+    @pytest.mark.parametrize(("cap", "lands"), [(None, 2), (75, 3)])
+    def test_a_capped_candidate_is_never_landed_on(self, temp_home, cap, lands):
+        h = _fleet(temp_home)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("2", cap)
+        h.tick_with_usage(
+            {"1": _usage7(95, 0), "2": _usage7(0, 80), "3": _usage7(85, 0)}
+        )
+        assert h.active_number() == lands
+
+    @pytest.mark.parametrize(
+        ("threshold", "pct5", "trigger"),
+        [(99.0, 90.0, None), (99.0, 95.0, None), (GLOBAL, 95.0, "proactive")],
+    )
+    def test_the_five_hour_window_follows_the_global_line_never_the_cap(
+        self, temp_home, threshold, pct5, trigger
+    ):
+        h = _fleet(temp_home, threshold=threshold)
+        h.switcher.set_account_weekly_cap("1", 50)
+        h.tick_with_usage({
+            "1": _usage7(pct5, 10), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert _switch_trigger(h) == trigger
+
+    @pytest.mark.parametrize(
+        ("weekly_line", "pct7", "trigger"),
+        [
+            (60.0, 91.0, "weekly-capped"),
+            (99.0, 91.0, "weekly-capped"),
+            (99.0, 89.0, None),
+            # A lower weekly line still leaves earlier, on the soft line.
+            (60.0, 75.0, "proactive"),
+        ],
+    )
+    def test_the_weekly_line_does_not_move_the_cap(
+        self, temp_home, weekly_line, pct7, trigger
+    ):
+        h = _fleet(temp_home, weekly_threshold=weekly_line)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({
+            "1": _usage7(10, pct7), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert _switch_trigger(h) == trigger
+
+    @pytest.mark.parametrize("cap", [None, 100])
+    def test_no_cap_and_a_cap_of_100_are_never_capped(self, temp_home, cap):
+        h = _fleet(temp_home, threshold=99.9)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("1", cap)
+        assert h.tick_with_usage({
+            "1": _usage7(10, 99), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        }) is TickOutcome.NO_ACTION
+
+    @pytest.mark.parametrize(
+        ("cap", "weekly", "expected"),
+        [(85.0, None, 85.0), (95.0, None, GLOBAL), (85.0, 97.0, 85.0), (None, 97.0, 97.0)],
+    )
+    def test_cadence_reads_the_cap_as_its_weekly_line(
+        self, temp_home, cap, weekly, expected
+    ):
+        h = _fleet(temp_home, weekly_threshold=weekly)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("1", cap)
+        h.tick_with_usage({n: _usage7(10, 10) for n in ("1", "2", "3")})
+        assert h.switcher._poll_inputs_override[1] == expected
+
+    @pytest.mark.parametrize(
+        ("pct7", "prev7", "recent_429", "lo", "hi"),
+        [
+            # Moved since the last poll: the band clamps (a 0.5 rise is under the
+            # movement rule, so urgent mode is not what sets 120 s).
+            (88.0, 87.5, False, 120.0, 120.0),
+            # In the band but flat: the band lets go, the normal cadence resumes.
+            (88.0, 88.0, False, 121.0, 300.0),
+            (80.0, 79.5, False, 121.0, 300.0),
+            (88.0, 87.5, True, 360.0, 1800.0),
+        ],
+    )
+    def test_the_active_polls_every_two_minutes_only_while_moving_in_the_band_below_its_cap(
+        self, temp_home, pct7, prev7, recent_429, lo, hi
+    ):
+        """The engine pins the cap; the planner reads it."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({n: _usage7(10, pct7) for n in ("1", "2", "3")})
+        before = UsageEntry(
+            last_good=_usage7(10, prev7), poll_interval_s=300.0,
+            last_429_at=h.switcher._usage_store.clock() if recent_429 else None,
+        )
+        plans = h.switcher._plans_after_fetch(
+            {"1": FetchRecord(usage=_usage7(10, pct7))}, {"1": before},
+            {"1": (None, None, None, None, True)},
+        )
+        assert lo <= plans["1"][1] <= hi, plans
+
+    @pytest.mark.parametrize(
+        ("start", "idle_polls", "bound"), [(70.0, 0, 1.0), (86.0, 0, 1.0), (89.0, 5, 1.7)]
+    )
+    def test_a_slow_burn_stepped_through_the_planned_intervals_trips_the_cap_inside_the_stated_overshoot(
+        self, temp_home, start, idle_polls, bound
+    ):
+        """0.3 points a minute, whole-number readings, the engine's pinned
+        inputs, every wait at its +10% jitter. Measured: 0.85 points burning, 1.45
+        after `idle_polls` flat polls in the band (one normal interval of burn,
+        300 s + 10% is 1.65 at most)."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({n: _usage7(10, 10) for n in ("1", "2", "3")})
+        threshold, weekly, models = h.switcher._poll_inputs_override
+        worst = 0.0
+        for phase in range(20):
+            true, t, polls, interval, prev = start + phase / 20, 0.0, 0, None, None
+            while not weekly_capped(90.0, usage := _usage7(10, float(int(true)))):
+                next_poll, interval = poll_policy.plan_after_fetch(
+                    prev_interval_s=interval, prev_usage=prev, new_usage=usage,
+                    is_active=True, threshold=threshold, weekly_threshold=weekly,
+                    models=models, recent_429=False, now=t,
+                    weekly_cap=h.switcher._poll_weekly_cap, rng=lambda: 1.0,
+                )
+                polls += 1
+                if polls > idle_polls:
+                    true += 0.3 * (next_poll - t) / 60
+                t, prev = next_poll, usage
+            worst = max(worst, true - 90.0)
+        assert 0.0 <= worst < bound
