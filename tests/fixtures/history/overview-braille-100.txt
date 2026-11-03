@@ -1,0 +1,51 @@
+Weekly room left                                                           last 7 days → next 7 days
+Made-up demo data: 15 accounts over four weeks.
+7.7 of 15 accounts' worth left
+2.5 more comes back in the next 24 hours as #7, #15 and #4 reset. 1 account has no recent reading,
+so it isn't counted.
+
+                                           now  ahead →
+ 15┤                                           ⠅
+   │                                           ⠅                                    ⠠⠐⠈ ⠁⠈
+   │                                           ⠅                  ⡀⠄⠠ ⠌ ⠁⠈ ⠁⠈ ⠁⠈ ⠁⠈ ⠁
+   │                                           ⠅               ⢀⠠⠁
+ 10┤                                           ⠅     ⠄⠠ ⠄⠠ ⠄⠠ ⠌
+   │⡀  ⡤⣀⣠⠋⠒⠤⣀⣀⣀      ⢀⣀⠖⠤⡀ ⡤⣀⣀⠗⠒⠒⠤⡀           ⠅ ⢠⡂⠐⢨ ⡀
+   │⠈⠢⣰⠁⢕⢕⢕⢕⢕⢕⢕⢕⠑⢄   ⡤⠎⠈⢕⢕⠉⠉⢕⢕⠈⢕⢕⢕⢕⠉⠢⡀       ⡦⢄⡀⢀⢸⠄⢈⠚ ⠈⠉⠒ ⣀      ⡄ ⣀
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠣⣀⠞⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠈⠒⠢⢄⢠⣀⠦⣰⠁⠅⠹⡫⡚⡄ ⠹⠈⠢⣀   ⠉⠒ ⣰⠤⠉⠃⠈⠁⠉ ⠼⠒ ⣀⡀             ⡆⠠ 6h 6.7
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠈⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠁⠈⢕⠈⢕⠅⠅⠁⢸⠈⠆    ⠁⢀                ⠈⠉ ⠤⣀      ⢠⢄⡀⠇
+  5┤⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅ ⠈  ⢦⡀    ⠑⢄                   ⠉ ⠤⣀ ⢀⢠ ⠈
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅    ⠈⠈⢆     ⠁⠠⣠⡐⢄⡄⡀⡆               ⠉⠈⠉  ⡀
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅       ⠁⡀     ⠈  ⠁⠈⠁⠈⠒⢤⢀⡀⠠⡀          ⢠  ⡉⠒ 24h 2.6
+   │⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅        ⠑⡄    ⢀⢀   ⡀  ⢀ ⠈⢲⠈⠢⡀       ⢀⢸⢆⠒⡧⡀
+  0┤⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕⠅⠅         ⠈⣀⣀⣀ ⣸⢸⢠⡗⣄⡜⣄ ⣸⢠⣀⣈⢣ ⣀⣐⣄⣀⣀⣀⣀⣀⣸⢻ ⠑⠇⠘ 30m 0.56
+   └─────────┴───────────┴────────────┴───────┼───┴───────────┴───────────┴───────────┴───
+          Oct 29      Oct 31        Nov 2       Nov 4       Nov 6       Nov 8      Nov 10
+  ── room left   ╌╌ 30m  ╌╌ 6h  ╌╌ 24h  pace   ┈┈ if no more use
+
+  Pace                       A day    More accounts  Next 7 days at that pace
+  ╌ Last 30 minutes            5.8     +27 accounts  Runs out Thu Nov 5, 5:52 AM
+  ╌ Last 6 hours               1.5  0 (sustainable)  Lowest 3.9, Mon Nov 9, 2:00 PM
+  ╌ Last 24 hours              2.9      +7 accounts  Runs out Sun Nov 8, 2:30 PM
+    Sustainable (14 accounts)  2.0                0  Faster than this runs out sooner or later
+  A day = accounts' worth of weekly limit used a day. More accounts = how many more than are counted
+  now it would take to keep up with that pace for good (pace x 7 days, less the accounts counted).
+  Assumes cswap auto keeps its best strategy: use stays on one account until its week is used up,
+  then moves to the one with the most room.
+
+Room on each account now  (7-day limit used)
+  #8           ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0%   5h   0%   resets in 6d 18h
+  #12          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0%   5h   0%   resets in 6d 18h
+  #14          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0%   5h   0%   resets in 6d 9h
+  #11          ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░   5%   5h   0%   resets in 4d 9h
+  #10          ███████░░░░░░░░░░░░░░░░░░░░░░░  22%   5h   0%   resets in 3d 7h
+  #9           ████████████████░░░░░░░░░░░░░░  54%   5h   0%   resets in 2d 18h
+  #2           ████████████████░░░░░░░░░░░░░░  55%   5h   0%   resets in 6d 4h
+  #3           ████████████████░░░░░░░░░░░░░░  55%   5h   0%   resets in 2d 14h
+  #13          ████████████████░░░░░░░░░░░░░░  55%   5h   0%   resets in 3d 22h
+  #5           █████████████████░░░░░░░░░░░░░  58%   5h   0%   resets in 6d 9h
+  #7  active   ███████████████████░░░░░░░░░░░  63%   5h   7%   resets in 11h 0m
+  #1           ████████████████████████░░░░░░  80%   5h   0%   resets in 3d 0h
+  #4           ███████████████████████████░░░  91%   5h   0%   resets in 23h 0m
+  #15          ███████████████████████████░░░  91%   5h   0%   resets in 11h 0m
+  #6           last reading 3d 14h ago, from before its weekly reset (last check: http-403)

@@ -2,8 +2,8 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch``, ``ui``, ``run`` and ``updates`` sections; other sections can be added
-additively.
+``autoswitch``, ``ui``, ``run``, ``updates`` and ``history`` sections; other
+sections can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -95,11 +95,27 @@ class UpdateSettings:
     check: bool = True
 
 
+@dataclass(frozen=True)
+class HistorySettings:
+    """Usage history (``history`` section; see ``history.py``).
+
+    On by default: the history is local and owner-only, holds no email
+    addresses, and costs no requests -- it keeps readings cswap has already
+    fetched. ``retention_days`` keeps a little over a year, so a week can be
+    set beside the same week a year earlier; a year of a dozen accounts is a
+    few tens of megabytes.
+    """
+
+    enabled: bool = True
+    retention_days: int = 400
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "run": RunSettings,
     "updates": UpdateSettings,
+    "history": HistorySettings,
 }
 
 
@@ -183,6 +199,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "updates", "check", "check", "bool",
             help="Check PyPI once a day and print a hint when a newer release exists",
+        ),
+        SettingSpec(
+            "history", "enabled", "enabled", "bool",
+            help="Keep a history of usage readings and switches for cswap history",
+        ),
+        SettingSpec(
+            "history", "retentionDays", "retention_days", "int", 30, 3650,
+            help="Days of usage history to keep (whole months are dropped past it)",
         ),
     )
 }
@@ -326,6 +350,32 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
         )
         return default
     return UpdateSettings(check=check)
+
+
+def load_history_settings(backup_root: Path) -> HistorySettings:
+    """Load the history section; a missing, mistyped or out-of-range value
+    is its default (logged), never an error."""
+    section = _read_raw(settings_path(backup_root)).get("history")
+    default = HistorySettings()
+    if not isinstance(section, dict):
+        return default
+    enabled = section.get("enabled", default.enabled)
+    if not isinstance(enabled, bool):
+        _logger.warning(
+            "settings.json: history.enabled %r is not true or false; using %r",
+            enabled, default.enabled,
+        )
+        enabled = default.enabled
+    days = section.get("retentionDays", default.retention_days)
+    spec = SETTING_SPECS["history.retentionDays"]
+    if isinstance(days, bool) or not isinstance(days, int) or not spec.lo <= days <= spec.hi:
+        _logger.warning(
+            "settings.json: history.retentionDays %r is not a whole number of "
+            "days from %g to %g; using %r",
+            days, spec.lo, spec.hi, default.retention_days,
+        )
+        days = default.retention_days
+    return HistorySettings(enabled=enabled, retention_days=days)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -501,6 +551,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "ui": load_ui_settings(backup_root),
         "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
+        "history": load_history_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

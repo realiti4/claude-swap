@@ -670,8 +670,14 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        after_tick: Callable[[], object] | None = None,
     ):
         self.switcher = switcher
+        # Housekeeping run_loop does after each tick, once every lock the tick
+        # took is released and before it sleeps (``cswap auto`` passes one that
+        # keeps the live HTML history report current). An error in it is
+        # logged and nothing more: it may never stop the loop.
+        self._after_tick = after_tick
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
@@ -2723,6 +2729,11 @@ class AutoSwitchEngine:
                     ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                 )
                 outcome = TickOutcome.ERROR
+            if self._after_tick is not None:
+                try:
+                    self._after_tick()
+                except Exception as e:
+                    _logger.debug("after-tick hook failed: %r", e)
             delay = self._next_delay(outcome)
             if delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)

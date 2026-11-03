@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude account usage</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,.10); --hover: rgba(11,11,11,.05);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --track: #cde2fb;
+  --warn: #fab219; --shadow: rgba(0,0,0,.12);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10); --hover: rgba(255,255,255,.06);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --track: #184f95;
+    --shadow: rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10); --hover: rgba(255,255,255,.06);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --track: #184f95;
+  --shadow: rgba(0,0,0,.5);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1280px; margin: 0 auto; padding: 28px 24px 56px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
+.sub, .section-sub { color: var(--ink2); margin: 0; }
+.section-sub { font-size: 13px; margin-bottom: 12px; }
+section { margin-top: 32px; }
+.filters { display: flex; gap: 12px; align-items: center; margin: 20px 0 0; flex-wrap: wrap; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--surface); }
+.seg button { font: inherit; font-size: 13px; color: var(--ink2); background: transparent; border: 0; padding: 6px 12px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button:hover { background: var(--hover); }
+.seg button[aria-checked="true"] { color: var(--ink); background: var(--hover); font-weight: 600; }
+.seg button:focus-visible, .plain:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+.notice { margin-top: 16px; color: var(--ink2); font-size: 13px; max-width: 900px; }
+.legend { display: flex; gap: 6px 18px; flex-wrap: wrap; margin-bottom: 12px; color: var(--ink2); font-size: 13px; align-items: center; }
+.legend .static { display: inline-flex; gap: 7px; align-items: center; padding: 2px 0; }
+.key-line { display: inline-block; width: 16px; height: 2px; border-radius: 1px; }
+.tag { font-size: 11.5px; color: var(--ink); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; margin-left: 6px; }
+.icon-warn { color: var(--warn); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--grid); vertical-align: middle; white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
+th { color: var(--ink2); font-weight: 600; }
+.n { text-align: right; font-variant-numeric: tabular-nums; }
+.muted { color: var(--ink2); }
+.tooltip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px var(--shadow); padding: 8px 10px;
+  font-size: 12.5px; min-width: 160px; display: none; }
+.tooltip .when { color: var(--ink2); margin-bottom: 4px; }
+.tooltip .row { display: flex; align-items: center; gap: 8px; line-height: 1.6; }
+.tooltip .row b { font-variant-numeric: tabular-nums; min-width: 34px; font-weight: 600; }
+.tooltip .row .lbl { color: var(--ink2); }
+.tooltip .foot { color: var(--ink2); margin-top: 4px; }
+.plain { font: inherit; font-size: 13px; color: var(--s1); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; }
+
+/* forecast lines, shortest pace window to longest: the same blue, stepping away from the surface.
+   Light uses steps 300/500/700: the only ones far enough apart (ΔE 19), at 2.2:1 for the lightest. */
+:root { --f1: #6da7ec; --f2: #256abf; --f3: #0d366b; }
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) { --f1: #3987e5; --f2: #86b6ef; --f3: #cde2fb; }
+}
+:root[data-theme="dark"] { --f1: #3987e5; --f2: #86b6ef; --f3: #cde2fb; }
+
+.grow { flex: 1; }
+.switch { display: inline-flex; align-items: center; gap: 8px; font: inherit; font-size: 13px; color: var(--ink2);
+  background: none; border: 0; padding: 4px 2px; cursor: pointer; }
+.switch .track { position: relative; width: 30px; height: 18px; border-radius: 9px; background: var(--axis); transition: background .15s; }
+.switch .knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--surface);
+  box-shadow: 0 1px 2px var(--shadow); transition: transform .15s; }
+.switch[aria-checked="true"] { color: var(--ink); font-weight: 600; }
+.switch[aria-checked="true"] .track { background: var(--s1); }
+.switch[aria-checked="true"] .knob { transform: translateX(12px); }
+.switch:focus-visible, .brow:focus-visible, .demo-pill:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+.demo-banner { display: flex; gap: 10px; align-items: baseline; margin-top: 16px; padding: 10px 14px; max-width: 900px;
+  background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--warn); border-radius: 6px; font-size: 13.5px; }
+.demo-banner[hidden], .demo-pill[hidden], .switch[hidden] { display: none; }
+.demo-pill { position: fixed; right: 16px; bottom: 16px; z-index: 5; font: inherit; font-size: 12.5px; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--warn); border-radius: 6px;
+  box-shadow: 0 4px 16px var(--shadow); padding: 6px 10px; cursor: pointer; }
+
+.ov-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 900px) { .ov-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 600px) { .demo-pill { display: none; } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px 10px; min-width: 0; }
+.card h3 { font-size: 14px; font-weight: 600; margin: 0; }
+.card .section-sub { margin: 2px 0 10px; }
+.card svg { display: block; width: 100%; overflow: visible; touch-action: none; }
+.card svg text { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.card svg text.lab { fill: var(--ink2); font-size: 11.5px; }
+.card svg text.val { fill: var(--ink); font-size: 11.5px; font-weight: 600; }
+.card svg text.empty { fill: var(--ink2); font-size: 12px; }
+.chart-box { outline: none; }
+.chart-box:focus-visible { outline: 2px solid var(--s1); outline-offset: 4px; border-radius: 4px; }
+.hero-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+.hero-fig { font-size: 48px; font-weight: 600; line-height: 1.05; }
+.hero-unit { color: var(--ink2); font-size: 14px; }
+.hero-note { color: var(--ink2); font-size: 13px; margin: 2px 0 10px; }
+.key-dash { display: inline-block; width: 16px; height: 0; border-top: 2px dashed var(--ink2); }
+.key-dot { display: inline-block; width: 16px; height: 0; border-top: 2px dotted var(--muted); }
+.fc { width: auto; margin: 0 0 10px; font-size: 12.5px; }
+.fc th, .fc td { padding: 2px 14px 2px 0; border: 0; white-space: normal; }  /* wraps on a phone */
+.fc th { color: var(--muted); font-weight: 400; font-size: 11.5px; }
+.fc .n { white-space: nowrap; }
+.fc tr.ref td { color: var(--ink2); }
+.fc .key-dash { vertical-align: middle; }
+.fc-note { color: var(--ink2); font-size: 12px; margin: -4px 0 10px; }
+.card svg text tspan.k { fill: var(--ink2); font-weight: 400; }
+.key-box { display: inline-block; width: 14px; height: 10px; border-radius: 2px; }
+.board { display: grid; gap: 2px; }
+.brow { display: grid; grid-template-columns: 74px minmax(0, 1fr) 38px 64px; gap: 8px; align-items: center; min-height: 21px;
+  border-radius: 4px; padding: 0 4px; font-size: 12.5px; }
+.brow.head { color: var(--muted); font-size: 11.5px; min-height: 18px; }
+.brow:not(.head):hover { background: var(--hover); }
+.brow .bnum { white-space: nowrap; overflow: hidden; }
+.brow .bnum .acct { font-weight: 600; }
+.brow .bnum .tag { margin-left: 4px; padding: 0 4px; font-size: 10.5px; }
+.brow .bval, .brow .breset { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.brow .breset { color: var(--ink2); }
+.brow .bnone { color: var(--ink2); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bars { display: grid; gap: 2px; }
+.bar7, .bar5 { display: block; border-radius: 3px; overflow: hidden; }
+.bar7 { height: 8px; background: var(--track); }
+.bar5 { height: 3px; background: var(--grid); }
+.bar7 > i, .bar5 > i { display: block; height: 100%; border-radius: 3px; }
+.bar7 > i { background: var(--s1); }
+.bar5 > i { background: var(--s2); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Claude account usage</h1>
+    <p class="sub" id="subtitle"></p>
+  </header>
+
+  <div class="filters">
+    <div class="seg" role="radiogroup" aria-label="Time range" id="ranges"></div>
+    <span class="grow"></span>
+    <button type="button" class="switch" role="switch" aria-checked="true" id="live-toggle" hidden
+      title="Reloads this page with the newest readings when you come back to it, or after 90 seconds without input">
+      <span class="track" aria-hidden="true"><span class="knob"></span></span>Keep up to date</button>
+    <button type="button" class="switch" role="switch" aria-checked="false" id="demo-toggle">
+      <span class="track" aria-hidden="true"><span class="knob"></span></span>Demo data</button>
+  </div>
+  <div class="demo-banner" id="demo-banner" role="note" hidden>
+    <span class="icon-warn" aria-hidden="true">⚠</span>
+    <div><b>Demo data.</b> Made-up usage for 15 accounts over four weeks, so you can see how the charts read once
+      history builds up. None of it comes from your accounts. <button class="plain" id="demo-off" type="button">Show my data</button></div>
+  </div>
+  <p class="notice" id="notice" hidden></p>
+
+
+  <section aria-labelledby="h-overall" id="overall">
+    <h2 id="h-overall">All accounts</h2>
+    <p class="section-sub">Sizes are in accounts' worth: 1.0 is one account's whole 7-day limit.</p>
+    <div class="ov-grid">
+      <div class="card" id="room-card">
+        <h3>Weekly room left</h3>
+        <div class="hero-row"><span class="hero-fig" id="room-fig">—</span><span class="hero-unit" id="room-unit"></span></div>
+        <p class="hero-note" id="room-note"></p>
+        <table class="fc" id="room-fc" aria-label="Forecasts of weekly room left at recent paces"></table>
+        <p class="fc-note" id="room-fc-note"></p>
+        <div class="legend" id="room-legend"></div>
+        <div class="chart-box" id="room-box" tabindex="0" aria-label="Weekly room left across all accounts. Use the arrow keys to move through time.">
+          <svg id="room-svg" role="img" aria-label="Weekly room left across all accounts over time, with forecasts at recent paces and the room coming back as limits reset if there's no more use"></svg>
+        </div>
+      </div>
+      <div class="card" id="board-card">
+        <h3>Room on each account now</h3>
+        <p class="section-sub">Most room first.</p>
+        <div class="legend"><span class="static"><span class="key-box" style="background:var(--s1)"></span>7-day used</span>
+          <span class="static"><span class="key-box" style="background:var(--s2);height:4px"></span>5-hour used</span></div>
+        <div class="board" id="board" role="list" aria-label="Accounts by weekly room left"></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+<div class="tooltip" id="tooltip" role="status" aria-live="polite"></div>
+<button type="button" class="demo-pill" id="demo-pill" hidden>Demo data · show mine</button>
+
+<script id="payload" type="application/json">/*__CSWAP_HISTORY_DATA__*/null</script>
+<script id="demo-payload" type="application/json">/*__CSWAP_HISTORY_DEMO__*/null</script>
+<script>
+(() => {
+"use strict";
+const DAY = 86400, HOUR = 3600;
+const SVG_NS = "http://www.w3.org/2000/svg";
+// cswap embeds two payloads (history_report.py): your history, and four weeks of made-up
+// data for the Demo switch. The switch is remembered in localStorage (or in #demo where
+// storage is blocked) and takes effect on reload, so every chart is built from one payload.
+const REAL = JSON.parse(document.getElementById("payload").textContent.replace("/*__CSWAP_HISTORY_DATA__*/", ""));
+const DEMO_DATA = JSON.parse(document.getElementById("demo-payload").textContent.replace("/*__CSWAP_HISTORY_DEMO__*/", ""));
+const DEMO_KEY = "cswap-report-demo";
+const store = (() => {
+  try { localStorage.setItem(DEMO_KEY + "-probe", "1"); localStorage.removeItem(DEMO_KEY + "-probe"); return localStorage; }
+  catch (e) { return null; }
+})();
+const DEMO = !!DEMO_DATA && (!REAL || (store ? store.getItem(DEMO_KEY) === "1" : location.hash === "#demo"));
+const P = DEMO ? DEMO_DATA : REAL;
+if (!P) { document.querySelector("main").textContent = "No data in this page: build it with cswap history --html."; return; }
+const NOW = P.generatedAt;
+// cswap auto's strategy (its default in reports from before it was kept): the forecasts follow it.
+const AUTO = Object.assign({strategy: "best"}, P.autoswitch || {});
+const RANGES = [
+  {id: "1d", label: "Last 24 hours", span: DAY},
+  {id: "7d", label: "Last 7 days", span: 7 * DAY},
+  {id: "30d", label: "Last 30 days", span: 30 * DAY},
+  {id: "all", label: "All", span: null},
+];
+// With `cswap history --html --days N` the data stops N days back, so wider ranges would mislead.
+const AVAILABLE = RANGES.filter(r => r.span == null || !P.rangeDays || r.span <= P.rangeDays * DAY + 60);
+const DEFAULT_RANGE = AVAILABLE.some(r => r.id === "7d") ? "7d" : AVAILABLE[0].id;
+const state = {range: DEFAULT_RANGE};
+const accounts = P.accounts.map(a => a.acct);
+// An account's alias (cswap alias), if it has one. The page carries no email addresses.
+const labelOf = n => (P.accounts.find(a => a.acct === n) || {}).label || "";
+const isRemoved = n => !!(P.accounts.find(a => a.acct === n) || {}).removed;
+
+// ---------- formatting
+const pct = v => v == null ? "—" : Math.round(v) + "%";
+const when = t => new Date(t * 1000).toLocaleString([], {weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit"});
+const day = t => new Date(t * 1000).toLocaleDateString([], {month: "short", day: "numeric"});
+function dur(s) {
+  s = Math.max(0, Math.round(s));
+  const d = Math.floor(s / DAY), h = Math.floor(s % DAY / HOUR), m = Math.floor(s % HOUR / 60);
+  if (d) return d + "d " + h + "h";
+  if (h) return h + "h " + m + "m";
+  return m + "m";
+}
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in props || {}) {
+    if (k === "text") e.textContent = props[k];
+    else if (k === "cls") e.className = props[k];
+    else e.setAttribute(k, props[k]);
+  }
+  for (const kid of kids) if (kid != null) e.append(kid);
+  return e;
+}
+function s(tag, attrs, parent) {
+  const e = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+// ---------- data helpers
+function range() {
+  const r = RANGES.find(x => x.id === state.range);
+  const start = r.span ? Math.max(NOW - r.span, P.dataStart) : P.dataStart;
+  return {start: Math.min(start, NOW - HOUR), end: NOW};
+}
+// cswap records readings, not switches, so the page knows who is active now only.
+const activeAt = t => t >= NOW - 60 ? P.activeNow : null;
+// ---------- header, notice, ranges
+function renderHeader() {
+  const nAcc = accounts.filter(n => !isRemoved(n)).length;
+  const gone = accounts.length - nAcc;
+  document.getElementById("subtitle").textContent = P.demo
+    ? "Demo: " + nAcc + " made-up accounts · four weeks of invented usage"
+    : nAcc + " accounts in cswap" + (gone ? " (plus " + gone + " since removed)" : "") + " · updated " + when(NOW);
+  const notice = document.getElementById("notice");
+  const bits = [];
+  if (P.recordingSince == null) {
+    bits.push("cswap hasn't recorded any usage history yet, so this shows its current readings only.");
+  } else if (NOW - P.recordingSince < 3 * DAY) {
+    bits.push("Usage history began " + when(P.recordingSince) + ", so the charts are short for now and fill in as cswap keeps checking usage." +
+      " Turn on Demo data, top right, to preview them with four weeks of made-up history.");
+  }
+  if (P.hiddenReadings) {
+    bits.push(P.hiddenReadings + " readings belong to accounts that have since given up their number to another account; they stay in the history files but aren't drawn here.");
+  }
+  notice.textContent = bits.join(" ");
+  notice.hidden = !bits.length;
+  const box = document.getElementById("ranges");
+  box.replaceChildren();
+  for (const r of AVAILABLE) {
+    const label = r.span == null && P.rangeDays ? "All (last " + P.rangeDays + (P.rangeDays === 1 ? " day)" : " days)") : r.label;
+    const b = h("button", {type: "button", role: "radio", "aria-checked": String(r.id === state.range), text: label});
+    b.addEventListener("click", () => { state.range = r.id; renderAll(); });
+    box.append(b);
+  }
+}
+function setupDemoSwitch() {
+  const toggle = document.getElementById("demo-toggle");
+  toggle.setAttribute("aria-checked", String(DEMO));
+  if (!REAL || !DEMO_DATA) toggle.disabled = true;  // only one payload: nothing to switch to
+  const set = on => {
+    if (store) { if (on) store.setItem(DEMO_KEY, "1"); else store.removeItem(DEMO_KEY); }
+    else location.hash = on ? "#demo" : "";
+    location.reload();
+  };
+  toggle.addEventListener("click", () => set(!DEMO));
+  document.getElementById("demo-off").addEventListener("click", () => set(false));
+  document.getElementById("demo-pill").addEventListener("click", () => set(false));
+  const banner = document.getElementById("demo-banner"), pill = document.getElementById("demo-pill");
+  banner.hidden = !DEMO;
+  pill.hidden = !DEMO || !REAL;
+  // the floating reminder shows only once the banner has scrolled away
+  if (DEMO && REAL && "IntersectionObserver" in window) {
+    new IntersectionObserver(([e]) => { pill.hidden = e.isIntersecting; }).observe(banner);
+  }
+  document.getElementById("demo-off").hidden = !REAL;
+  if (DEMO) document.title = "Claude account usage (demo data)";
+}
+
+// ---------- time axis
+function timeTicks(t0, t1, maxTicks = 4) {
+  const span = t1 - t0;
+  const steps = [HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, DAY, 2 * DAY, 3 * DAY, 7 * DAY, 14 * DAY, 30 * DAY];
+  const step = steps.find(x => span / x <= Math.max(2, maxTicks)) || 30 * DAY;
+  const d = new Date(t0 * 1000);
+  const out = [];
+  if (step < DAY) {
+    const hs = step / HOUR;
+    d.setMinutes(0, 0, 0);
+    d.setHours(Math.ceil((d.getHours() + (d.getTime() / 1000 < t0 ? 1 : 0)) / hs) * hs);
+    while (d.getTime() / 1000 <= t1) {
+      const t = d.getTime() / 1000;
+      if (t >= t0) out.push({t, label: d.getHours() === 0 ? day(t) : d.toLocaleTimeString([], {hour: "numeric"})});
+      d.setHours(d.getHours() + hs);
+    }
+  } else {
+    d.setHours(0, 0, 0, 0);
+    if (d.getTime() / 1000 < t0) d.setDate(d.getDate() + 1);
+    while (d.getTime() / 1000 <= t1) {
+      out.push({t: d.getTime() / 1000, label: day(d.getTime() / 1000)});
+      d.setDate(d.getDate() + step / DAY);
+    }
+  }
+  return out;
+}
+// ---------- tooltip
+const tooltip = document.getElementById("tooltip");
+// A tooltip opened from the keyboard survives the scroll that focusing its chart causes.
+let kbdTip = null;
+function keepKbdTip(el, show, fromKeyboard) { kbdTip = fromKeyboard ? {el, show} : null; }
+window.addEventListener("scroll", () => {
+  if (kbdTip && document.activeElement === kbdTip.el && tooltip.style.display === "block") { kbdTip.show(); return; }
+  clearOv();
+}, {passive: true});
+
+// ---------- all accounts
+// The totals cover the accounts cswap auto can rotate onto now: managed, not disabled, with a
+// weekly limit (history_forecast.fleet_of).
+const FLEET = P.fleet;
+const NACC = Math.max(1, FLEET.length);  // for dividing; text uses FLEET.length
+const worth = v => v == null ? "—" : v === 0 || v >= 1 ? v.toFixed(1) : v.toFixed(2);
+const clampPct = v => Math.min(100, Math.max(0, v || 0));
+function listAccts(ns) {
+  const tags = ns.map(n => "#" + n);
+  if (tags.length <= 1) return tags.join("");
+  if (tags.length <= 4) return tags.slice(0, -1).join(", ") + " and " + tags[tags.length - 1];
+  return tags.slice(0, 3).join(", ") + " and " + (tags.length - 3) + " more";
+}
+// Room comes worked out by cswap (history_forecast), so this page and `cswap history` can't
+// disagree: the room now, at evenly spaced moments across each range ([t, 7-day room,
+// per-model room, accounts reporting]), and the weekly resets ahead ({t, n, frees}).
+const ROOM = P.room;
+const roomNow = () => ROOM.now;
+const resetsAhead = (key, until) => (ROOM.resets[key] || []).filter(e => e.t <= until);
+const projected = (start, events, t) => Math.min(NACC, start + events.reduce((sum, e) => sum + (e.t <= t ? e.frees : 0), 0));
+
+// The room at time t on a forecast path (after the step, at a reset); as history_forecast.path_at.
+function pathAt(path, t) {
+  let k = 0;
+  while (k + 1 < path.length && path[k + 1][0] <= t) k++;
+  const a = path[k], b = path[k + 1];
+  return !b || b[0] === a[0] ? a[1] : a[1] + (b[1] - a[1]) * (t - a[0]) / (b[0] - a[0]);
+}
+
+// ---------- forecasts
+// Room ahead if use carries on at the pace of a recent stretch.
+const PACES = [
+  {id: "30m", span: 30 * 60, name: "Last 30 minutes", adj: "30-minute", short: "30m", color: "var(--f1)"},
+  {id: "6h", span: 6 * HOUR, name: "Last 6 hours", adj: "6-hour", short: "6h", color: "var(--f2)"},
+  {id: "24h", span: DAY, name: "Last 24 hours", adj: "24-hour", short: "24h", color: "var(--f3)"},
+];
+// Each pace comes worked out by cswap (history_forecast.py), so this page and `cswap history`
+// can't disagree: whether it's available (and why not), its rate (accounts' worth a second),
+// how many more accounts it would take to keep up with, and the room ahead as [t, room]
+// points, with when it runs out and its low point.
+function whyNot(f) {
+  if (f.reason === "no-room-now") return "No current readings to start from";
+  if (f.reason === "no-active") return "No reading of the active account yet";
+  if (f.reason === "stale-active" && f.since != null) return "No reading of the active account since " + when(f.since);
+  if (f.reason === "warming-up" && f.needs != null) return "After " + dur(f.needs) + " more of history";
+  return "Not available";
+}
+const FORECAST_END = NOW + 7 * DAY;
+const FORECASTS = PACES.map(p => {
+  const f = (P.forecasts || []).find(x => x.id === p.id) || {ok: false};
+  return Object.assign({}, p, f, f.ok ? {} : {why: whyNot(f)});
+});
+function outlook(f) {
+  if (!f.ok) return f.why;
+  if (f.out != null) return f.out <= NOW + 60 ? "Out of room now" : "Runs out " + when(f.out);
+  // still falling when the week runs out: its low is wherever the forecast stops
+  if (f.low.t >= FORECAST_END - 60) return "Down to " + worth(f.low.v) + " by " + when(f.low.t);
+  // a low that rounds to today's figure would read as a fall that doesn't show
+  if (f.low.t > NOW + 60 && worth(f.low.v) !== worth(f.path[0][1])) return "Lowest " + worth(f.low.v) + ", " + when(f.low.t);
+  return "Never lower than now";
+}
+// as history_render.more_accounts_words
+const extraWords = n => n === 0 ? "0 (sustainable)" : "+" + n + (n === 1 ? " account" : " accounts");
+function renderForecast() {
+  const k = P.counted || 0;
+  const rows = FORECASTS.map(f => h("tr", {},
+    h("td", {}, h("span", {cls: "key-dash", "aria-hidden": "true", style: "margin-right:8px;border-color:" + (f.ok ? f.color : "var(--axis)")}), f.name),
+    h("td", {cls: "n", text: f.ok ? worth(f.rate * DAY) : "—"}),
+    h("td", {cls: "n", text: f.ok ? extraWords(f.extra) : "—"}),
+    h("td", {cls: f.ok ? "" : "muted", text: outlook(f)})));
+  // Each account's limit comes back once a week, so k accounts can keep up with k/7 a day in
+  // the long run. Use below that can still run low for a while when room is short now.
+  if (k) rows.push(h("tr", {cls: "ref"}, h("td", {}, h("span", {cls: "key-dash", "aria-hidden": "true", style: "margin-right:8px;visibility:hidden"}),
+    "Sustainable pace (" + k + (k === 1 ? " account)" : " accounts)")),
+    h("td", {cls: "n", text: worth(k / 7)}), h("td", {cls: "n", text: "0"}),
+    h("td", {text: "Use faster than this runs out sooner or later"})));
+  document.getElementById("room-fc-note").textContent = AUTO.strategy === "consume-first"
+    ? "Assumes cswap auto keeps its consume-first strategy: use goes to the account whose week resets soonest."
+    : AUTO.strategy === "priority-consume-first"
+    ? "Assumes cswap auto keeps its priority-consume-first strategy: use goes to the highest priority tier with room, soonest reset first."
+    : "Assumes cswap auto keeps its best strategy: use stays on one account until its week is used up, then moves to the one with the most room.";
+  document.getElementById("room-fc").replaceChildren(
+    h("thead", {}, h("tr", {}, h("th", {scope: "col", text: "Pace"}), h("th", {scope: "col", cls: "n", text: "A day"}),
+      h("th", {scope: "col", cls: "n", text: "More accounts to keep up"}),
+      h("th", {scope: "col", text: "Next 7 days at that pace"}))),
+    h("tbody", {}, ...rows));
+}
+
+function tipRow(color, value, label, style) {
+  const key = style === "dot" ? "key-dot" : style ? "key-dash" : "key-line";
+  return h("div", {cls: "row"}, h("span", {cls: key, style: (key === "key-line" ? "background:" : "border-color:") + color}),
+    h("b", {text: value}), h("span", {cls: "lbl", text: label}));
+}
+function showTip(kids, clientX, clientTop, fromKeyboard) {
+  tooltip.replaceChildren(...kids);
+  tooltip.style.display = "block";
+  const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+  let left = clientX + 14;
+  if (left + tw > window.innerWidth - 8) left = clientX - 14 - tw;
+  let top = clientTop;
+  if (top + th > window.innerHeight - 8) top = window.innerHeight - 8 - th;
+  tooltip.style.left = Math.max(8, left) + "px";
+  tooltip.style.top = Math.max(8, top) + "px";
+  tooltip.setAttribute("aria-live", fromKeyboard ? "polite" : "off");
+}
+// Pointer to chart coordinates and back, through the SVG's own transform, so they stay right
+// however the viewBox is scaled into the page.
+function svgPoint(g, e) {
+  const ctm = g.svg.getScreenCTM();
+  if (!ctm) return [-1, -1];
+  const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(ctm.inverse());
+  return [p.x, p.y];
+}
+function toClient(g, x, y) {
+  const ctm = g.svg.getScreenCTM();
+  if (!ctm) return [0, 0];
+  const p = new DOMPoint(x, y).matrixTransform(ctm);
+  return [p.x, p.y];
+}
+function sizeSvg(svg, W, H) {
+  svg.replaceChildren();
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.setAttribute("height", H);
+}
+const ov = {room: null};
+function clearOv() {
+  tooltip.style.display = "none";
+  const g = ov.room;
+  if (g) { g.cross.setAttribute("visibility", "hidden"); g.dots.forEach(d => d.setAttribute("visibility", "hidden")); g.hoverT = null; }
+}
+
+// Weekly room left: the past from the readings; ahead, the forecasts at recent paces (dashed) and
+// the room that comes back as limits reset if there's no more use (dotted).
+function drawRoom(R) {
+  const svg = document.getElementById("room-svg"), box = document.getElementById("room-box");
+  const now = roomNow();
+  const ahead = 7 * DAY;  // a full week ahead whatever the range: every weekly limit resets once in it
+  const t0 = R.start, t1 = NOW + ahead;
+  // idle: the colour of its "if no more use" line. The 7-day one is a mid grey, so the blue
+  // dashes are only ever the forecasts (and the palest blue in dark mode isn't mistaken for it).
+  const series = [{key: "d7", label: "7-day", color: "var(--s1)", idle: "var(--muted)", start: now.d7, ev: resetsAhead("d7", t1), area: true}];
+  if (P.modelName) series.push({key: "m", label: P.modelName + " weekly", color: "var(--s3)", idle: "var(--s3)", start: now.m, ev: resetsAhead("m", t1)});
+  const fcs = FORECASTS.filter(f => f.ok);
+
+  document.getElementById("room-fig").textContent = worth(now.d7);
+  document.getElementById("room-unit").textContent = "of " + FLEET.length + (FLEET.length === 1 ? " account's" : " accounts'") + " worth left";
+  const soon = resetsAhead("d7", NOW + DAY);
+  const notes = [];
+  if (now.d7 != null) {
+    notes.push(soon.length
+      ? worth(soon.reduce((sum, e) => sum + e.frees, 0)) + " more comes back in the next 24 hours as " + listAccts(soon.map(e => e.n)) + (soon.length === 1 ? " resets" : " reset")
+      : "No weekly limit resets in the next 24 hours");
+  }
+  const missing = FLEET.length - now.k;
+  if (missing > 0) notes.push(missing + (missing === 1 ? " account has" : " accounts have") + " no recent reading, so " + (missing === 1 ? "it isn't" : "they aren't") + " counted");
+  document.getElementById("room-note").textContent = notes.length ? notes.join(". ") + "." : "";
+  document.getElementById("room-legend").replaceChildren(...series.map(sr =>
+    h("span", {cls: "static"}, h("span", {cls: "key-line", style: "background:" + sr.color}), h("span", {text: sr.label + " room"}))),
+    h("span", {cls: "static"}, h("span", {cls: "key-dot"}), h("span", {text: "If no more use: room coming back as limits reset"})));
+
+  // fill the card when the list beside it makes the row taller than the chart needs
+  const card = document.getElementById("room-card");
+  const spare = card.getBoundingClientRect().bottom - box.getBoundingClientRect().top - 14;
+  const W = Math.max(260, box.clientWidth), H = Math.round(Math.max(220, Math.min(360, spare)));
+  const m = {l: 28, r: fcs.length ? 62 : 40, t: 18, b: 22};  // room on the right for the forecast labels
+  const x = t => m.l + (t - t0) / (t1 - t0) * (W - m.l - m.r);
+  const y = v => m.t + (1 - v / NACC) * (H - m.t - m.b);
+  sizeSvg(svg, W, H);
+  const xn = x(NOW);
+  s("rect", {x: xn, y: m.t, width: Math.max(0, x(t1) - xn), height: H - m.t - m.b, fill: "var(--hover)"}, svg);
+  const step = [1, 2, 5, 10, 20, 50, 100].find(v => NACC / v <= 4) || 200;
+  const ticks = [];
+  for (let v = 0; v < NACC - step * 0.4; v += step) ticks.push(v);
+  ticks.push(NACC);
+  for (const v of ticks) {
+    s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1, "shape-rendering": "crispEdges"}, svg);
+    s("text", {x: m.l - 6, y: y(v) + 3.5, "text-anchor": "end"}, svg).textContent = String(v);
+  }
+  let datedAhead = false;
+  for (const tk of timeTicks(t0, t1, Math.max(4, Math.floor((W - m.l - m.r) / 80)))) {
+    const tx = x(tk.t);
+    if (tx < m.l + 16 || tx > W - m.r - 12 || Math.abs(tx - xn) < 18) continue;
+    if (tx > xn) datedAhead = true;
+    s("text", {x: tx, y: H - 5, "text-anchor": "middle"}, svg).textContent = tk.label;
+  }
+  // long ranges tick a week apart, which can leave the week ahead undated: date its end
+  if (!datedAhead && x(t1) - xn > 60) s("text", {x: x(t1), y: H - 5, "text-anchor": "end"}, svg).textContent = day(t1);
+  s("line", {x1: xn, x2: xn, y1: m.t - 6, y2: H - m.b, stroke: "var(--axis)", "stroke-width": 1, "shape-rendering": "crispEdges"}, svg);
+  s("text", {x: xn - 4, y: m.t - 7, "text-anchor": "end", class: "lab"}, svg).textContent = "Now";
+  if (x(t1) - xn > 50) s("text", {x: xn + 4, y: m.t - 7, "text-anchor": "start"}, svg).textContent = "Ahead";
+
+  // ends exactly on the headline figure (cswap's last sample is the room now)
+  const samples = (ROOM.series[state.range] || []).map(sm => ({t: sm[0], d7: sm[1], m: sm[2], k: sm[3]}));
+  const fmt = pt => pt[0].toFixed(1) + "," + pt[1].toFixed(1);
+  for (const sr of series.slice().reverse()) {  // the 7-day line last, so it sits on top
+    const runs = [];
+    let run = null;
+    for (const sm of samples) {
+      const v = sm[sr.key];
+      if (v == null) { run = null; continue; }
+      if (!run) { run = []; runs.push(run); }
+      run.push([x(sm.t), y(v)]);
+    }
+    if (sr.area && runs.length) {
+      const base = y(0).toFixed(1);
+      s("path", {d: runs.map(rn => "M" + rn[0][0].toFixed(1) + "," + base + "L" + rn.map(fmt).join("L") + "L" + rn[rn.length - 1][0].toFixed(1) + "," + base + "Z").join(""),
+        fill: sr.color, "fill-opacity": 0.1}, svg);
+    }
+    if (runs.length) s("path", {d: runs.map(rn => "M" + rn.map(fmt).join("L")).join(""), fill: "none", stroke: sr.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round"}, svg);
+    if (sr.start == null) continue;
+    let d = "M" + xn.toFixed(1) + "," + y(sr.start).toFixed(1), v = sr.start;
+    for (const e of sr.ev) { v = Math.min(NACC, v + e.frees); d += "H" + x(e.t).toFixed(1) + "V" + y(v).toFixed(1); }
+    d += "H" + x(t1).toFixed(1);
+    // dots: if no more use (the forecasts at a pace are dashed)
+    s("path", {d, fill: "none", stroke: sr.idle, "stroke-width": 2, "stroke-dasharray": "0 4.5", "stroke-linecap": "round", "stroke-linejoin": "round"}, svg);
+    sr.end = v;
+  }
+  for (const f of fcs) {  // the longest window last, on top: it's the steadiest
+    const pts = f.path.filter(p => p[0] <= t1).concat([[t1, pathAt(f.path, t1)]]);
+    s("path", {d: "M" + pts.map(p => x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join("L"), fill: "none", stroke: f.color,
+      "stroke-width": 2, "stroke-dasharray": "6 4", "stroke-linejoin": "round"}, svg);
+  }
+  const main = series[0];
+  if (main.start != null) {
+    s("circle", {cx: xn, cy: y(main.start), r: 4, fill: main.color, stroke: "var(--surface)", "stroke-width": 2}, svg);
+    if (!fcs.length) s("text", {x: x(t1) + 6, y: y(main.end) + 4, class: "val"}, svg).textContent = worth(main.end);
+  }
+  // each forecast's figure at the right edge, nudged apart where they would overlap
+  const labs = fcs.map(f => { const v = pathAt(f.path, t1); return {f, v, y: y(v) + 4}; }).sort((a, b) => a.y - b.y);
+  for (let i = 1; i < labs.length; i++) labs[i].y = Math.max(labs[i].y, labs[i - 1].y + 12);
+  const over = labs.length ? labs[labs.length - 1].y - (H - m.b + 4) : 0;
+  if (over > 0) for (const l of labs) l.y -= over;
+  for (const l of labs) {
+    const tx = s("text", {x: x(t1) + 6, y: l.y, class: "val"}, svg);
+    s("tspan", {class: "k"}, tx).textContent = l.f.short + " ";
+    s("tspan", {}, tx).textContent = worth(l.v);
+  }
+  const first = samples.find(sm => sm.d7 != null);
+  const emptyTo = first ? x(first.t) : xn;
+  if (emptyTo - m.l > 170) {
+    s("text", {x: (m.l + emptyTo) / 2, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "empty"}, svg).textContent =
+      first && first.t < NOW ? "Readings start " + when(P.recordingSince > t0 && P.recordingSince < first.t ? P.recordingSince : first.t) : "No readings in this range yet";
+  }
+  const cross = s("line", {y1: m.t, y2: H - m.b, stroke: "var(--ink2)", "stroke-width": 1, visibility: "hidden", "shape-rendering": "crispEdges"}, svg);
+  // hover dots: one per series, then one per forecast
+  const dots = series.map(sr => sr.color).concat(fcs.map(f => f.color)).map(color =>
+    s("circle", {r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden"}, svg));
+  ov.room = {svg, W, H, m, x, y, t0, t1, samples, series, fcs, cross, dots, hoverT: null};
+}
+function roomHover(t, fromKeyboard) {
+  const g = ov.room;
+  if (!g) return;
+  t = Math.max(g.t0, Math.min(g.t1, t));
+  let vals, fvals, foot, head;
+  const ahead = t > NOW;
+  if (!ahead) {
+    const i = Math.round((t - g.t0) / Math.max(1, NOW - g.t0) * (g.samples.length - 1));
+    const sm = g.samples[Math.max(0, Math.min(g.samples.length - 1, i))];
+    t = sm.t;
+    vals = g.series.map(sr => sm[sr.key]);
+    fvals = g.fcs.map(() => null);
+    const act = activeAt(t);
+    head = when(t);
+    foot = sm.k + " of " + FLEET.length + " accounts reporting" + (act != null ? " · #" + act + " active" : "");
+  } else {
+    vals = g.series.map(sr => sr.start == null ? null : projected(sr.start, sr.ev, t));
+    fvals = g.fcs.map(f => pathAt(f.path, t));
+    const by = g.series[0].ev.filter(e => e.t <= t).map(e => e.n);
+    head = when(t) + " · ahead";
+    foot = by.length ? "Weekly resets by then: " + listAccts(by) + "." : "No weekly resets by then.";
+  }
+  g.hoverT = t;
+  const X = g.x(t);
+  g.cross.setAttribute("x1", X); g.cross.setAttribute("x2", X); g.cross.setAttribute("visibility", "visible");
+  vals.concat(fvals).forEach((v, i) => {
+    const dot = g.dots[i];
+    if (v == null) { dot.setAttribute("visibility", "hidden"); return; }
+    if (i < g.series.length) dot.setAttribute("fill", ahead ? g.series[i].idle : g.series[i].color);  // the line it sits on
+    dot.setAttribute("cx", X); dot.setAttribute("cy", g.y(v)); dot.setAttribute("visibility", "visible");
+  });
+  const kids = [h("div", {cls: "when", text: head})];
+  g.fcs.forEach((f, i) => { if (ahead) kids.push(tipRow(f.color, worth(fvals[i]), "At the " + f.adj + " pace", "dash")); });
+  g.series.forEach((sr, i) => kids.push(ahead
+    ? tipRow(sr.idle, worth(vals[i]), sr.label + " room, if no more use", "dot")
+    : tipRow(sr.color, worth(vals[i]), sr.label + " room left")));
+  kids.push(h("div", {cls: "foot", text: foot}));
+  const [cx, cy] = toClient(g, X, 0);
+  showTip(kids, cx, cy + 8, fromKeyboard);
+  keepKbdTip(document.getElementById("room-box"), () => roomHover(t, true), fromKeyboard);
+}
+
+// Room on each account now, most room first.
+function renderBoard() {
+  // cswap's list (history_forecast.accounts_now): every managed account, most room first, with
+  // the figures the total counts; disabled accounts and ones with no weekly limit are marked.
+  const list = P.board;
+  const head = h("div", {cls: "brow head", "aria-hidden": "true"}, h("span", {text: "Account"}), h("span", {text: "Used"}),
+    h("span", {cls: "bval", text: "7-day"}), h("span", {cls: "breset", text: "Resets in"}));
+  const rows = list.map(r => {
+    const c = r;
+    const tag = r.active ? "Active" : r.disabled ? "Disabled" : null;
+    const num = h("span", {cls: "bnum"}, h("span", {cls: "acct", text: "#" + r.n}), tag ? h("span", {cls: "tag", text: tag}) : null);
+    let mid, label;
+    const resetIn = c.d7Reset > NOW ? dur(c.d7Reset - NOW) : "—";
+    if (r.d7 == null) {
+      const why = !r.weekly ? "No weekly limit" : c.t == null ? "No reading yet"
+        : r.staleReset ? "Last reading from before its weekly reset" : "No reading for " + dur(NOW - c.t);
+      mid = h("span", {cls: "bnone"}, h("span", {cls: "icon-warn", "aria-hidden": "true", text: "⚠ "}), why);
+      label = "#" + r.n + ": " + why;
+    } else {
+      mid = h("span", {cls: "bars", "aria-hidden": "true"},
+        h("span", {cls: "bar7"}, h("i", {style: "width:" + clampPct(r.d7) + "%"})),
+        h("span", {cls: "bar5"}, h("i", {style: "width:" + clampPct(r.h5) + "%"})));
+      label = "#" + r.n + (r.active ? " (active)" : r.disabled ? " (disabled, not counted)" : "") + ": " + pct(r.d7) + " of the 7-day limit used, 5-hour " + pct(r.h5) + ", resets in " + resetIn;
+    }
+    const row = h("div", {cls: "brow", role: "listitem", tabindex: "0", "aria-label": label}, num, mid,
+      h("span", {cls: "bval", text: r.d7 == null ? "—" : pct(r.d7)}), h("span", {cls: "breset", text: r.d7 == null ? "—" : resetIn}));
+    const tip = fromKeyboard => {
+      const kids = [h("div", {cls: "when", text: "#" + r.n + (labelOf(r.n) ? " · " + labelOf(r.n) : "")}),
+        tipRow("var(--s1)", pct(r.d7), "7-day used"), tipRow("var(--s2)", pct(r.h5), "5-hour used")];
+      if (P.modelName) kids.push(tipRow("var(--s3)", pct(r.m), P.modelName + " weekly used"));
+      kids.push(h("div", {cls: "foot", text: r.d7 == null
+        ? (!r.weekly ? "This account has no 7-day limit, so it adds no weekly room"
+          : c.t != null ? "Last reading " + when(c.t) + (r.staleReset ? ", before its weekly reset" : "") + (c.error ? " · last check: " + c.error : "") : "No reading yet")
+        : c.d7Reset > NOW ? "Weekly limit resets " + when(c.d7Reset) : "Reset time not known"}));
+      const rect = row.getBoundingClientRect();
+      showTip(kids, rect.left + rect.width * 0.55, rect.bottom + 4, fromKeyboard);
+      keepKbdTip(row, () => tip(true), fromKeyboard);
+    };
+    row.addEventListener("pointerenter", () => tip(false));
+    row.addEventListener("pointerleave", clearOv);
+    row.addEventListener("focus", () => tip(true));
+    row.addEventListener("blur", clearOv);
+    return row;
+  });
+  document.getElementById("board").replaceChildren(head, ...rows);
+}
+
+function drawOverall() {
+  drawRoom(range());
+}
+function setupOverall() {
+  const roomBox = document.getElementById("room-box");
+  roomBox.addEventListener("pointermove", e => {
+    const g = ov.room;
+    if (g) roomHover(g.t0 + (svgPoint(g, e)[0] - g.m.l) / (g.W - g.m.l - g.m.r) * (g.t1 - g.t0), false);
+  });
+  roomBox.addEventListener("focus", () => roomHover(NOW, true));
+  roomBox.addEventListener("keydown", e => {
+    const g = ov.room;
+    if (!g) return;
+    let t = g.hoverT == null ? NOW : g.hoverT;
+    if (e.key === "ArrowLeft") t -= (g.t1 - g.t0) / 120;
+    else if (e.key === "ArrowRight") t += (g.t1 - g.t0) / 120;
+    else if (e.key === "Home") t = g.t0;
+    else if (e.key === "End") t = g.t1;
+    else if (e.key === "Escape") { clearOv(); return; }
+    else return;
+    e.preventDefault();
+    roomHover(t, true);
+  });
+  roomBox.addEventListener("pointerleave", clearOv);
+  roomBox.addEventListener("blur", clearOv);
+}
+
+// ---------- wiring
+function renderAll() {
+  clearOv();
+  renderHeader();
+  renderBoard();
+  renderForecast();  // before drawOverall: it sets the room card's height
+  drawOverall();
+}
+// ---------- staying current
+// cswap rebuilds its own copy of this page (history/report.html) as it records new readings
+// (P.live: this is that file, not a one-off copy). An open copy reloads itself when you come back to the tab after a
+// minute or more away, or after 90 seconds without input while it's in view. It comes back with
+// the same range and scroll position (kept for this tab only). The "Keep up
+// to date" switch turns that off, for example for a screen reader, which sends no input events.
+const VIEW_KEY = "cswap-report-view", LIVE_KEY = "cswap-report-live";
+const session = (() => {
+  try { sessionStorage.setItem(VIEW_KEY + "-probe", "1"); sessionStorage.removeItem(VIEW_KEY + "-probe"); return sessionStorage; }
+  catch (e) { return null; }
+})();
+function saveView() {
+  if (session) session.setItem(VIEW_KEY, JSON.stringify({range: state.range, y: Math.round(window.scrollY)}));
+}
+function restoreView() {
+  let v = null;
+  try { v = JSON.parse(session && session.getItem(VIEW_KEY) || "null"); } catch (e) { v = null; }
+  if (!v || typeof v !== "object") return null;
+  if (AVAILABLE.some(r => r.id === v.range)) state.range = v.range;
+  return typeof v.y === "number" && v.y > 0 ? v.y : null;
+}
+function setupAutoReload() {
+  window.addEventListener("pagehide", saveView);
+  const toggle = document.getElementById("live-toggle");
+  const live = !!(REAL && REAL.live);  // the bare template and one-off copies never change
+  toggle.hidden = !live;
+  if (!live) return;
+  let on = !(store && store.getItem(LIVE_KEY) === "0");
+  toggle.setAttribute("aria-checked", String(on));
+  toggle.addEventListener("click", () => {
+    on = !on;
+    toggle.setAttribute("aria-checked", String(on));
+    if (store) { if (on) store.removeItem(LIVE_KEY); else store.setItem(LIVE_KEY, "0"); }
+  });
+  const opened = Date.now();
+  let lastInput = opened, hiddenAt = document.hidden ? opened : null;
+  for (const ev of ["pointermove", "pointerdown", "keydown", "wheel", "touchstart", "scroll", "focusin"]) {
+    window.addEventListener(ev, () => { lastInput = Date.now(); }, {passive: true, capture: true});
+  }
+  // mid-task: text selected, or moving around the page from the keyboard
+  const keyboardFocus = () => {
+    const el = document.activeElement;
+    try { return !!el && el !== document.body && el.matches(":focus-visible"); } catch (e) { return false; }
+  };
+  const busy = () => String(window.getSelection() || "").length > 0 || keyboardFocus();
+  const reload = () => { saveView(); location.reload(); };
+  setInterval(() => {  // in view and left alone; a hidden tab waits until you come back
+    if (!on || document.hidden || busy()) return;
+    if (Date.now() - opened >= 2 * 60e3 && Date.now() - lastInput > 90e3) reload();
+  }, 30e3);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { hiddenAt = Date.now(); return; }
+    const away = hiddenAt == null ? 0 : Date.now() - hiddenAt;
+    hiddenAt = null;
+    if (on && away >= 60e3 && !busy()) reload();
+  });
+}
+
+// restoreView puts the scroll back after drawing; without storage, leave it to the browser
+if (session && "scrollRestoration" in history) history.scrollRestoration = "manual";
+const restoreY = restoreView();
+setupDemoSwitch();
+setupOverall();
+renderAll();
+if (restoreY != null) window.scrollTo(0, restoreY);
+setupAutoReload();
+let pending = false;
+const resized = new ResizeObserver(() => {
+  if (pending) return;
+  pending = true;
+  requestAnimationFrame(() => { pending = false; drawOverall(); });
+});
+resized.observe(document.getElementById("overall"));
+window.__ready = true;
+
+})();
+</script>
+</body>
+</html>
