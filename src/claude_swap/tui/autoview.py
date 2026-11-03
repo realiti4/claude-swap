@@ -390,7 +390,8 @@ class AutoScreen(Screen):
         # Same strategy the engine ticks on, so the panel's order can never
         # disagree with the account a tick would actually switch to.
         consume_first = bool(
-            self._settings and self._settings.strategy == "consume-first"
+            self._settings
+            and self._settings.strategy in ("consume-first", "weekly-first")
         )
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}

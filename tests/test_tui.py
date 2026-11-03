@@ -2286,10 +2286,11 @@ class TestAutoScreen:
             assert re.search(r"Fable\S*:95% \(line 97%\)", rows[2]), rows[2]
             assert re.search(r"Fable\S*:90% \(line 97%\)", rows[3]), rows[3]
 
+    @pytest.mark.parametrize("strategy", ["consume-first", "weekly-first"])
     async def test_candidates_drain_soonest_seven_day_reset_first(
-        self, tmp_path, fake_engine
+        self, tmp_path, fake_engine, strategy
     ):
-        """Under the default (consume-first) strategy, 'Next best' lists
+        """Under consume-first and weekly-first, 'Next best' lists
         switchable accounts in the order the engine would actually switch to
         them: soonest 7-day reset first, so quota is spent before it resets
         and goes to waste. The active's 5-hour window stays a gate, never a
@@ -2297,7 +2298,8 @@ class TestAutoScreen:
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1, "autoswitch": {"threshold": 90},
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "strategy": strategy},
         }))
 
         def _entry(pct7: float, reset7_s: float, pct5: float | None = None) -> UsageEntry:
