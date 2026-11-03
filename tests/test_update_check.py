@@ -13,6 +13,7 @@ from claude_swap.update_check import (
     CACHE_TTL,
     FAILURE_TTL,
     _detect_install_method,
+    _installed_version_on_disk,
     check_for_update,
     held_back_release_notice,
     run_self_upgrade,
@@ -600,14 +601,20 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert held_back_release_notice("0.27.2") is None
 
     @patch("claude_swap.update_check.subprocess.run")
-    def test_cswap_upgrade_prints_notice_after_uv(self, mock_run, tmp_path, capsys):
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value="0.28.0")
+    def test_cswap_upgrade_prints_notice_after_uv(
+        self, mock_on_disk, mock_run, tmp_path, capsys
+    ):
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.side_effect = [MagicMock(returncode=0), _uv_pip_list(_OUTDATED)]
 
         assert run_self_upgrade("0.27.2") == 0
 
         out = capsys.readouterr().out
+        # The before -> after report is printed ahead of the held-back notice.
+        assert "claude-swap upgraded: 0.27.2 -> 0.28.0" in out
         assert "claude-swap 0.28.0 is on PyPI" in out
+        assert out.index("upgraded:") < out.index("is on PyPI")
         assert 'uv tool upgrade claude-swap --exclude-newer "0 days"' in out
         upgrade, listing = (c.args[0] for c in mock_run.call_args_list)
         assert upgrade == ["uv", "tool", "upgrade", "claude-swap"]
@@ -624,7 +631,10 @@ class TestHeldBackReleaseNotice(_UvInstall):
         mock_run.assert_called_once()
 
     @patch("claude_swap.update_check.subprocess.run")
-    def test_pipx_install_gets_no_notice(self, mock_run, tmp_path, monkeypatch, capsys):
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
+    def test_pipx_install_gets_no_notice(
+        self, mock_on_disk, mock_run, tmp_path, monkeypatch, capsys
+    ):
         monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "pipx")
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.return_value = MagicMock(returncode=0)
@@ -653,8 +663,9 @@ class TestHeldBackReleaseNotice(_UvInstall):
 @patch("claude_swap.update_check.sys.platform", "linux")
 class TestRunSelfUpgrade:
     @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
-    def test_uv_invokes_uv_tool_upgrade(self, mock_detect, mock_run):
+    def test_uv_invokes_uv_tool_upgrade(self, mock_detect, mock_on_disk, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
 
         assert run_self_upgrade() == 0
@@ -663,8 +674,9 @@ class TestRunSelfUpgrade:
         )
 
     @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
     @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
-    def test_pipx_invokes_pipx_upgrade(self, mock_detect, mock_run):
+    def test_pipx_invokes_pipx_upgrade(self, mock_detect, mock_on_disk, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
 
         assert run_self_upgrade() == 0
@@ -699,6 +711,71 @@ class TestRunSelfUpgrade:
         assert run_self_upgrade() == 1
         err = capsys.readouterr().err
         assert "PATH" in err
+
+
+@patch("claude_swap.update_check.sys.platform", "linux")
+class TestRunSelfUpgradeReport:
+    """After a successful upgrade, report what actually landed on disk so the
+    user is not misled by a package manager that exits 0 without changing
+    anything (#491). Verification is best effort: it never masks the
+    upgrade's own exit status."""
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_reports_successful_upgrade(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "claude_swap.update_check._installed_version_on_disk", return_value="0.28.0"
+        ):
+            assert run_self_upgrade("0.27.2") == 0
+        assert "claude-swap upgraded: 0.27.2 -> 0.28.0" in capsys.readouterr().out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_reports_unchanged_upgrade(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "claude_swap.update_check._installed_version_on_disk", return_value="0.27.2"
+        ):
+            assert run_self_upgrade("0.27.2") == 0
+        assert "claude-swap is still at 0.27.2" in capsys.readouterr().out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_no_result_line_when_verification_fails(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "claude_swap.update_check._installed_version_on_disk", return_value=None
+        ):
+            assert run_self_upgrade("0.27.2") == 0
+        out = capsys.readouterr().out
+        assert "upgraded:" not in out
+        assert "is still at" not in out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_no_result_line_when_verification_times_out(self, mock_detect, mock_run, capsys):
+        # The verification subprocess.run times out; _installed_version_on_disk
+        # catches subprocess.SubprocessError and returns None, so we stay
+        # silent and keep the upgrade's exit status.
+        mock_run.side_effect = [
+            MagicMock(returncode=0),
+            subprocess.TimeoutExpired("py", 10),
+            MagicMock(returncode=0, stdout="[]"),
+        ]
+        assert run_self_upgrade("0.27.2") == 0
+        out = capsys.readouterr().out
+        assert "upgraded:" not in out
+        assert "is still at" not in out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_failed_upgrade_reports_nothing(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=2)
+        assert run_self_upgrade("0.27.2") == 2
+        out = capsys.readouterr().out
+        assert "upgraded:" not in out
+        assert "is still at" not in out
 
 
 @patch("claude_swap.update_check.sys.platform", "win32")

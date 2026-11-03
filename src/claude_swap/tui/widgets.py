@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
+from claude_swap import pace, subscription
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
+from claude_swap.printer import format_age
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -158,7 +159,34 @@ def usage_rows(
                 suffix = f"{suffix}  {marker}" if suffix else marker
                 suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
         rows.append((window["name"], pct, suffix, suffix_full))
+    rejected = last_good.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe: at its limit until the refusal ends,
+        # whatever the windows above say (auto-switching excludes it).
+        reset, reset_full = _reset_parts(rejected, now)
+        suffix = f"rejected (!)  {reset}" if reset else "rejected (!)"
+        suffix_full = f"rejected (!)  {reset_full}" if reset_full else "rejected (!)"
+        rows.append(("probe", 100.0, suffix, suffix_full))
     return rows
+
+
+def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
+    """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
+    a lapsed subscription is a highlighted ``Free`` rather than an appended
+    "expired", and the age follows once the plan has gone two TTLs without
+    refreshing."""
+    record = acc.subscription_plan
+    if not record:
+        return
+    plan = record["plan"]
+    text.append(f"{gap}· ", style=palette.muted)
+    text.append(
+        subscription.plan_label(plan),
+        style=palette.sev_warn if subscription.is_expired(plan) else palette.muted,
+    )
+    if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
+        age = format_age(int(record["fetchedAt"] * 1000))
+        text.append(f" ({age})", style=palette.muted)
 
 
 def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
@@ -208,6 +236,7 @@ def account_card_text(
         text.append("   (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "   "):
         text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "   ", palette)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -305,6 +334,7 @@ def mini_account_text(
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
         text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "  ", palette)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
@@ -352,6 +382,11 @@ def mini_account_text(
         if pct >= 100:
             text.append(" (!)", style=palette.sev_crit)
         parts += 1
+    if isinstance(last_good, dict) and isinstance(last_good.get("rejected"), dict):
+        if parts:
+            text.append(" · ", style=palette.track)
+        text.append("rejected (!)", style=palette.sev_crit)  # a refused setup-token probe
+        parts += 1
     # Spend is a separate axis from a rate-limit window (never enters the
     # ranking — see oauth.relevant_windows) so it must show whether or not a
     # 5h/7d window already rendered above, not only as a last-resort fallback
@@ -371,8 +406,8 @@ def mini_account_text(
         parts += 1
     if not parts:
         # Nothing above rendered — every source `usage_rows` draws from
-        # (spend, 5h, 7d, scoped) uses the same truthiness test as the loops
-        # above, so `rows` is provably empty here too.
+        # (spend, 5h, 7d, scoped, rejected) uses the same truthiness test as
+        # the loops above, so `rows` is provably empty here too.
         text.append("usage unknown", style=palette.muted)
     return text
 
