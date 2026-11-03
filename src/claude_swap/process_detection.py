@@ -16,6 +16,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from claude_swap import spawn
 from claude_swap.paths import get_claude_config_home
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,7 @@ def _ps(pid: int, *columns: str) -> str | None:
     if sys.platform == "win32":
         return None
     try:
-        proc = subprocess.run(
+        proc = spawn.run(
             ["ps", "-o", ",".join(f"{c}=" for c in columns), "-p", str(pid)],
             capture_output=True,
             text=True,

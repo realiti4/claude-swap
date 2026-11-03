@@ -148,6 +148,20 @@ def test_usage_summary_includes_scoped_model_limits():
     assert menubar.usage_summary(usage) == "5h 82% · 7d 12% · Fable 4% · $ 30%"
 
 
+def test_usage_summary_leads_with_a_probe_rejection():
+    usage = {
+        "five_hour": {"pct": 20.0},
+        "seven_day": {"pct": 30.0},
+        "rejected": {
+            "retry_after_s": 3600.0,
+            "resets_at": _dt.datetime.fromtimestamp(
+                _NOW + 3600, tz=_dt.timezone.utc
+            ).isoformat(),
+        },
+    }
+    assert menubar.usage_summary(usage, _NOW) == "rejected (!) (1h 0m) · 5h 20% · 7d 30%"
+
+
 def test_usage_summary_scoped_over_limit_marker():
     usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
     assert menubar.usage_summary(usage) == "Fable 100% (!)"
@@ -276,6 +290,12 @@ def test_usage_log_key_ignores_clock_tracks_pct():
 
 
 # --- title ---------------------------------------------------------------------
+
+def test_format_title_flags_a_rejected_active_account():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    usage = {**_USAGE, "rejected": {"retry_after_s": None, "resets_at": None}}
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ loc · rejected (!) · 42%"
+
 
 def test_format_title_name_and_5h():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")

@@ -47,7 +47,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -998,7 +998,7 @@ class SessionManager:
         # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
         try:
-            result = subprocess.run(
+            result = spawn.run(
                 [claude_bin, "auth", "status", "--json"],
                 env=_probe_env(session_dir),
                 capture_output=True,
