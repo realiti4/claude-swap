@@ -1380,8 +1380,10 @@ def classify_candidate_block(
     if not blocking:
         return "open", None
     # 5h/7d before models in `relevant_windows` order, so the first
-    # matching entry in `blocking` is deterministically 5h over 7d.
-    full = next((label for label, _ in blocking if label in ("5h", "7d")), None)
+    # matching entry in `blocking` is deterministically 5h over 7d. A refused
+    # probe's `rejected` window is the account at its limit: full, not a model.
+    full_labels = ("5h", "7d", oauth.REJECTED_LABEL)
+    full = next((label for label, _ in blocking if label in full_labels), None)
     if full is not None:
         return "full", full
     return "model", blocking[0][0]

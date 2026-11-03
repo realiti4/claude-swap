@@ -5628,6 +5628,40 @@ class TestAModelWindowIsNotABlackout:
             [("5h", 95.0), ("7d", 92.0), ("Fable", 10.0)], 90.0
         ) == ("full", "5h")
 
+    def test_classify_a_rejected_probe_is_a_full_block_not_a_model_wall(self):
+        """A refused setup-token probe adds a 100% ``"rejected"`` window
+        (``oauth.REJECTED_LABEL``): the account is at its limit, so no
+        model choice escapes it. Reading it as ``"model"`` made the panel
+        and the decision log claim dropping a model would open the account."""
+        assert classify_candidate_block(
+            [("5h", 10.0), ("7d", 5.0), ("Fable", 20.0), ("rejected", 100.0)],
+            90.0,
+        ) == ("full", "rejected")
+
+    def test_a_rejected_probe_is_not_a_model_only_wall_to_the_predicate(self):
+        """The same blocker through ``_model_window_binds_everywhere``: an
+        account whose only blocker is the refusal is not "blocked ONLY by
+        the model window", so it cannot arm the fleet-wide model drop."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = {"1": {
+            "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+            "scoped": [{"name": "Fable", "pct": 20.0}],
+            "rejected": {"resets_at": None},
+        }}
+        assert _model_window_binds_everywhere(usage, ("Fable",), 90.0) is False
+
+    def test_the_decision_log_reads_a_rejected_probe_as_full(self):
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "2": 0.0},
+            threshold=90.0,
+            windows={"2": {"5h": 10.0, "7d": 5.0, "Fable": 20.0, "rejected": 100.0}},
+        )
+        text = event.human()
+        assert "(rejected full)" in text, text
+        assert "rejected-walled" not in text, text
+
     def test_the_decision_log_names_what_blocked_each_candidate(self):
         event = PollEvent(
             active={"number": 6, "email": "a@example.com"},

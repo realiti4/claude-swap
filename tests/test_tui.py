@@ -2948,6 +2948,24 @@ class TestUnswitchableRowsAreListed:
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
 
+    def test_the_panel_reads_a_rejected_probe_as_full_not_model_walled(self):
+        """A refused probe puts the account at its limit (a 100% `rejected`
+        window): no model choice escapes it, so the row must not read
+        `rejected-walled` (dropping a model would open it)."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "refused@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 20.0}],
+                "rejected": {"retry_after_s": 3600.0, "resets_at": None},
+            }),
+        ), active="1", settings=settings)
+        assert "rejected-walled" not in out, out
+        assert "  rejected full" in out, out
+
     @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
     def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):
         """The owner's report, 2026-09-17: a 7d window at 92% printed `7d
