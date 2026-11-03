@@ -5745,6 +5745,20 @@ class TestWeeklyFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_a_peer_with_a_sliver_left_ranks_after_a_servable_one(self, temp_home):
+        """A weekly line of 99 lets a 7d 97.5% peer (2.5 raw points, at or
+        under SPENT_HEADROOM_PCT) pass the landing and hysteresis gates. It
+        resets soonest, but the servability tier puts it after #3, which can
+        still serve, so the soonest reset is picked among servable peers."""
+        h = self._harness(temp_home, threshold=90.0, weekly_threshold=99.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.5, 10, _R_LATEST),  # active, over the 5h line
+            "2": _usage7(10, 97.5, _R_SOON),    # resets first, 2.5 points left
+            "3": _usage7(10, 20, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_headroom_breaks_a_reset_tie(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({

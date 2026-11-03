@@ -3591,8 +3591,11 @@ class AutoSwitchEngine:
                 # headroom breaks ties, then sequence order.
                 #
                 # weekly-first reaches this arm only on `proactive`, where every
-                # candidate passed the landing gate, so both tiers are constant
-                # and the key is `(reset or inf, -lh)`.
+                # candidate passed the landing gate, so the `over` tier is
+                # constant. The servability tier is not: a weekly line above 97
+                # admits a candidate with <= SPENT_HEADROOM_PCT raw headroom,
+                # which sorts after every servable one. So weekly-first lands
+                # on the soonest weekly reset among servable candidates.
                 #
                 # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
                 # does not belong: `at-limit` is a stopped session. The

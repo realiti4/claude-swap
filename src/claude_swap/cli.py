@@ -878,7 +878,8 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Target selection: 'best' (most quota left), "
             "'weekly-first' (switch at the threshold like best, onto the "
-            "account whose weekly window resets soonest), "
+            "account whose weekly window resets soonest, among those with "
+            "quota left), "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest; default), or 'priority-consume-first' (highest account "
             "priority, then soonest weekly reset; only targets below all switch lines)"
