@@ -619,18 +619,21 @@ class AutoScreen(Screen):
                             entry.append(
                                 f"  {blocked_model} full", style=palette.muted
                             )
+                capped = weekly_capped(acc.policy.weekly_cap, acc.usage.last_good)
                 if acc.disabled:
                     entry.append("  auto-swap disabled", style=palette.muted)
                 elif (
                     acc.number not in ordered_rank
                     and kind == "open"
                     and not unmodeled
+                    and not capped
                 ):
                     # "open": nothing per-window blocks it, yet the engine's
                     # own pass still refused it -- a weekly reset later than
                     # the active's own, losing the hysteresis margin to a
                     # healthier peer, or ranking behind a sooner recovery.
-                    # Every other excluded row already has a reason above.
+                    # Every other excluded row already has a reason above,
+                    # a capped one its "capped" label below.
                     # Never when `unmodeled`: this pass never ran, so
                     # "refused" is not a claim this row can support.
                     why = reasons.get(acc.number)
@@ -659,7 +662,6 @@ class AutoScreen(Screen):
                         bars.get(acc.number, settings.threshold),
                     )
                 )
-                capped = weekly_capped(acc.policy.weekly_cap, acc.usage.last_good)
                 if capped:
                     # A veto, not a rank: the engine never lands here.
                     entry.append(

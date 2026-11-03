@@ -286,24 +286,18 @@ def rank_switch_candidates(
         policy = policies.get(num)
         return weekly_capped(policy.weekly_cap if policy else None, usage.get(num))
 
-    oauth_candidates = [
-        acc.number
+    # Capped peers drop before the split by kind, as `_tick_inner` does.
+    candidates = [
+        acc
         for acc in snap.accounts
         if acc.number != active_number
         and acc.switchable
         and not acc.disabled
-        and acc.kind != "api_key"
         and _capped(acc.number) is None
     ]
+    oauth_candidates = [acc.number for acc in candidates if acc.kind != "api_key"]
     api_key_candidates = (
-        [
-            acc.number
-            for acc in snap.accounts
-            if acc.number != active_number
-            and acc.switchable
-            and not acc.disabled
-            and acc.kind == "api_key"
-        ]
+        [acc.number for acc in candidates if acc.kind == "api_key"]
         if settings.include_api_key_accounts
         else []
     )
@@ -564,6 +558,11 @@ def ordered_accounts(
             # sentinel-like tier above, or the two screens disagree on the
             # same snapshot.
             return (3,)
+        if weekly_capped(acc.policy.weekly_cap, acc.usage.last_good):
+            # A veto the engine never lands past, so it drops out of
+            # `ordered_rank` above: behind every waiting row, ahead of the
+            # non-targets, as the auto view's own (997.0,) tier.
+            return (1.5,)
         if acc.disabled:
             return (2,)
         # Soonest BINDING-window recovery first, unknown last -- matches

@@ -2301,6 +2301,52 @@ class TestPanelOrderIsTheEnginesOrder:
         assert ordered == [], ordered
         text = _autoview_text(snap, "1", settings)
         assert "no candidate qualifies" in text and "Next best (" not in text, text
+        row = next(ln for ln in text.splitlines() if "user2@example.com" in ln)
+        assert "capped" in row and "not a candidate" not in row, row
+
+    def test_a_capped_peer_takes_the_same_place_on_both_screens(self):
+        """#2 is capped and recovers sooner (its 7d window, 1h) than #3,
+        which is refused (95% against the 90 line, back in 2h): the capped
+        row sorts behind the waiting row on `ordered_accounts` as it does in
+        the panel, never among the refused peers by its reset."""
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        capped = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 5.0, "resets_at": _iso_in(7200)},
+                "seven_day": {"pct": 52.0, "resets_at": _iso_in(3600)},
+            },
+            fetched_at=time.time(), age_s=0.0,
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(96.0, 10.0)),
+                make_account(2, entry=capped, policy=AccountPolicy(weekly_cap=50.0)),
+                make_account(3, entry=make_entry(95.0, 10.0)),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "3", "2"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
+    def test_a_capped_api_key_peer_is_not_the_last_resort(self):
+        """The engine drops a capped peer before it splits the rest by kind,
+        so a capped API-key slot is no last resort either."""
+        settings = AutoSwitchSettings(
+            strategy="best", threshold=90.0, include_api_key_accounts=True
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(96.0, 10.0)),
+                make_account(
+                    2, kind="api_key", entry=make_entry(5.0, 52.0),
+                    policy=AccountPolicy(weekly_cap=50.0),
+                ),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
+        assert ordered == [], ordered
 
 
 @pytest.mark.asyncio
