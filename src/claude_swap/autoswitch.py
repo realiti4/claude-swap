@@ -3302,6 +3302,11 @@ class AutoSwitchEngine:
         """
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
+        # weekly-first is `best` with consume-first's ranking: the same
+        # departure line, landing gates, hysteresis and escapes as `best`, but
+        # a proactive move picks the eligible account whose weekly window
+        # resets soonest, since its unused weekly quota is lost first.
+        weekly_first = settings.strategy == "weekly-first"
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -3507,7 +3512,9 @@ class AutoSwitchEngine:
                 else (100.0 - h) >= thresholds[num]
             )
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(usage.get(num), now)
+                if consume_first or weekly_first
+                else None
             )
             if by_recovery_axis and (
                 recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
@@ -3577,9 +3584,15 @@ class AutoSwitchEngine:
                 room = -max(h, 0.0)
                 reset = _binding_recovery_ts(usage.get(num), self._models, now)
                 key: tuple = (reset, room) if by_recovery_axis else (room, reset)
-            elif consume_first and trigger != "at-limit":
+            elif (consume_first and trigger != "at-limit") or (
+                weekly_first and trigger == "proactive"
+            ):
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
+                #
+                # weekly-first reaches this arm only on `proactive`, where every
+                # candidate passed the landing gate, so both tiers are constant
+                # and the key is `(reset or inf, -lh)`.
                 #
                 # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
                 # does not belong: `at-limit` is a stopped session. The
