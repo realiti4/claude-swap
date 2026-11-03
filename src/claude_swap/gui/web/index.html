@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-swap</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --panel-2: #f0f0ec; --line: #e2e1dc;
+  --text: #1f1f1d; --muted: #6b6a64; --faint: #9a9890;
+  --accent: #c96442; --accent-text: #ffffff; --accent-soft: #f6e6df;
+  --ok: #3f8f5b; --warn: #c58a1a; --danger: #c2453a; --info: #3c6fb4;
+  --bar-bg: #ebeae5; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+  --radius: 8px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1a1a18; --panel: #232321; --panel-2: #2b2b28; --line: #363632;
+    --text: #ecebe6; --muted: #a3a29b; --faint: #75746d;
+    --accent: #d97757; --accent-text: #1a1a18; --accent-soft: #3a2a23;
+    --ok: #5cb47b; --warn: #e0a83a; --danger: #e0675b; --info: #6f9fe0;
+    --bar-bg: #34342f; --shadow: 0 1px 2px rgba(0,0,0,.3);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1a1a18; --panel: #232321; --panel-2: #2b2b28; --line: #363632;
+  --text: #ecebe6; --muted: #a3a29b; --faint: #75746d;
+  --accent: #d97757; --accent-text: #1a1a18; --accent-soft: #3a2a23;
+  --ok: #5cb47b; --warn: #e0a83a; --danger: #e0675b; --info: #6f9fe0;
+  --bar-bg: #34342f; --shadow: 0 1px 2px rgba(0,0,0,.3);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  display: flex; overflow: hidden;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+code, pre, .mono { font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace; font-size: 12px; }
+
+/* layout */
+nav {
+  width: 148px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; padding: 10px 8px;
+}
+.brand { font-weight: 650; font-size: 14px; padding: 4px 8px 10px; display: flex; align-items: center; gap: 8px; }
+.brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+nav a {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px;
+  color: var(--muted); text-decoration: none; cursor: pointer; user-select: none;
+}
+nav a:hover { background: var(--panel-2); color: var(--text); }
+nav a.active { background: var(--accent-soft); color: var(--text); font-weight: 600; }
+nav .spacer { flex: 1; }
+nav .foot { font-size: 11px; color: var(--faint); padding: 6px 8px 0; line-height: 1.6; }
+.pill-run { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-left: auto; }
+.pill-run.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+main { flex: 1; overflow-y: auto; padding: 14px 18px 28px; }
+.page { display: none; max-width: 1080px; margin: 0 auto; }
+.page.active { display: block; }
+h1 { font-size: 16px; margin: 0 0 2px; font-weight: 650; }
+h2 { font-size: 13px; margin: 16px 0 8px; font-weight: 650; }
+.sub { color: var(--muted); margin: 0 0 12px; font-size: 12px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; }
+
+/* controls */
+.btn {
+  border: 1px solid var(--line); background: var(--panel); border-radius: 6px;
+  padding: 4px 10px; cursor: pointer; white-space: nowrap; line-height: 1.4;
+}
+.btn:hover:not(:disabled) { background: var(--panel-2); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.06); background: var(--accent); }
+.btn.danger { color: var(--danger); }
+.btn.danger.solid { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.sm { padding: 2px 8px; font-size: 12px; }
+.btn.ghost { border-color: transparent; background: transparent; }
+input[type=text], input[type=number], input[type=password], select, textarea {
+  border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 4px 8px; min-width: 0;
+}
+input:focus, select:focus, textarea:focus, .btn:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 1px; }
+label.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.card.pad { padding: 12px 14px; }
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }
+.small { font-size: 12px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 0 6px; line-height: 17px;
+  border-radius: 999px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); white-space: nowrap;
+}
+.badge.accent { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+.badge.warn { color: var(--warn); }
+.badge.danger { color: var(--danger); }
+.badge.info { color: var(--info); }
+
+/* toolbar */
+.toolbar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+.status-line { font-size: 11px; color: var(--faint); margin-left: auto; }
+
+/* accounts */
+.accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 10px; }
+.acc { padding: 10px 12px 8px; position: relative; }
+.acc.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
+.acc.disabled { opacity: .72; }
+.acc-head { display: flex; gap: 8px; align-items: flex-start; }
+.slot {
+  flex: none; width: 24px; height: 24px; border-radius: 6px; font-size: 12px; background: var(--panel-2); border: 1px solid var(--line);
+  display: grid; place-items: center; font-weight: 650;
+}
+.acc.active .slot { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.acc-title { min-width: 0; flex: 1; }
+.email { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; }
+.meters { margin: 8px 0 4px; display: grid; gap: 6px; }
+.meter-top { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+.meter-top .lbl { color: var(--muted); }
+.meter-top .pct { font-weight: 650; font-variant-numeric: tabular-nums; }
+.bar { height: 5px; border-radius: 99px; background: var(--bar-bg); position: relative; margin-top: 3px; overflow: visible; }
+.bar > i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 99px; background: var(--ok); max-width: 100%; }
+.bar > i.warn { background: var(--warn); }
+.bar > i.danger { background: var(--danger); }
+.bar > b { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: .45; border-radius: 1px; }
+.bar > s { position: absolute; top: -2px; bottom: -2px; width: 1px; border-left: 1px dashed var(--muted); opacity: .7; }
+.note { font-size: 12px; padding: 6px 8px; border-radius: 6px; background: var(--panel-2); color: var(--muted); margin: 8px 0 4px; }
+.note.warn { color: var(--warn); }
+.note.danger { color: var(--danger); }
+.models { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
+.acc-foot { display: flex; gap: 4px; align-items: center; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); }
+.acc-foot .age { font-size: 11px; color: var(--faint); margin-right: auto; }
+.empty { text-align: center; padding: 28px 16px; }
+.empty h3 { margin: 0 0 6px; }
+
+/* dropdown menu */
+.menu {
+  position: fixed; z-index: 40; min-width: 160px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.18); padding: 5px; display: none;
+}
+.menu.open { display: block; }
+.menu button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 5px 9px; font-size: 12.5px; border-radius: 6px; cursor: pointer; }
+.menu button:hover { background: var(--panel-2); }
+.menu button.danger { color: var(--danger); }
+.menu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
+
+/* tables */
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { font-size: 11.5px; color: var(--muted); font-weight: 600; }
+tr:last-child td { border-bottom: 0; }
+td.actions { text-align: right; white-space: nowrap; }
+
+/* settings */
+.set-row { display: grid; grid-template-columns: minmax(200px, 1fr) 180px auto; gap: 10px; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--line); }
+.set-row:last-child { border-bottom: 0; }
+.set-row .key { font-weight: 600; }
+.set-row .help { font-size: 11.5px; color: var(--muted); }
+.set-row input, .set-row select { width: 100%; }
+
+/* auto page */
+.auto-head { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.big-state { font-size: 14px; font-weight: 650; display: flex; align-items: center; gap: 10px; }
+.kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px; margin-top: 10px; }
+.kv div { background: var(--panel-2); border-radius: 6px; padding: 5px 8px; }
+.kv span { display: block; font-size: 11px; color: var(--muted); }
+.kv strong { font-variant-numeric: tabular-nums; }
+.log { max-height: 460px; overflow-y: auto; font-size: 12px; }
+.log .ev { display: flex; gap: 10px; padding: 4px 12px; border-bottom: 1px solid var(--line); }
+.log .ev:last-child { border-bottom: 0; }
+.log .ev time { color: var(--faint); font-variant-numeric: tabular-nums; flex: none; }
+.log .ev.switch { color: var(--ok); font-weight: 600; }
+.log .ev.error, .log .ev.account-quarantined, .log .ev.quarantine { color: var(--danger); }
+.log .ev.all-exhausted, .log .ev.config-warning { color: var(--warn); }
+.log .ev.gui { color: var(--info); }
+
+/* modal */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: grid; place-items: center; z-index: 50; padding: 16px; }
+.modal { width: min(440px, 100%); max-height: calc(100vh - 32px); overflow: auto; padding: 14px 16px; }
+.modal.wide { width: min(720px, 100%); }
+.modal h3 { margin: 0 0 4px; font-size: 14px; }
+.modal .desc { color: var(--muted); font-size: 12px; margin: 0 0 10px; white-space: pre-wrap; }
+.modal .field { margin-bottom: 8px; display: block; }
+.modal .field > span { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+.modal .field input[type=text], .modal .field input[type=number], .modal .field input[type=password], .modal .field select, .modal .field textarea { width: 100%; }
+.modal .btns { display: flex; justify-content: flex-end; gap: 6px; margin-top: 12px; }
+.modal pre { background: var(--panel-2); padding: 12px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; margin: 0; max-height: 60vh; overflow: auto; }
+.path-pick { display: flex; gap: 6px; }
+.path-pick input { flex: 1; }
+
+/* toast */
+#toasts { position: fixed; right: 18px; bottom: 18px; display: grid; gap: 8px; z-index: 60; max-width: min(420px, calc(100vw - 36px)); }
+.toast { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--info); border-radius: 6px; padding: 7px 11px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.15); animation: slide .18s ease-out; white-space: pre-wrap; word-break: break-word; }
+.toast.ok { border-left-color: var(--ok); }
+.toast.warn { border-left-color: var(--warn); }
+.toast.error { border-left-color: var(--danger); }
+.toast b { display: block; margin-bottom: 2px; }
+@keyframes slide { from { transform: translateY(8px); opacity: 0; } }
+.spinner { width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; vertical-align: -2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.danger-zone { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+.grid2 .card h3 { margin: 0 0 2px; font-size: 13px; }
+.grid2 .card p { margin: 0 0 8px; }
+
+@media (max-width: 720px) {
+  body { flex-direction: column; overflow: auto; }
+  nav { width: auto; flex-direction: row; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid var(--line); }
+  nav .brand, nav .spacer, nav .foot { display: none; }
+  main { padding: 16px; overflow: visible; }
+  .accounts { grid-template-columns: 1fr; }
+  .set-row { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<nav>
+  <div class="brand"><span class="dot"></span>claude-swap</div>
+  <a data-page="accounts" class="active">账号</a>
+  <a data-page="auto">自动切换 <span class="pill-run" id="nav-engine"></span></a>
+  <a data-page="mappings">目录映射</a>
+  <a data-page="settings">设置</a>
+  <a data-page="data">备份与迁移</a>
+  <a data-page="about">诊断与关于</a>
+  <div class="spacer"></div>
+  <a id="theme-toggle" title="切换主题">主题：<span id="theme-name">跟随系统</span></a>
+  <div class="foot" id="foot"></div>
+</nav>
+
+<main>
+  <!-- 账号 -->
+  <section class="page active" id="page-accounts">
+    <div class="toolbar">
+      <button class="btn primary" data-act="add-current" title="把 Claude Code 当前登录的账号加入管理">添加登录</button>
+      <button class="btn" data-act="add-token" title="用 setup-token 或 API Key 添加">Token 添加</button>
+      <button class="btn" data-act="switch-best" title="切到剩余额度最多的账号">智能切换</button>
+      <button class="btn" data-act="switch-next" title="按顺序轮换到下一个账号">下一个</button>
+      <button class="btn" data-act="switch-avail" title="轮换到下一个，跳过已达上限的账号">跳过限额</button>
+      <button class="btn ghost" data-act="refresh" title="立即刷新（F5）">刷新</button>
+      <span class="status-line" id="snap-status"></span>
+    </div>
+    <div id="accounts" class="accounts"></div>
+  </section>
+
+  <!-- 自动切换 -->
+  <section class="page" id="page-auto">
+    <h1>自动切换</h1>
+    <p class="sub">监视当前账号用量，达到阈值前自动切到更合适的账号。窗口打开期间运行；可在「设置」中调整阈值、策略、间隔等。</p>
+    <div class="card pad">
+      <div class="auto-head">
+        <div class="big-state"><span class="pill-run" id="auto-dot"></span><span id="auto-state">已停止</span></div>
+        <div class="grow"></div>
+        <button class="btn primary" id="auto-start">启动</button>
+        <button class="btn" id="auto-dry" title="只记录将会做什么，不真正切换">演练模式启动</button>
+        <button class="btn danger" id="auto-stop" disabled>停止</button>
+      </div>
+      <div class="kv" id="auto-kv"></div>
+    </div>
+    <h2 class="row">事件日志 <span class="grow"></span>
+      <label class="check small muted" style="font-weight:400"><input type="checkbox" id="log-verbose"> 显示轮询详情</label>
+      <button class="btn sm" id="log-clear">清空</button>
+    </h2>
+    <div class="card log" id="auto-log"><div class="ev muted">暂无事件</div></div>
+  </section>
+
+  <!-- 目录映射 -->
+  <section class="page" id="page-mappings">
+    <h1>目录映射</h1>
+    <p class="sub">把目录绑定到账号：在该目录（及子目录）以会话模式运行时自动使用对应账号。映射只在本机有效。</p>
+    <div class="toolbar">
+      <button class="btn primary" id="map-add">添加映射</button>
+      <button class="btn" id="run-default" title="在新终端中以默认登录运行 claude">在终端运行默认账号</button>
+    </div>
+    <div class="card" id="map-table"></div>
+  </section>
+
+  <!-- 设置 -->
+  <section class="page" id="page-settings">
+    <h1>设置</h1>
+    <p class="sub">保存在 <span class="mono" id="settings-path"></span> 。修改自动切换相关设置会自动重启正在运行的自动切换。</p>
+    <div class="card" id="settings-list"></div>
+  </section>
+
+  <!-- 备份与迁移 -->
+  <section class="page" id="page-data">
+    <h1>备份与迁移</h1>
+    <p class="sub">导出 / 导入账号，在多台机器之间共享用量读数，以及清理数据。</p>
+    <div class="grid2">
+      <div class="card pad">
+        <h3>导出账号</h3>
+        <p class="muted small">导出文件包含登录凭据，请妥善保管。</p>
+        <div class="field" style="margin-bottom:10px"><select id="exp-account" style="width:100%"></select></div>
+        <label class="check small"><input type="checkbox" id="exp-full"> 完整导出（含整个 ~/.claude.json，用于本机备份）</label>
+        <div class="row" style="margin-top:12px"><button class="btn primary" id="exp-go">选择位置并导出</button></div>
+      </div>
+      <div class="card pad">
+        <h3>导入账号</h3>
+        <p class="muted small">默认跳过已存在的账号（失效令牌的槽位会被自动替换）。</p>
+        <label class="check small"><input type="checkbox" id="imp-force"> 覆盖已存在的账号</label>
+        <div class="row" style="margin-top:12px"><button class="btn primary" id="imp-go">选择文件并导入</button></div>
+      </div>
+      <div class="card pad">
+        <h3>导入用量读数</h3>
+        <p class="muted small">采用另一台机器 <span class="mono">cswap list --json</span> 的用量读数（适用于共用账号的多台机器）。</p>
+        <div class="row small">本机暂停拉取这些账号 <input type="number" id="iu-hold" min="0" placeholder="秒，可空" style="width:120px"></div>
+        <div class="row" style="margin-top:12px"><button class="btn" id="iu-go">选择文件并导入</button></div>
+      </div>
+      <div class="card pad">
+        <h3>未认领的凭据</h3>
+        <p class="muted small">切换过程中无法归属到槽位而暂存的凭据，一般会自动清理。</p>
+        <div id="unclaimed" class="small muted">加载中…</div>
+      </div>
+      <div class="card pad danger-zone">
+        <h3 style="color:var(--danger)">清除全部数据</h3>
+        <p class="muted small">删除 claude-swap 保存的所有账号凭据、备份与设置。不影响 Claude Code 当前登录。</p>
+        <button class="btn danger" id="purge-go">清除全部数据…</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 诊断与关于 -->
+  <section class="page" id="page-about">
+    <h1>诊断与关于</h1>
+    <p class="sub" id="about-line"></p>
+    <div class="toolbar">
+      <button class="btn" id="ab-status">当前状态</button>
+      <button class="btn" id="ab-token">令牌诊断</button>
+      <button class="btn" id="ab-folder">打开数据目录</button>
+      <button class="btn" id="ab-update">检查更新</button>
+    </div>
+    <div class="card pad"><pre id="ab-out" class="mono muted" style="margin:0;white-space:pre-wrap">点击上方按钮查看输出。</pre></div>
+  </section>
+</main>
+
+<div class="menu" id="menu"></div>
+<div id="toasts"></div>
+
+<script>
+"use strict";
+const TOKEN = "__CSWAP_TOKEN__";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/* ---------------- bridge ---------------- */
+const ready = TOKEN ? Promise.resolve() : new Promise((res) => {
+  if (window.pywebview && window.pywebview.api) res();
+  else window.addEventListener("pywebviewready", res, { once: true });
+});
+async function api(name, ...args) {
+  await ready;
+  if (!TOKEN) return window.pywebview.api[name](...args);
+  const r = await fetch("/api/" + name, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Token": TOKEN }, body: JSON.stringify(args),
+  });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j.result;
+}
+
+/* ---------------- state ---------------- */
+const S = { boot: null, snap: null, settings: [], busy: false, eventSeq: 0, events: [], snapPending: false };
+
+/* ---------------- theme ---------------- */
+const THEMES = ["auto", "light", "dark"], THEME_NAMES = { auto: "跟随系统", light: "浅色", dark: "深色" };
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+function applyTheme(t) {
+  if (t === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  $("#theme-name").textContent = THEME_NAMES[t];
+}
+let theme = store("cswap-theme") || "auto";
+applyTheme(theme);
+$("#theme-toggle").onclick = () => { theme = THEMES[(THEMES.indexOf(theme) + 1) % 3]; store("cswap-theme", theme); applyTheme(theme); };
+
+/* ---------------- nav ---------------- */
+function showPage(name) {
+  $$("nav a[data-page]").forEach((a) => a.classList.toggle("active", a.dataset.page === name));
+  $$(".page").forEach((p) => p.classList.toggle("active", p.id === "page-" + name));
+  if (name === "settings") loadSettings();
+  if (name === "mappings") loadMappings();
+  if (name === "data") loadData();
+  if (name === "auto") { loadSettings(); renderAuto(); }
+}
+$$("nav a[data-page]").forEach((a) => (a.onclick = () => showPage(a.dataset.page)));
+
+/* ---------------- toasts & modals ---------------- */
+function toast(msg, kind = "info", title = "") {
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.innerHTML = (title ? `<b>${esc(title)}</b>` : "") + esc(msg);
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), kind === "error" ? 9000 : 4500);
+}
+function modal(html, { wide = false } = {}) {
+  const ov = document.createElement("div");
+  ov.className = "overlay";
+  ov.innerHTML = `<div class="card modal ${wide ? "wide" : ""}">${html}</div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.addEventListener("mousedown", (e) => { if (e.target === ov) close(); });
+  return { el: $(".modal", ov), close };
+}
+function confirmBox(title, desc, { yes = "确定", danger = false } = {}) {
+  return new Promise((res) => {
+    const m = modal(`<h3>${esc(title)}</h3><p class="desc">${esc(desc)}</p>
+      <div class="btns"><button class="btn" data-x="no">取消</button><button class="btn ${danger ? "danger solid" : "primary"}" data-x="yes">${esc(yes)}</button></div>`);
+    $('[data-x="no"]', m.el).onclick = () => { m.close(); res(false); };
+    $('[data-x="yes"]', m.el).onclick = () => { m.close(); res(true); };
+    $('[data-x="yes"]', m.el).focus();
+  });
+}
+function outputBox(title, text) {
+  const m = modal(`<h3>${esc(title)}</h3><pre class="mono">${esc(text || "（无输出）")}</pre>
+    <div class="btns"><button class="btn primary">关闭</button></div>`, { wide: true });
+  $(".btns .btn", m.el).onclick = m.close;
+}
+/* fields: [{name, label, type: text|number|password|select|check|path|textarea, value, options:[[v,l]], placeholder, pathKind}] */
+function form(title, desc, fields, { yes = "确定" } = {}) {
+  return new Promise((res) => {
+    const f = fields.map((fd) => {
+      const id = "f_" + fd.name;
+      let input;
+      if (fd.type === "select") input = `<select id="${id}">${fd.options.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(fd.value ?? "") ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+      else if (fd.type === "check") return `<div class="field"><label class="check"><input type="checkbox" id="${id}" ${fd.value ? "checked" : ""}> ${esc(fd.label)}</label></div>`;
+      else if (fd.type === "textarea") input = `<textarea id="${id}" rows="3" placeholder="${esc(fd.placeholder || "")}">${esc(fd.value ?? "")}</textarea>`;
+      else if (fd.type === "path") input = `<div class="path-pick"><input type="text" id="${id}" value="${esc(fd.value ?? "")}" placeholder="${esc(fd.placeholder || "")}"><button class="btn" type="button" data-pick="${id}" data-kind="${fd.pathKind || "folder"}">浏览…</button></div>`;
+      else input = `<input type="${fd.type || "text"}" id="${id}" value="${esc(fd.value ?? "")}" placeholder="${esc(fd.placeholder || "")}" ${fd.min != null ? `min="${fd.min}"` : ""} ${fd.max != null ? `max="${fd.max}"` : ""} step="any">`;
+      return `<label class="field"><span>${esc(fd.label)}</span>${input}</label>`;
+    }).join("");
+    const m = modal(`<h3>${esc(title)}</h3>${desc ? `<p class="desc">${esc(desc)}</p>` : ""}<form>${f}
+      <div class="btns"><button class="btn" type="button" data-x="no">取消</button><button class="btn primary" type="submit">${esc(yes)}</button></div></form>`);
+    $$("[data-pick]", m.el).forEach((b) => (b.onclick = async () => {
+      const p = await api("pick_path", b.dataset.kind, "");
+      if (p) $("#" + b.dataset.pick, m.el).value = p;
+      else if (S.boot && S.boot.mode === "browser") toast("浏览器模式下无法打开系统对话框，请直接输入路径。", "warn");
+    }));
+    $('[data-x="no"]', m.el).onclick = () => { m.close(); res(null); };
+    $("form", m.el).onsubmit = (e) => {
+      e.preventDefault();
+      const out = {};
+      for (const fd of fields) {
+        const el = $("#f_" + fd.name, m.el);
+        out[fd.name] = fd.type === "check" ? el.checked : el.value.trim();
+      }
+      m.close(); res(out);
+    };
+    const first = $("input, select, textarea", m.el);
+    if (first) first.focus();
+  });
+}
+/* Ask for a file path: native dialog in the app, typed path in browser mode. */
+async function pickPath(kind, filename, title) {
+  const p = await api("pick_path", kind, filename || "");
+  if (p) return p;
+  if (S.boot && S.boot.mode === "browser") {
+    const r = await form(title, "浏览器模式下无法打开系统对话框，请输入完整路径。", [{ name: "p", label: "路径", value: filename || "" }]);
+    return r && r.p ? r.p : null;
+  }
+  return null;
+}
+
+/* ---------------- action runner ---------------- */
+function firstLine(text) { return (text || "").split("\n").map((s) => s.trim()).find(Boolean) || ""; }
+async function act(label, name, args, { showOutput = false, okMsg = "" } = {}) {
+  if (S.busy) { toast("另一个操作仍在进行中", "warn"); return null; }
+  S.busy = true; document.body.style.cursor = "progress";
+  try {
+    const r = await api(name, ...(args || []));
+    if (!r.ok) { outputBox(label + " — 失败", r.output); return r; }
+    const p = r.payload || {};
+    if ("switched" in p) {
+      if (p.switched) { const to = p.to || {}; toast("已切换到 " + (to.email || "账号 " + to.number), "ok", "切换"); }
+      else toast(String(p.reason || "未执行切换"), "warn", "未切换");
+    } else if (showOutput && r.output) outputBox(label, r.output);
+    else toast(okMsg || firstLine(r.output) || label + " 完成", "ok");
+    return r;
+  } catch (e) {
+    outputBox(label + " — 出错", String(e && e.message || e));
+    return null;
+  } finally {
+    S.busy = false; document.body.style.cursor = "";
+    refreshSnapshot();
+  }
+}
+
+/* ---------------- formatting ---------------- */
+function fmtDur(s) {
+  s = Math.max(0, Math.floor(s));
+  if (s < 60) return s + "秒";
+  if (s < 3600) return Math.floor(s / 60) + "分";
+  if (s < 86400) { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); return h + "小时" + (m ? " " + m + "分" : ""); }
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600); return d + "天" + (h ? " " + h + "小时" : "");
+}
+function resetText(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso); if (isNaN(t)) return "";
+  const rem = (t - Date.now()) / 1000;
+  if (rem <= 0) return "即将重置";
+  const d = new Date(t), now = new Date();
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const clock = d.toDateString() === now.toDateString() ? hm : (d.getMonth() + 1) + "/" + d.getDate() + " " + hm;
+  return fmtDur(rem) + " 后重置 · " + clock;
+}
+const pctFmt = (p) => (p == null ? "—" : (Math.round(p * 10) / 10) + "%");
+function barClass(p, line) { if (p == null) return ""; const l = line ?? 90; return p >= l ? "danger" : p >= l - 15 ? "warn" : ""; }
+const SENTINEL_ZH = {
+  "token expired": "令牌已过期 — 本轮暂缓刷新，会自动重试",
+  "foreign credential": "当前凭据属于其他账号 — 切换一次即可修复",
+  "api key": "API Key 账号（按量计费，无额度窗口）",
+  "keychain unavailable": "钥匙串不可用 — 已锁定或被占用，请稍后重试",
+  "re-login needed": "需要重新登录 — 刷新令牌已失效：用该账号登录 Claude Code 后点「添加当前登录」",
+  "no credentials": "没有可用凭据",
+};
+
+/* ---------------- accounts ---------------- */
+function meter(label, w, line, extra) {
+  if (!w) return "";
+  const p = w.pct, cls = barClass(p, line);
+  const tick = line != null ? `<b style="left:calc(${Math.min(line, 100)}% - 1px)" title="切换阈值 ${line}%"></b>` : "";
+  const pace = w.expectedPct != null ? `<s style="left:${Math.min(w.expectedPct, 100)}%" title="按时间均匀消耗的预期值 ${pctFmt(w.expectedPct)}"></s>` : "";
+  return `<div><div class="meter-top"><span class="lbl">${label}${extra || ""}</span>
+    <span><span class="reset faint" data-at="${esc(w.resetsAt || "")}">${esc(resetText(w.resetsAt))}</span>
+    <span class="pct">${pctFmt(p)}</span></span></div>
+    <div class="bar"><i class="${cls}" style="width:${Math.max(0, Math.min(p || 0, 100))}%"></i>${pace}${tick}</div></div>`;
+}
+function accountCard(a, snap) {
+  const u = a.usage || {};
+  const g5 = a.threshold ?? snap.threshold;
+  const g7 = snap.weeklyThreshold ?? (a.threshold ?? snap.threshold);
+  const badges = [];
+  if (a.isActive) badges.push(`<span class="badge accent">当前</span>`);
+  if (a.alias) badges.push(`<span class="badge">@${esc(a.alias)}</span>`);
+  badges.push(`<span class="badge">${esc(a.org)}</span>`);
+  if (a.plan) badges.push(`<span class="badge info">${esc(a.plan)}</span>`);
+  if (a.kind === "api_key") badges.push(`<span class="badge warn">API Key</span>`);
+  if (a.disabled) badges.push(`<span class="badge danger">已禁用</span>`);
+  if (a.threshold != null) badges.push(`<span class="badge" title="单独的切换阈值">阈值 ${a.threshold}%</span>`);
+  if (a.priority) badges.push(`<span class="badge" title="priority-consume-first 策略的优先级">优先级 ${a.priority}</span>`);
+
+  let body = "";
+  if (a.sentinel) {
+    const danger = a.sentinel === "re-login needed";
+    body += `<div class="note ${danger ? "danger" : "warn"}">${esc(SENTINEL_ZH[a.sentinel] || a.sentinelNote || a.sentinel)}${a.lastSeen ? `<div class="faint">${esc(a.lastSeen)}</div>` : ""}</div>`;
+  } else if (!a.usage) {
+    body += `<div class="note">尚无用量数据，正在等待首次读取…</div>`;
+  } else {
+    let pace = "";
+    if (u.sevenDay && u.sevenDay.aheadOfPace != null) pace = u.sevenDay.aheadOfPace ? ` <span class="badge warn" title="用得比时间进度快">偏快</span>` : "";
+    body += `<div class="meters">${meter("5 小时", u.fiveHour, g5)}${meter("7 天", u.sevenDay, g7, pace)}</div>`;
+    if (u.scoped && u.scoped.length) body += `<div class="models">${u.scoped.map((w) => `<span title="${esc(resetText(w.resetsAt))}">${esc(w.name)}: <b>${pctFmt(w.pct)}</b></span>`).join("")}</div>`;
+    if (u.spend) body += `<div class="models" style="margin-top:6px"><span>额外用量：${esc(u.spend.used)} / ${esc(u.spend.limit)} ${esc(u.spend.currency || "")}（${pctFmt(u.spend.pct)}）</span></div>`;
+  }
+  const age = a.ageS != null && a.ageS > 300 ? `${fmtDur(a.ageS)}前读取` : a.lastError ? `上次读取失败：${a.lastError}` : "";
+  return `<div class="card acc ${a.isActive ? "active" : ""} ${a.disabled ? "disabled" : ""}" data-num="${esc(a.number)}">
+    <div class="acc-head"><div class="slot">${esc(a.number)}</div>
+      <div class="acc-title"><div class="email" title="${esc(a.email)}">${esc(a.email)}</div><div class="badges">${badges.join("")}</div></div></div>
+    ${body}
+    <div class="acc-foot"><span class="age" title="${esc(a.lastError || "")}">${esc(age)}</span>
+      <button class="btn sm primary" data-acc="switch" ${a.isActive ? "disabled" : ""}>切换</button>
+      <button class="btn sm" data-acc="run" title="在新终端中以该账号运行 Claude Code（不影响默认登录）">终端运行</button>
+      <button class="btn sm" data-acc="more">更多 ▾</button></div></div>`;
+}
+function renderAccounts() {
+  const snap = S.snap; if (!snap) return;
+  const box = $("#accounts");
+  if (!snap.accounts.length) {
+    box.innerHTML = `<div class="card empty" style="grid-column:1/-1"><h3>还没有管理任何账号</h3>
+      <p class="muted">先在 Claude Code 中登录一个账号，然后点击「添加登录」。<br>如需添加更多账号：在 Claude Code 中登录另一个账号（不要先 /logout），再次点击添加。</p>
+      <button class="btn primary" data-act="add-current">添加登录</button></div>`;
+  } else box.innerHTML = snap.accounts.map((a) => accountCard(a, snap)).join("");
+  let st = snap.takenAt ? "更新于 " + new Date(snap.takenAt * 1000).toLocaleTimeString() : "";
+  if (snap.error) st = "刷新失败：" + snap.error;
+  $("#snap-status").textContent = st;
+  renderEngineDot();
+}
+function tickResets() { $$(".reset[data-at]").forEach((el) => { if (el.dataset.at) el.textContent = resetText(el.dataset.at); }); }
+function accByNum(n) { return S.snap && S.snap.accounts.find((a) => a.number === n); }
+function accountOptions(withEmpty) {
+  const o = (S.snap ? S.snap.accounts : []).map((a) => [a.number, `${a.number}: ${a.email}${a.alias ? " (@" + a.alias + ")" : ""}`]);
+  return withEmpty ? [["", withEmpty], ...o] : o;
+}
+
+async function refreshSnapshot(full = false) {
+  if (S.snapPending) return;
+  S.snapPending = true;
+  try { S.snap = await api("snapshot", full); renderAccounts(); }
+  catch (e) { $("#snap-status").textContent = "刷新失败：" + (e.message || e); }
+  finally { S.snapPending = false; }
+}
+
+/* toolbar */
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-act]"); if (!b) return;
+  const a = b.dataset.act;
+  if (a === "refresh") return refreshSnapshot(true);
+  if (a === "switch-next") return act("切换到下一个", "switch_strategy", [null]);
+  if (a === "switch-best") return act("智能切换", "switch_strategy", ["best"]);
+  if (a === "switch-avail") return act("跳过限额轮换", "switch_strategy", ["next-available"]);
+  if (a === "add-current") {
+    const r = await form("添加当前登录", "把 Claude Code 当前登录的账号备份为一个受管理账号。若该账号已在管理中，会就地刷新其凭据。",
+      [{ name: "slot", label: "槽位（可空，自动分配）", type: "number", min: 1 }, { name: "alias", label: "别名（可空）", placeholder: "例如 work" }], { yes: "添加" });
+    if (!r) return;
+    if (r.slot && accByNum(r.slot) && !(await confirmBox("覆盖槽位", `槽位 ${r.slot} 已被 ${accByNum(r.slot).email} 占用，确定覆盖？`, { yes: "覆盖", danger: true }))) return;
+    return act("添加当前登录", "add_current", [r.slot || null, r.alias || null], { showOutput: true });
+  }
+  if (a === "add-token") {
+    const r = await form("通过 Token 添加", "支持 setup-token（sk-ant-oat01-…，由 claude setup-token 生成）或 API Key（sk-ant-api03-…）。",
+      [{ name: "token", label: "Token", type: "password" }, { name: "email", label: "邮箱（可空，仅用于显示）" }, { name: "slot", label: "槽位（可空）", type: "number", min: 1 }], { yes: "添加" });
+    if (!r) return;
+    if (r.slot && accByNum(r.slot) && !(await confirmBox("覆盖槽位", `槽位 ${r.slot} 已被 ${accByNum(r.slot).email} 占用，确定覆盖？`, { yes: "覆盖", danger: true }))) return;
+    return act("通过 Token 添加", "add_token", [r.token, r.email || null, r.slot || null], { showOutput: true });
+  }
+});
+
+/* per-account buttons */
+$("#accounts").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-acc]"); if (!b) return;
+  const n = b.closest("[data-num]").dataset.num, a = accByNum(n); if (!a) return;
+  const k = b.dataset.acc;
+  if (k === "switch") act("切换到账号 " + n, "switch_to", [n]);
+  else if (k === "run") runSession(n);
+  else if (k === "more") openMenu(b, a);
+});
+
+const menu = $("#menu");
+function closeMenu() { menu.classList.remove("open"); }
+document.addEventListener("mousedown", (e) => { if (!menu.contains(e.target) && !e.target.closest('[data-acc="more"]')) closeMenu(); });
+window.addEventListener("resize", closeMenu);
+$("main").addEventListener("scroll", closeMenu);
+function openMenu(btn, a) {
+  const items = [
+    ["alias", "设置别名…"], ["threshold", "单独切换阈值…"], ["priority", "优先级…"],
+    ["toggle", a.disabled ? "启用（加入自动轮换）" : "禁用（移出自动轮换）"], "-",
+    ["move", "移动到槽位…"], ["swap", "与其他账号交换槽位…"], ["map", "映射到目录…"], ["export", "导出此账号…"],
+    ["force", "强制切换（不先备份当前登录）"], "-", ["remove", "删除账号…", "danger"],
+  ];
+  menu.innerHTML = items.map((it) => it === "-" ? "<hr>" : `<button data-m="${it[0]}" class="${it[2] || ""}">${esc(it[1])}</button>`).join("");
+  menu.classList.add("open");
+  const r = btn.getBoundingClientRect(), mw = menu.offsetWidth, mh = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(r.right - mw, innerWidth - mw - 8)) + "px";
+  menu.style.top = (r.bottom + 4 + mh > innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + "px";
+  menu.onclick = (e) => { const m = e.target.closest("[data-m]"); if (!m) return; closeMenu(); accountAction(m.dataset.m, a); };
+}
+async function accountAction(k, a) {
+  const n = a.number, who = `账号 ${n}（${a.email}）`;
+  if (k === "alias") {
+    const r = await form("设置别名", who + "\n别名可在任何需要账号编号的地方使用，只能包含字母、数字、- _ .，留空则删除。", [{ name: "v", label: "别名", value: a.alias }]);
+    if (r) act("设置别名", "set_alias", [n, r.v]);
+  } else if (k === "threshold") {
+    const r = await form("单独切换阈值", who + "\n达到该用量（50–99.9%）时自动切换离开此账号，替代全局阈值。留空恢复全局默认。", [{ name: "v", label: "阈值 %", type: "number", min: 50, max: 99.9, value: a.threshold ?? "" }]);
+    if (r) act("设置阈值", "set_threshold", [n, r.v]);
+  } else if (k === "priority") {
+    const r = await form("优先级", who + "\n仅用于 priority-consume-first 策略：数值越高越先使用（0–1000），留空恢复为 0。", [{ name: "v", label: "优先级", type: "number", min: 0, max: 1000, value: a.priority || "" }]);
+    if (r) act("设置优先级", "set_priority", [n, r.v]);
+  } else if (k === "toggle") {
+    act(a.disabled ? "启用账号" : "禁用账号", "set_disabled", [n, !a.disabled]);
+  } else if (k === "move") {
+    const r = await form("移动到槽位", who + "\n目标槽位为空则直接移动，已被占用则两者交换。", [{ name: "v", label: "目标槽位", type: "number", min: 1 }]);
+    if (r && r.v) act("移动账号", "move", [n, r.v]);
+  } else if (k === "swap") {
+    const opts = accountOptions().filter(([v]) => v !== n);
+    if (!opts.length) return toast("没有其他账号可交换", "warn");
+    const r = await form("交换槽位", who, [{ name: "v", label: "与哪个账号交换", type: "select", options: opts }]);
+    if (r) act("交换槽位", "swap", [n, r.v]);
+  } else if (k === "map") {
+    const r = await form("映射到目录", who + "\n在该目录及子目录下以会话模式运行时自动使用此账号。", [{ name: "p", label: "目录", type: "path", pathKind: "folder" }]);
+    if (r && r.p) { await act("添加映射", "map_dir", [n, r.p]); loadMappings(); }
+  } else if (k === "export") {
+    const p = await pickPath("save", `claude-swap-account-${n}.json`, "导出此账号");
+    if (p) act("导出账号", "export_accounts", [p, n, false], { showOutput: true });
+  } else if (k === "force") {
+    if (await confirmBox("强制切换", `直接激活 ${who} 的已存储凭据，不先备份当前登录。仅在当前登录已损坏时使用。`, { yes: "强制切换", danger: true }))
+      act("强制切换", "switch_to", [n, true]);
+  } else if (k === "remove") {
+    if (await confirmBox("删除账号", `确定删除 ${who}？\n其存储的凭据和配置备份会被删除。`, { yes: "删除", danger: true }))
+      act("删除账号", "remove", [n]);
+  }
+}
+
+/* ---------------- session mode ---------------- */
+async function runSession(n, cwd) {
+  const r = await form("在终端运行", (n ? `以账号 ${n} 在新终端中运行 Claude Code` : "在新终端中运行 Claude Code（使用目录映射，没有映射则用默认登录）") +
+    "。其他终端和 VS Code 扩展仍使用默认账号，两个账号可并行工作。需要已安装 claude 命令。", [
+    { name: "cwd", label: "工作目录", type: "path", pathKind: "folder", value: cwd || "", placeholder: "默认：用户主目录" },
+    { name: "hist", label: "聊天记录", type: "select", value: "", options: [["", "按设置（run.shareHistory）"], ["1", "与默认账号共享"], ["0", "该账号独立"]] },
+    { name: "share", label: "共享 ~/.claude 中的设置、CLAUDE.md、skills、MCP 等", type: "check", value: true },
+    { name: "req", label: "若该账号就是默认登录则拒绝运行（保证隔离）", type: "check", value: false },
+    { name: "extra", label: "传给 claude 的额外参数（可空）", placeholder: "例如 --resume" },
+  ], { yes: "打开终端" });
+  if (!r) return;
+  const hist = r.hist === "" ? null : r.hist === "1";
+  act("在终端运行", "run_session", [n || null, r.share, hist, r.req, r.extra, r.cwd || null]);
+}
+
+/* ---------------- auto-switch ---------------- */
+function engineState() { return (S.snap && S.snap.engine) || { running: false, dryRun: false }; }
+function renderEngineDot() {
+  const e = engineState();
+  $("#nav-engine").classList.toggle("on", e.running);
+  $("#auto-dot").classList.toggle("on", e.running);
+  $("#auto-state").textContent = e.running ? (e.dryRun ? "运行中（演练模式，不会真正切换）" : "运行中") : "已停止";
+  $("#auto-start").disabled = e.running; $("#auto-dry").disabled = e.running; $("#auto-stop").disabled = !e.running;
+}
+const STRATEGY_ZH = { best: "best — 额度最多", "weekly-first": "weekly-first — 周额度最早重置优先", "consume-first": "consume-first — 先用掉即将过期的", "priority-consume-first": "priority-consume-first — 按优先级" };
+function renderAuto() {
+  renderEngineDot();
+  const v = (k) => { const s = S.settings.find((x) => x.key === k); return s ? s.value : null; };
+  const kv = [
+    ["切换阈值（5 小时）", v("autoswitch.threshold") != null ? v("autoswitch.threshold") + "%" : "—"],
+    ["周阈值（7 天 / 模型）", v("autoswitch.weeklyThreshold") != null ? v("autoswitch.weeklyThreshold") + "%" : "同上"],
+    ["策略", STRATEGY_ZH[v("autoswitch.strategy")] || v("autoswitch.strategy") || "—"],
+    ["轮询间隔", v("autoswitch.intervalSeconds") != null ? v("autoswitch.intervalSeconds") + " 秒" : "—"],
+    ["冷却时间", v("autoswitch.cooldownSeconds") != null ? v("autoswitch.cooldownSeconds") + " 秒" : "—"],
+    ["参与判断的模型", v("autoswitch.model") || "仅账号级 5h/7d"],
+  ];
+  $("#auto-kv").innerHTML = kv.map(([k, x]) => `<div><span>${esc(k)}</span><strong>${esc(x)}</strong></div>`).join("");
+  renderLog();
+}
+function renderLog() {
+  const verbose = $("#log-verbose").checked;
+  const evs = S.events.filter((e) => verbose || !["poll", "sleep", "no-switch"].includes(e.event)).slice(-300).reverse();
+  $("#auto-log").innerHTML = evs.length ? evs.map((e) => {
+    const t = e.ts ? new Date(e.ts).toLocaleTimeString() : "";
+    return `<div class="ev ${esc(e.event)}"><time>${esc(t === "Invalid Date" ? e.ts : t)}</time><span>${esc(e.text || e.event)}</span></div>`;
+  }).join("") : `<div class="ev muted">暂无事件</div>`;
+}
+$("#log-verbose").onchange = renderLog;
+$("#log-clear").onclick = () => { S.events = []; renderLog(); };
+async function engine(name, args) {
+  const r = await api(name, ...(args || []));
+  if (!r.ok) outputBox("自动切换", r.output);
+  if (S.snap) S.snap.engine = r.engine || engineState();
+  renderEngineDot(); pollEvents();
+}
+$("#auto-start").onclick = () => engine("engine_start", [false]);
+$("#auto-dry").onclick = () => engine("engine_start", [true]);
+$("#auto-stop").onclick = () => engine("engine_stop");
+async function pollEvents() {
+  try {
+    const r = await api("events", S.eventSeq);
+    const fresh = r.events || [];
+    S.eventSeq = r.seq;
+    if (S.snap) S.snap.engine = r.engine;
+    if (fresh.length) {
+      S.events.push(...fresh);
+      if (S.events.length > 1000) S.events = S.events.slice(-1000);
+      for (const e of fresh) {
+        if (e.event === "switch" && !e.dryRun) { toast(e.text, "ok", "已自动切换"); refreshSnapshot(); }
+        else if (e.event === "account-quarantined" || e.event === "quarantine") toast(e.text, "error", "账号已隔离");
+        else if (e.event === "all-exhausted") toast(e.text, "warn", "所有账号额度已用尽");
+        else if (e.event === "config-warning") toast(e.text, "warn", "配置警告");
+        else if (e.event === "error" && e.text) toast(e.text, "error", "自动切换");
+      }
+      if ($("#page-auto").classList.contains("active")) renderLog();
+    }
+    renderEngineDot();
+  } catch (e) { /* transient */ }
+}
+
+/* ---------------- mappings ---------------- */
+async function loadMappings() {
+  const box = $("#map-table");
+  try {
+    const rows = await api("mappings");
+    box.innerHTML = rows.length ? `<table><tr><th>目录</th><th>账号</th><th></th></tr>${rows.map((r) => `<tr>
+      <td class="mono">${esc(r.path)}</td>
+      <td>${r.number ? esc(r.number + ": " + r.email) : `<span class="muted">${esc(r.email)}（账号已删除）</span>`}</td>
+      <td class="actions"><button class="btn sm" data-run="${esc(r.path)}">在此目录运行</button>
+      <button class="btn sm" data-open="${esc(r.path)}">打开</button>
+      <button class="btn sm danger" data-unmap="${esc(r.path)}">移除</button></td></tr>`).join("")}</table>`
+      : `<div class="empty muted">还没有目录映射。</div>`;
+  } catch (e) { box.innerHTML = `<div class="empty muted">${esc(e.message || e)}</div>`; }
+}
+$("#map-table").addEventListener("click", async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.unmap) { await act("移除映射", "unmap_dir", [b.dataset.unmap]); loadMappings(); }
+  else if (b.dataset.run) runSession(null, b.dataset.run);
+  else if (b.dataset.open) act("打开目录", "open_folder", [b.dataset.open], { okMsg: "已打开" });
+});
+$("#map-add").onclick = async () => {
+  if (!S.snap || !S.snap.accounts.length) return toast("请先添加账号", "warn");
+  const r = await form("添加目录映射", "", [{ name: "n", label: "账号", type: "select", options: accountOptions() }, { name: "p", label: "目录", type: "path", pathKind: "folder" }]);
+  if (r && r.p) { await act("添加映射", "map_dir", [r.n, r.p]); loadMappings(); }
+};
+$("#run-default").onclick = () => runSession(null);
+
+/* ---------------- settings ---------------- */
+const SETTING_ZH = {
+  "autoswitch.threshold": "5 小时窗口（未设周阈值时为所有窗口）达到该百分比时切换",
+  "autoswitch.weeklyThreshold": "7 天及单模型窗口的切换线（未设置时同上）",
+  "autoswitch.intervalSeconds": "自动切换的轮询间隔（秒）",
+  "autoswitch.cooldownSeconds": "两次主动切换之间的最短间隔（秒）",
+  "autoswitch.hysteresisPct": "目标账号的剩余额度至少要比当前多出这么多百分点",
+  "autoswitch.strategy": "自动切换选择目标账号的方式",
+  "autoswitch.includeApiKeyAccounts": "允许切换到 API Key 账号（按 token 计费）",
+  "autoswitch.unhealthyTicks": "连续多少次轮询失败后视为不健康",
+  "autoswitch.model": "额外按这些模型的周限额切换（如 Fable、Fable,Opus 或 all）",
+  "ui.theme": "命令行 / TUI 的配色（GUI 主题在左下角切换）",
+  "run.shareHistory": "会话模式默认共享聊天记录",
+  "updates.check": "命令行每天检查一次 PyPI 新版本",
+  "usage.headerProbe": "通过 1 token 的 Haiku 请求读取 setup-token 用量（会消耗少量额度）",
+};
+async function loadSettings() {
+  try { S.settings = await api("settings"); } catch (e) { return; }
+  if (S.boot) $("#settings-path").textContent = S.boot.settingsPath;
+  $("#settings-list").innerHTML = S.settings.map((s) => {
+    const val = s.value == null ? "" : s.value;
+    let input;
+    if (s.kind === "bool") input = `<select data-key="${esc(s.key)}"><option value="true" ${val === true ? "selected" : ""}>开启</option><option value="false" ${val === false ? "selected" : ""}>关闭</option></select>`;
+    else if (s.kind === "choice") input = `<select data-key="${esc(s.key)}">${s.choices.map((c) => `<option ${c === val ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>`;
+    else if (s.kind === "float" || s.kind === "int") input = `<input type="number" data-key="${esc(s.key)}" value="${esc(val)}" ${s.lo != null ? `min="${s.lo}"` : ""} ${s.hi != null ? `max="${s.hi}"` : ""} step="${s.kind === "int" ? 1 : "any"}" placeholder="${s.default == null ? "未设置" : esc(s.default)}">`;
+    else input = `<input type="text" data-key="${esc(s.key)}" value="${esc(val)}" placeholder="未设置">`;
+    const range = s.lo != null ? `（${s.lo}–${s.hi}）` : "";
+    return `<div class="set-row"><div><div class="key mono">${esc(s.key)} ${s.isSet ? "" : `<span class="badge">默认</span>`}</div>
+      <div class="help">${esc(SETTING_ZH[s.key] || s.help)}${esc(range)}</div></div>
+      <div>${input}</div>
+      <div class="row"><button class="btn sm primary" data-save="${esc(s.key)}">保存</button>
+      <button class="btn sm" data-unset="${esc(s.key)}" ${s.isSet ? "" : "disabled"} title="默认值：${esc(s.default ?? "未设置")}">恢复默认</button></div></div>`;
+  }).join("");
+  if ($("#page-auto").classList.contains("active")) renderAuto();
+}
+$("#settings-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.save) {
+    const el = $(`[data-key="${CSS.escape(b.dataset.save)}"]`, $("#settings-list"));
+    if (el.value === "") return toast("值不能为空；要清除请点「恢复默认」", "warn");
+    await act("保存设置", "set_setting", [b.dataset.save, el.value]);
+  } else if (b.dataset.unset) await act("恢复默认", "unset_setting", [b.dataset.unset]);
+  loadSettings();
+});
+
+/* ---------------- data ---------------- */
+async function loadData() {
+  $("#exp-account").innerHTML = [["", "全部账号"], ...accountOptions()].map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("");
+  try {
+    const rows = await api("unclaimed");
+    $("#unclaimed").innerHTML = rows.length ? `<table>${rows.map((r) => `<tr><td class="mono">${esc(r.id)}</td><td>槽位 ${esc(r.slot)}</td><td>${esc(r.reason)}</td>
+      <td class="actions"><button class="btn sm danger" data-purge="${esc(r.id)}">删除</button></td></tr>`).join("")}</table>` : "没有未认领的凭据。";
+  } catch (e) { $("#unclaimed").textContent = String(e.message || e); }
+}
+$("#unclaimed").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-purge]"); if (!b) return;
+  if (await confirmBox("删除暂存凭据", `删除 ${b.dataset.purge} 的凭据内容？恢复方式是重新 /login 后添加。`, { yes: "删除", danger: true })) {
+    await act("删除暂存凭据", "purge_unclaimed", [b.dataset.purge]); loadData();
+  }
+});
+$("#exp-go").onclick = async () => {
+  const acct = $("#exp-account").value;
+  const p = await pickPath("save", acct ? `claude-swap-account-${acct}.json` : "claude-swap-backup.json", "导出账号");
+  if (p) act("导出账号", "export_accounts", [p, acct || null, $("#exp-full").checked], { showOutput: true });
+};
+$("#imp-go").onclick = async () => {
+  const p = await pickPath("open", "", "导入账号");
+  if (p) act("导入账号", "import_accounts", [p, $("#imp-force").checked], { showOutput: true });
+};
+$("#iu-go").onclick = async () => {
+  const p = await pickPath("open", "", "导入用量读数");
+  if (p) act("导入用量读数", "import_usage", [p, $("#iu-hold").value || null], { showOutput: true });
+};
+$("#purge-go").onclick = async () => {
+  if (!(await confirmBox("清除全部数据", "将删除 claude-swap 保存的所有账号凭据、备份目录、会话配置与设置。此操作不可撤销。", { yes: "继续", danger: true }))) return;
+  const r = await form("再次确认", "请输入 PURGE 以确认清除。", [{ name: "v", label: "确认文字" }], { yes: "清除" });
+  if (!r || r.v !== "PURGE") return r && toast("输入不匹配，已取消", "warn");
+  act("清除全部数据", "purge_all", [], { showOutput: true });
+};
+
+/* ---------------- about ---------------- */
+async function showText(name, label) {
+  $("#ab-out").textContent = "运行中…";
+  try { const r = await api(name); $("#ab-out").textContent = (r.ok ? "" : "失败：\n") + (r.output || "（无输出）"); }
+  catch (e) { $("#ab-out").textContent = String(e.message || e); }
+}
+$("#ab-status").onclick = () => showText("status_text");
+$("#ab-token").onclick = () => showText("token_status_text");
+$("#ab-folder").onclick = () => act("打开数据目录", "open_folder", [null], { okMsg: "已打开数据目录" });
+$("#ab-update").onclick = async () => {
+  $("#ab-out").textContent = "正在检查…";
+  const r = await api("check_update");
+  if (!r.ok) { $("#ab-out").textContent = r.output; return; }
+  $("#ab-out").textContent = r.newer ? `发现新版本 ${r.latest}（当前 ${r.current}）` : `已是最新版本（${r.current}）`;
+  if (r.newer && (await confirmBox("发现新版本", `最新版本 ${r.latest}，当前 ${r.current}。打开下载页面？`, { yes: "打开" }))) api("open_url", r.url);
+};
+
+/* ---------------- boot ---------------- */
+(async function boot() {
+  try { S.boot = await api("boot"); }
+  catch (e) { document.body.innerHTML = `<pre style="padding:24px">无法连接后端：${esc(e.message || e)}</pre>`; return; }
+  const b = S.boot;
+  $("#foot").innerHTML = `v${esc(b.version)}<br>${b.mode === "browser" ? "浏览器模式" : "桌面模式"}`;
+  $("#about-line").innerHTML = `版本 <b>${esc(b.version)}</b> · ${esc(b.platform)} · ${b.mode === "browser" ? "浏览器模式（关闭此页约 2 分钟后后台自动退出）" : "桌面模式"}<br>数据目录：<span class="mono">${esc(b.backupDir)}</span>`;
+  await refreshSnapshot();
+  loadSettings();
+  setInterval(() => { if (!document.hidden || engineState().running) refreshSnapshot(); }, 3000);
+  setInterval(pollEvents, 2000);
+  setInterval(tickResets, 1000);
+  if (b.mode === "browser") setInterval(() => api("ping").catch(() => {}), 5000);
+})();
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closeMenu(); const ov = $$(".overlay").pop(); if (ov) ov.remove(); }
+  if ((e.key === "F5" || (e.key === "r" && (e.ctrlKey || e.metaKey)))) { e.preventDefault(); refreshSnapshot(true); }
+});
+</script>
+</body>
+</html>

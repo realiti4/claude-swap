@@ -6,6 +6,9 @@ on:
 
 jobs:
   publish:
+    # PyPI publishing belongs to the upstream project; this fork ships
+    # desktop builds through desktop-release.yml instead.
+    if: github.repository == 'realiti4/claude-swap'
     runs-on: ubuntu-latest
     permissions:
       id-token: write

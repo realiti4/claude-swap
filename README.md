@@ -2,6 +2,17 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
+## 桌面版（GUI）
+
+本仓库在原版命令行工具之上增加了 Windows / macOS 桌面界面，覆盖全部功能：账号用量看板、切换、添加（当前登录或 Token）、删除 / 禁用 / 别名 / 阈值 / 优先级 / 移动与交换槽位、自动切换（含演练模式与事件日志）、会话模式（在新终端中以指定账号运行 Claude Code）、目录映射、全部设置项、导入导出、用量读数导入、未认领凭据清理与数据清除。
+
+- **下载**：在 [Releases](https://github.com/xutianhao6/claude-swap-desktop/releases) 下载对应系统的安装包（Windows `*-setup.exe` / 便携 `*.zip`，macOS `*.dmg`）。
+- **体积**：界面使用系统自带的 WebView（Windows WebView2 / macOS WKWebView），不内置浏览器内核；Windows 安装包约 10 MB。
+- **命令行**：桌面版同时包含命令行。Windows 安装时勾选「加入 PATH」即可在终端使用 `cswap`；macOS 使用 `claude-swap.app/Contents/MacOS/claude-swap <命令>`。终端仪表盘（`cswap tui`）不包含在桌面版中。
+- **从源码运行**：`uv sync --extra gui && uv run --extra gui cswap-gui`（加 `--browser` 可改用系统浏览器打开）。
+- **本地打包**：`uv run --extra gui python packaging/build.py`（Windows 加 `--installer` 生成安装器，需要 Inno Setup 6）。
+- **发布**：推送 `v*` 标签（如 `git tag v0.30.0b1 && git push origin v0.30.0b1`），GitHub Actions 会构建 Windows x64、macOS arm64 / x64 并发布到 Releases。
+
 ## Installation
 
 ### Using uv (recommended)

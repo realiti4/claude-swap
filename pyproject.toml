@@ -33,6 +33,7 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+gui = ["pywebview>=5.3"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -43,6 +44,9 @@ Issues = "https://github.com/realiti4/claude-swap/issues"
 claude-swap = "claude_swap.cli:main"
 cswap = "claude_swap.cli:main"
 
+[project.gui-scripts]
+cswap-gui = "claude_swap.gui:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -51,7 +55,12 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+dev = [
+    "pyinstaller>=6.22.3",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
