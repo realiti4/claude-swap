@@ -7565,18 +7565,16 @@ class TestWarmthAndAlternation375:
     def test_t0758_narrows_375s_own_motivating_fleet_once_dwell_is_satisfied(
         self, temp_home
     ):
-        """`TestOutcomeDigest375`'s motivating fleet (active headroom 22,
-        candidate headroom 4 resetting a day out against the active's 5)
-        pins `NO_ACTION` on a SINGLE tick with no dwell stamp -- that
-        fixture never seeds `lastActiveAt`, so the dwell gate holds it
-        regardless of the floor this change narrows, and that pin is
-        untouched by this change. This is the same shape WITH dwell
-        satisfied: T0758's carve-out reaches it too, deliberately -- #375
-        forbade chasing whichever window resets soonest regardless of
-        cost in general, and T0758 narrows exactly that rule for a
-        candidate whose own window would otherwise expire unspent. Named
-        explicitly so the two pins are never read as contradicting one
-        another by accident."""
+        """#375's motivating fleet (active headroom 22, candidate
+        headroom 4 resetting a day out against the active's 5) is held on
+        a SINGLE tick with no dwell stamp -- without `lastActiveAt` the
+        dwell gate holds it regardless of the floor this change narrows,
+        and that hold is untouched by this change. This is the same shape
+        WITH dwell satisfied: T0758's carve-out reaches it too,
+        deliberately -- #375 forbade chasing whichever window resets
+        soonest regardless of cost in general, and T0758 narrows exactly
+        that rule for a candidate whose own window would otherwise expire
+        unspent."""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now

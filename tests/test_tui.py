@@ -2128,23 +2128,26 @@ class TestPanelOrderIsTheEnginesOrder:
     top row is the account the tick switches to. Pinned for the two regimes
     upstream added that order unlike the strategies the panel once imitated:
     `priority-consume-first` (tier, then soonest weekly reset) and a fleet
-    entirely over its lines (most room, whatever returns first)."""
+    entirely over its lines (most room, whatever returns first); and the weekly
+    cap's veto (a capped peer is never listed, a capped active is left at once)."""
 
     @staticmethod
-    def _tick_and_panel(temp_home, fleet, *, tiers=None, **kw):
+    def _tick_and_panel(temp_home, fleet, *, tiers=None, caps=None, **kw):
         """Tick the real engine on ``fleet`` (account 1 active); return the
         account it switched to, the panel's ordered list and its rendered text
-        for the same fleet."""
+        for the same fleet. ``caps`` maps an account to its weekly cap."""
         from claude_swap.autoswitch import TickOutcome
         from tests.test_autoswitch import EngineHarness
 
-        tiers = tiers or {}
+        tiers, caps = tiers or {}, caps or {}
         h = EngineHarness(temp_home, **kw)
         for num in fleet:
             h.seed(int(num), f"user{num}@example.com")
         h.make_live("user1@example.com", 1)
         for num, tier in tiers.items():
             h.switcher.set_account_priority(num, tier)
+        for num, cap in caps.items():
+            h.switcher.set_account_weekly_cap(num, cap)
         assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
         snap = AccountsSnapshot(
             accounts=[
@@ -2154,7 +2157,9 @@ class TestPanelOrderIsTheEnginesOrder:
                     entry=UsageEntry(
                         last_good=value, fetched_at=time.time(), age_s=0.0
                     ),
-                    policy=AccountPolicy(priority=tiers.get(num, 0)),
+                    policy=AccountPolicy(
+                        priority=tiers.get(num, 0), weekly_cap=caps.get(num)
+                    ),
                 )
                 for num, value in fleet.items()
             ],
@@ -2224,6 +2229,78 @@ class TestPanelOrderIsTheEnginesOrder:
         assert engine_pick == "2"
         assert ordered == ["2", "3"], ordered
         assert "Next best (most headroom)" in rendered, rendered
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    def test_a_capped_peer_with_the_most_room_is_not_the_top_pick(
+        self, temp_home, strategy
+    ):
+        """#2 holds the most room (48 points against 40) but its 7d reading
+        is past its weekly cap, which the engine vetoes before ranking: the
+        tick lands on #3, and so must the panel's order, which every screen
+        (`ordered_accounts`) reads."""
+        def w(pct5, pct7):
+            return {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}}
+
+        fleet = {"1": w(98.0, 10.0), "2": w(5.0, 52.0), "3": w(60.0, 10.0)}
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, fleet, caps={"2": 50.0}, strategy=strategy, threshold=90.0,
+            cooldown_seconds=0.0,
+        )
+        assert engine_pick == "3"
+        assert ordered == ["3"], ordered
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "priority-consume-first"])
+    def test_a_capped_active_below_its_line_is_left_at_once(self, temp_home, strategy):
+        """The active reads 20% on 5h but 60% on 7d against a cap of 50: the
+        engine leaves it now (`weekly-capped`), so the panel previews the move
+        instead of "not previewed (active below threshold)"."""
+        def w(pct5, pct7):
+            return {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}}
+
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, {"1": w(20.0, 60.0), "2": w(10.0, 10.0)},
+            caps={"1": 50.0}, strategy=strategy, threshold=90.0,
+            cooldown_seconds=0.0,
+        )
+        assert engine_pick == "2"
+        assert ordered == ["2"], ordered
+        assert "not previewed" not in rendered, rendered
+
+    def test_a_peer_under_a_cap_does_not_stop_a_spent_peer_being_admitted(
+        self, temp_home
+    ):
+        """The capped active asks no recovery margin of a spent peer when
+        every peer the engine counts is over its lines. #3 is capped, so the
+        engine does not count it: #2 (spent) is the only candidate and is
+        taken. Counting #3 (under its lines) would refuse #2 "at its limit"."""
+        def w(pct5, pct7):
+            return {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}}
+
+        engine_pick, ordered, _rendered = self._tick_and_panel(
+            temp_home, {"1": w(20.0, 60.0), "2": w(100.0, 10.0), "3": w(10.0, 55.0)},
+            caps={"1": 50.0, "3": 50.0}, strategy="best", threshold=90.0,
+            cooldown_seconds=0.0,
+        )
+        assert engine_pick == "2"
+        assert ordered == ["2"], ordered
+
+    def test_a_fleet_of_capped_peers_reads_no_candidate_qualifies(self):
+        """Only #2 is ranked and it is capped: the engine finds no candidate,
+        so the panel says so rather than offering a top row."""
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(96.0, 10.0)),
+                make_account(
+                    2, entry=make_entry(5.0, 52.0), policy=AccountPolicy(weekly_cap=50.0)
+                ),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
+        assert ordered == [], ordered
+        text = _autoview_text(snap, "1", settings)
+        assert "no candidate qualifies" in text and "Next best (" not in text, text
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ from claude_swap.autoswitch import (
     rank_priority_candidates,
 )
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.lines import weekly_capped
 from claude_swap.models import AccountsSnapshot
 from claude_swap.poll_policy import binding_pct
 from claude_swap.settings import parse_model_names
@@ -277,6 +278,14 @@ def rank_switch_candidates(
     # The engine's own tick map (`_resolve_thresholds`): `.get` reads the
     # overrides only, `[num]` falls back to the global threshold.
     bars = ThresholdMap(switch_bars(snap), settings.threshold)
+    policies = {acc.number: acc.policy for acc in snap.accounts}
+
+    def _capped(num: str | None) -> tuple[str, float] | None:
+        """The engine's weekly-cap veto (`_tick_inner`'s `_capped`), on the
+        same `weekly_capped`: the active must leave, a candidate is dropped."""
+        policy = policies.get(num)
+        return weekly_capped(policy.weekly_cap if policy else None, usage.get(num))
+
     oauth_candidates = [
         acc.number
         for acc in snap.accounts
@@ -284,6 +293,7 @@ def rank_switch_candidates(
         and acc.switchable
         and not acc.disabled
         and acc.kind != "api_key"
+        and _capped(acc.number) is None
     ]
     api_key_candidates = (
         [
@@ -301,6 +311,8 @@ def rank_switch_candidates(
     def _trigger_for(active_headroom: float | None, active_disabled: bool) -> str:
         if active_disabled:
             return "disabled-active"
+        if _capped(active_number) is not None:
+            return "weekly-capped"  # a cap is no line: it leaves now, below one too
         if active_headroom is None:
             return "unreadable-active"
         if settings.strategy == "dynamic":
@@ -400,8 +412,9 @@ def rank_switch_candidates(
         if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
             return _rank_dynamic_on(axis, trigger)
         headroom = _headroom_by_account(usage, axis)
-        if settings.strategy == "priority-consume-first":
-            # The engine ranks every trigger through its priority pass alone.
+        if settings.strategy == "priority-consume-first" and trigger != "weekly-capped":
+            # The engine ranks every trigger through its priority pass alone,
+            # a capped active's excepted: strict landing would hold it in place.
             ordered, *_ = rank_priority_candidates(
                 oauth_candidates=oauth_candidates,
                 usage=usage,
@@ -414,7 +427,7 @@ def rank_switch_candidates(
                 settings=settings,
                 now=now,
                 thresholds=bars,
-                policies={acc.number: acc.policy for acc in snap.accounts},
+                policies=policies,
                 models=axis,
             )
             # The legend names `_rank_priority_candidates`'s own sort key.
