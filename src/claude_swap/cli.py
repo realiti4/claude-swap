@@ -757,6 +757,139 @@ def _priority_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _history_command(argv: list[str]) -> None:
+    """Handle `cswap history [--days N] [--json] ...`.
+
+    Reads the usage history cswap records as it checks usage (see
+    history.py) and draws it in the terminal: weekly room left across every
+    account with a week's forecast, the paces behind it, and each account's
+    room now. No fetching and no
+    credential access: it shows what is recorded, so it is instant and costs
+    no requests.
+    """
+    import shutil
+    import time
+
+    parser = argparse.ArgumentParser(
+        prog="cswap history",
+        description=(
+            "Show recorded usage: weekly room left across every account, in "
+            "accounts' worth (1.0 = one account's whole 7-day limit), with a "
+            "7-day forecast at recent paces and the room that comes back as "
+            "weekly limits reset. cswap records the history itself as it checks "
+            "usage (cswap auto, list, the dashboard); nothing is fetched here."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap history                 # the last 7 days and the week ahead
+  cswap history --days 30       # a longer look back
+  cswap history --json          # the same numbers for scripts
+  cswap history --demo          # made-up data, to see what the view shows
+
+Recording: cswap config set history.enabled false   (stops it; keeps what's recorded)
+           cswap config set history.retentionDays 90
+        """,
+    )
+    parser.add_argument(
+        "--days", type=float, default=7.0, metavar="N",
+        help="How far back to draw, in days (default 7; fractions work: 0.5)",
+    )
+    parser.add_argument(
+        "--width", type=int, metavar="COLS",
+        help="Draw for this many columns (default: the terminal's width)",
+    )
+    parser.add_argument(
+        "--ascii", action="store_true",
+        help="Draw with plain ASCII (automatic when the terminal can't show braille)",
+    )
+    parser.add_argument(
+        "--demo", action="store_true",
+        help="Show made-up data for 15 accounts instead of yours",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON to stdout",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if not 0 < args.days <= 3650:
+        parser.error("--days must be more than 0 and at most 3650")
+    if args.width is not None and args.width < 50:
+        parser.error("--width must be at least 50 (the narrowest the chart is laid out for)")
+
+    from claude_swap.history_forecast import DAY_S, analyse
+    from claude_swap.history_render import MIN_WIDTH, overview_json, render_overview
+    from claude_swap.settings import load_history_settings
+
+    try:
+        now = time.time()
+        # Paces look back up to a day whatever the range.
+        since = now - max(args.days, 1.0) * DAY_S
+        settings_note = None
+        if args.demo:
+            from claude_swap.history_demo import demo_history
+
+            history = demo_history(now)
+        else:
+            switcher = ClaudeAccountSwitcher(debug=args.debug)
+            _guard_root(switcher)
+            history = switcher.usage_history(since=since, now=now)
+            if not load_history_settings(switcher.backup_dir).enabled:
+                settings_note = (
+                    "Recording is off (history.enabled is false). Turn it back on "
+                    "with: cswap config set history.enabled true"
+                )
+        if args.json:
+            print(json.dumps(overview_json(analyse(history), days=args.days), indent=2))
+            return
+
+        if not history.accounts:
+            print("No accounts yet. Add one with: cswap add")
+            return
+        width = args.width or shutil.get_terminal_size((100, 24)).columns
+        if width < MIN_WIDTH:
+            error(
+                f"Error: the chart needs at least {MIN_WIDTH} columns and this terminal "
+                f"has {width}. Widen it, pass --width, or use --json."
+            )
+            sys.exit(1)
+        unicode = not args.ascii and printer.stdout_can_show("⣿─█╌┈→")
+        color = printer.colors_enabled()
+        lines = render_overview(
+            analyse(history), days=args.days, width=width, unicode=unicode,
+            color=color, settings_note=settings_note,
+        )
+        _print_rich_lines(lines, width=width, color=color)
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def _print_rich_lines(lines, *, width: int, color: bool) -> None:
+    """Print rich ``Text`` lines to stdout: colour only when cswap's own
+    colour policy (NO_COLOR, FORCE_COLOR, a TTY, TERM) allows it, and never
+    wrapped -- each line is laid out for ``width`` already."""
+    from rich.console import Console
+
+    console = Console(
+        file=sys.stdout,
+        width=max(width, max((len(line) for line in lines), default=0)),
+        color_system="auto" if color else None,
+        force_terminal=color,
+        no_color=not color,
+        highlight=False,
+        emoji=False,
+        markup=False,
+    )
+    for line in lines:
+        console.print(line, overflow="crop", no_wrap=True, crop=False)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1226,6 +1359,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "history":
+        _history_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1270,6 +1406,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s history [--days N]         weekly room left, recent paces, a week's forecast
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

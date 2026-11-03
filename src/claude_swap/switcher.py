@@ -51,6 +51,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
+from claude_swap.history import History, UsageHistory, load_history
 from claude_swap.fsutil import (
     atomic_write_bytes,
     atomic_write_text,
@@ -355,7 +356,9 @@ class ClaudeAccountSwitcher:
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
-        self._usage_store = UsageStore(self.backup_dir / "cache")
+        # Usage history (history.py): the store hands it every new good reading.
+        self._history = UsageHistory(self.backup_dir, account_ids=self._history_account_ids)
+        self._usage_store = UsageStore(self.backup_dir / "cache", history=self._history)
         # (settings mtime, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
@@ -1937,6 +1940,28 @@ class ClaudeAccountSwitcher:
             for num, entry in self._usage_store.entries(identities).items()
         }
 
+    def usage_history(self, *, since: float, now: float | None = None) -> History:
+        """The recorded usage history from ``since`` on, joined with the
+        accounts cswap manages now and their latest stored readings.
+
+        A pure file read, like :meth:`usage_fetch_stamps`: no fetching and no
+        credential access, so ``cswap history`` costs no requests and never
+        touches the Keychain.
+        """
+        data = self._get_sequence_data() or {}
+        identities = {
+            num: (info.get("email", ""), info.get("organizationUuid", "") or "")
+            for num, info in data.get("accounts", {}).items()
+        }
+        return load_history(
+            self.backup_dir,
+            data,
+            self._usage_store.entries(identities),
+            now=self._usage_store.clock() if now is None else now,
+            since=since,
+            strategy=load_settings(self.backup_dir).strategy,
+        )
+
     def set_poll_policy_inputs(
         self,
         threshold: float,
@@ -2276,6 +2301,18 @@ class ClaudeAccountSwitcher:
         """
         with FileLock(self.lock_file):
             self._write_account_credentials(account_num, email, credentials)
+
+    def _history_account_ids(self) -> dict[str, str]:
+        """Slot -> stable account uuid, for usage history rows (which carry
+        no email). Slots without a uuid yet (add-token placeholders) are
+        left out; their rows carry the slot number alone."""
+        data = self._read_json(self.sequence_file) or {}
+        out = {}
+        for num, acct in (data.get("accounts") or {}).items():
+            uuid = (acct.get("uuid") or "").strip() if isinstance(acct, dict) else ""
+            if uuid:
+                out[str(num)] = uuid
+        return out
 
     def account_identity(self, account_num: str) -> dict:
         """Stored identity for a slot: ``{"email", "organizationUuid", "uuid"}``."""

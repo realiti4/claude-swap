@@ -24,6 +24,12 @@ still fetching; recording the outcome releases it and a crashed claimer ages
 out. The collector records per *batch*, so a fast account's lease is held
 until its batch's slowest fetch lands — the lease TTL is sized for the whole
 batch, not one request.
+
+Every new good reading is also handed to the usage history (``history.py``),
+when the store was built with one, after the lock is released: the store is
+the single place ``lastGood`` is written, so recording here catches every
+collector (``cswap auto``, ``--list``, the TUI, the menu bar, ``import-usage``)
+without any of them knowing about it.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap.history import NewReading, UsageHistory
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -853,10 +860,18 @@ class UsageStore:
     on a single slot).
     """
 
-    def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float] = time.time,
+        history: UsageHistory | None = None,
+    ):
         self.path = cache_dir / "usage.json"
         self._lock_path = cache_dir / ".usage.lock"
         self.clock = clock
+        # Told about every new good reading, after the store's lock is
+        # released (see the module docstring). None records nothing.
+        self.history = history
 
     # -- raw I/O ------------------------------------------------------------
 
@@ -877,6 +892,12 @@ class UsageStore:
         atomic_write_json(
             self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows}
         )
+
+    def _record_history(self, readings: list[NewReading]) -> None:
+        """Hand new readings to the history. Outside the store's lock, and
+        never raising: a history write must not cost the store its write."""
+        if self.history is not None and readings:
+            self.history.record_readings(readings)
 
     @staticmethod
     def _matches(row: object, identity: Identity) -> bool:
@@ -1097,6 +1118,7 @@ class UsageStore:
             return set()
         now = self.clock()
         accepted: set[str] = set()
+        new_readings: list[NewReading] = []
 
         def apply(num: str, row: dict) -> None:
             accepted.add(num)
@@ -1109,6 +1131,13 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
+                if isinstance(rec.usage, dict):
+                    # The row's previous fetchedAt is the exact time of the
+                    # check before this one: what dates the use behind any
+                    # change. A row just replaced for a new identity has none.
+                    new_readings.append(NewReading(
+                        num, rec.usage, now, _num_or_none(row.get("fetchedAt"))
+                    ))
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
@@ -1174,6 +1203,7 @@ class UsageStore:
                 apply(num, row)
             if accepted:
                 self._write_rows(rows)
+        self._record_history(new_readings)
         return accepted
 
     def adopt(
@@ -1211,12 +1241,15 @@ class UsageStore:
             return set()
         now = self.clock()
         adopted: set[str] = set()
+        new_readings: list[NewReading] = []
 
         def apply(num: str, row: dict) -> None:
             usage, age_s = readings[num]
             fetched_at = now - max(0.0, age_s)
             stored = _num_or_none(row.get("fetchedAt"))
             if stored is None or fetched_at > stored:
+                if isinstance(usage, dict):
+                    new_readings.append(NewReading(num, usage, fetched_at, stored))
                 row["lastGood"] = usage
                 row["fetchedAt"] = fetched_at
                 stored = fetched_at
@@ -1236,6 +1269,7 @@ class UsageStore:
                 row.pop("heldUntil", None)
 
         self._mutate(identities, readings.keys(), apply)
+        self._record_history(new_readings)
         return adopted
 
     def set_poll_plan(

@@ -76,6 +76,17 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     color: $secondary;
 }
 
+/* The weekly-room chart above the watch screen's cards. */
+#history-panel {
+    height: auto;
+    max-height: 50%;  /* the panel fits itself to this; the cap is a backstop */
+    overflow: hidden hidden;
+    padding: 0 3;
+    margin-top: 1;
+    background: $background;
+    border-bottom: solid $panel;
+}
+
 /* -- auto screen ---------------------------------------------------------- */
 
 #auto-top {
