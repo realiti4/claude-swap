@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -261,16 +262,20 @@ class TestBackupReadCache:
         self, temp_home: Path, block_real_keychain, keychain: _Keychain
     ):
         """Any add/remove/swap/move/switch/import — from any process — rewrites
-        ``sequence.json``; a cached read notices by its mtime."""
+        ``sequence.json``; a cached read notices even when the rewrite is the
+        same length and lands on the same coarse mtime tick (the atomic write
+        still replaces the inode)."""
         s = _switcher(temp_home, block_real_keychain, 2)
         store = s._store
         store._read_account_credentials("2", _email(2), cached=True)
         store._read_account_credentials("2", _email(2), cached=True)
         assert keychain.backup_calls(2) == 1
 
+        mtime_ns = s.sequence_file.stat().st_mtime_ns
         data = s._get_sequence_data()
         data["lastUpdated"] = "2024-06-01T00:00:00Z"
         s._write_json(s.sequence_file, data)
+        os.utime(s.sequence_file, ns=(mtime_ns, mtime_ns))
         store._read_account_credentials("2", _email(2), cached=True)
         assert keychain.backup_calls(2) == 2
 
