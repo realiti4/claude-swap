@@ -406,8 +406,8 @@ def test_the_tui_row_and_card_show_one_plan_label_the_profile_one():
     )
     row = widgets.mini_account_text(snap, now).plain
     card = widgets.account_card_text(snap, 80, now=now).plain
-    assert "[personal]  · Max 5x" in row
-    assert "[personal]   · Max 5x" in card
+    assert row.count("Max 5x") == 1
+    assert card.count("Max 5x") == 1
     assert "Ultra" not in row + card
 
 
