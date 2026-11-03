@@ -200,7 +200,10 @@ class TestAccountSnapshotPolicyField:
         positional construction in the repo.
         """
         names = [f.name for f in dataclasses.fields(AccountSnapshot)]
-        assert names[-1] == "policy"
+        # After `disabled`: appended, not inserted. Fields added since (the
+        # token fingerprint, the plan) sit between or after, so "last" and
+        # "immediately after" are no longer the right proxy: only "nothing
+        # slipped in ahead of `alias`/`disabled`".
         assert names.index("policy") > names.index("disabled")
 
     def test_snapshot_is_still_frozen_and_still_has_display_tag(self):

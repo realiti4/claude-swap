@@ -18,6 +18,7 @@ are built on the walled capture.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -26,7 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap import menubar, oauth, poll_policy, usage_store
+from claude_swap import menubar, oauth, poll_policy, subscription, usage_store
 from claude_swap.autoswitch import PollEvent, _window_pcts, consume_first_rank_key
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountSnapshot
@@ -341,11 +342,9 @@ def test_a_record_stamps_the_plan_beside_lastgood(store):
     assert store.entries(IDENT)["1"].plan == "Ultra"
 
 
-PLAN_BLOBS = [
-    ({"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}, "Ultra"),
-    ({"rateLimitTier": "default_claude_new_tier"}, "default_claude_new_tier"),
-    ({}, None),
-]
+PROFILE_PLAN = {"tier": "default_claude_max_5x", "subscriptionStatus": "active"}
+
+ULTRA_BLOB = {"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}
 
 
 def _list_with(blob: dict, sample_sequence_data: dict) -> None:
@@ -369,24 +368,35 @@ def _list_with(blob: dict, sample_sequence_data: dict) -> None:
         switcher.list_accounts()
 
 
-@pytest.mark.parametrize("blob,plan", PLAN_BLOBS)
-def test_list_shows_the_plan_after_the_tag(
-    temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys, blob, plan
+def test_list_shows_one_plan_label_the_profile_one(
+    temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys, monkeypatch
 ):
-    _list_with(blob, sample_sequence_data)
+    """The credential's own label (``Ultra``) is not drawn beside the profile's."""
+    monkeypatch.setattr(
+        subscription, "fetch_plan",
+        lambda token, *a, **k: subscription.PlanFetch(
+            plan=PROFILE_PLAN, account_uuid="uuid-2", organization_uuid=""
+        ),
+    )
+    _list_with(ULTRA_BLOB, sample_sequence_data)
     header = next(
         line for line in capsys.readouterr().out.splitlines() if "account2@example.com" in line
     )
-    assert header.rstrip().endswith(f"[personal] {plan}" if plan else "[personal]")
+    assert header.rstrip().endswith("[personal] · Max 5x")
+    assert "Ultra" not in header
 
 
-def test_the_tui_row_and_card_show_the_plan():
-    plan, now = "Ultra", time.time()
-    snap, bare = _snapshot(_usage("live"), plan), _snapshot(_usage("live"))
-    assert f"[personal]  {plan}" in widgets.mini_account_text(snap, now).plain
-    assert f"[personal]  {plan}" in widgets.account_card_text(snap, 80, now=now).plain
-    assert plan not in widgets.mini_account_text(bare, now).plain
-    assert plan not in widgets.account_card_text(bare, 80, now=now).plain
+def test_the_tui_row_and_card_show_one_plan_label_the_profile_one():
+    now = time.time()
+    snap = dataclasses.replace(
+        _snapshot(_usage("live"), "Ultra"),
+        subscription_plan={"plan": PROFILE_PLAN, "fetchedAt": now},
+    )
+    row = widgets.mini_account_text(snap, now).plain
+    card = widgets.account_card_text(snap, 80, now=now).plain
+    assert "[personal]  · Max 5x" in row
+    assert "[personal]   · Max 5x" in card
+    assert "Ultra" not in row + card
 
 
 def test_the_menubar_row_shows_the_plan():
