@@ -234,3 +234,123 @@ class TestValidationAtTheWriteBoundary(PolicyCliBase):
         self._fleet(temp_home)
         self._threshold(["2", good])
         assert self._record(ClaudeAccountSwitcher(), "2")["threshold"] == float(good)
+
+
+class TestWeeklyLine(PolicyCliBase):
+    """`--weekly PCT` / `--unset-weekly`: the account's own line for its 7d
+    and per-model windows, alongside or instead of its threshold."""
+
+    @staticmethod
+    def _fleet_weekly(s: ClaudeAccountSwitcher, value: str = "98") -> None:
+        from claude_swap.settings import set_setting
+
+        set_setting(s.backup_dir, "autoswitch.weeklyThreshold", value)
+
+    def test_it_writes_only_the_weekly_key(self, temp_home: Path, capsys):
+        self._fleet(temp_home)
+        self._threshold(["2", "--weekly", "90"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert record["weeklyThreshold"] == 90.0
+        assert "threshold" not in record
+
+    def test_both_lines_in_one_call(self, temp_home: Path, capsys):
+        self._fleet(temp_home)
+        self._threshold(["2", "85", "--weekly", "90"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert record["threshold"] == 85.0
+        assert record["weeklyThreshold"] == 90.0
+
+    def test_a_bad_weekly_value_writes_neither_line(self, temp_home: Path, capsys):
+        """The threshold must not land and then the weekly value fail."""
+        s = self._fleet(temp_home)
+        before = self._bytes(s)
+        with pytest.raises(SystemExit) as exc:
+            self._threshold(["2", "85", "--weekly", "150"])
+        assert exc.value.code != 0
+        assert self._bytes(s) == before
+        err = capsys.readouterr().err
+        assert "--weekly" in err and "99.9" in err
+
+    def test_unset_weekly_removes_only_the_weekly_key(self, temp_home: Path, capsys):
+        self._fleet(temp_home)
+        self._threshold(["2", "85", "--weekly", "90"])
+        self._threshold(["2", "--unset-weekly"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert "weeklyThreshold" not in record
+        assert record["threshold"] == 85.0
+
+    def test_unset_leaves_the_weekly_line(self, temp_home: Path, capsys):
+        self._fleet(temp_home)
+        self._threshold(["2", "85", "--weekly", "90"])
+        self._threshold(["2", "--unset"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert "threshold" not in record
+        assert record["weeklyThreshold"] == 90.0
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["2", "--weekly", "90", "--unset-weekly"],
+            ["--weekly", "90"],
+            ["--unset-weekly"],
+        ],
+    )
+    def test_contradictory_or_incomplete_calls_are_rejected(
+        self, temp_home: Path, capsys, argv
+    ):
+        s = self._fleet(temp_home)
+        before = self._bytes(s)
+        with pytest.raises(SystemExit) as exc:
+            self._threshold(argv)
+        assert exc.value.code != 0
+        assert self._bytes(s) == before
+
+    def test_the_listing_shows_both_global_lines_and_each_override(
+        self, temp_home: Path, capsys
+    ):
+        s = self._fleet(temp_home)
+        self._fleet_weekly(s)
+        self._threshold(["1", "85"])
+        self._threshold(["2", "--weekly", "90"])
+        self._threshold(["3", "80", "--weekly", "92.5"])
+        capsys.readouterr()
+
+        self._threshold([])
+        out = capsys.readouterr().out
+        assert "90%, weekly 98%" in out
+        assert "Account-1  85%\n" in out
+        assert "Account-2  weekly 90%\n" in out
+        assert "Account-3  80%, weekly 92.5%\n" in out
+
+    def test_setting_a_threshold_under_a_fleet_weekly_line_says_where_the_week_stops(
+        self, temp_home: Path, capsys
+    ):
+        s = self._fleet(temp_home)
+        self._fleet_weekly(s)
+        capsys.readouterr()
+        self._threshold(["2", "85"])
+        out = capsys.readouterr().out
+        assert "weeklyThreshold (98%)" in out
+        assert "--weekly" in out
+
+    def test_the_note_is_silent_without_a_fleet_weekly_line(
+        self, temp_home: Path, capsys
+    ):
+        """No `weeklyThreshold`: the threshold is every window's line."""
+        self._fleet(temp_home)
+        capsys.readouterr()
+        self._threshold(["2", "85"])
+        assert "weeklyThreshold" not in capsys.readouterr().out
+
+    def test_the_note_is_silent_once_the_account_has_its_own_weekly_line(
+        self, temp_home: Path, capsys
+    ):
+        """The user has already said where this account's week stops."""
+        s = self._fleet(temp_home)
+        self._fleet_weekly(s)
+        self._threshold(["2", "--weekly", "90"])
+        capsys.readouterr()
+        self._threshold(["2", "85"])
+        out = capsys.readouterr().out
+        assert "85" in out
+        assert "weeklyThreshold" not in out

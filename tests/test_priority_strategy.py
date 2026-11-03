@@ -399,3 +399,13 @@ def test_priority_strategy_uses_existing_configurable_cutoffs(tmp_path):
     assert settings.threshold == 85
     assert settings.weekly_threshold == 99.9
 
+
+
+def test_a_per_account_weekly_line_is_a_landing_cutoff(temp_home):
+    """Priority rotation never lands on an account at its own weekly line:
+    primary 2 sits at 7d 70% under the fleet's 99.9 but over its own 65."""
+    h = fleet(temp_home)
+    h.switcher.set_account_weekly_threshold("2", 65)
+    values = usage(h, pcts=(90, 0, 0, 0))
+    assert h.tick_with_usage(values) is TickOutcome.SWITCHED
+    assert h.active_number() == 4  # The fallback tier's soonest weekly reset.

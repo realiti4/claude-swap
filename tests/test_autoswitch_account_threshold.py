@@ -83,7 +83,9 @@ def _over(h: EngineHarness, headroom: float | None, line: float) -> bool | None:
     binds and the flag is `100 - headroom >= line`."""
     if headroom is None:
         return None
-    return h.engine._binding(_usage(100.0 - headroom), h.settings, line).over
+    return h.engine._binding(
+        _usage(100.0 - headroom), h.settings, ThresholdMap({"x": line}, GLOBAL), "x"
+    ).over
 
 
 class TestThresholdMap:
@@ -108,6 +110,25 @@ class TestThresholdMap:
     def test_it_is_a_mapping_of_str_to_float(self):
         thresholds = ThresholdMap({"2": 85.0}, GLOBAL)
         assert dict(thresholds) == {"2": 85.0}
+
+    def test_weekly_reads_the_override_else_the_weekly_default(self):
+        thresholds = ThresholdMap(
+            {"2": 85.0}, GLOBAL, weekly_overrides={"3": 92.0}, weekly_default=97.0
+        )
+        assert thresholds.weekly("3") == pytest.approx(92.0)
+        # A threshold override says nothing about the weekly line.
+        assert thresholds.weekly("2") == pytest.approx(97.0)
+        assert thresholds.weekly("nonexistent") == pytest.approx(97.0)
+
+    def test_weekly_is_none_when_no_weekly_line_applies(self):
+        assert ThresholdMap({"2": 85.0}, GLOBAL).weekly("2") is None
+
+    def test_the_fleet_map_carries_both_global_lines(self):
+        settings = AutoSwitchSettings(threshold=85.0, weekly_threshold=97.0)
+        thresholds = ThresholdMap.fleet(settings)
+        assert dict(thresholds) == {}
+        assert thresholds["1"] == pytest.approx(85.0)
+        assert thresholds.weekly("1") == pytest.approx(97.0)
 
 
 class TestResolveThresholds:
@@ -385,6 +406,23 @@ class TestAntiFlapUsesTheBarredAccountsThreshold:
             "proactive", dict(self.STATE), {"2": 12.0}, None, True,
             h.settings, "1", thresholds=ThresholdMap({"2": 85.0}, GLOBAL),
             usage={"2": _usage(88.0)},
+        ) == "2"
+
+    def test_no_return_reads_the_barred_accounts_own_weekly_line(self, temp_home):
+        """Barred account at 7d 88% under a fleet weekly line of 98: landing-
+        eligible, so the bar releases, unless its own weekly line is 85."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        common = dict(usage={"2": _usage7(0.0, 88.0)})
+        args = ("proactive", dict(self.STATE), {"2": 12.0}, None, True, h.settings, "1")
+        assert h.engine._no_return_account(
+            *args, thresholds=ThresholdMap.fleet(h.settings), **common
+        ) is None
+        assert h.engine._no_return_account(
+            *args,
+            thresholds=ThresholdMap(
+                {}, GLOBAL, weekly_overrides={"2": 85.0}, weekly_default=98.0
+            ),
+            **common,
         ) == "2"
 
     def test_no_return_at_the_default_matches_todays_verdict(self, temp_home):
@@ -1151,7 +1189,9 @@ class TestBestRanksByRoomUnderEachAccountsOwnLine:
 class TestThePerAccountLineIsTheFiveHourLine:
     """An account's threshold takes the place of the global wherever the global
     is a line: the 5h window's line under a weekly line, and every window's
-    line without one. The weekly windows stay on `weekly_threshold`."""
+    line without one. The weekly windows stay on the weekly line; an account
+    gets a weekly line of its own only through `weekly_threshold` (see
+    `TestThePerAccountWeeklyLine`)."""
 
     PEERS = {"2": _usage7(10.0, 10.0), "3": _usage7(10.0, 10.0)}
 
@@ -1210,6 +1250,202 @@ class TestThePerAccountLineIsTheFiveHourLine:
         assert h.switcher._poll_inputs_override == expected
 
 
+class TestThePerAccountWeeklyLine:
+    """`cswap threshold N --weekly W`: an account's own line for its weekly
+    windows, in place of `weeklyThreshold`, on both sides of a switch.
+
+    The case it exists for: an account kept at 90% of its week for someone
+    outside the rotation, in a fleet whose weekly line is 98. Its threshold
+    alone cannot do that once a weekly line is set (it moves only the 5h
+    window), so without this the account is run to 98.
+    """
+
+    PEERS = {"2": _usage7(10.0, 10.0), "3": _usage7(10.0, 10.0)}
+
+    def _reserved(self, temp_home, num: str = "1", line: float = 90.0, **kw):
+        h = _fleet(temp_home, weekly_threshold=98.0, **kw)
+        h.switcher.set_account_weekly_threshold(num, line)
+        h.engine = h._make_engine()
+        return h
+
+    def test_the_active_leaves_at_its_own_weekly_line(self, temp_home):
+        h = self._reserved(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(10.0, 91.0), **self.PEERS})
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() != 1
+
+    def test_the_same_usage_holds_on_the_fleets_weekly_line(self, temp_home):
+        """Control: 7d 91% is under the fleet's 98 without the account's own
+        weekly line, and under it with only a THRESHOLD override of 90 —
+        today's rule, which this field does not change."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        h.switcher.set_account_threshold("1", 90.0)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({"1": _usage7(10.0, 91.0), **self.PEERS})
+        assert outcome is TickOutcome.NO_ACTION
+        assert _details(h)[0] == "7d 91% < 98%"
+
+    def test_below_its_weekly_line_the_detail_quotes_that_line(self, temp_home):
+        h = self._reserved(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(10.0, 89.0), **self.PEERS})
+        assert outcome is TickOutcome.NO_ACTION
+        assert _details(h)[0] == "7d 89% < 90%"
+
+    def test_a_candidate_over_its_own_weekly_line_is_not_a_landing_target(
+        self, temp_home
+    ):
+        """Active 1 is over its 5h line (5 points of room). Candidate 2 at 7d
+        91% under the fleet's 98 has 16.4 points of room and outranks 3 at 5h
+        85% (15 points), but sits over its own weekly line of 90."""
+        h = self._reserved(temp_home, num="2")
+        outcome = h.tick_with_usage({
+            "1": _usage7(95.0, 0.0),
+            "2": _usage7(0.0, 91.0),
+            "3": _usage7(85.0, 0.0),
+        })
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 3
+
+    def test_without_it_the_same_fleet_lands_on_the_room_winner(self, temp_home):
+        """Identity control for the case above: no weekly override, so 2's
+        16.4 points beat 3's 15 and the engine lands on 2."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95.0, 0.0),
+            "2": _usage7(0.0, 91.0),
+            "3": _usage7(85.0, 0.0),
+        })
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+
+    def test_it_can_also_raise_an_accounts_weekly_line(self, temp_home):
+        """It replaces the weekly line, like the threshold override replaces
+        the threshold: 7d 98.5% holds under an own line of 99.5, though the
+        fleet's 98 would leave."""
+        h = self._reserved(temp_home, line=99.5)
+        outcome = h.tick_with_usage({"1": _usage7(10.0, 98.5), **self.PEERS})
+        assert outcome is TickOutcome.NO_ACTION
+        assert _details(h)[0] == "7d 98.5% < 99.5%"
+
+    def test_it_works_without_a_fleet_weekly_line(self, temp_home):
+        """With no `weeklyThreshold`, the account's own weekly line splits its
+        windows the way a fleet weekly line would; the peers keep one line."""
+        h = _fleet(temp_home, threshold=95.0)
+        h.switcher.set_account_weekly_threshold("1", 80.0)
+        h.engine = h._make_engine()
+        peers = {"2": _usage7(10.0, 85.0), "3": _usage7(10.0, 85.0)}
+        outcome = h.tick_with_usage({"1": _usage7(10.0, 85.0), **peers})
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() != 1
+
+    def test_the_5h_window_keeps_the_threshold(self, temp_home):
+        """A weekly line does not touch the 5h window: 5h 92% departs on the
+        global 90 though the account's weekly line is 95."""
+        h = self._reserved(temp_home, line=95.0)
+        outcome = h.tick_with_usage({"1": _usage7(92.0, 10.0), **self.PEERS})
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+
+    def test_the_poll_event_carries_the_active_accounts_weekly_line(
+        self, temp_home
+    ):
+        h = self._reserved(temp_home)
+        h.tick_with_usage({"1": _usage7(10.0, 40.0), **self.PEERS})
+        poll = _polls(h)[0]
+        assert poll.threshold == pytest.approx(GLOBAL)
+        assert poll.weekly_threshold == pytest.approx(90.0)
+
+    def test_a_peers_weekly_line_does_not_reach_the_poll_event(self, temp_home):
+        h = self._reserved(temp_home, num="2")
+        h.tick_with_usage({"1": _usage7(10.0, 40.0), **self.PEERS})
+        assert _polls(h)[0].weekly_threshold == pytest.approx(98.0)
+
+    def test_the_escalation_band_reads_the_active_accounts_weekly_line(
+        self, temp_home
+    ):
+        """7d 80% is inside the band under its own 90 (`80 >= 75`) and
+        outside it under the fleet's 98 (`80 >= 83` is false), so only the
+        weekly line can make this tick refetch every candidate."""
+        h = self._reserved(temp_home)
+        snap = {"1": _usage7(10.0, 80.0), **self.PEERS}
+        _outcome, mock = _tick(h, [snap])
+        assert mock.call_count == TestEscalationBandUsesActiveThreshold.BASE_CALLS + 1
+
+        control = _fleet(temp_home, weekly_threshold=98.0)
+        _outcome, mock = _tick(control, [snap])
+        assert mock.call_count == TestEscalationBandUsesActiveThreshold.BASE_CALLS
+
+
+class TestPollPinIsTheActiveAccountsWeeklyLine:
+    """The poll planner's weekly line is the ACTIVE account's own weekly
+    line. Its only weekly reader is `poll_policy`'s urgent mode, which
+    applies to the active account alone, so a fleet minimum would only
+    stretch the active account's urgent band over a line it is not judged
+    against. The threshold half keeps the fleet minimum
+    (`TestPollPolicyMinimumThreshold`)."""
+
+    USAGE = {
+        "1": _usage7(10.0, 10.0), "2": _usage7(10.0, 10.0),
+        "3": _usage7(10.0, 10.0),
+    }
+
+    def test_no_weekly_overrides_pin_the_weekly_line_unchanged(self, temp_home):
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        assert h.switcher._poll_inputs_override[:2] == (GLOBAL, 98.0)
+
+    def test_the_active_accounts_own_weekly_line_is_pinned(self, temp_home):
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        h.switcher.set_account_weekly_threshold("1", 70.0)
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[:2] == (GLOBAL, 70.0)
+
+    def test_a_peers_lower_weekly_line_does_not_reach_the_pin(self, temp_home):
+        """Fleet 98, account 2 kept at 50: the active account's urgent band
+        must stay at 83%, not open at 35%."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        h.switcher.set_account_weekly_threshold("2", 50.0)
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[:2] == (GLOBAL, 98.0)
+        h.tick_with_usage(self.USAGE)
+        assert h.switcher._poll_inputs_override[:2] == (GLOBAL, 98.0)
+
+    def test_without_a_fleet_weekly_line_the_active_accounts_line_is_pinned(
+        self, temp_home
+    ):
+        h = _fleet(temp_home)
+        h.switcher.set_account_weekly_threshold("1", 80.0)
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[:2] == (GLOBAL, 80.0)
+
+    def test_without_any_weekly_line_for_the_active_the_pin_stays_none(
+        self, temp_home
+    ):
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("2", 70.0)
+        h.switcher.set_account_weekly_threshold("2", 80.0)
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[:2] == (70.0, None)
+
+    def test_a_persisted_weekly_line_reaches_the_pin_on_the_next_tick(
+        self, temp_home
+    ):
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        h.switcher.set_account_weekly_threshold("1", 75.0)
+        h.tick_with_usage(self.USAGE)
+        assert h.switcher._poll_inputs_override[:2] == (GLOBAL, 75.0)
+
+    def test_the_pin_follows_the_active_account_across_a_switch(self, temp_home):
+        """Account 1 (own weekly 75) departs at 7d 80%; the next tick re-pins
+        to the fleet line of the account it landed on."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        h.switcher.set_account_weekly_threshold("1", 75.0)
+        h.engine = h._make_engine()
+        usage = {**self.USAGE, "1": _usage7(10.0, 80.0)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() != 1
+        h.tick_with_usage(usage)
+        assert h.switcher._poll_inputs_override[:2] == (GLOBAL, 98.0)
+
+
 class TestRecoveryUsesTheRankingsScale:
     """`_binding_recovery_ts` must pick the binding window on the same scale
     the ranking does, or the engine schedules around a window it did not
@@ -1225,7 +1461,10 @@ class TestRecoveryUsesTheRankingsScale:
         h = _fleet(temp_home, weekly_threshold=90.0)
         now = h.clock.now
         assert now < _parse_reset_ts(_R_SOON)
-        binding = h.engine._binding(self.USAGE, h.settings, 55.5)
+        binding = h.engine._binding(
+            self.USAGE, h.settings,
+            ThresholdMap({"1": 55.5}, GLOBAL, weekly_default=90.0), "1",
+        )
         recovery = _binding_recovery_ts(
             self.USAGE,
             h.engine._models,
@@ -1236,6 +1475,125 @@ class TestRecoveryUsesTheRankingsScale:
         )
         assert recovery == _parse_reset_ts(binding.resets_at)
         assert recovery == _parse_reset_ts(_R_SOON)
+
+
+class TestRecoveryReadsEachAccountsOwnWeeklyLine:
+    """Every recovery timestamp picks the binding window under the account's
+    OWN weekly line, at each of the four sites that schedule on one.
+
+    The flipping shape: 5h 85% resetting in an hour and 7d 90% resetting in
+    five days. Under the fleet's weekly line of 98 the 5h window binds (15
+    points of room against 17.35), so the account is back in an hour; under
+    its own weekly line of 85 the 7d window is over and binds, so it is back
+    in five days. Each test asserts the verdict only the five-day answer
+    gives, so reading `settings.weekly_threshold` at that site fails it.
+    """
+
+    def _flipping(self, h) -> dict:
+        now = h.clock.now
+        return {
+            "five_hour": {"pct": 85.0, "resets_at": _iso_at(now + 3600)},
+            "seven_day": {"pct": 90.0, "resets_at": _iso_at(now + 5 * 86400)},
+        }
+
+    def _back_in(self, h, days: float) -> dict:
+        """Over its 5h line, resetting in `days`, 7d idle: binds on 5h under
+        any weekly line."""
+        return {
+            "five_hour": {"pct": 95.0, "resets_at": _iso_at(h.clock.now + days * 86400)},
+            "seven_day": {"pct": 0.0},
+        }
+
+    @staticmethod
+    def _lines(num: str) -> ThresholdMap:
+        return ThresholdMap(
+            {}, GLOBAL, weekly_overrides={num: 85.0}, weekly_default=98.0
+        )
+
+    def test_the_departure_snapshot_records_the_leavers_own_binding_reset(
+        self, temp_home
+    ):
+        """Account 1 leaves on its own weekly line; `leftRecoveryAt` is its 7d
+        reset, not the 5h reset the fleet's line would pick."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        h.switcher.set_account_weekly_threshold("1", 85.0)
+        h.engine = h._make_engine()
+        usage = {
+            "1": self._flipping(h),
+            "2": _usage7(10.0, 10.0),
+            "3": _usage7(10.0, 10.0),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED, _reasons(h)
+        state = h.engine._read_state()
+        assert state["leftRecoveryAt"] == pytest.approx(h.clock.now + 5 * 86400)
+
+    def _failover_state(self) -> dict:
+        return {
+            "lastSwitchFrom": 2,
+            "leftHeadroom": None,
+            "leftRecoveryAt": None,
+            "leftTrigger": "failover",
+        }
+
+    def test_the_failover_leg_reads_the_barred_peers_own_weekly_line(
+        self, temp_home
+    ):
+        """Barred peer 2 is over its own weekly line (no landing release) and
+        back in five days, after the active's two: the bar holds. On the
+        fleet's line it would read back in an hour and release."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        assert h.engine._left_account_recovered(
+            self._failover_state(),
+            usage={"1": self._back_in(h, 2), "2": self._flipping(h)},
+            headroom={"1": 5.0, "2": 10.0},
+            active_headroom=None,
+            settings=h.settings,
+            now=h.clock.now,
+            current="1",
+            thresholds=self._lines("2"),
+        ) is False
+
+    def test_the_failover_leg_reads_the_actives_own_weekly_line(self, temp_home):
+        """Active 1 is back in five days on its own weekly line, so a peer
+        back in two releases the bar. On the fleet's line the active would
+        read back in an hour and the bar would hold."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        assert h.engine._left_account_recovered(
+            self._failover_state(),
+            usage={"1": self._flipping(h), "2": self._back_in(h, 2)},
+            headroom={"1": 10.0, "2": 5.0},
+            active_headroom=None,
+            settings=h.settings,
+            now=h.clock.now,
+            current="1",
+            thresholds=self._lines("1"),
+        ) is True
+
+    def test_the_ordinary_recovery_leg_reads_the_barred_peers_own_weekly_line(
+        self, temp_home
+    ):
+        """Ordinary departure, no dominance and no headroom gain: only the
+        recovery leg can release. The peer left with a two-day recovery and
+        now reads five days on its own line, so the bar holds; on the fleet's
+        line it would read an hour and release."""
+        h = _fleet(temp_home, weekly_threshold=98.0)
+        state = {
+            "lastSwitchFrom": 2,
+            "lastSwitchTo": "1",
+            "leftHeadroom": 20.0,
+            "leftRecoveryAt": h.clock.now + 2 * 86400,
+            "leftTrigger": "proactive",
+        }
+        assert h.engine._left_account_recovered(
+            state,
+            usage={"1": _usage7(50.0, 0.0), "2": self._flipping(h)},
+            headroom={"1": 50.0, "2": 10.0},
+            active_headroom=50.0,
+            settings=h.settings,
+            now=h.clock.now,
+            current="1",
+            thresholds=self._lines("2"),
+        ) is False
 
 
 def _tick(h: EngineHarness, snapshots: list[dict]):
