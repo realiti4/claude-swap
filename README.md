@@ -296,6 +296,7 @@ cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set run.shareHistory true    # every cswap run shares chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
+cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -394,6 +395,19 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
+**Setup-token usage.** The usage endpoint does not answer setup-tokens (their
+scope is inference-only), so cswap does not ask it and shows these accounts as
+`usage unavailable`. With `cswap config set usage.headerProbe true`, cswap reads
+their 5h/7d utilization (and Fable's weekly window) from the rate-limit headers of
+a 1-output-token Haiku request instead, sent at the normal poll cadence. Each
+probe is a real (tiny) request on that account's subscription, which is why it is
+off by default. Other per-model windows and extra-usage spend are not in those
+headers. A reading missing the 5h or 7d window (or a window `autoswitch.model`
+names) is shown but not used for auto-switching, and a probe the server rejects
+for quota marks the account as at its limit, with no further probe, until the
+refusal's `Retry-After` passes. A bare 429 without that rejection is treated like
+any other failed fetch.
+
 **API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
 (`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses
 after `/login` with a key) rather than an OAuth setup-token. It switches like any
@@ -402,6 +416,11 @@ usage-aware `switch` strategies never skip them as rate-limited. Create personal
 service-account keys scoped to a single workspace: a multi-workspace key needs an
 `anthropic-workspace-id` header on every request, which Claude Code does not add for
 a stored key.
+
+**Note:** Third-party providers configured through `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` are not managed or switched; those
+exported variables stay in effect after a switch, so unset them to use the
+swapped account.
 
 ## Uninstall
 
