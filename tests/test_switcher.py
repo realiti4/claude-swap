@@ -1240,6 +1240,56 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
 
 
+class TestFetchAccountUsageFromAnotherProfile:
+    """From a session shell the active slot is resolved through
+    ``CLAUDE_CONFIG_DIR``, so the default login's slot is polled as an idle
+    one. Its token family still belongs to the default profile's claude."""
+
+    def _switcher_in_session_shell(self, monkeypatch) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        profile = switcher.backup_dir / "sessions" / "2-account2_example.com"
+        profile.mkdir(parents=True)
+        (profile / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "account2@example.com"}}
+        ))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        return switcher
+
+    def test_default_login_is_not_refreshed(
+        self, temp_home: Path, mock_claude_config: Path, monkeypatch
+    ):
+        """Consuming the backup's grant would leave the default store on the
+        consumed generation and log the default profile's claude out."""
+        switcher = self._switcher_in_session_shell(monkeypatch)
+        expired = _oauth_creds("sk-default", -3600)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(
+                (1, "test@example.com", "", "", False, expired, "")
+            )
+
+        refresh.assert_not_called()
+        mock_fetch.assert_not_called()
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+
+    def test_a_slot_nobody_is_logged_into_still_refreshes(
+        self, temp_home: Path, mock_claude_config: Path, monkeypatch
+    ):
+        switcher = self._switcher_in_session_shell(monkeypatch)
+        expired = _oauth_creds("sk-idle", -3600)
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(
+                (3, "idle@example.com", "", "", False, expired, "")
+            )
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        assert mock_fetch.call_args.kwargs["refresh_via"] == switcher.consume_backup_grant
+
+
 class TestAdoptSessionCredential:
     """An exited session's profile holds the slot's newest generation; the
     backup only learns about it through adoption."""
@@ -2163,6 +2213,39 @@ class TestActiveAccountRefresh:
 
         assert result.sentinel is None
         write_live.assert_called_once_with(self._REFRESHED)
+
+    def test_another_profiles_keychain_credential_is_not_refreshed(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """#206 on the usage path. In a `cswap run` session shell on macOS the
+        active credential is the profile's hashed Keychain item, and the write
+        path reaches only the default profile's. Refreshing it would strand
+        every claude on the profile with the consumed generation and put this
+        account's token in the default login, so the expired token is left to
+        the profile's own claude: no POST, no write."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher.platform = Platform.MACOS
+        profile = switcher.backup_dir / "sessions" / "1-test_example.com"
+        profile.mkdir(parents=True)
+        (profile / ".claude.json").write_text(mock_claude_config.read_text())
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok) as refresh:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        refresh.assert_not_called()
+        write_live.assert_not_called()
+        write_backup.assert_not_called()
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
 
     def test_lock_reread_adopts_a_fresher_live_credential(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
