@@ -7506,3 +7506,63 @@ class TestPreWarmActive:
         with patch("claude_swap.autoswitch.oauth.try_prewarm_account") as mock_ping:
             h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
         mock_ping.assert_not_called()
+
+
+def _header_usage(**windows) -> dict:
+    """A setup-token header-probe reading (``source: headers``)."""
+    return {**windows, "source": oauth.USAGE_SOURCE_HEADERS}
+
+
+class TestHeaderProbeReadings:
+    """Setup-token readings from rate-limit headers decide only when complete,
+    and a refused probe never becomes a healthy landing spot."""
+
+    def test_partial_reading_is_not_a_target(self, harness):
+        # #2 shows only a 5h window at 5% (no 7d header): unknown, not 95%
+        # headroom, so the switch lands on the measured #3.
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(five_hour={"pct": 5.0}),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_complete_reading_is_a_target(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(five_hour={"pct": 5.0}, seven_day={"pct": 5.0}),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_rejected_probe_is_not_a_target(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(
+                five_hour={"pct": 5.0},
+                seven_day={"pct": 5.0},
+                rejected={"retry_after_s": 600.0, "resets_at": _iso_at(
+                    harness.clock.now + 600
+                )},
+            ),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_fable_switching_needs_the_fable_bucket(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            # No 7d_oi header: Fable headroom unknown, so not a target.
+            "2": _header_usage(five_hour={"pct": 5.0}, seven_day={"pct": 0.0}),
+            "3": _model_usage(5, 60),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3

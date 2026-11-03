@@ -52,6 +52,7 @@ class TestConfigList:
             "ui.theme",
             "run.shareHistory",
             "updates.check",
+            "usage.headerProbe",
             "autoswitch.preWarmReserves",
             "autoswitch.preWarmActive",
             "resume.slackSeconds",
@@ -63,7 +64,7 @@ class TestConfigList:
             "resume.switchOnStop",
         ):
             assert key in out
-        assert out.count("(default)") == 21
+        assert out.count("(default)") == 22
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -90,7 +91,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 21
+        assert len(by_key) == 22
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
