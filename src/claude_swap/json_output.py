@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, subscription
 from claude_swap.models import AccountPolicy
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
@@ -131,6 +131,16 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    # A setup-token header-probe reading: its completeness and any refusal
+    # decide whether it may gate auto-switching, so both survive export.
+    if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        out["source"] = oauth.USAGE_SOURCE_HEADERS
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        out["rejected"] = {
+            "retryAfterS": rejected.get("retry_after_s"),
+            "resetsAt": rejected.get("resets_at"),
+        }
     return out
 
 
@@ -203,8 +213,21 @@ def usage_from_json(usage: object) -> dict:
                 raise ValueError(f"{label}.name must be a non-empty string")
             scoped.append({"name": name, **entry})
         out["scoped"] = scoped
+    if "rejected" in usage:
+        rejected = usage["rejected"]
+        if not isinstance(rejected, dict):
+            raise ValueError("rejected must be an object")
+        retry_after = rejected.get("retryAfterS")
+        if retry_after is not None and not _is_number(retry_after):
+            raise ValueError("rejected.retryAfterS must be a number or null")
+        resets_at = rejected.get("resetsAt")
+        if resets_at is not None and not isinstance(resets_at, str):
+            raise ValueError("rejected.resetsAt must be an ISO-8601 string or null")
+        out["rejected"] = {"retry_after_s": retry_after, "resets_at": resets_at}
     if not out:
         raise ValueError("usage carries no windows")
+    if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        out["source"] = oauth.USAGE_SOURCE_HEADERS
     return out
 
 
@@ -303,6 +326,26 @@ def last_good_usage_fields(
     return out
 
 
+def subscription_plan_fields(record: dict) -> dict:
+    """JSON for a stored plan record: label, raw fields, expiry, and age.
+
+    ``fetchedAt`` is always present, so a script can tell a plan fetched this
+    morning from one that has not refreshed in days and decide for itself how
+    far to trust ``expired``.
+    """
+    plan = record["plan"]
+    fields = {
+        "label": subscription.plan_label(plan),
+        "tier": plan["tier"],
+    }
+    for key in ("organizationType", "billingType", "subscriptionStatus"):
+        if key in plan:
+            fields[key] = plan[key]
+    fields["expired"] = subscription.is_expired(plan)
+    fields["fetchedAt"] = _timestamp(record["fetchedAt"])
+    return fields
+
+
 def account_row(
     number: int,
     email: str,
@@ -320,6 +363,7 @@ def account_row(
     disabled: bool = False,
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
+    subscription_plan: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -350,6 +394,10 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive field: the slot's subscription plan once one has been fetched
+    # (see ``subscription``); a slot never fetched emits no key at all.
+    if subscription_plan:
+        row["plan"] = subscription_plan_fields(subscription_plan)
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
