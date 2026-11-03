@@ -169,6 +169,12 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
             rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
         else:
             rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused header probe (setup-tokens): at its limit until it ends.
+        cell = oauth.fresh_reset_strings(rejected)
+        body = f"rejected   until {cell[1]:<12}  in {cell[0]}" if cell else "rejected"
+        rows.append(("probe", body))
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
     return [f"{label + ':':<{width}} {body}" for label, body in rows]
 
@@ -206,6 +212,10 @@ ERROR_NOTES = {
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+    "setup-token": (
+        "setup-tokens cannot read the usage endpoint — "
+        "`cswap config set usage.headerProbe true` reads it from a 1-token request"
     ),
 }
 

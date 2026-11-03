@@ -103,10 +103,10 @@ class UsageSettings:
     (``cswap add-token``), so read its 5h/7d utilization from the rate-limit
     headers of a 1-output-token Haiku request instead. Each probe is a real,
     if tiny, request against that account's quota, sent at the normal poll
-    cadence; off leaves such accounts at "usage unavailable".
+    cadence, so it is opt-in; off leaves such accounts at "usage unavailable".
     """
 
-    header_probe: bool = True
+    header_probe: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -201,7 +201,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "usage", "headerProbe", "header_probe", "bool",
-            help="Read setup-token usage from a 1-token Haiku request's rate-limit headers",
+            help="Read setup-token usage from a 1-token Haiku request's rate-limit headers (opt-in: uses quota)",
         ),
     )
 }

@@ -200,29 +200,30 @@ class TestUpdateSettings:
 
 
 class TestUsageSettings:
-    def test_missing_file_enables_header_probe(self, tmp_path: Path):
-        assert load_usage_settings(tmp_path) == UsageSettings(header_probe=True)
+    def test_missing_file_leaves_header_probe_off(self, tmp_path: Path):
+        # Opt-in: each probe is a real inference request on the subscription.
+        assert load_usage_settings(tmp_path) == UsageSettings(header_probe=False)
 
-    def test_reads_false(self, tmp_path: Path):
+    def test_reads_true(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
-            json.dumps({"usage": {"headerProbe": False}})
+            json.dumps({"usage": {"headerProbe": True}})
         )
-        assert load_usage_settings(tmp_path).header_probe is False
+        assert load_usage_settings(tmp_path).header_probe is True
 
     def test_non_bool_falls_back_to_default(self, tmp_path: Path):
-        # A string "false" is not False: never bool(str).
+        # A string "true" is not True: never bool(str).
         settings_path(tmp_path).write_text(
-            json.dumps({"usage": {"headerProbe": "false"}})
+            json.dumps({"usage": {"headerProbe": "true"}})
         )
-        assert load_usage_settings(tmp_path).header_probe is True
+        assert load_usage_settings(tmp_path).header_probe is False
 
     def test_set_and_unset_header_probe(self, tmp_path: Path):
-        assert set_setting(tmp_path, "usage.headerProbe", "false") is False
+        assert set_setting(tmp_path, "usage.headerProbe", "true") is True
         raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw == {"schemaVersion": 1, "usage": {"headerProbe": False}}
-        assert load_usage_settings(tmp_path).header_probe is False
-        assert unset_setting(tmp_path, "usage.headerProbe") is True
+        assert raw == {"schemaVersion": 1, "usage": {"headerProbe": True}}
         assert load_usage_settings(tmp_path).header_probe is True
+        assert unset_setting(tmp_path, "usage.headerProbe") is True
+        assert load_usage_settings(tmp_path).header_probe is False
 
 
 class TestSettingSpecs:

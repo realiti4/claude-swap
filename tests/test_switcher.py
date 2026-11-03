@@ -38,6 +38,7 @@ from claude_swap.switcher import (
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
+    _usage_entry_lines,
 )
 
 
@@ -1260,19 +1261,21 @@ class TestSetupTokenHeaderProbeWiring:
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(None, error="http-429")) as mock_fetch:
             switcher._fetch_account_usage(self._info())
-            assert mock_fetch.call_args.kwargs["header_probe"] is True
-            set_setting(switcher.backup_dir, "usage.headerProbe", "false")
+            # Opt-in: each probe is a real request on the subscription.
+            assert mock_fetch.call_args.kwargs["header_probe"] is False
+            set_setting(switcher.backup_dir, "usage.headerProbe", "true")
             # A same-second rewrite can keep the mtime; force a visible change.
             path = settings_path(switcher.backup_dir)
             os.utime(path, (time.time() + 5, time.time() + 5))
             switcher._fetch_account_usage(self._info())
-            assert mock_fetch.call_args.kwargs["header_probe"] is False
+            assert mock_fetch.call_args.kwargs["header_probe"] is True
 
     def test_probe_is_paced_by_the_store(self, temp_home: Path):
         """One collect pass sends one probe; a second pass inside the serve
         TTL re-serves the stored reading without any request."""
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerProbe", "true")
         endpoint = urllib.error.HTTPError(
             "https://api.anthropic.com/api/oauth/usage", 429, "Too Many",
             hdrs=None, fp=None,
@@ -1299,14 +1302,36 @@ class TestSetupTokenHeaderProbeWiring:
             first = switcher._collect_usage_entries([self._info()])["3"]
             second = switcher._collect_usage_entries([self._info()])["3"]
 
-        assert urls == [
-            "https://api.anthropic.com/api/oauth/usage", oauth.USAGE_PROBE_URL,
-        ]
+        # The usage endpoint is never asked: it cannot read a setup-token.
+        assert urls == [oauth.USAGE_PROBE_URL]
         assert first.last_error is None
         assert first.last_good["five_hour"]["pct"] == 25.0
         assert first.last_good["seven_day"]["pct"] == 50.0
         assert first.next_poll_at is not None
         assert oauth.account_headroom(second.decision_value()) == 50.0
+
+    def test_probe_off_sends_no_request_and_says_why(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            entry = switcher._collect_usage_entries([self._info()])["3"]
+        urlopen.assert_not_called()
+        assert entry.last_good is None
+        assert entry.last_error == "setup-token"
+        lines = _usage_entry_lines(entry)
+        assert "usage.headerProbe true" in lines[0]
+
+    def test_partial_and_rejected_readings_stay_visible(self):
+        partial = {"five_hour": {"pct": 5.0}, "source": oauth.USAGE_SOURCE_HEADERS}
+        assert _format_usage_lines(partial) == ["5h:   5%"]
+        rejected = {
+            "five_hour": {"pct": 34.0},
+            "seven_day": {"pct": 60.0},
+            "rejected": {"retry_after_s": None, "resets_at": None},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        assert _format_usage_lines(rejected)[-1] == "probe: rejected"
 
 
 class TestAdoptSessionCredential:

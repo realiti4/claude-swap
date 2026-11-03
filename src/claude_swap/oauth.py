@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from claude_swap.printer import warning as print_warning
 
@@ -426,9 +426,10 @@ def is_setup_token(oauth: dict | None) -> bool:
     """Whether an OAuth payload is an inference-only setup-token.
 
     ``claude setup-token`` issues a long-lived access token with no refresh
-    token and only the ``user:inference`` scope. The usage endpoint never
-    answers such a token, so its usage is read from response headers instead
-    (see :func:`request_usage_via_probe`).
+    token and only the ``user:inference`` scope. The usage endpoint needs
+    ``user:profile``, so it never answers such a token: its usage is read
+    from response headers instead (see :func:`request_usage_via_probe`), or
+    not at all.
     """
     if not isinstance(oauth, dict) or oauth.get("refreshToken"):
         return False
@@ -436,8 +437,42 @@ def is_setup_token(oauth: dict | None) -> bool:
     return isinstance(scopes, list) and set(scopes) == set(SETUP_TOKEN_SCOPES)
 
 
+# Marks a usage dict read from rate-limit headers (``usage["source"]``). The
+# headers can omit a window the endpoint always reports, so such a reading
+# gates decisions only when it is complete (see :func:`relevant_windows`).
+USAGE_SOURCE_HEADERS = "headers"
+
 # Unified rate-limit header prefix → usage API window key.
 _UNIFIED_WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
+# Per-model weekly buckets in the unified headers → the model display name the
+# usage API's ``weekly_scoped`` limits use, so ``autoswitch.model`` matches
+# them the same way. ``7d_oi`` is Fable's weekly window.
+_UNIFIED_SCOPED_WINDOWS = (("7d_oi", "Fable"),)
+
+
+def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
+    """``(utilization %, resets_at ISO)`` of one unified header window, or None
+    when its utilization is missing or unusable (a missing reset only drops
+    ``resets_at``)."""
+    base = f"anthropic-ratelimit-unified-{prefix}"
+    try:
+        fraction = float(headers.get(f"{base}-utilization"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fraction) or fraction < 0:
+        return None
+    return round(fraction * 100, 2), _epoch_header_iso(headers.get(f"{base}-reset"))
+
+
+def _epoch_header_iso(raw) -> str | None:
+    """An epoch-seconds header value as ISO 8601, or None when unusable."""
+    try:
+        ts = float(raw)
+        if math.isfinite(ts) and ts > 0:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return None
 
 
 def parse_unified_ratelimit_headers(headers) -> dict:
@@ -446,29 +481,43 @@ def parse_unified_ratelimit_headers(headers) -> dict:
 
     ``-utilization`` is a 0-1 fraction (the API's ``utilization`` is a
     percentage) and ``-reset`` is epoch seconds (the API's ``resets_at`` is
-    ISO 8601). A window with a missing or unusable utilization is left out;
-    a missing reset only drops ``resets_at``. The headers carry no per-model
-    (``limits``) windows and no ``extra_usage``.
+    ISO 8601). A window with a missing or unusable utilization is left out.
+    Fable's ``7d_oi`` bucket becomes a ``weekly_scoped`` limit named "Fable";
+    the headers carry no other per-model window and no ``extra_usage``.
+    A ``rejected`` unified status adds a ``rejected`` entry (see
+    :func:`request_usage_via_probe`).
     """
     data: dict = {}
     for prefix, key in _UNIFIED_WINDOWS:
-        base = f"anthropic-ratelimit-unified-{prefix}"
-        try:
-            fraction = float(headers.get(f"{base}-utilization"))
-        except (TypeError, ValueError):
+        window = _unified_window(headers, prefix)
+        if window is None:
             continue
-        if not math.isfinite(fraction) or fraction < 0:
+        pct, resets_at = window
+        data[key] = {"utilization": pct}
+        if resets_at:
+            data[key]["resets_at"] = resets_at
+    limits = []
+    for prefix, name in _UNIFIED_SCOPED_WINDOWS:
+        window = _unified_window(headers, prefix)
+        if window is None:
             continue
-        window: dict = {"utilization": round(fraction * 100, 2)}
-        try:
-            reset_ts = float(headers.get(f"{base}-reset"))
-            if math.isfinite(reset_ts) and reset_ts > 0:
-                window["resets_at"] = datetime.fromtimestamp(
-                    reset_ts, tz=timezone.utc
-                ).isoformat()
-        except (TypeError, ValueError, OverflowError, OSError):
-            pass
-        data[key] = window
+        pct, resets_at = window
+        limit: dict = {
+            "kind": "weekly_scoped",
+            "scope": {"model": {"display_name": name}},
+            "percent": pct,
+        }
+        if resets_at:
+            limit["resets_at"] = resets_at
+        limits.append(limit)
+    if limits:
+        data["limits"] = limits
+    if headers.get("anthropic-ratelimit-unified-status") == "rejected":
+        data["rejected"] = {
+            "resets_at": _epoch_header_iso(
+                headers.get("anthropic-ratelimit-unified-reset")
+            ),
+        }
     return data
 
 
@@ -477,9 +526,15 @@ def request_usage_via_probe(access_token: str) -> dict:
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
     utilization, and inference is the one thing a setup-token may do. The
-    request asks for a single Haiku output token. An exhausted account
-    answers 429 with the same headers, so that is read too; any response
-    without them re-raises. Returns the raw usage API shape (possibly empty).
+    request asks for a single Haiku output token. Returns the raw usage API
+    shape (possibly empty) from :func:`parse_unified_ratelimit_headers`.
+
+    A 429 is the account refusing inference, whatever the utilization
+    numbers say (a per-model or overage limit can bind below 100% on 5h/7d),
+    so it is returned as a reading with a ``rejected`` entry rather than
+    raised: ``{"retry_after_s": Retry-After or None, "resets_at": when the
+    refusal ends — now + Retry-After, else the unified reset header, else
+    None}``. Any other error re-raises.
     """
     body = json.dumps({
         "model": USAGE_PROBE_MODEL,
@@ -501,14 +556,27 @@ def request_usage_via_probe(access_token: str) -> dict:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
+        if e.code != 429:
+            raise
         data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}
-        if e.code == 429 and data:
-            return data
-        raise
+        _kind, retry_after = _classify_usage_error(e)
+        rejected = data.get("rejected") or {"resets_at": None}
+        if retry_after is not None:
+            rejected["resets_at"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+            ).isoformat()
+        rejected["retry_after_s"] = retry_after
+        data["rejected"] = rejected
+        return data
 
 
 def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
-    """Usage from the header probe, classified like an endpoint fetch."""
+    """Usage from the header probe, classified like an endpoint fetch.
+
+    The result is marked ``source: headers`` and keeps the probe's
+    ``rejected`` entry, so a refused probe is stored (and decided on) as an
+    account at its limit until the refusal ends, never as a healthy reading.
+    """
     try:
         data = request_usage_via_probe(access_token)
     except Exception as e:
@@ -517,13 +585,20 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
         _logger.warning("Usage header probe failed %s: %s", context, cause)
         _logger.debug("Usage header probe failure detail %s: %r", context, e)
         return UsageOutcome(None, error=kind, retry_after_s=retry_after)
-    usage = build_usage_result(data)
-    if usage is None:
+    usage = build_usage_result(data) or {}
+    if "rejected" in data:
+        usage["rejected"] = data["rejected"]
+        _logger.warning(
+            "Usage header probe %s: request rejected (retry-after %s)",
+            context, data["rejected"].get("retry_after_s"),
+        )
+    if not usage:
         _logger.warning(
             "Usage header probe %s: response carried no rate-limit headers",
             context,
         )
         return UsageOutcome(None, error="bad-response")
+    usage["source"] = USAGE_SOURCE_HEADERS
     return UsageOutcome(usage)
 
 
@@ -662,6 +737,32 @@ def build_usage_result(data: dict) -> dict | None:
 FIVE_HOUR_LABEL = "5h"
 
 
+# Label of the window a refused header probe adds (see relevant_windows).
+REJECTED_LABEL = "rejected"
+
+
+def _header_reading_complete(usage: dict, models: Sequence[str]) -> bool:
+    """Whether a header-probe reading carries every window a decision needs.
+
+    The 5h and 7d windows always, plus each configured per-model window; the
+    headers only carry Fable's, so ``all`` (every per-model window the
+    account has) can never be shown complete.
+    """
+    if not all(isinstance(usage.get(k), dict) for k in ("five_hour", "seven_day")):
+        return False
+    if not models:
+        return True
+    wanted = {m.lower() for m in models}
+    if "all" in wanted:
+        return False
+    have = {
+        s["name"].lower()
+        for s in usage.get("scoped") or []
+        if isinstance(s, dict) and isinstance(s.get("name"), str)
+    }
+    return wanted <= have
+
+
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
@@ -676,27 +777,40 @@ def relevant_windows(
     ``spend`` (pay-as-you-go extra-usage credits) is a separate axis and is
     deliberately excluded. ``resets_at`` is the ISO string as fetched, or
     ``None`` when the API sent none.
+
+    A header-probe reading (``source: headers``) missing any window the
+    decision needs (:func:`_header_reading_complete`) yields none of its
+    windows, so it reads as unknown — still shown, never ranked: one 5h
+    window at 5% must not pass for 95% headroom. A refused probe
+    (``rejected``) adds a 100% ``"rejected"`` window resetting when the
+    refusal ends, so the account reads as at its limit until then.
     """
     if not isinstance(usage, dict):
         return []
     windows: list[tuple[str, float, str | None]] = []
-    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
-        window = usage.get(key)
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-            windows.append((label, float(window["pct"]), window.get("resets_at")))
-    if models:
-        wanted = {m.lower() for m in models}
-        match_all = "all" in wanted
-        scoped = usage.get("scoped")
-        if isinstance(scoped, list):
-            for s in scoped:
-                if (
-                    isinstance(s, dict)
-                    and isinstance(s.get("pct"), (int, float))
-                    and isinstance(s.get("name"), str)
-                    and (match_all or s["name"].lower() in wanted)
-                ):
-                    windows.append((s["name"], float(s["pct"]), s.get("resets_at")))
+    if usage.get("source") != USAGE_SOURCE_HEADERS or _header_reading_complete(
+        usage, models
+    ):
+        for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
+            window = usage.get(key)
+            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+                windows.append((label, float(window["pct"]), window.get("resets_at")))
+        if models:
+            wanted = {m.lower() for m in models}
+            match_all = "all" in wanted
+            scoped = usage.get("scoped")
+            if isinstance(scoped, list):
+                for s in scoped:
+                    if (
+                        isinstance(s, dict)
+                        and isinstance(s.get("pct"), (int, float))
+                        and isinstance(s.get("name"), str)
+                        and (match_all or s["name"].lower() in wanted)
+                    ):
+                        windows.append((s["name"], float(s["pct"]), s.get("resets_at")))
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        windows.append((REJECTED_LABEL, 100.0, rejected.get("resets_at")))
     return windows
 
 
@@ -762,10 +876,6 @@ _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
 )
 
-# Usage-endpoint refusals after which a setup-token falls back to the header
-# probe. Anything else (timeouts, 5xx) is not specific to the token kind.
-_PROBE_FALLBACK_CODES = frozenset({401, 403, 429})
-
 
 def try_fetch_usage_for_account(
     account_num: str,
@@ -785,16 +895,23 @@ def try_fetch_usage_for_account(
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
 
-    ``header_probe`` lets a setup-token credential (see
-    :func:`is_setup_token`) whose usage request is refused fall back to
-    :func:`request_usage_via_probe`. It replaces the failed request, so the
-    caller's poll plan and backoff pace it exactly like an endpoint fetch.
+    A setup-token credential (see :func:`is_setup_token`) never reaches the
+    usage endpoint, which cannot answer its inference-only scope. With
+    ``header_probe`` its usage comes from :func:`request_usage_via_probe`
+    instead, in place of the endpoint request, so the caller's poll plan and
+    backoff pace it exactly like an endpoint fetch; without it the outcome is
+    the ``"setup-token"`` error and no request is sent.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
         return UsageOutcome(None, error="no-access-token")
+
+    if is_setup_token(oauth):
+        if header_probe:
+            return _usage_from_probe(access_token, context)
+        return UsageOutcome(None, error="setup-token")
 
     working_credentials = credentials
 
@@ -844,20 +961,6 @@ def try_fetch_usage_for_account(
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
-        if (
-            header_probe
-            and e.code in _PROBE_FALLBACK_CODES
-            and is_setup_token(oauth)
-        ):
-            # Measured: the usage endpoint answers setup-tokens 429 even on a
-            # first request (others have reported 401/403). Not a budget
-            # signal for these tokens, so no warning and no 429 stamp — the
-            # probe's own outcome is what gets recorded.
-            _logger.debug(
-                "Usage endpoint answered %s %s; reading usage from a header "
-                "probe instead", kind, context,
-            )
-            return _usage_from_probe(access_token, context)
         if (
             e.code != 401
             or is_active
