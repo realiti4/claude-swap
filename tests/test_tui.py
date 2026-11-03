@@ -4148,6 +4148,27 @@ class TestUnswitchableRowsAreListed:
         )
         assert "Next best (soonest reset)" in out, out
 
+    def test_weekly_first_lists_the_soonest_reset_first_under_its_axis(self):
+        """weekly-first's proactive arm ranks through the engine's own pass
+        (soonest weekly reset, headroom breaking ties), and the panel names
+        that axis, as it does for consume-first."""
+        active = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 50.0}}
+
+        def cand(pct, days):
+            return {
+                "five_hour": {"pct": pct},
+                "seven_day": {"pct": pct, "resets_at": _iso_in(days * 86400)},
+            }
+
+        settings = AutoSwitchSettings(strategy="weekly-first", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "later@x.com", switchable=True, last_good=cand(10.0, 5)),
+            self._acct("3", "sooner@x.com", switchable=True, last_good=cand(40.0, 1)),
+        ), active="1", settings=settings)
+        assert out.index("sooner@x.com") < out.index("later@x.com"), out
+        assert "Next best (soonest reset)" in out, out
+
     def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
         """Every OTHER unswitchable/blocked row already says why; `disabled`
         was the one silent exception in the real-usage (chip) branch --

@@ -4386,6 +4386,11 @@ class AutoSwitchEngine:
         reasons = {} if reasons is None else reasons
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
+        # weekly-first is `best` with consume-first's ranking: the same
+        # departure line, landing gates, hysteresis and escapes as `best`, but
+        # a proactive move picks the eligible account whose weekly window
+        # resets soonest, since its unused weekly quota is lost first.
+        weekly_first = settings.strategy == "weekly-first"
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -4665,7 +4670,9 @@ class AutoSwitchEngine:
                 else (100.0 - h) >= cand_bar
             )
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(usage.get(num), now)
+                if consume_first or weekly_first
+                else None
             )
             if (
                 by_recovery_axis
@@ -4861,6 +4868,13 @@ class AutoSwitchEngine:
                     weekly_threshold=settings.weekly_threshold,
                     scale=_ruler(settings),
                 )
+                key_axis[num] = "soonest reset"
+            elif weekly_first and trigger == "proactive":
+                # Soonest weekly reset first (unknown resets sort last), most
+                # policy headroom breaks ties, then sequence order. weekly-first
+                # keeps `best`'s headroom order for the at-limit and failover
+                # escapes, which may land on accounts over their lines.
+                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
                 key_axis[num] = "soonest reset"
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
