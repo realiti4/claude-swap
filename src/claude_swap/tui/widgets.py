@@ -38,6 +38,7 @@ def bar_cells(
     *,
     stale: bool = False,
     threshold: float | None = None,
+    expected_pct: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
     """Just the bar glyphs: severity-colored fill, track, optional tick."""
@@ -52,11 +53,16 @@ def bar_cells(
     tick_at: int | None = None
     if threshold is not None:
         tick_at = min(width - 1, max(0, round(threshold / 100.0 * width)))
+    expected_at: int | None = None
+    if expected_pct is not None:
+        expected_at = min(width - 1, max(0, round(expected_pct / 100.0 * width)))
     color = palette.severity(pct)
     fill_style = f"{color} dim" if stale else color
     for i in range(width):
         if tick_at is not None and i == tick_at:
             text.append(_BAR_TICK, style=palette.sev_warn)
+        elif expected_at is not None and i == expected_at:
+            text.append("│", style=palette.foreground)
         elif i < full:
             text.append(_BAR_FILLED, style=fill_style)
         elif i == full and half:
@@ -74,17 +80,23 @@ def usage_bar(
     *,
     stale: bool = False,
     threshold: float | None = None,
+    expected_pct: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
     """One full bar line: ``5h ━━━━╸────┃──  47%  resets 2h 13m · 20:39``."""
     text = Text()
     text.append(f"{label} ", style=palette.muted)
-    text.append(bar_cells(pct, width, stale=stale, threshold=threshold, palette=palette))
+    text.append(bar_cells(
+        pct, width, stale=stale, threshold=threshold,
+        expected_pct=expected_pct, palette=palette,
+    ))
     if pct is None:
         text.append("  usage unknown", style=palette.muted)
     else:
         color = palette.severity(pct)
         text.append(f" {pct:3.0f}%", style=f"{color} dim" if stale else color)
+        if expected_pct is not None:
+            text.append(f"  exp {expected_pct:.0f}%", style=palette.muted)
     if suffix:
         text.append(f"  {suffix}", style=palette.muted)
     return text
@@ -107,6 +119,33 @@ def _pace_suffix(window: dict, fetched_at: float | None) -> str:
     """"(ahead of pace)" when a weekly window is meaningfully ahead, else ""."""
     result = pace.compute_pace(window, fetched_at=fetched_at)
     return "(ahead of pace)" if result and result.ahead else ""
+
+
+def _expected_for_row(
+    usage: dict, label: str, fetched_at: float | None
+) -> float | None:
+    """Expected linear pace for a 5h / 7d / per-model weekly row."""
+    if label == FIVE_HOUR_LABEL:
+        window = usage.get("five_hour")
+        period_s = 5 * 3600
+    elif label == "7d":
+        window = usage.get("seven_day")
+        period_s = pace.WEEKLY_PERIOD_S
+    elif label == "$$":
+        return None  # No fixed 5h/7d pace for monetary spending limits.
+    else:
+        window = next(
+            (w for w in (usage.get("scoped") or []) if w.get("name") == label),
+            None,
+        )
+        period_s = pace.WEEKLY_PERIOD_S
+    result = pace.compute_pace(
+        window,
+        fetched_at=fetched_at,
+        period_s=period_s,
+        suppress_after_reset_s=0,
+    )
+    return result.expected_pct if result else None
 
 
 def usage_rows(
@@ -264,6 +303,9 @@ def account_card_text(
                 bar_width,
                 stale=stale,
                 threshold=row_line,
+                expected_pct=_expected_for_row(
+                    acc.usage.last_good, label, acc.usage.fetched_at
+                ),
                 palette=palette,
             )
         )
