@@ -516,7 +516,12 @@ Not detectable and therefore not modelled:
   **S4U** logon, so it runs outside your desktop session. Two consequences:
   - Its toast notifications may not appear.
   - Its log, `~/.claude-swap-backup/autostart-task.log`, is **UTF-16**
-    (PowerShell 5.1 `*>>`). Read it with `Get-Content -Tail 20`.
+    (PowerShell 5.1 `*>>`), and it can **lag or stall** while the engine keeps
+    working. On 2026-11-03 after a sleep/wake, it stopped at 06:27 while the
+    engine switched accounts at 06:31. The reliable record is
+    `~/.claude-swap-backup/claude-swap.log`: switches, fetch failures and
+    auto-continue all go there, written by cswap itself. Check that one
+    first.
 - **Auto-continue waiters run inside your desktop session** (spawned by
   Claude Code's hook), so they can reach the sessions' `\\.\pipe\LOCAL\…`
   inboxes and show notifications.
@@ -569,13 +574,19 @@ uv sync && uv run pytest && uv run ruff check . && uv run ruff format --check .
 Resolve any conflict by keeping upstream's code and re-applying the fork
 insertion from the table above.
 
-**Windows quirk.** Here, every *new* checkout of
-`scripts/windows/install-autostart.ps1` (a fresh worktree, a temp copy) is
-blocked immediately after git writes it. The likely cause is
-security software reacting to a script that registers an S4U scheduled task;
-Defender's history showed nothing, so this is unconfirmed. The existing
-checkout is unaffected. Use `git merge-tree` or a plain merge in the main
-checkout rather than `git worktree add`.
+**Windows quirk (confirmed 2026-11-03).** On this machine, every *new* copy
+of `scripts/windows/install-autostart.ps1` (a fresh worktree, a temp copy, a
+rewrite) is blocked right after it is written, and can't even be deleted
+afterwards: Windows reports "the file contains a virus or potentially
+unwanted software". The cause is the installed third-party antivirus (not
+Defender, whose real-time protection is off here). It treats a script that
+registers a hidden, auto-starting PowerShell task as a persistence pattern.
+The existing checkout is unaffected.
+
+Consequences:
+- don't `git worktree add`, and don't rewrite that script in place;
+- use `git merge-tree` or a plain merge in the main checkout;
+- clear blocked copies from the antivirus's quarantine.
 
 ## 7. Research notes and roadmap
 

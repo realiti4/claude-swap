@@ -103,6 +103,11 @@ Start-ScheduledTask -TaskName "Claude Swap Auto"
 Get-Content "$env:USERPROFILE\.claude-swap-backup\autostart-task.log" -Tail 5   # fresh lines = running
 ```
 
+If that task log looks stuck, check `claude-swap.log` (same folder, UTF-8)
+before assuming the loop died. The task log goes through PowerShell and can
+stall, for example after the machine sleeps, while cswap's own log keeps
+recording switches and errors.
+
 The task runs with an S4U logon, outside your desktop session. Its log is
 UTF-16 (use `Get-Content`, not tools that expect UTF-8), and its toast
 notifications may not appear. Auto-continue's notifications come from inside
