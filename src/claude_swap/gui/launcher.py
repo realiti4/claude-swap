@@ -31,7 +31,7 @@ def split_args(text: str) -> list[str]:
 
 
 def cli_command() -> list[str]:
-    """argv prefix that runs the claude-swap CLI."""
+    """argv prefix that runs the claude-swap CLI in a terminal."""
     if getattr(sys, "frozen", False):
         if sys.platform != "win32":
             # One executable on macOS: given arguments, it runs as the CLI.
@@ -43,78 +43,118 @@ def cli_command() -> list[str]:
     return [sys.executable, "-m", "claude_swap"]
 
 
-def _child_env() -> dict[str, str]:
+def cli_capture_command() -> list[str]:
+    """argv prefix that runs the CLI as a captured, windowless child."""
+    if getattr(sys, "frozen", False):
+        # Straight to the executable: no cmd.exe in between to quote around.
+        return [sys.executable, "--cli"] if sys.platform == "win32" else [sys.executable]
+    return [sys.executable, "-m", "claude_swap"]
+
+
+def _claude_candidates() -> list[Path]:
+    home = Path.home()
+    if sys.platform == "win32":
+        appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+        return [home / ".local" / "bin" / "claude.exe", appdata / "npm" / "claude.cmd"]
+    return [
+        home / ".local" / "bin" / "claude",
+        home / ".claude" / "local" / "claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+        home / ".npm-global" / "bin" / "claude",
+    ]
+
+
+def find_claude() -> str | None:
+    """The claude executable, also when the app was started without a shell.
+
+    A macOS app opened from Finder gets launchd's bare PATH, so the usual
+    install locations are tried after PATH.
+    """
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in _claude_candidates():
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def tool_path(claude: str, path: str) -> str:
+    """PATH for running ``claude``: its own folder first (an npm install
+    needs the node beside it), then the common tool folders a Finder-started
+    app does not inherit."""
+    extra = [str(Path(claude).parent)]
+    if sys.platform == "darwin":
+        extra += ["/opt/homebrew/bin", "/usr/local/bin"]
+    parts = [p for p in path.split(os.pathsep) if p]
+    return os.pathsep.join(dict.fromkeys(extra + parts))
+
+
+def child_env(set_env: dict[str, str] | None = None, unset_env: tuple[str, ...] = ()) -> dict[str, str]:
     env = dict(os.environ)
-    # The GUI forces NO_COLOR for its captured output; the terminal wants color.
+    # The GUI forces NO_COLOR for its captured output; terminals want color.
     if env.get("CSWAP_GUI_NO_COLOR") == "1":
         env.pop("NO_COLOR", None)
         env.pop("CSWAP_GUI_NO_COLOR", None)
+    for key in unset_env:
+        env.pop(key, None)
+    env.update(set_env or {})
     return env
 
 
-def open_terminal(args: list[str], cwd: str | None = None) -> str:
-    """Open a new terminal window running the CLI with ``args``.
+def open_terminal(
+    argv: list[str],
+    cwd: str | None = None,
+    *,
+    set_env: dict[str, str] | None = None,
+    unset_env: tuple[str, ...] = (),
+    keep_open: bool = True,
+) -> str:
+    """Open a new terminal window running ``argv``.
 
-    Returns the command line as shown to the user.
+    ``keep_open`` leaves the window open after the command exits so its
+    output stays readable; otherwise the window closes on success and waits
+    for a key only on failure. Returns the command line as shown to the user.
     """
-    argv = cli_command() + args
     cwd = cwd or str(Path.home())
     if not os.path.isdir(cwd):
         raise LaunchError(f"目录不存在：{cwd}")
-    env = _child_env()
 
     if sys.platform == "win32":
         shown = subprocess.list2cmdline(argv)
-        # `cmd /k` keeps the window open after claude exits so errors stay
-        # readable; `call` keeps cmd from stripping the quoted exe path.
+        # `call` keeps cmd from stripping the quoted exe path (and runs .cmd
+        # shims such as npm's claude.cmd).
+        line = f"cmd.exe /k call {shown}" if keep_open else f"cmd.exe /c call {shown} || pause"
         subprocess.Popen(
-            f'cmd.exe /k call {shown}',
+            line,
             cwd=cwd,
-            env=env,
+            env=child_env(set_env, unset_env),
             creationflags=subprocess.CREATE_NEW_CONSOLE,
         )
         return shown
 
-    shown = shlex.join(argv)
     if sys.platform == "darwin":
-        script = f"cd {shlex.quote(cwd)} && {shown}"
+        shown = shlex.join(argv)
+        # Terminal.app starts a fresh login shell, so the environment travels
+        # inside the script rather than through Popen.
+        parts = [f"cd {shlex.quote(cwd)}"]
+        parts += [f"unset {key}" for key in unset_env]
+        parts += [f"export {key}={shlex.quote(value)}" for key, value in (set_env or {}).items()]
+        parts.append(shown if keep_open else f"{shown} && exit")
         applescript = (
             'tell application "Terminal"\n'
-            f"  do script {_applescript_str(script)}\n"
+            f"  do script {_applescript_str('; '.join(parts))}\n"
             "  activate\n"
             "end tell"
         )
         try:
-            subprocess.Popen(["osascript", "-e", applescript], env=env)
+            subprocess.Popen(["osascript", "-e", applescript])
         except OSError as e:
             raise LaunchError(f"无法打开 Terminal：{e}") from e
         return shown
 
-    # Linux / other POSIX: try the usual terminal emulators.
-    hold = f'{shown}; echo; read -r -p "Press Enter to close..." _'
-    inner = ["bash", "-c", hold]
-    candidates: list[list[str]] = []
-    preferred = os.environ.get("TERMINAL")
-    if preferred:
-        candidates.append([preferred, "-e", *inner])
-    candidates += [
-        ["x-terminal-emulator", "-e", *inner],
-        ["gnome-terminal", "--", *inner],
-        ["konsole", "-e", *inner],
-        ["xfce4-terminal", "-x", *inner],
-        ["kitty", *inner],
-        ["alacritty", "-e", *inner],
-        ["wezterm", "start", "--", *inner],
-        ["xterm", "-e", *inner],
-    ]
-    for cand in candidates:
-        if shutil.which(cand[0]):
-            try:
-                subprocess.Popen(cand, cwd=cwd, env=env, start_new_session=True)
-                return shown
-            except OSError:
-                continue
-    raise LaunchError("找不到可用的终端程序（可设置 TERMINAL 环境变量）。命令：" + shown)
+    raise LaunchError("桌面版仅支持 Windows 和 macOS")
 
 
 def _applescript_str(text: str) -> str:

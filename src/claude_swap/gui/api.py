@@ -19,6 +19,9 @@ import io
 import json
 import os
 import re
+import secrets
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -29,7 +32,7 @@ from typing import Callable
 
 from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.gui import launcher
+from claude_swap.gui import desktop, launcher
 from claude_swap.json_output import usage_to_json
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.snapshot_source import SnapshotSource
@@ -43,9 +46,98 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 # Engine events kept for the page's log; older ones fall off.
 _EVENT_BUFFER = 500
 
+_LOGIN_ID_RE = re.compile(r"\d+-[0-9a-f]{8}")
+# The manual-flow link `auth login` prints (wrapped in an OSC 8 hyperlink):
+# its page shows a code to paste back instead of calling a local port.
+_LOGIN_URL_RE = re.compile(r"https://[^\s\x07\x1b]+")
+# A sign-in left open this long is abandoned.
+LOGIN_TIMEOUT_S = 15 * 60
+
+
+_UI_PREFS = {"simple": True, "view": "cli", "theme": "auto", "tray": True}
+_UI_PREF_CHOICES = {"view": ("cli", "desktop"), "theme": ("auto", "light", "dark")}
+
+
+def _valid_pref(key: str, value) -> bool:
+    return value in _UI_PREF_CHOICES.get(key, (value,))
+
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
+
+
+def _win_set_clipboard(text: str) -> None:
+    """CF_UNICODETEXT via user32 (clip.exe would keep a BOM in the text)."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+    data = text.encode("utf-16-le") + b"\0\0"
+    for _ in range(10):  # another app may hold the clipboard for a moment
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        raise OSError("剪贴板被占用")
+    try:
+        user32.EmptyClipboard()
+        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        pointer = kernel32.GlobalLock(handle)
+        ctypes.memmove(pointer, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(13, handle):  # CF_UNICODETEXT
+            raise OSError("无法写入剪贴板")
+    finally:
+        user32.CloseClipboard()
+
+
+class _Login:
+    """One `claude auth login` running windowless against a staging profile."""
+
+    def __init__(self, proc: subprocess.Popen, staging: Path) -> None:
+        self.proc = proc
+        self.staging = staging
+        self.started = time.time()
+        self.output: list[str] = []
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        for line in iter(self.proc.stdout.readline, ""):
+            self.output.append(line)
+
+    def text(self) -> str:
+        return "".join(self.output)
+
+    def url(self) -> str | None:
+        match = _LOGIN_URL_RE.search(self.text())
+        return match.group(0) if match else None
+
+    def send(self, line: str) -> None:
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+
+    def kill(self) -> None:
+        if self.proc.poll() is not None:
+            return
+        if sys.platform == "win32":
+            # claude is often an npm .cmd shim: take node down with it.
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(self.proc.pid)],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            with contextlib.suppress(OSError):
+                os.killpg(self.proc.pid, 15)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self.proc.wait(timeout=5)
 
 
 class GuiApi:
@@ -66,9 +158,16 @@ class GuiApi:
         self._window = None  # pywebview window, for native file dialogs
         self._last_plan_refresh = 0.0
         self._last_ping = time.time()
+        self._logins: dict[str, _Login] = {}
+        self._logins_lock = threading.Lock()
+        self._desktop_lock = threading.Lock()  # Claude Desktop, apart from the CLI's
+        self._desktop_login: dict | None = None
 
     def _attach_window(self, window) -> None:
         self._window = window
+
+    def _show_window(self) -> None:
+        """Bring the window forward; replaced once the window runs."""
 
     # -- boot / housekeeping --------------------------------------------------
 
@@ -82,7 +181,37 @@ class GuiApi:
             "backupDir": str(self._switcher.backup_dir),
             "settingsPath": str(settings_path(self._switcher.backup_dir)),
             "frozen": bool(getattr(sys, "frozen", False)),
+            "prefs": self.ui_prefs(),
         }
+
+    # The webview runs in private mode, so page storage does not outlive the
+    # window; view preferences live beside the settings instead.
+    def _prefs_path(self) -> Path:
+        return self._switcher.backup_dir / "gui-prefs.json"
+
+    def ui_prefs(self) -> dict:
+        prefs = dict(_UI_PREFS)
+        try:
+            saved = json.loads(self._prefs_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        if isinstance(saved, dict):
+            for key, default in _UI_PREFS.items():
+                if isinstance(saved.get(key), type(default)) and _valid_pref(key, saved[key]):
+                    prefs[key] = saved[key]
+        return prefs
+
+    def set_ui_pref(self, key: str, value) -> dict:
+        if key not in _UI_PREFS or not isinstance(value, type(_UI_PREFS[key])) or not _valid_pref(key, value):
+            return {"ok": False, "output": f"无效的界面设置：{key}"}
+        prefs = self.ui_prefs()
+        prefs[key] = value
+        path = self._prefs_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(prefs), encoding="utf-8")
+        os.replace(tmp, path)
+        return {"ok": True, "output": ""}
 
     def ping(self) -> bool:
         """Browser-mode heartbeat; the server exits once pings stop."""
@@ -252,6 +381,198 @@ class GuiApi:
             )
         )
 
+    # -- browser login ------------------------------------------------------------
+    #
+    # Adds an account without touching the live login: `claude auth login`
+    # runs windowless against a throwaway CLAUDE_CONFIG_DIR, then `cswap add`
+    # captures that profile in a child process (never by flipping this
+    # process's environment, which the snapshot poller and auto-switch engine
+    # read). `auth login` opens the browser itself and exits once signed in,
+    # so no claude is left behind to rotate the refresh token the slot just
+    # stored; the profile is deleted right after capture for the same reason.
+    # When the browser cannot reach its local callback, the page shows the
+    # printed manual link and passes the code it yields to `auth login`'s
+    # stdin.
+
+    def _staging_root(self) -> Path:
+        return self._switcher.backup_dir / "login-staging"
+
+    def _staging_dir(self, login_id: str) -> Path:
+        if not _LOGIN_ID_RE.fullmatch(login_id or ""):
+            raise ValueError("invalid login id")
+        return self._staging_root() / login_id
+
+    def login_start(self, email: str | None = None) -> dict:
+        from claude_swap.session import AUTH_OVERRIDE_ENV_VARS
+
+        claude = launcher.find_claude()
+        if not claude:
+            return {"ok": False, "output": "没有找到 claude 命令，请先安装 Claude Code。"}
+        email = (email or "").strip()
+        if email and not re.fullmatch(r"[^\s\"'&|<>^%!]+@[^\s\"'&|<>^%!]+", email):
+            return {"ok": False, "output": "邮箱格式不正确"}
+        self._cleanup_staging()
+        login_id = f"{int(time.time())}-{secrets.token_hex(4)}"
+        staging = self._staging_root() / login_id
+        staging.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(staging, 0o700)
+        argv = [claude, "auth", "login", "--claudeai"]
+        if email:
+            argv += ["--email", email]
+        env = launcher.child_env(
+            {"CLAUDE_CONFIG_DIR": str(staging), "NO_COLOR": "1"},
+            # An exported API key or token would bypass the login, and a
+            # secure-storage override would send the credential elsewhere.
+            (*AUTH_OVERRIDE_ENV_VARS, "CLAUDE_SECURESTORAGE_CONFIG_DIR", "BROWSER"),
+        )
+        env["PATH"] = launcher.tool_path(claude, env.get("PATH", ""))
+        try:
+            proc = subprocess.Popen(
+                argv,
+                env=env,
+                cwd=str(staging),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                start_new_session=sys.platform != "win32",
+            )
+        except OSError as e:
+            self._remove_staging(staging)
+            return {"ok": False, "output": f"无法启动登录：{e}"}
+        with self._logins_lock:
+            self._logins[login_id] = _Login(proc, staging)
+        return {"ok": True, "id": login_id}
+
+    def login_poll(self, login_id: str) -> dict:
+        """``waiting`` while signing in, then ``ready``, ``failed`` or ``gone``."""
+        from claude_swap.session import read_config_dir_credentials
+
+        staging = self._staging_dir(login_id)
+        with self._logins_lock:
+            login = self._logins.get(login_id)
+        if login is None or not staging.is_dir():
+            return {"state": "gone"}
+        code = login.proc.poll()
+        if code is None:
+            if time.time() - login.started > LOGIN_TIMEOUT_S:
+                self.login_cancel(login_id)
+                return {"state": "failed", "output": "登录超时，已取消。"}
+            return {"state": "waiting", "url": login.url()}
+        email = None
+        try:
+            config = json.loads((staging / ".claude.json").read_text(encoding="utf-8"))
+            email = (config.get("oauthAccount") or {}).get("emailAddress")
+        except (OSError, ValueError):
+            pass
+        try:
+            creds = read_config_dir_credentials(str(staging))
+        except Exception:
+            creds = None
+        if code == 0 and creds and email:
+            return {"state": "ready", "email": email}
+        output = strip_ansi(login.text()).strip()
+        self.login_cancel(login_id)
+        return {"state": "failed", "output": output or f"登录未完成（退出码 {code}）"}
+
+    def login_code(self, login_id: str, code: str) -> dict:
+        """Hand the code from the manual-flow page to the waiting `auth login`."""
+        self._staging_dir(login_id)  # validates the id
+        code = (code or "").strip()
+        if not code or any(c.isspace() for c in code):
+            return {"ok": False, "output": "授权码不正确"}
+        with self._logins_lock:
+            login = self._logins.get(login_id)
+        if login is None or login.proc.poll() is not None:
+            return {"ok": False, "output": "登录已结束"}
+        try:
+            login.send(code)
+        except OSError as e:
+            return {"ok": False, "output": f"无法提交授权码：{e}"}
+        return {"ok": True, "output": ""}
+
+    def login_finish(
+        self, login_id: str, slot: int | None = None, alias: str | None = None, overwrite: bool = False
+    ) -> dict:
+        from claude_swap.locking import FileLock
+
+        staging = self._staging_dir(login_id)
+        if not self._action_lock.acquire(blocking=False):
+            return {"ok": False, "output": "另一个操作仍在进行中，请稍候。"}
+        try:
+            before = (self._switcher._get_sequence_data() or {}).get("activeAccountNumber")
+            argv = launcher.cli_capture_command() + ["add"]
+            if slot not in (None, ""):
+                argv += ["--slot", str(int(slot))]
+            if alias:
+                argv += ["--alias", alias]
+            env = launcher.child_env(
+                {"CLAUDE_CONFIG_DIR": str(staging), "NO_COLOR": "1"},
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR",),
+            )
+            try:
+                proc = subprocess.run(
+                    argv,
+                    env=env,
+                    input="y\n" if overwrite else "",  # the slot-overwrite prompt
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=180,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                ok, output = proc.returncode == 0, proc.stdout + proc.stderr
+            except (OSError, subprocess.TimeoutExpired) as e:
+                ok, output = False, f"Error: {e}"
+            # `add` records the captured account as active, but the live login
+            # never moved; put the record back.
+            with FileLock(self._switcher.lock_file):
+                data = self._switcher._get_sequence_data()
+                if data is not None and data.get("activeAccountNumber") != before:
+                    data["activeAccountNumber"] = before
+                    self._switcher._write_json(self._switcher.sequence_file, data)
+        finally:
+            self._action_lock.release()
+        if ok:
+            with self._logins_lock:
+                self._logins.pop(login_id, None)
+            self._remove_staging(staging)
+        return {"ok": ok, "output": strip_ansi(output).strip()}
+
+    def login_cancel(self, login_id: str) -> dict:
+        staging = self._staging_dir(login_id)
+        with self._logins_lock:
+            login = self._logins.pop(login_id, None)
+        if login is not None:
+            login.kill()
+        self._remove_staging(staging)
+        return {"ok": True, "output": ""}
+
+    def _remove_staging(self, staging: Path) -> None:
+        from claude_swap.session import delete_macos_keychain_entry
+
+        delete_macos_keychain_entry(staging)
+        shutil.rmtree(staging, ignore_errors=True)
+
+    def _cleanup_staging(self, max_age_s: float = 3600) -> None:
+        """Drop abandoned staging profiles (a crash or a closed window)."""
+        root = self._staging_root()
+        if not root.is_dir():
+            return
+        with self._logins_lock:
+            running = set(self._logins)
+        for child in root.iterdir():
+            try:
+                if child.name not in running and time.time() - child.stat().st_mtime > max_age_s:
+                    self._remove_staging(child)
+            except OSError:
+                pass
+
     def remove(self, number: str) -> dict:
         return self._run(lambda: self._switcher.remove_account(str(number), assume_yes=True))
 
@@ -314,7 +635,7 @@ class GuiApi:
         if extra:
             args += ["--", *extra]
         try:
-            shown = launcher.open_terminal(args, cwd=cwd or None)
+            shown = launcher.open_terminal(launcher.cli_command() + args, cwd=cwd or None)
         except launcher.LaunchError as e:
             return {"ok": False, "output": str(e)}
         return {"ok": True, "output": f"已在新终端中启动：{shown}"}
@@ -519,6 +840,259 @@ class GuiApi:
         if self._engine is not None:
             self._engine.stop()
             self._engine = None
+        with self._logins_lock:
+            pending = list(self._logins)
+        for login_id in pending:
+            self.login_cancel(login_id)
+
+    # -- Claude Desktop accounts ---------------------------------------------------
+    #
+    # Kept apart from the Claude Code accounts above: a Desktop switch never
+    # touches the CLI login and a CLI switch never touches Desktop. The one
+    # link is display: a uuid the CLI also manages lends its email.
+
+    def _desktop_store(self) -> desktop.DesktopStore:
+        return desktop.DesktopStore(self._switcher.backup_dir / "desktop")
+
+    def _desktop_do(self, fn: Callable[[Path, desktop.DesktopStore], dict | None]) -> dict:
+        """Run one Desktop action, single-flight, with errors as output."""
+        if not self._desktop_lock.acquire(blocking=False):
+            return {"ok": False, "output": "另一个 Desktop 操作仍在进行中，请稍候。"}
+        try:
+            data_dir = desktop.find_data_dir()
+            if data_dir is None:
+                raise desktop.DesktopError("没有找到 Claude Desktop 的数据，请先安装并打开一次 Claude Desktop")
+            return {"ok": True, "output": "", **(fn(data_dir, self._desktop_store()) or {})}
+        except (desktop.DesktopError, OSError, ValueError) as e:
+            return {"ok": False, "output": str(e)}
+        finally:
+            self._desktop_lock.release()
+
+    def _cli_emails(self) -> dict[str, str]:
+        data = self._switcher._get_sequence_data() or {}
+        return {
+            acc["uuid"]: acc.get("email")
+            for acc in (data.get("accounts") or {}).values()
+            if isinstance(acc, dict) and acc.get("uuid")
+        }
+
+    def _desktop_register(self, store: desktop.DesktopStore, uuid: str, name: str | None = None) -> dict:
+        accounts = store.load()
+        record = accounts.setdefault(uuid, {"addedAt": time.time()})
+        if name:
+            record["name"] = name.strip()
+        email = self._cli_emails().get(uuid)
+        if email:
+            record["email"] = email
+        store.save(accounts)
+        return record
+
+    def _desktop_capture(self, data_dir: Path, store: desktop.DesktopStore) -> str | None:
+        """Save the live sign-in (Desktop closed); an unknown one is added."""
+        uuid = store.capture(data_dir)
+        if uuid:
+            self._desktop_register(store, uuid)
+        return uuid
+
+    def desktop_state(self) -> dict:
+        data_dir = desktop.find_data_dir()
+        store = self._desktop_store()
+        accounts = store.load()
+        emails = self._cli_emails()
+        live = desktop.signed_in_uuid(desktop.read_config(data_dir)) if data_dir else None
+        fingerprint = desktop.key_fingerprint(data_dir) if data_dir else None
+        rows = []
+        for uuid, record in accounts.items():
+            meta = store.snapshot_meta(uuid)
+            rows.append({
+                "uuid": uuid,
+                "name": record.get("name"),
+                "email": record.get("email") or emails.get(uuid),
+                "isLive": uuid == live,
+                "savedAt": meta.get("savedAt") if meta else None,
+                "stale": bool(meta) and meta.get("keyFingerprint") != fingerprint,
+                "addedAt": record.get("addedAt") or 0,
+            })
+        rows.sort(key=lambda r: r["addedAt"])
+        return {
+            "available": data_dir is not None,
+            "dataDir": str(data_dir) if data_dir else None,
+            "running": bool(data_dir) and bool(desktop.running_pids()),
+            "live": live and {
+                "uuid": live,
+                "email": emails.get(live) or (accounts.get(live) or {}).get("email"),
+                "known": live in accounts,
+            },
+            "accounts": rows,
+        }
+
+    def desktop_import_current(self, name: str | None = None) -> dict:
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            uuid = desktop.signed_in_uuid(desktop.read_config(data_dir))
+            if uuid is None:
+                raise desktop.DesktopError("Claude Desktop 当前没有登录")
+            record = self._desktop_register(store, uuid, name)
+            if not desktop.running_pids():
+                store.capture(data_dir)  # closed: the files are settled, save now
+            return {"uuid": uuid, "email": record.get("email")}
+
+        return self._desktop_do(go)
+
+    def desktop_switch(self, uuid: str) -> dict:
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            if uuid not in store.load():
+                raise desktop.DesktopError("未知的 Desktop 账号")
+            if desktop.signed_in_uuid(desktop.read_config(data_dir)) == uuid:
+                if not desktop.running_pids():
+                    desktop.launch_desktop(data_dir)
+                return {"same": True}
+            store.check(data_dir, uuid)  # before closing anything
+            desktop.quit_desktop()
+            saved = self._desktop_capture(data_dir, store)
+            try:
+                store.restore(data_dir, uuid)
+            except Exception:
+                if saved:
+                    store.restore(data_dir, saved)
+                raise
+            finally:
+                desktop.launch_desktop(data_dir)
+            return {"same": False}
+
+        return self._desktop_do(go)
+
+    def desktop_login_start(self) -> dict:
+        """Restart Desktop signed out; the sign-in it then does is the new account."""
+
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            desktop.quit_desktop()
+            previous = self._desktop_capture(data_dir, store)
+            desktop.clear(data_dir)
+            desktop.launch_desktop(data_dir)
+            self._desktop_login = {"dataDir": data_dir, "previous": previous}
+            return {}
+
+        return self._desktop_do(go)
+
+    def desktop_login_poll(self) -> dict:
+        login = self._desktop_login
+        if login is None:
+            return {"state": "gone"}
+        uuid = desktop.signed_in_uuid(desktop.read_config(login["dataDir"]))
+        if uuid is None:
+            return {"state": "waiting", "running": bool(desktop.running_pids())}
+        record = self._desktop_store().load().get(uuid) or {}
+        return {
+            "state": "ready",
+            "uuid": uuid,
+            "email": self._cli_emails().get(uuid) or record.get("email"),
+            "known": bool(record),
+            "name": record.get("name"),
+        }
+
+    def desktop_login_finish(self, name: str | None = None) -> dict:
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            uuid = desktop.signed_in_uuid(desktop.read_config(data_dir))
+            if uuid is None:
+                raise desktop.DesktopError("Claude Desktop 还没有登录")
+            self._desktop_login = None
+            record = self._desktop_register(store, uuid, name)
+            return {"uuid": uuid, "email": record.get("email")}
+
+        return self._desktop_do(go)
+
+    def desktop_login_cancel(self) -> dict:
+        """Give up on the new sign-in and put the previous account back."""
+        login, self._desktop_login = self._desktop_login, None
+
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            previous = login and login["previous"]
+            if not previous or desktop.signed_in_uuid(desktop.read_config(data_dir)) == previous:
+                return {}
+            desktop.quit_desktop()
+            self._desktop_capture(data_dir, store)
+            store.restore(data_dir, previous)
+            desktop.launch_desktop(data_dir)
+            return {}
+
+        return self._desktop_do(go)
+
+    def desktop_rename(self, uuid: str, name: str) -> dict:
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            accounts = store.load()
+            if uuid not in accounts:
+                raise desktop.DesktopError("未知的 Desktop 账号")
+            if (name or "").strip():
+                accounts[uuid]["name"] = name.strip()
+            else:
+                accounts[uuid].pop("name", None)
+            store.save(accounts)
+            return {}
+
+        return self._desktop_do(go)
+
+    def desktop_remove(self, uuid: str) -> dict:
+        """Forget an account; a live sign-in stays signed in."""
+
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            accounts = store.load()
+            store.snapshot_dir(uuid)  # validates
+            accounts.pop(uuid, None)
+            store.save(accounts)
+            store.drop(uuid)
+            return {}
+
+        return self._desktop_do(go)
+
+    def desktop_launch(self) -> dict:
+        def go(data_dir: Path, store: desktop.DesktopStore) -> dict:
+            if not desktop.running_pids():
+                desktop.launch_desktop(data_dir)
+            return {}
+
+        return self._desktop_do(go)
+
+    # -- tray menu (underscored: not exposed to the page) ---------------------------
+
+    def _tray_cli_accounts(self) -> list[dict]:
+        data = self._switcher._get_sequence_data() or {}
+        active = str(data.get("activeAccountNumber"))
+        rows = []
+        for number, acc in sorted((data.get("accounts") or {}).items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
+            if not isinstance(acc, dict):
+                continue
+            label = f"{number}. {acc.get('email') or '?'}"
+            if acc.get("alias"):
+                label += f" (@{acc['alias']})"
+            rows.append({
+                "number": str(number),
+                "label": label,
+                "active": str(number) == active,
+                "disabled": bool(acc.get("disabled")),
+            })
+        return rows
+
+    def _tray_desktop_live(self) -> dict | None:
+        """Desktop's sign-in when it is not one of the managed accounts yet."""
+        live = self.desktop_state()["live"]
+        if not live or live["known"]:
+            return None
+        return {"label": live["email"] or f"账号（{live['uuid'][:8]}）"}
+
+    def _tray_desktop_accounts(self) -> list[dict] | None:
+        """None when Claude Desktop is not installed here."""
+        state = self.desktop_state()
+        if not state["available"]:
+            return None
+        return [
+            {
+                "uuid": a["uuid"],
+                "label": a["name"] or a["email"] or f"未命名账号（{a['uuid'][:8]}）",
+                "live": a["isLive"],
+                "switchable": not a["isLive"] and bool(a["savedAt"]) and not a["stale"],
+            }
+            for a in state["accounts"]
+        ]
 
     # -- desktop helpers ----------------------------------------------------------
 
@@ -556,6 +1130,19 @@ class GuiApi:
         if not url.startswith("https://"):
             return {"ok": False, "output": "只允许打开 https 链接"}
         webbrowser.open(url)
+        return {"ok": True, "output": ""}
+
+    def copy_text(self, text: str) -> dict:
+        """System clipboard, for pages whose origin has no Clipboard API."""
+        try:
+            if sys.platform == "win32":
+                _win_set_clipboard(str(text))
+            elif sys.platform == "darwin":
+                subprocess.run(["pbcopy"], input=str(text).encode("utf-8"), check=True, timeout=10)
+            else:
+                return {"ok": False, "output": "不支持的平台"}
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"ok": False, "output": str(e)}
         return {"ok": True, "output": ""}
 
     def check_update(self) -> dict:

@@ -137,6 +137,15 @@ label.check { display: inline-flex; align-items: center; gap: 6px; cursor: point
 .acc-foot .age { font-size: 11px; color: var(--faint); margin-right: auto; }
 .empty { text-align: center; padding: 28px 16px; }
 .empty h3 { margin: 0 0 6px; }
+.seg { display: inline-flex; gap: 2px; padding: 2px; margin-bottom: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.seg button { border: 0; background: transparent; color: var(--muted); font: inherit; padding: 4px 14px; border-radius: 6px; cursor: pointer; }
+.seg button.on { background: var(--panel); color: var(--text); font-weight: 600; box-shadow: var(--shadow); }
+.desk-hint { font-size: 12px; margin: 0 0 10px; }
+.desk-live { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin: 0 0 10px; }
+.desc.warn { color: var(--warn); }
+.ui-card { padding: 10px 12px; margin-bottom: 10px; }
+.ui-card .help { font-size: 12px; color: var(--muted); margin-top: 3px; }
+body.simple .adv { display: none !important; }
 
 /* dropdown menu */
 .menu {
@@ -207,6 +216,15 @@ td.actions { text-align: right; white-space: nowrap; }
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
 .grid2 .card h3 { margin: 0 0 2px; font-size: 13px; }
 .grid2 .card p { margin: 0 0 8px; }
+.choices { display: grid; gap: 8px; margin-top: 4px; }
+.choice { display: block; width: 100%; text-align: left; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 9px 12px; cursor: pointer; }
+.choice:hover { border-color: var(--accent); background: var(--accent-soft); }
+.choice b { display: block; font-size: 13px; }
+.choice span { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.lg-manual { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+.lg-label { font-size: 11.5px; color: var(--muted); margin: 6px 0 4px; }
+.lg-manual .row { flex-wrap: nowrap; }
+.lg-manual input[type=text] { flex: 1; min-width: 0; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; }
 
 @media (max-width: 720px) {
   body { flex-direction: column; overflow: auto; }
@@ -223,10 +241,10 @@ td.actions { text-align: right; white-space: nowrap; }
   <div class="brand"><span class="dot"></span>claude-swap</div>
   <a data-page="accounts" class="active">账号</a>
   <a data-page="auto">自动切换 <span class="pill-run" id="nav-engine"></span></a>
-  <a data-page="mappings">目录映射</a>
+  <a data-page="mappings" class="adv">目录映射</a>
   <a data-page="settings">设置</a>
-  <a data-page="data">备份与迁移</a>
-  <a data-page="about">诊断与关于</a>
+  <a data-page="data" class="adv">备份与迁移</a>
+  <a data-page="about" class="adv">诊断与关于</a>
   <div class="spacer"></div>
   <a id="theme-toggle" title="切换主题">主题：<span id="theme-name">跟随系统</span></a>
   <div class="foot" id="foot"></div>
@@ -235,16 +253,29 @@ td.actions { text-align: right; white-space: nowrap; }
 <main>
   <!-- 账号 -->
   <section class="page active" id="page-accounts">
+    <div class="seg" id="acc-view"><button data-view="cli" class="on">CLI 账号</button><button data-view="desktop">Desktop 账号</button></div>
+    <div id="view-cli">
     <div class="toolbar">
-      <button class="btn primary" data-act="add-current" title="把 Claude Code 当前登录的账号加入管理">添加登录</button>
-      <button class="btn" data-act="add-token" title="用 setup-token 或 API Key 添加">Token 添加</button>
+      <button class="btn primary" data-act="add">添加账号</button>
       <button class="btn" data-act="switch-best" title="切到剩余额度最多的账号">智能切换</button>
-      <button class="btn" data-act="switch-next" title="按顺序轮换到下一个账号">下一个</button>
-      <button class="btn" data-act="switch-avail" title="轮换到下一个，跳过已达上限的账号">跳过限额</button>
+      <button class="btn adv" data-act="switch-next" title="按顺序轮换到下一个账号">下一个</button>
+      <button class="btn adv" data-act="switch-avail" title="轮换到下一个，跳过已达上限的账号">跳过限额</button>
       <button class="btn ghost" data-act="refresh" title="立即刷新（F5）">刷新</button>
       <span class="status-line" id="snap-status"></span>
     </div>
     <div id="accounts" class="accounts"></div>
+    </div>
+    <div id="view-desktop" hidden>
+      <div class="toolbar">
+        <button class="btn primary" data-dact="add">添加账号</button>
+        <button class="btn" data-dact="launch">启动 Desktop</button>
+        <button class="btn ghost" data-dact="refresh">刷新</button>
+        <span class="status-line" id="desk-status"></span>
+      </div>
+      <p class="muted desk-hint">管理官方 Claude Desktop 的登录，与 CLI 账号互不影响。切换时会强制重启 Claude Desktop。请不要在 Desktop 中「退出登录」，那会让该账号保存的登录失效。</p>
+      <div id="desk-live"></div>
+      <div id="desk-accounts" class="accounts"></div>
+    </div>
   </section>
 
   <!-- 自动切换 -->
@@ -256,7 +287,7 @@ td.actions { text-align: right; white-space: nowrap; }
         <div class="big-state"><span class="pill-run" id="auto-dot"></span><span id="auto-state">已停止</span></div>
         <div class="grow"></div>
         <button class="btn primary" id="auto-start">启动</button>
-        <button class="btn" id="auto-dry" title="只记录将会做什么，不真正切换">演练模式启动</button>
+        <button class="btn adv" id="auto-dry" title="只记录将会做什么，不真正切换">演练模式启动</button>
         <button class="btn danger" id="auto-stop" disabled>停止</button>
       </div>
       <div class="kv" id="auto-kv"></div>
@@ -283,6 +314,10 @@ td.actions { text-align: right; white-space: nowrap; }
   <section class="page" id="page-settings">
     <h1>设置</h1>
     <p class="sub">保存在 <span class="mono" id="settings-path"></span> 。修改自动切换相关设置会自动重启正在运行的自动切换。</p>
+    <div class="card ui-card"><label class="check"><input type="checkbox" id="simple-mode"> <b>简洁模式</b></label>
+      <div class="help">只保留账号管理、自动切换和常用设置；隐藏目录映射、备份与迁移、诊断，以及进阶按钮和设置项。</div>
+      <label class="check" style="margin-top:8px"><input type="checkbox" id="tray-mode"> <b>关闭窗口时最小化到托盘</b></label>
+      <div class="help">在后台继续运行（自动切换不中断），右键托盘图标可快速切换 Desktop / CLI 账号或退出。</div></div>
     <div class="card" id="settings-list"></div>
   </section>
 
@@ -377,7 +412,7 @@ function applyTheme(t) {
 }
 let theme = store("cswap-theme") || "auto";
 applyTheme(theme);
-$("#theme-toggle").onclick = () => { theme = THEMES[(THEMES.indexOf(theme) + 1) % 3]; store("cswap-theme", theme); applyTheme(theme); };
+$("#theme-toggle").onclick = () => { theme = THEMES[(THEMES.indexOf(theme) + 1) % 3]; store("cswap-theme", theme); applyTheme(theme); setPref("theme", theme); };
 
 /* ---------------- nav ---------------- */
 function showPage(name) {
@@ -564,7 +599,7 @@ function accountCard(a, snap) {
     ${body}
     <div class="acc-foot"><span class="age" title="${esc(a.lastError || "")}">${esc(age)}</span>
       <button class="btn sm primary" data-acc="switch" ${a.isActive ? "disabled" : ""}>切换</button>
-      <button class="btn sm" data-acc="run" title="在新终端中以该账号运行 Claude Code（不影响默认登录）">终端运行</button>
+      <button class="btn sm adv" data-acc="run" title="在新终端中以该账号运行 Claude Code（不影响默认登录）">终端运行</button>
       <button class="btn sm" data-acc="more">更多 ▾</button></div></div>`;
 }
 function renderAccounts() {
@@ -572,8 +607,8 @@ function renderAccounts() {
   const box = $("#accounts");
   if (!snap.accounts.length) {
     box.innerHTML = `<div class="card empty" style="grid-column:1/-1"><h3>还没有管理任何账号</h3>
-      <p class="muted">先在 Claude Code 中登录一个账号，然后点击「添加登录」。<br>如需添加更多账号：在 Claude Code 中登录另一个账号（不要先 /logout），再次点击添加。</p>
-      <button class="btn primary" data-act="add-current">添加登录</button></div>`;
+      <p class="muted">可以通过浏览器登录、导入 Claude Code 当前登录，或使用 Token 添加。</p>
+      <button class="btn primary" data-act="add">添加账号</button></div>`;
   } else box.innerHTML = snap.accounts.map((a) => accountCard(a, snap)).join("");
   let st = snap.takenAt ? "更新于 " + new Date(snap.takenAt * 1000).toLocaleTimeString() : "";
   if (snap.error) st = "刷新失败：" + snap.error;
@@ -595,6 +630,257 @@ async function refreshSnapshot(full = false) {
   finally { S.snapPending = false; }
 }
 
+/* add account: one chooser, three ways in */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function chooseAddMethod() {
+  const m = modal(`<h3>添加账号</h3><div class="choices">
+    <button class="choice" data-way="browser"><b>浏览器登录</b><span>打开浏览器登录要添加的账号，不影响当前登录，也无需先退出</span></button>
+    <button class="choice" data-way="current"><b>添加当前 CLI 登录</b><span>导入 Claude Code 当前已登录的账号；已在管理中则刷新其凭据</span></button>
+    <button class="choice" data-way="token"><b>通过 Token 添加</b><span>setup-token（sk-ant-oat01-…）或 API Key（sk-ant-api03-…）</span></button>
+  </div><div class="btns"><button class="btn" data-x="no">取消</button></div>`);
+  $('[data-x="no"]', m.el).onclick = m.close;
+  m.el.addEventListener("click", (e) => {
+    const c = e.target.closest("[data-way]"); if (!c) return;
+    m.close();
+    if (c.dataset.way === "browser") browserLogin();
+    else if (c.dataset.way === "current") act("添加当前 CLI 登录", "add_current", [null, null], { showOutput: true });
+    else addToken();
+  });
+}
+async function addToken() {
+  const r = await form("通过 Token 添加", "setup-token 可用 claude setup-token 生成；API Key 按量计费。",
+    [{ name: "token", label: "Token", type: "password" }, { name: "email", label: "邮箱（可空，仅用于显示）" }], { yes: "添加" });
+  if (r) act("通过 Token 添加", "add_token", [r.token, r.email || null, null], { showOutput: true });
+}
+
+/* browser login: windowless `claude auth login` in a throwaway profile, then captured */
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* no clipboard in this origin */ }
+  const r = await api("copy_text", text);
+  return r.ok;
+}
+async function browserLogin() {
+  const s = await api("login_start", null);
+  if (!s.ok) return outputBox("浏览器登录 — 失败", s.output);
+  const m = modal(`<h3>浏览器登录</h3>
+    <p class="desc" id="lg-msg"><span class="spinner"></span> 已在默认浏览器打开登录页，请登录要添加的账号，完成后会自动添加。</p>
+    <div class="lg-manual">
+      <div class="lg-label">手动登录链接（浏览器没有打开，或想换个浏览器时使用）</div>
+      <div class="row"><input type="text" id="lg-url" readonly placeholder="正在获取…">
+        <button class="btn" data-x="copy" disabled>复制</button><button class="btn" data-x="open" disabled>打开</button></div>
+      <div class="lg-label">通过手动链接登录后，页面会显示授权码，粘贴到这里：</div>
+      <div class="row"><input type="text" id="lg-code" placeholder="粘贴授权码" autocomplete="off" spellcheck="false">
+        <button class="btn primary" data-x="code">提交</button></div>
+    </div>
+    <div class="btns"><button class="btn" data-x="cancel">取消</button></div>`, { wide: true });
+  const urlBox = $("#lg-url", m.el), codeBox = $("#lg-code", m.el);
+  let done = false;
+  const cancel = () => { done = true; m.close(); api("login_cancel", s.id); };
+  $('[data-x="cancel"]', m.el).onclick = cancel;
+  urlBox.onfocus = () => urlBox.select();
+  $('[data-x="copy"]', m.el).onclick = async () => {
+    if (await copyText(urlBox.value)) toast("已复制登录链接", "ok");
+    else { urlBox.focus(); toast("复制失败，请手动按 Ctrl+C", "warn"); }
+  };
+  $('[data-x="open"]', m.el).onclick = () => api("open_url", urlBox.value);
+  const submit = async () => {
+    const r = await api("login_code", s.id, codeBox.value);
+    if (!r.ok) return toast(r.output, "error");
+    codeBox.value = "";
+    $("#lg-msg", m.el).innerHTML = `<span class="spinner"></span> 已提交授权码，正在验证…`;
+  };
+  $('[data-x="code"]', m.el).onclick = submit;
+  codeBox.onkeydown = (e) => { if (e.key === "Enter") submit(); };
+  while (!done) {
+    await sleep(1000);
+    if (done) return;
+    if (!document.body.contains(m.el)) { api("login_cancel", s.id); return; } // closed by clicking outside
+    let p;
+    try { p = await api("login_poll", s.id); } catch (e) { continue; }
+    if (p.state === "waiting") {
+      if (p.url && urlBox.value !== p.url) {
+        urlBox.value = p.url;
+        $$('[data-x="copy"], [data-x="open"]', m.el).forEach((b) => (b.disabled = false));
+      }
+      continue;
+    }
+    done = true;
+    if (p.state === "gone") { m.close(); return toast("登录已取消", "warn"); }
+    if (p.state === "failed") { m.close(); return outputBox("浏览器登录 — 失败", p.output); }
+    $("#lg-msg", m.el).innerHTML = `<span class="spinner"></span> 已登录 ${esc(p.email)}，正在添加…`;
+    $$("button, input", m.el).forEach((b) => (b.disabled = true));
+    const res = await api("login_finish", s.id, null, null, false);
+    m.close();
+    if (res.ok) toast("已添加 " + p.email, "ok", "添加账号");
+    else { outputBox("添加失败", res.output); api("login_cancel", s.id); }
+    refreshSnapshot();
+  }
+}
+
+/* ---------------- view prefs: simple mode, CLI / Desktop ---------------- */
+const P = { simple: true, view: "cli", theme: "auto", tray: true };
+const ADV_PAGES = ["mappings", "data", "about"];
+function setPref(k, v) { P[k] = v; api("set_ui_pref", k, v).catch(() => {}); }
+function applySimple() {
+  document.body.classList.toggle("simple", P.simple);
+  const cur = $("nav a.active[data-page]");
+  if (P.simple && cur && ADV_PAGES.includes(cur.dataset.page)) showPage("accounts");
+}
+function setView(v) {
+  P.view = v;
+  $$("#acc-view button").forEach((b) => b.classList.toggle("on", b.dataset.view === v));
+  $("#view-cli").hidden = v !== "cli";
+  $("#view-desktop").hidden = v !== "desktop";
+  if (v === "desktop") loadDesktop();
+}
+$("#acc-view").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-view]");
+  if (b && b.dataset.view !== P.view) { setView(b.dataset.view); setPref("view", P.view); }
+});
+function desktopVisible() { return !document.hidden && P.view === "desktop" && $("#page-accounts").classList.contains("active"); }
+
+/* ---------------- Claude Desktop accounts (apart from the CLI's) ---------------- */
+const D = { state: null };
+function deskTitle(a) { return a.name || a.email || "未命名账号（" + a.uuid.slice(0, 8) + "）"; }
+async function loadDesktop() {
+  try { D.state = await api("desktop_state"); } catch (e) { return; }
+  renderDesktop();
+}
+function deskCard(a, i) {
+  const badges = [];
+  if (a.isLive) badges.push(`<span class="badge accent">当前</span>`);
+  if (a.name && a.email) badges.push(`<span class="badge">${esc(a.email)}</span>`);
+  if (a.stale) badges.push(`<span class="badge danger">登录已失效</span>`);
+  else if (!a.savedAt && !a.isLive) badges.push(`<span class="badge warn">未保存登录</span>`);
+  const age = a.savedAt ? "登录保存于 " + new Date(a.savedAt * 1000).toLocaleString() : a.isLive ? "切走时会自动保存登录" : "";
+  const canSwitch = !a.isLive && a.savedAt && !a.stale;
+  return `<div class="card acc ${a.isLive ? "active" : ""}" data-uuid="${esc(a.uuid)}">
+    <div class="acc-head"><div class="slot">${i + 1}</div>
+      <div class="acc-title"><div class="email" title="${esc(a.uuid)}">${esc(deskTitle(a))}</div><div class="badges">${badges.join("")}</div></div></div>
+    <div class="acc-foot"><span class="age">${esc(age)}</span>
+      <button class="btn sm primary" data-dacc="switch" ${canSwitch ? "" : "disabled"}>切换</button>
+      <button class="btn sm" data-dacc="rename">重命名</button>
+      <button class="btn sm" data-dacc="remove">删除</button></div></div>`;
+}
+function renderDesktop() {
+  const s = D.state; if (!s) return;
+  $("#desk-status").textContent = s.available ? (s.running ? "Desktop 运行中" : "Desktop 未运行") : "";
+  const live = $("#desk-live");
+  if (!s.available) {
+    live.innerHTML = "";
+    $("#desk-accounts").innerHTML = `<div class="card empty" style="grid-column:1/-1"><h3>没有找到 Claude Desktop</h3>
+      <p class="muted">请先安装并打开一次官方 Claude Desktop。</p></div>`;
+    return;
+  }
+  live.innerHTML = s.live && !s.live.known ? `<div class="note warn desk-live"><span>Desktop 当前登录的 ${esc(s.live.email || "账号（" + s.live.uuid.slice(0, 8) + "）")} 还没有添加。</span>
+    <button class="btn sm" data-dact="import">添加</button></div>` : "";
+  $("#desk-accounts").innerHTML = s.accounts.length ? s.accounts.map(deskCard).join("") :
+    `<div class="card empty" style="grid-column:1/-1"><h3>还没有 Desktop 账号</h3>
+      <p class="muted">可以通过浏览器登录，或导入 Desktop 当前登录的账号。</p>
+      <button class="btn primary" data-dact="add">添加账号</button></div>`;
+}
+function busyBox(text) {
+  return modal(`<h3>请稍候</h3><p class="desc"><span class="spinner"></span> ${esc(text)}</p>`);
+}
+async function deskAct(label, text, name, args, okMsg) {
+  const busy = busyBox(text);
+  let r;
+  try { r = await api(name, ...args); } finally { busy.close(); }
+  if (r.ok) { if (okMsg) toast(okMsg, "ok", label); } else outputBox(label + " — 失败", r.output);
+  loadDesktop();
+  return r;
+}
+async function nameIfUnknown(email) {
+  if (email) return null;
+  const r = await form("给这个账号起个名字", "无法自动识别这个 Desktop 账号的邮箱（它不在 CLI 账号中），起个名字方便区分。", [{ name: "name", label: "名称" }], { yes: "保存" });
+  return r && r.name ? r.name : null;
+}
+async function deskImport() {
+  const r = await deskAct("导入当前登录", "正在导入…", "desktop_import_current", [null]);
+  if (!r.ok) return;
+  const name = await nameIfUnknown(r.email);
+  if (name) await api("desktop_rename", r.uuid, name);
+  toast("已添加 " + (name || r.email || "账号"), "ok", "Desktop 账号");
+  loadDesktop();
+}
+function deskChooseAdd() {
+  const m = modal(`<h3>添加 Desktop 账号</h3><div class="choices">
+    <button class="choice" data-way="browser"><b>浏览器登录</b><span>Claude Desktop 以未登录状态重启，在 Desktop 中登录新账号（当前账号的登录会先保存）</span></button>
+    <button class="choice" data-way="current"><b>导入当前登录</b><span>添加 Claude Desktop 当前已登录的账号，不会重启</span></button>
+  </div><div class="btns"><button class="btn" data-x="no">取消</button></div>`);
+  $('[data-x="no"]', m.el).onclick = m.close;
+  m.el.addEventListener("click", (e) => {
+    const c = e.target.closest("[data-way]"); if (!c) return;
+    m.close();
+    if (c.dataset.way === "browser") deskBrowserLogin(); else deskImport();
+  });
+}
+async function deskBrowserLogin() {
+  if (!(await confirmBox("通过浏览器登录 Desktop 账号",
+    "将强制重启 Claude Desktop，并以未登录状态打开。当前账号的登录会先保存，之后可以随时切回。Desktop 中未发送的内容会丢失。",
+    { yes: "强制重启并开始", danger: true }))) return;
+  const busy = busyBox("正在重启 Claude Desktop…");
+  let s;
+  try { s = await api("desktop_login_start"); } finally { busy.close(); }
+  if (!s.ok) return outputBox("浏览器登录 — 失败", s.output);
+  const m = modal(`<h3>等待 Desktop 登录</h3>
+    <p class="desc"><span class="spinner"></span> Claude Desktop 已以未登录状态打开。请在 Desktop 中点击登录，它会打开浏览器；登录完成后这里会自动添加。</p>
+    <p class="desc warn" id="dl-run" hidden>Claude Desktop 没有在运行。 <button class="btn sm" data-x="launch">启动 Desktop</button></p>
+    <div class="btns"><button class="btn" data-x="cancel">取消并恢复原账号</button></div>`);
+  let done = false;
+  $('[data-x="launch"]', m.el).onclick = () => api("desktop_launch");
+  $('[data-x="cancel"]', m.el).onclick = async () => {
+    done = true; m.close();
+    await deskAct("取消登录", "正在恢复原账号…", "desktop_login_cancel", [], "已恢复原账号");
+  };
+  while (!done) {
+    await sleep(1500);
+    // Closing the dialog only stops watching: the sign-in is still saved on the next switch.
+    if (done || !document.body.contains(m.el)) return;
+    let p;
+    try { p = await api("desktop_login_poll"); } catch (e) { continue; }
+    if (p.state === "waiting") { $("#dl-run", m.el).hidden = p.running; continue; }
+    done = true;
+    m.close();
+    if (p.state !== "ready") return loadDesktop();
+    const name = p.known ? null : await nameIfUnknown(p.email);
+    const r = await api("desktop_login_finish", name);
+    if (r.ok) toast("已添加 " + (name || r.email || p.name || "账号"), "ok", "Desktop 账号");
+    else outputBox("添加失败", r.output);
+    loadDesktop();
+  }
+}
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-dact]");
+  if (b) {
+    const a = b.dataset.dact;
+    if (a === "refresh") return loadDesktop();
+    if (a === "add") return deskChooseAdd();
+    if (a === "import") return deskImport();
+    if (a === "launch") return deskAct("启动 Desktop", "正在启动…", "desktop_launch", []);
+    return;
+  }
+  const c = e.target.closest("[data-dacc]"); if (!c) return;
+  const uuid = c.closest("[data-uuid]").dataset.uuid;
+  const acc = D.state.accounts.find((x) => x.uuid === uuid); if (!acc) return;
+  const act = c.dataset.dacc, title = deskTitle(acc);
+  if (act === "switch") {
+    if (!(await confirmBox("切换 Claude Desktop 账号",
+      `将强制重启 Claude Desktop 并切换到 ${title}。Desktop 中未发送的内容会丢失。`,
+      { yes: "强制重启并切换", danger: true }))) return;
+    return deskAct("切换 Desktop 账号", "正在重启 Claude Desktop 并切换…", "desktop_switch", [uuid], "已切换到 " + title);
+  }
+  if (act === "rename") {
+    const r = await form("重命名", acc.email ? "留空则显示邮箱。" : "", [{ name: "name", label: "名称", value: acc.name || "" }], { yes: "保存" });
+    if (r) deskAct("重命名", "正在保存…", "desktop_rename", [uuid, r.name], "");
+    return;
+  }
+  if (act === "remove") {
+    if (!(await confirmBox("删除 Desktop 账号", `删除 ${title} 及其保存的登录？${acc.isLive ? "Desktop 当前的登录不受影响。" : "之后需要重新登录才能切回它。"}`, { yes: "删除", danger: true }))) return;
+    deskAct("删除", "正在删除…", "desktop_remove", [uuid], "已删除 " + title);
+  }
+});
+
 /* toolbar */
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-act]"); if (!b) return;
@@ -603,20 +889,7 @@ document.addEventListener("click", async (e) => {
   if (a === "switch-next") return act("切换到下一个", "switch_strategy", [null]);
   if (a === "switch-best") return act("智能切换", "switch_strategy", ["best"]);
   if (a === "switch-avail") return act("跳过限额轮换", "switch_strategy", ["next-available"]);
-  if (a === "add-current") {
-    const r = await form("添加当前登录", "把 Claude Code 当前登录的账号备份为一个受管理账号。若该账号已在管理中，会就地刷新其凭据。",
-      [{ name: "slot", label: "槽位（可空，自动分配）", type: "number", min: 1 }, { name: "alias", label: "别名（可空）", placeholder: "例如 work" }], { yes: "添加" });
-    if (!r) return;
-    if (r.slot && accByNum(r.slot) && !(await confirmBox("覆盖槽位", `槽位 ${r.slot} 已被 ${accByNum(r.slot).email} 占用，确定覆盖？`, { yes: "覆盖", danger: true }))) return;
-    return act("添加当前登录", "add_current", [r.slot || null, r.alias || null], { showOutput: true });
-  }
-  if (a === "add-token") {
-    const r = await form("通过 Token 添加", "支持 setup-token（sk-ant-oat01-…，由 claude setup-token 生成）或 API Key（sk-ant-api03-…）。",
-      [{ name: "token", label: "Token", type: "password" }, { name: "email", label: "邮箱（可空，仅用于显示）" }, { name: "slot", label: "槽位（可空）", type: "number", min: 1 }], { yes: "添加" });
-    if (!r) return;
-    if (r.slot && accByNum(r.slot) && !(await confirmBox("覆盖槽位", `槽位 ${r.slot} 已被 ${accByNum(r.slot).email} 占用，确定覆盖？`, { yes: "覆盖", danger: true }))) return;
-    return act("通过 Token 添加", "add_token", [r.token, r.email || null, r.slot || null], { showOutput: true });
-  }
+  if (a === "add") return chooseAddMethod();
 });
 
 /* per-account buttons */
@@ -810,7 +1083,8 @@ const SETTING_ZH = {
 async function loadSettings() {
   try { S.settings = await api("settings"); } catch (e) { return; }
   if (S.boot) $("#settings-path").textContent = S.boot.settingsPath;
-  $("#settings-list").innerHTML = S.settings.map((s) => {
+  const shown = P.simple ? S.settings.filter((s) => SIMPLE_SETTINGS.includes(s.key)) : S.settings;
+  $("#settings-list").innerHTML = shown.map((s) => {
     const val = s.value == null ? "" : s.value;
     let input;
     if (s.kind === "bool") input = `<select data-key="${esc(s.key)}"><option value="true" ${val === true ? "selected" : ""}>开启</option><option value="false" ${val === false ? "selected" : ""}>关闭</option></select>`;
@@ -835,6 +1109,10 @@ $("#settings-list").addEventListener("click", async (e) => {
   } else if (b.dataset.unset) await act("恢复默认", "unset_setting", [b.dataset.unset]);
   loadSettings();
 });
+
+const SIMPLE_SETTINGS = ["autoswitch.threshold", "autoswitch.weeklyThreshold", "autoswitch.strategy"];
+$("#simple-mode").onchange = (e) => { setPref("simple", e.target.checked); applySimple(); loadSettings(); };
+$("#tray-mode").onchange = (e) => setPref("tray", e.target.checked);
 
 /* ---------------- data ---------------- */
 async function loadData() {
@@ -893,12 +1171,19 @@ $("#ab-update").onclick = async () => {
   try { S.boot = await api("boot"); }
   catch (e) { document.body.innerHTML = `<pre style="padding:24px">无法连接后端：${esc(e.message || e)}</pre>`; return; }
   const b = S.boot;
+  Object.assign(P, b.prefs || {});
+  theme = P.theme; applyTheme(theme);
+  $("#simple-mode").checked = P.simple;
+  $("#tray-mode").checked = P.tray;
+  applySimple();
+  setView(P.view);
   $("#foot").innerHTML = `v${esc(b.version)}<br>${b.mode === "browser" ? "浏览器模式" : "桌面模式"}`;
   $("#about-line").innerHTML = `版本 <b>${esc(b.version)}</b> · ${esc(b.platform)} · ${b.mode === "browser" ? "浏览器模式（关闭此页约 2 分钟后后台自动退出）" : "桌面模式"}<br>数据目录：<span class="mono">${esc(b.backupDir)}</span>`;
   await refreshSnapshot();
   loadSettings();
   setInterval(() => { if (!document.hidden || engineState().running) refreshSnapshot(); }, 3000);
   setInterval(pollEvents, 2000);
+  setInterval(() => { if (desktopVisible()) loadDesktop(); }, 4000);
   setInterval(tickResets, 1000);
   if (b.mode === "browser") setInterval(() => api("ping").catch(() => {}), 5000);
 })();

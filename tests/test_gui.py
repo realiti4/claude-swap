@@ -170,5 +170,155 @@ def test_server_requires_token_and_loopback_host(api: GuiApi, monkeypatch):
     thread.join(10)
 
 
+# Runs the real `cswap add` in the child with the suite's network stubs, which
+# a subprocess would not otherwise inherit.
+_HERMETIC_CLI = (
+    "import sys\n"
+    "import claude_swap.oauth as o, claude_swap.subscription as s\n"
+    "o.fetch_oauth_profile = lambda token: None\n"
+    "s.fetch_plan = lambda *a, **k: s.PlanFetch()\n"
+    "from claude_swap.cli import main\n"
+    "sys.argv = ['cswap', *sys.argv[1:]]\n"
+    "main()\n"
+)
+
+
+def _write_login(config_dir: Path, email: str, token: str) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{token}"}})
+    )
+    creds = {
+        "claudeAiOauth": {
+            "accessToken": f"sk-ant-oat01-{token}",
+            "refreshToken": f"sk-ant-ort01-{token}",
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "scopes": ["user:inference", "user:profile"],
+        }
+    }
+    (config_dir / ".credentials.json").write_text(json.dumps(creds))
+
+
+# Stands in for `claude auth login`: prints the manual link the way the real
+# one does (inside an OSC 8 hyperlink), then signs in with the code it reads.
+_FAKE_CLAUDE = r'''
+import json, os, sys, time
+url = "https://claude.com/cai/oauth/authorize?code=true&state=s1"
+print("Opening browser to sign in...")
+print(f"If the browser didn't open, visit: \x1b]8;;{url}\x07{url}\x1b]8;;\x07", flush=True)
+code = sys.stdin.readline().strip()
+if code != "good-code":
+    print("OAuth error: invalid code", flush=True)
+    sys.exit(1)
+d = os.environ["CLAUDE_CONFIG_DIR"]
+with open(os.path.join(d, ".claude.json"), "w") as f:
+    json.dump({"oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-b"}}, f)
+with open(os.path.join(d, ".credentials.json"), "w") as f:
+    json.dump({"claudeAiOauth": {"accessToken": "sk-ant-oat01-b", "refreshToken": "sk-ant-ort01-b",
+        "expiresAt": int(time.time() * 1000) + 3600000, "scopes": ["user:inference", "user:profile"]}}, f)
+print("Login successful.", flush=True)
+'''
+
+
+@pytest.fixture
+def fake_claude(tmp_path, monkeypatch) -> None:
+    script = tmp_path / "fake_claude.py"
+    script.write_text(_FAKE_CLAUDE)
+    if sys.platform == "win32":
+        exe = tmp_path / "claude.cmd"
+        exe.write_text(f'@"{sys.executable}" "{script}" %*\r\n')
+    else:
+        exe = tmp_path / "claude"
+        exe.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        exe.chmod(0o755)
+    monkeypatch.setattr(launcher, "find_claude", lambda: str(exe))
+
+
+def _poll_until(api: GuiApi, login_id: str, *, state: str, timeout: float = 20) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = api.login_poll(login_id)
+        if result["state"] == state and (state != "waiting" or result.get("url")):
+            return result
+        time.sleep(0.1)
+    raise AssertionError(f"login never reached {state!r}: {result}")
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="slot credentials would go to the real Keychain")
+def test_browser_login_captures_staging_profile_without_touching_live_login(
+    temp_home, monkeypatch, fake_claude
+):
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    # Live login: account A, managed as slot 1.
+    (temp_home / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-a"}})
+    )
+    _write_login(temp_home / ".claude", "unused@example.com", "a")
+    (temp_home / ".claude" / ".claude.json").unlink()
+    switcher = ClaudeAccountSwitcher()
+    switcher.add_account()
+    assert switcher.current_account_number() == "1"
+
+    api = GuiApi(switcher, mode="webview")
+    monkeypatch.setattr(launcher, "cli_capture_command", lambda: [sys.executable, "-c", _HERMETIC_CLI])
+
+    started = api.login_start()
+    assert started["ok"], started["output"]
+    login_id = started["id"]
+    staging = api._staging_dir(login_id)
+    waiting = _poll_until(api, login_id, state="waiting")
+    assert waiting["url"] == "https://claude.com/cai/oauth/authorize?code=true&state=s1"
+
+    assert not api.login_code(login_id, "two words")["ok"]
+    assert api.login_code(login_id, "good-code")["ok"]
+    assert _poll_until(api, login_id, state="ready") == {"state": "ready", "email": "b@example.com"}
+
+    result = api.login_finish(login_id, alias="work")
+    assert result["ok"], result["output"]
+
+    seq = json.loads(switcher.sequence_file.read_text())
+    emails = {num: acc["email"] for num, acc in seq["accounts"].items()}
+    assert emails == {"1": "a@example.com", "2": "b@example.com"}
+    assert seq["accounts"]["2"].get("alias") == "work"
+    # The live login never moved, and the record says so.
+    assert seq["activeAccountNumber"] == 1
+    assert switcher.current_account_number() == "1"
+    assert "sk-ant-oat01-b" in switcher.read_account_credentials("2", "b@example.com")
+    assert not staging.exists()
+    assert api.login_poll(login_id) == {"state": "gone"}
+
+
+def test_browser_login_reports_a_rejected_code(api: GuiApi, fake_claude):
+    login_id = api.login_start()["id"]
+    _poll_until(api, login_id, state="waiting")
+    assert api.login_code(login_id, "wrong")["ok"]
+    failed = _poll_until(api, login_id, state="failed")
+    assert "invalid code" in failed["output"]
+    assert not api._staging_dir(login_id).exists()
+
+
+def test_browser_login_cancel_stops_the_login(api: GuiApi, fake_claude):
+    login_id = api.login_start()["id"]
+    _poll_until(api, login_id, state="waiting")
+    proc = api._logins[login_id].proc
+    api.login_cancel(login_id)
+    assert proc.poll() is not None
+    assert not api._staging_dir(login_id).exists()
+    assert api.login_poll(login_id) == {"state": "gone"}
+    assert not api.login_code(login_id, "good-code")["ok"]
+
+
+def test_browser_login_without_claude(api: GuiApi, monkeypatch):
+    monkeypatch.setattr(launcher, "find_claude", lambda: None)
+    assert not api.login_start()["ok"]
+
+
+def test_login_ids_cannot_escape_the_staging_root(api: GuiApi):
+    for bad in ("../x", "..\\x", "1-abc", "", "1700000000-abcdef12/../../x"):
+        with pytest.raises(ValueError):
+            api._staging_dir(bad)
+
+
 def test_releases_constants_point_at_this_fork():
     assert "xutianhao6/claude-swap-desktop" in gui_api.RELEASES_API

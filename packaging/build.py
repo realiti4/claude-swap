@@ -14,6 +14,7 @@ Artifacts land in build/release/.
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
@@ -61,7 +62,11 @@ def windows(ver: str, installer: bool) -> list[Path]:
             if f.is_file():
                 zf.write(f, Path("claude-swap") / f.relative_to(app))
     if installer:
-        iscc = shutil.which("iscc") or r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+        candidates = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Inno Setup 6/ISCC.exe",  # per-user install
+            Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
+        ]
+        iscc = shutil.which("iscc") or next((str(p) for p in candidates if p.exists()), "ISCC.exe")
         subprocess.run(
             [
                 iscc, f"/DAppVersion={ver}", f"/DSourceDir={app}", f"/DOutputDir={RELEASE}",

@@ -171,6 +171,10 @@ class TestPlanLabel:
             "default_claude_pro"
         )
 
+    def test_pro_organization_wins_over_the_shared_free_tier(self):
+        plan = {"tier": "default_claude_ai", "organizationType": "claude_pro"}
+        assert subscription.plan_label(plan) == "Pro"
+
     def test_unknown_organization_type_falls_through_to_the_tier(self):
         plan = {"tier": "default_claude_max_20x", "organizationType": "claude_max"}
         assert subscription.plan_label(plan) == "Max 20x"

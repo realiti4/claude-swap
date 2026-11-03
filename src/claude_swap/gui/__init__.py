@@ -15,6 +15,7 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import traceback
 from importlib import resources
 from pathlib import Path
@@ -77,12 +78,48 @@ def _run_webview(api, page: str) -> bool:
     )
     if api is not None:
         api._attach_window(window)
+    tray = None
+    quitting = threading.Event()
+
+    def show() -> None:
+        window.show()
+        window.restore()
+
+    if api is not None:
+        api._show_window = show
+
+    def quit_app() -> None:
+        quitting.set()
+        window.destroy()
+
+    def on_closing():
+        # Close hides to the tray (when it runs and the user keeps it on);
+        # the tray's own quit really closes.
+        if tray is None or quitting.is_set() or not api.ui_prefs().get("tray", True):
+            return True
+        # Hide once the close has been cancelled, not from inside it.
+        threading.Thread(target=window.hide, daemon=True).start()
+        if not tray.hinted:
+            tray.hinted = True
+            tray.notify("claude-swap 仍在后台运行", "右键托盘图标可快速切换账号或退出。")
+        return False
+
+    def after_start() -> None:
+        nonlocal tray
+        if api is not None:
+            from claude_swap.gui.tray import start_tray
+
+            tray = start_tray(api, show, quit_app)
+
+    window.events.closing += on_closing
     try:
-        webview.start(private_mode=True)
+        webview.start(after_start, private_mode=True)
     except Exception:
         traceback.print_exc()
         return False
     finally:
+        if tray is not None:
+            tray.stop()
         if api is not None:
             api.shutdown()
     return True
@@ -107,7 +144,11 @@ def main(argv: list[str] | None = None) -> int:
 
     page = _page()
     if not force_browser:
+        from claude_swap.gui import single
+
         api = GuiApi(switcher, mode="webview")
+        if not single.claim(switcher.backup_dir, lambda: api._show_window()):
+            return 0  # the running window was brought forward
         if _run_webview(api, page.replace("__CSWAP_TOKEN__", "")):
             return 0
         mode = "browser"
