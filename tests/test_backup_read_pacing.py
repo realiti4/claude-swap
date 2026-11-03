@@ -167,7 +167,8 @@ class TestBackupReadCooldown:
         assert keychain.backup_calls(2) == 1
 
     def test_a_cooldown_is_announced_once_and_its_skips_are_silent(
-        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog
+        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog,
+        monkeypatch,
     ):
         """Skipped reads are expected, not failures: no per-lookup warning
         (31 per snapshot at 11 accounts, ~600/min on the 3 s tick), one info
@@ -193,8 +194,11 @@ class TestBackupReadCooldown:
             assert len(announced) == 1, "one announcement per cooldown"
 
             # The cooldown lapses, the re-probe fails again: a new cooldown,
-            # announced again — once.
-            s._store._keychain_disabled_until = time.monotonic() - 1
+            # announced again, once. The clock advances rather than the
+            # deadline rewinding: on a coarse tick (Windows, 15.6 ms) a rewound
+            # deadline lets both cooldowns start in one tick, equal floats.
+            real = time.monotonic
+            monkeypatch.setattr(time, "monotonic", lambda: real() + 61)
             s.accounts_snapshot(fetch=set())
             s.accounts_snapshot(fetch=set())
             announced = [
