@@ -124,6 +124,10 @@ class ResumeSettings:
     # automatically: the plan may have changed (the same 24h line Claude
     # Code's built-in auto-continue draws). 0 = no cap.
     max_wait_hours: float = 24.0
+    # `cswap auto` leaves the active account as soon as a session reports it
+    # stopped on that account's limit, without waiting for the usage endpoint
+    # to confirm (it is often what's failing when this matters).
+    switch_on_stop: bool = True
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -247,6 +251,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "resume", "maxWaitHours", "max_wait_hours", "float", 0.0, 720.0,
             help="Hold (don't auto-continue) sessions stopped longer ago than this; 0 = no cap",
+        ),
+        SettingSpec(
+            "resume", "switchOnStop", "switch_on_stop", "bool",
+            help="cswap auto leaves an account the moment a session stops on its limit",
         ),
     )
 }

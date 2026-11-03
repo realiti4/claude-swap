@@ -320,6 +320,53 @@ Things to know:
   stopped on the same limit don't all start in the same second. It then
   re-checks that nobody typed in the meantime.
 
+### 4.6b Stops drive `cswap auto` (`resume.switchOnStop`)
+
+The waiter never switches, but `cswap auto` reads the same records.
+`resume.limit_stops()` returns the limits Claude Code itself reported, newest
+first, and the engine acts on them at the top of each tick, before any usage
+collection:
+
+| Filter (in `limit_stops`) | Why |
+|---|---|
+| `state == waiting` only | a session that carried on, or was continued, says nothing about the account now |
+| not `rehearsal`, default profile only | rehearsal stops are fakes; `cswap run` profiles are pinned to one account |
+| `resetsAt` still in the future (5 h trust when it isn't recorded) | the limit lifts at its own reset |
+
+The engine (`_active_limit_stop`) then takes the newest stop whose identity is
+the active account and whose `stalledAt` is later than `lastSwitchAt + 60 s`
+(`SWITCH_SETTLE_S`). An earlier stop belongs to the account it already left.
+One inside the window may come from a session still on the old token: Windows
+and Linux sessions re-read the credentials file on change, and macOS caches
+the Keychain for ~30 s. Given such a stop:
+
+- It skips usage collection and pre-warm. It decides on
+  `usage_entries_by_account(fetch=set())`, the store as it stands, with no
+  network call before `_freshen_target`.
+- The trigger is `at-limit`, whatever the stale reading says: no cooldown, no
+  unhealthy-tick counting, and escape ranking.
+- If ranking finds nothing (no candidate readable), `_unmeasured_escape`
+  returns unreadable candidates in sequence order, minus any account another
+  live stop names. This comes before API-key fallback, since those cost
+  money. `priority-consume-first` keeps its own freshness rule, so there the
+  blind landing usually holds.
+- The departure is recorded as `leftHeadroom: 0` and
+  `leftRecoveryAt: <reported resetsAt>`, so the no-return bar releases at the
+  real reset.
+- The decision goes to `claude-swap.log`:
+  `Session <id> stopped on account <n>'s <type> limit; leaving it now`.
+
+Known gap: `lastSwitchAt` is written only by engine switches. After a manual
+`cswap switch` onto an account that a live stop still names (before its
+reset), the engine leaves it again on the next tick.
+
+A tick slower than `SLOW_TICK_S` (120 s) logs
+`Auto-switch tick took <n>s (stalled?)`. On 2026-11-03 the S4U daemon
+printed nothing from 07:11 to 07:33 while the machine was awake (no sleep in
+the System log). Its next line still named the pre-07:27 account. Every
+network call and lock in the tick path has a timeout, so the cause is still
+open, and this warning is how the next one gets caught.
+
 ### 4.7 Loop guard
 
 - When a new stop follows one of our continues with **no** real output and
@@ -628,10 +675,12 @@ Consequences:
 
 ### Roadmap (by impact)
 
-1. **Instant switch on a limit stop.** The hook could touch a "tick now" flag
-   that the `cswap auto` loop watches, so it switches right away instead of
-   waiting for the next poll (up to 15 s). Stops still happen today when a
-   burst outruns the poll.
+1. **Switch from the hook itself.** Since 2026-11-03 a stop makes the loop
+   switch on its next tick (§4.6b). That still depends on the loop ticking:
+   a stalled daemon (the 22-minute silence in §4.6b) can't act. The waiter
+   could run one engine tick itself when the stop names the live account.
+   It would need a guard against double switches with the loop: `_perform`
+   would re-check `current` under the state lock.
 2. **"Use it or lose it" strategy.** Among candidates with headroom, prefer
    the account whose window resets soonest, since its unused quota is lost at
    reset anyway. Today's only strategy, `best`, picks the most headroom.

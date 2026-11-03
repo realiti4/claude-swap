@@ -90,6 +90,7 @@ include = [
     "src/claude_swap/resume.py",
     "src/claude_swap/resume_cli.py",
     "src/claude_swap/transcript.py",
+    "tests/test_autoswitch_limit_stop.py",
     "tests/test_hooks.py",
     "tests/test_inbox.py",
     "tests/test_notifications.py",

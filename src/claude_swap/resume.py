@@ -83,6 +83,12 @@ ARM_GRACE_S = 120.0
 # turn keeps going; after a waiter saw the session moving, don't spawn
 # another for this long unless the transcript really shows a stop.
 RESPAWN_DAMPING_S = 60.0
+# A stop logged this soon after `cswap auto` switched may still be the old
+# account's: a running session picks new credentials up on its next request,
+# and macOS caches them for ~30 s.
+SWITCH_SETTLE_S = 60.0
+# How long a stop with no recorded reset counts (one five-hour window).
+UNTIMED_STOP_TRUST_S = 5 * 3600.0
 
 WAITING = "waiting"
 RESUMED = "resumed"
@@ -237,6 +243,65 @@ def list_records(backup_root: Path) -> list[ResumeRecord]:
         if record is not None:
             records.append(record)
     return records
+
+
+@dataclass(frozen=True)
+class LimitStop:
+    """A usage limit Claude Code reported for an account: a session on it is
+    stopped right now, and the limit's own reset hasn't passed."""
+
+    session_id: str
+    identity: tuple[str, str]
+    stalled_at: float
+    resets_at: float | None
+    limit_type: str | None
+
+
+def limit_stops(backup_root: Path, clock: Callable[[], float] = time.time) -> list[LimitStop]:
+    """Limits Claude Code itself reported, newest first, for ``cswap auto``.
+
+    A stop is first-hand proof an account is spent, even while the usage
+    endpoint can't be reached. Only sessions still stopped count (one that
+    carried on, or was continued, says nothing about the account now), only
+    on the default profile (the only one account switches apply to), and
+    only until the limit's own reset. Rehearsal stops are fakes. Empty when
+    ``resume.switchOnStop`` is off.
+
+    ``clock`` is read only when there is a stop to judge, so an engine tick
+    with none reads its clock exactly as it would without this check.
+    """
+    if not load_resume_settings(backup_root).switch_on_stop:
+        return []
+    stops = []
+    now: float | None = None
+    for record in list_records(backup_root):
+        identity = record.identity
+        if (
+            record.state != WAITING
+            or record.rehearsal
+            or not record.default_profile
+            or identity is None
+            or record.stalled_at is None
+        ):
+            continue
+        if now is None:
+            now = clock()
+        if record.resets_at is not None:
+            if record.resets_at <= now:
+                continue
+        elif now - record.stalled_at > UNTIMED_STOP_TRUST_S:
+            continue
+        stops.append(
+            LimitStop(
+                session_id=record.session_id,
+                identity=identity,
+                stalled_at=record.stalled_at,
+                resets_at=record.resets_at,
+                limit_type=record.limit_type,
+            )
+        )
+    stops.sort(key=lambda stop: stop.stalled_at, reverse=True)
+    return stops
 
 
 def _records_lock(backup_root: Path) -> FileLock:

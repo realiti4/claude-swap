@@ -60,6 +60,7 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap.resume import SWITCH_SETTLE_S, LimitStop, limit_stops
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import (
@@ -116,6 +117,12 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# A tick normally takes seconds (network-bound ones under a minute). One this
+# slow is logged, so a stalled engine shows up in claude-swap.log: on
+# 2026-11-03 the daemon printed nothing for 22 minutes while the machine was
+# awake, and the console log alone could not say why.
+SLOW_TICK_S = 120.0
 
 # Margin on the reset axis for the no-return bar's release
 # (`_left_account_recovered`): the account we left counts as recovered only
@@ -971,6 +978,7 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        started = time.monotonic()
         try:
             outcome = self._tick_inner()
             self._persist_health_counters(self._health_account)
@@ -983,6 +991,10 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             return TickOutcome.ERROR
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed > SLOW_TICK_S:
+                _logger.warning("Auto-switch tick took %.0fs (stalled?)", elapsed)
 
     def _resolve_thresholds(
         self, settings: AutoSwitchSettings | None = None,
@@ -1188,12 +1200,24 @@ class AutoSwitchEngine:
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
-        entries, usage, headroom = self._collect_scheduled_usage(
-            current,
-            quarantined,
-            threshold=thresholds[current],
-            weekly_threshold=settings.weekly_threshold,
-        )
+        # A session that stopped on the active account's limit (auto-continue
+        # records it) is first-hand proof the account is spent. Decide on what
+        # the usage store already holds instead of waiting on the endpoint,
+        # which is often what's failing when this matters (2026-11-03: three
+        # sessions stopped in a network glitch, the switch landed 80 s later).
+        stops = self._limit_stops()
+        limit_stop = self._active_limit_stop(current, state, stops)
+        if limit_stop is None:
+            entries, usage, headroom = self._collect_scheduled_usage(
+                current,
+                quarantined,
+                threshold=thresholds[current],
+                weekly_threshold=settings.weekly_threshold,
+            )
+        else:
+            entries = self.switcher.usage_entries_by_account(fetch=set())
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            headroom = _headroom_by_account(usage, self._models)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1221,7 +1245,11 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (settings.pre_warm_reserves or settings.pre_warm_active) and not self.dry_run:
+        if (
+            (settings.pre_warm_reserves or settings.pre_warm_active)
+            and not self.dry_run
+            and limit_stop is None
+        ):
             self._prewarm_idle_accounts(current, quarantined, usage)
 
         if (
@@ -1238,7 +1266,16 @@ class AutoSwitchEngine:
 
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
-        if active_headroom is not None:
+        if limit_stop is not None:
+            # Whatever the endpoint reads (stale, lagging or unreachable).
+            _logger.info(
+                "Session %s stopped on account %s's %s limit; leaving it now",
+                limit_stop.session_id[:8],
+                current,
+                limit_stop.limit_type or "usage",
+            )
+            trigger = "at-limit"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             # Each window against its OWN line, the closest one decides (see
@@ -1514,6 +1551,8 @@ class AutoSwitchEngine:
         priority_active_ready = priority_mode and current in switchable and self._priority_ready(
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
+        if not ordered and limit_stop is not None:
+            ordered = self._unmeasured_escape(oauth_candidates, headroom, stops)
         if (
             not ordered and api_key_candidates
             and trigger not in ("consume-first", "priority")
@@ -1629,6 +1668,9 @@ class AutoSwitchEngine:
                 scale=settings.threshold,
             ),
         )
+        if limit_stop is not None:
+            # Spent by Claude Code's own report, until the reset it reported.
+            left_snapshot = (0.0, limit_stop.resets_at or left_snapshot[1])
         transient_failure = False
         systemic = ""
         for num in ordered:
@@ -2705,6 +2747,46 @@ class AutoSwitchEngine:
                     state.setdefault("preWarm", {})[n] = entry
 
                 self._mutate_state(record_failure)
+
+    def _limit_stops(self) -> list[LimitStop]:
+        """Limits Claude Code reported (``resume.limit_stops``); never fails
+        a tick."""
+        try:
+            return limit_stops(self.switcher.backup_dir, self.clock)
+        except Exception as e:
+            _logger.debug("Reading limit stops failed (%s): %s", type(e).__name__, e)
+            return []
+
+    def _active_limit_stop(
+        self, current: str, state: dict, stops: list[LimitStop]
+    ) -> LimitStop | None:
+        """The newest stop reported for the active account since our last
+        switch settled, if any. Older ones were the account we already left;
+        ones inside the settle window may be a session still on its token."""
+        last = state.get("lastSwitchAt")
+        settled = (float(last) if isinstance(last, (int, float)) else 0.0) + SWITCH_SETTLE_S
+        for stop in stops:
+            if stop.stalled_at <= settled:
+                continue
+            if self.switcher.account_number_for_identity(*stop.identity) == current:
+                return stop
+        return None
+
+    def _unmeasured_escape(
+        self,
+        candidates: list[str],
+        headroom: dict[str, float | None],
+        stops: list[LimitStop],
+    ) -> list[str]:
+        """Candidates whose usage can't be read and that no session reported
+        limited, in sequence order. With the active account known spent and
+        nothing measurable (the endpoint is down), an account that may have
+        room beats one that has none. A wrong guess costs one more stop,
+        which names that account in turn."""
+        limited = {
+            self.switcher.account_number_for_identity(*stop.identity) for stop in stops
+        }
+        return [n for n in candidates if headroom.get(n) is None and n not in limited]
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

@@ -142,6 +142,29 @@ any work, that counts as consecutive. After `resume.maxConsecutive` (default 3)
 in a row, claude-swap stops and sends a notification instead of retrying
 forever. A prompt you type yourself resets the count.
 
+### A stop makes `cswap auto` switch at once
+
+A session stopping on a limit is first-hand proof that the account is spent.
+So `cswap auto` doesn't wait for the usage endpoint to agree. On its next
+tick (within `autoswitch.intervalSeconds`, 15 s on this machine) it leaves
+the account:
+
+- It decides on the usage it already has stored and makes no usage calls
+  first. In a network glitch, the endpoint is exactly what fails. Before this
+  change, unreadable usage meant three "usage unknown" ticks and then waiting
+  for a candidate to become readable again (found live on 2026-11-03: the
+  switch landed 80 s after three sessions stopped).
+- It picks the best account it can measure. If none is measurable, it picks
+  the first account in rotation that no session has reported limited. A
+  wrong guess costs one more stop, which names that account in turn.
+- Then the waiters continue the stopped sessions as usual (`account-switched`).
+
+It ignores stops from sessions that already carried on, from `cswap run`
+profiles, from rehearsals, and stops logged up to 60 s after `cswap auto`'s
+own last switch (a running session can still be on the old account's token
+that long). This needs the `cswap auto` loop and the auto-continue hook.
+Turn it off with `cswap config set resume.switchOnStop false`.
+
 ---
 
 ## Commands
@@ -178,6 +201,7 @@ by a waiter.
 | `resume.notify` | `true` | desktop notification when a session is continued, held, or given up on |
 | `resume.enabled` | `true` | the master switch; `cswap resume off`/`on` set it |
 | `resume.maxWaitHours` | `24` | hold sessions stopped longer ago than this (0 = no cap) |
+| `resume.switchOnStop` | `true` | `cswap auto` leaves an account the moment a session stops on its limit |
 
 ```bash
 cswap config set resume.slackSeconds 300
