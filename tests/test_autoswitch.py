@@ -1687,6 +1687,27 @@ class TestAdaptiveScheduler:
         assert "2" not in counts
         assert counts["3"] >= 1
 
+    def test_disabled_account_polled_after_switchable_candidates_without_escalating(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        h.switcher.set_account_disabled("3", True)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        # t0: switchable candidate 2 takes priority for the alternate slot.
+        self._tick(h, counts, usage)
+        assert counts == {"1": 1, "2": 1}
+        # t60: candidate 2 is not due yet, so disabled account 3 is polled
+        # for store-only display surfaces (menu bar, TUI auto screen).
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        # Escalation only refreshes switchable candidates, never disabled ones.
+        h.clock.advance(360)
+        usage["1"] = _usage(80)
+        self._tick(h, counts, usage)
+        assert counts == {"1": 2, "2": 2, "3": 1}
+
     def test_expired_active_enters_idle_hold_even_during_backoff(
         self, temp_home, monkeypatch
     ):
