@@ -49,6 +49,7 @@ def make_entry(
     age_s: float = 5.0,
     scoped: list[tuple[str, float]] | None = None,
     spend: dict | None = None,
+    reset7_s: float = 86400 * 3,
 ) -> UsageEntry:
     """``pct5``/``pct7`` of None omit that window (e.g. annual plans lack 7d)."""
     if sentinel is not None:
@@ -57,7 +58,7 @@ def make_entry(
     if pct5 is not None:
         last_good["five_hour"] = {"pct": pct5, "resets_at": _iso_in(7200)}
     if pct7 is not None:
-        last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(86400 * 3)}
+        last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(reset7_s)}
     if scoped is not None:
         last_good["scoped"] = [
             {"name": name, "pct": pct, "resets_at": _iso_in(86400 * 2)}
@@ -1860,6 +1861,117 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
+
+    @staticmethod
+    def _reset_fleet() -> list:
+        """#2 has the most room but resets last; #3 resets soonest with room;
+        #4 resets soonest of all but is over the 90% threshold."""
+        h = 3600
+        return [
+            make_account(1, active=True, entry=make_entry(20.0, 20.0)),
+            make_account(2, entry=make_entry(5.0, 10.0, reset7_s=96 * h + 600)),
+            make_account(3, entry=make_entry(5.0, 50.0, reset7_s=26 * h + 600)),
+            make_account(4, entry=make_entry(5.0, 95.0, reset7_s=12 * h + 600)),
+        ]
+
+    @staticmethod
+    def _candidates(screen) -> str:
+        from textual.widgets import Static
+
+        return screen.query_one("#candidates", Static).render().plain
+
+    @staticmethod
+    def _order(plain: str, *numbers: int) -> list[int]:
+        return sorted(numbers, key=lambda n: plain.index(f"user{n}@example.com"))
+
+    async def test_consume_first_ranks_candidates_by_soonest_weekly_reset(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "consume-first"},
+        }))
+        app = make_app(FakeSwitcher(self._reset_fleet(), tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app.screen)
+            assert "Next (soonest weekly reset)" in plain
+            # soonest reset among accounts with room first; over-threshold last
+            assert self._order(plain, 2, 3, 4) == [3, 2, 4]
+            assert "50% used · resets 1d 2h" in plain
+
+    @pytest.mark.parametrize("strategy", ["weekly-first", "consume-first"])
+    async def test_strategy_cycle_reorders_candidates_immediately(
+        self, tmp_path, fake_engine, strategy
+    ):
+        app = make_app(FakeSwitcher(self._reset_fleet(), tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            screen = app.screen
+            before = self._candidates(screen)
+            assert "Next best" in before and "resets" not in before
+            assert self._order(before, 2, 3, 4) == [2, 3, 4]
+            # no new snapshot in between: the key itself redraws
+            await self._cycle_to(pilot, screen, strategy)
+            after = self._candidates(screen)
+            assert "Next (soonest weekly reset)" in after
+            assert self._order(after, 2, 3, 4) == [3, 2, 4]
+            await self._cycle_to(pilot, screen, "best")
+            assert self._order(self._candidates(screen), 2, 3, 4) == [2, 3, 4]
+
+    async def test_priority_strategy_ranks_by_priority_then_reset(
+        self, tmp_path, fake_engine
+    ):
+        from claude_swap.models import AccountPolicy
+
+        h = 3600
+        fleet = [
+            *self._reset_fleet(),
+            # middling room and reset, but the only priority-1 account
+            dataclasses.replace(
+                make_account(5, entry=make_entry(5.0, 70.0, reset7_s=72 * h + 600)),
+                policy=AccountPolicy(priority=1),
+            ),
+        ]
+        # #4 is over its line: priority never lifts it above an eligible one
+        fleet[3] = dataclasses.replace(fleet[3], policy=AccountPolicy(priority=5))
+        app = make_app(FakeSwitcher(fleet, tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            screen = app.screen
+            assert self._order(self._candidates(screen), 2, 3, 4, 5) == [2, 3, 5, 4]
+            await self._cycle_to(pilot, screen, "consume-first")
+            assert self._order(self._candidates(screen), 2, 3, 4, 5) == [3, 5, 2, 4]
+            await self._cycle_to(pilot, screen, "priority-consume-first")
+            plain = self._candidates(screen)
+            assert "Next (priority, then soonest weekly reset)" in plain
+            assert self._order(plain, 2, 3, 4, 5) == [5, 3, 2, 4]
+            assert "priority 1 · resets 3d" in plain
+
+    async def test_consume_first_tiering_follows_the_session_threshold(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "consume-first", "threshold": 94.0},
+        }))
+        app = make_app(FakeSwitcher(self._reset_fleet(), tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            screen = app.screen
+            # 94%: #4 (95% used) is over the line, so it ranks last
+            assert self._order(self._candidates(screen), 2, 3, 4) == [3, 2, 4]
+            await pilot.press("t", "right", "right", "enter")
+            await pilot.pause()
+            # 96%: #4 has room again and resets soonest of all
+            assert self._order(self._candidates(screen), 2, 3, 4) == [4, 3, 2]
 
 
 class TestEventText:

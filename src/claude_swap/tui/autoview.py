@@ -14,6 +14,8 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -28,6 +30,7 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _seven_day_reset_ts,
     pct_label,
 )
 from claude_swap.exceptions import ConfigError
@@ -145,9 +148,7 @@ class AutoScreen(Screen):
     def _on_theme_change(self, _theme: str) -> None:
         self._update_summary()
         self._update_badge()
-        snap = self.app.snapshot
-        if snap is not None:
-            self._on_snapshot(snap)
+        self._refresh_candidates()
 
     def action_back(self) -> None:
         if self._adjusting:
@@ -250,6 +251,7 @@ class AutoScreen(Screen):
             self._engine.apply_strategy(nxt)
             self._engine.wake()
         self._update_summary()
+        self._refresh_candidates()
         self._note(f"— strategy → {nxt} for this session —")
 
     def action_save_defaults(self) -> None:
@@ -392,32 +394,56 @@ class AutoScreen(Screen):
             self._candidates_text(snap, active_number=snap.active_number)
         )
 
+    def _refresh_candidates(self) -> None:
+        """Redraw from the current snapshot after a strategy/threshold/theme
+        change, without waiting for the next usage refresh."""
+        self._on_snapshot(self.app.snapshot)
+
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by headroom against their own switch lines
-        (best first) — the engine's own ordering."""
-        # Same window set AND the same lines as the engine: autoswitch.model,
-        # each account's own line (its policy threshold, else the session
-        # threshold — `_settings` is what `_set_threshold` replaces), the
-        # weekly line, and the session threshold as the ruler every account is
-        # scored on, so the displayed ranking can never disagree with the
-        # account it picks.
+        """Switch targets in the order the session strategy ranks them.
+
+        Same window set AND the same lines as the engine: autoswitch.model,
+        each account's own line (its policy threshold, else the session
+        threshold — `_settings` is what `_set_threshold` replaces), the weekly
+        line, and the session threshold as the ruler every account is scored
+        on. Then the engine's key for the session strategy, so the list never
+        contradicts the account it picks:
+
+        - ``best``: most policy headroom.
+        - ``weekly-first`` / ``consume-first``: soonest weekly reset among
+          accounts under their lines (ties to most policy headroom).
+        - ``priority-consume-first``: highest account priority, then soonest
+          weekly reset, among accounts under their lines.
+
+        Accounts over their lines follow (the engine will not land on them
+        proactively), by policy headroom; unread rows last. It is the
+        strategy's order, not the engine's next move — anti-flap, cooldown and
+        consume-first's "only for a sooner reset" gates still apply on top.
+        """
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
-        ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
+        strategy = settings.strategy if settings else "best"
+        by_reset = strategy in ("weekly-first", "consume-first")
+        by_priority = strategy == "priority-consume-first"
+        now = time.time()
+        # (tier, primary, secondary) ascending: tier 0 the strategy's own
+        # order, 1 over-line, 2 unread (sentinels ahead of plain unknowns).
+        ranked: list[tuple[tuple[int, float, float], str]] = []
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
+            last_good = acc.usage.last_good
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
             )
             binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models),
+                oauth.relevant_windows(last_good, models),
                 line,
                 weekly,
                 scale=threshold,
@@ -429,10 +455,10 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
+                key = (2, 0.0, 998.0)
             elif binding is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
+                key = (2, 0.0, 999.0)
             else:
                 # The raw pct of the window that binds, and — only once the
                 # lines differ, globally or for this account — the line it is
@@ -445,14 +471,40 @@ class AutoScreen(Screen):
                     entry.append(
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
-                ranked.append((-binding.line_headroom, acc.number))
+                if by_priority and acc.policy.priority:
+                    entry.append(
+                        f" · priority {acc.policy.priority}", style=palette.muted
+                    )
+                if by_reset or by_priority:
+                    reset = data.window_reset_text(last_good, "seven_day", now)
+                    if reset:
+                        entry.append(f" · {reset}", style=palette.muted)
+                lh = binding.line_headroom
+                if binding.over and (by_reset or by_priority):
+                    key = (1, -lh, 0.0)
+                elif by_reset or by_priority:
+                    reset_ts = _seven_day_reset_ts(last_good, now)
+                    soonest = math.inf if reset_ts is None else reset_ts
+                    key = (
+                        (0, -acc.policy.priority, soonest)
+                        if by_priority
+                        else (0, soonest, -lh)
+                    )
+                else:
+                    key = (0, -lh, 0.0)
+            ranked.append((key, acc.number))
             lines[acc.number] = entry
 
         text = Text()
-        text.append("Next best", style=palette.muted)
+        heading = {
+            "weekly-first": "Next (soonest weekly reset)",
+            "consume-first": "Next (soonest weekly reset)",
+            "priority-consume-first": "Next (priority, then soonest weekly reset)",
+        }.get(strategy, "Next best")
+        text.append(heading, style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
+        for _key, number in sorted(ranked):
             text.append(lines[number])
         return text
