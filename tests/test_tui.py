@@ -22,6 +22,7 @@ import pytest
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.settings import AUTOSWITCH_STRATEGIES
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import UsageEntry
@@ -1366,6 +1367,7 @@ class _FakeEngine:
         self.dry_run = dry_run
         self.stopped = False
         self.applied_thresholds: list[float] = []
+        self.applied_strategies: list[str] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1382,6 +1384,10 @@ class _FakeEngine:
     def apply_threshold(self, threshold: float) -> None:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
+
+    def apply_strategy(self, strategy: str) -> None:
+        self.settings = dataclasses.replace(self.settings, strategy=strategy)
+        self.applied_strategies.append(strategy)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -1546,6 +1552,160 @@ class TestAutoScreen:
             screen.action_threshold_step(-60.0)
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
+
+    # -- strategy cycle (s) and save-as-defaults (d) ---------------------
+
+    @staticmethod
+    def _summary(screen) -> str:
+        from textual.widgets import Static
+
+        return screen.query_one("#auto-summary", Static).render().plain
+
+    @staticmethod
+    async def _cycle_to(pilot, screen, strategy: str) -> None:
+        for _ in AUTOSWITCH_STRATEGIES:
+            if screen._settings.strategy == strategy:
+                return
+            await pilot.press("s")
+            await pilot.pause()
+        raise AssertionError(f"{strategy!r} is not in the strategy cycle")
+
+    @staticmethod
+    def _log(screen) -> str:
+        from textual.widgets import RichLog
+
+        log = screen.query_one("#event-log", RichLog)
+        return "\n".join(line.text for line in log.lines)
+
+    async def test_strategy_cycle_is_session_only(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            engine = fake_engine.instances[0]
+            choices = AUTOSWITCH_STRATEGIES
+            assert choices[0] == "best" and len(choices) >= 2
+            assert "strategy best ·" in self._summary(screen)
+            await pilot.press("s")
+            await pilot.pause()
+            nxt = choices[1]
+            assert screen._settings.strategy == nxt
+            assert engine.applied_strategies == [nxt]
+            assert engine.wakes == 1  # decide under the new strategy now
+            assert f"strategy {nxt} (session)" in self._summary(screen)
+            assert f"strategy → {nxt} for this session" in self._log(screen)
+            assert not (tmp_path / "settings.json").exists()
+            # walks every strategy in spec order, then wraps; matching the
+            # file value again drops the (session) tag
+            for _ in choices[1:]:
+                await pilot.press("s")
+            await pilot.pause()
+            assert engine.applied_strategies == [*choices[1:], "best"]
+            assert "strategy best ·" in self._summary(screen)
+            # a dry↔live restart rebuilds the engine with the session pick
+            await pilot.press("s", "l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert fake_engine.instances[1].settings.strategy == nxt
+
+    async def test_save_defaults_cancel_writes_nothing(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await self._cycle_to(pilot, screen, "consume-first")
+            await pilot.press("t", "right", "right", "enter", "d")
+            await pilot.pause()
+            from claude_swap.tui.modals import ConfirmModal
+
+            assert isinstance(app.screen, ConfirmModal)
+            body = app.screen._message
+            assert "strategy consume-first" in body and "threshold 92%" in body
+            await pilot.press("n")
+            await pilot.pause()
+            assert app.screen is screen
+            assert not (tmp_path / "settings.json").exists()
+            assert "(session)" in self._summary(screen)
+
+    async def test_save_defaults_confirm_persists_both_keys(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        from claude_swap.settings import load_settings
+
+        # An unrelated key already in the file must survive the save.
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"cooldownSeconds": 120.0},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await self._cycle_to(pilot, screen, "consume-first")
+            # d while still in threshold-adjust mode finishes the adjust first
+            await pilot.press("t", "right", "right", "d")
+            await pilot.pause()
+            assert screen._adjusting is False
+            await pilot.press("y")
+            await pilot.pause()
+            saved = load_settings(tmp_path)
+            assert saved.strategy == "consume-first"
+            assert saved.threshold == 92.0
+            assert saved.cooldown_seconds == 120.0
+            assert "(session)" not in self._summary(screen)
+            assert "saved as defaults" in self._log(screen)
+            await pilot.press("escape")
+            await settle(pilot)
+            # the saved threshold is now the file value — no revert to 90
+            assert app.threshold_pct == 92.0
+
+    async def test_save_defaults_when_unchanged_skips_the_prompt(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("d")
+            await pilot.pause()
+            assert app.screen is screen
+            assert "already the defaults" in self._log(screen)
+            assert not (tmp_path / "settings.json").exists()
+
+    async def test_save_defaults_failure_is_reported_and_keeps_session(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await self._cycle_to(pilot, screen, "consume-first")
+            # Corrupt the file after mount: set_setting refuses to overwrite it.
+            (tmp_path / "settings.json").write_text("{not json")
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("y")
+            await pilot.pause()
+            assert "could not save defaults" in self._log(screen)
+            assert "strategy consume-first (session)" in self._summary(screen)
+            assert (tmp_path / "settings.json").read_text() == "{not json"
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

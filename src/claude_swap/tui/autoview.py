@@ -30,9 +30,16 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     pct_label,
 )
+from claude_swap.exceptions import ConfigError
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import (
+    AUTOSWITCH_STRATEGIES,
+    SETTING_SPECS,
+    load_settings,
+    parse_model_names,
+    set_setting,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -66,7 +73,9 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
+        Binding("s", "cycle_strategy", "Strategy"),
         Binding("t", "adjust_threshold", "Threshold"),
+        Binding("d", "save_defaults", "Save defaults"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -87,6 +96,11 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Same session-only rule for the strategy (s cycles it). Both
+        # ``_configured_*`` values are the settings.json baseline: the
+        # "(session)" tags compare against them, and ``d`` (save defaults)
+        # is the only thing that moves them after mount.
+        self._configured_strategy: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -108,6 +122,7 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
+        self._configured_strategy = self._settings.strategy
         self.app.threshold_pct = self._settings.threshold
         # The weekly line is not session-adjustable, so this is only the same
         # sync-to-the-file correction; nothing to restore on unmount.
@@ -175,12 +190,9 @@ class AutoScreen(Screen):
             return  # no net change: nothing to announce, no tick to force
         if self._engine is not None:
             self._engine.wake()  # show a decision at the new value now
-        self.query_one("#event-log", RichLog).write(
-            Text(
-                f"— threshold set to {pct_label(self._settings.threshold)}% "
-                "for this session —",
-                style=Palette.from_theme(self.app.current_theme).muted,
-            )
+        self._note(
+            f"— threshold set to {pct_label(self._settings.threshold)}% "
+            "for this session —"
         )
 
     def _set_threshold(self, value: float) -> None:
@@ -201,6 +213,10 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
+        text.append(f"strategy {self._settings.strategy}")
+        if self._settings.strategy != self._configured_strategy:
+            text.append(" (session)", style=palette.muted)
+        text.append(" · ")
         text.append(
             f"threshold {pct_label(self._settings.threshold)}%",
             style=palette.accent if self._adjusting else "",
@@ -215,6 +231,79 @@ class AutoScreen(Screen):
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
+
+    # -- strategy (s) and save as defaults (d) --------------------------------
+
+    def action_cycle_strategy(self) -> None:
+        """Next strategy in AUTOSWITCH_STRATEGIES order, session-only like the
+        threshold. The engine reads it on its next tick; wake it so the log
+        shows a decision under the new strategy right away."""
+        choices = AUTOSWITCH_STRATEGIES
+        current = self._settings.strategy
+        nxt = (
+            choices[(choices.index(current) + 1) % len(choices)]
+            if current in choices
+            else choices[0]
+        )
+        self._settings = replace(self._settings, strategy=nxt)
+        if self._engine is not None:
+            self._engine.apply_strategy(nxt)
+            self._engine.wake()
+        self._update_summary()
+        self._note(f"— strategy → {nxt} for this session —")
+
+    def action_save_defaults(self) -> None:
+        if self._adjusting:
+            self._end_adjust()  # save what the user is looking at, mode closed
+        s = self._settings
+        if (s.strategy, s.threshold) == (
+            self._configured_strategy,
+            self._configured_threshold,
+        ):
+            self._note("— strategy and threshold are already the defaults —")
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                "Save as defaults?\n\n"
+                f"  strategy {s.strategy}\n"
+                f"  threshold {pct_label(s.threshold)}%\n\n"
+                "Written to settings.json. A `cswap auto` or menu-bar engine "
+                "that is already running picks them up on its next start.",
+                title="Save defaults",
+                yes_label="Save",
+            ),
+            self._on_save_confirm,
+        )
+
+    def _on_save_confirm(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        s = self._settings
+        root = self.app.switcher.backup_dir
+        # Two single-key writes through `cswap config set`'s path: validated,
+        # and every other key in the file survives. Each baseline moves only
+        # once its own write landed, so after a partial failure the
+        # "(session)" tags still tell the truth about what is on disk.
+        try:
+            set_setting(root, "autoswitch.strategy", s.strategy)
+            self._configured_strategy = s.strategy
+            set_setting(root, "autoswitch.threshold", str(s.threshold))
+            self._configured_threshold = s.threshold
+        except (ConfigError, OSError) as e:
+            self._update_summary()
+            self._note(f"— could not save defaults: {e} —", role="sev_warn")
+            return
+        self._update_summary()
+        self._note(
+            f"— saved as defaults: strategy {s.strategy}, "
+            f"threshold {pct_label(s.threshold)}% —"
+        )
+
+    def _note(self, message: str, *, role: str = "muted") -> None:
+        palette = Palette.from_theme(self.app.current_theme)
+        self.query_one("#event-log", RichLog).write(
+            Text(message, style=getattr(palette, role))
+        )
 
     # -- engine -------------------------------------------------------------
 
