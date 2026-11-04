@@ -1020,9 +1020,12 @@ def five_hour_live(usage: dict | str | None) -> bool:
 
 def display_usage(usage: dict | str | None) -> dict | str | None:
     """``usage`` with a 5h window that is not running left out, for the screens:
-    no bar, chip or "resets" text is drawn for a window that is not running."""
+    no bar, chip or "resets" text is drawn for a window that is not running.
+    A window reported without a figure (``pct`` None) is unknown, not idle: it stays."""
     if isinstance(usage, dict) and "five_hour" in usage and not five_hour_live(usage):
-        return {k: v for k, v in usage.items() if k != "five_hour"}
+        window = usage["five_hour"]
+        if not (isinstance(window, dict) and "pct" in window and window["pct"] is None):
+            return {k: v for k, v in usage.items() if k != "five_hour"}
     return usage
 
 
