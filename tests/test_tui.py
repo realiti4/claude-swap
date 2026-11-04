@@ -689,7 +689,7 @@ class TestUsageRows:
         card = account_card_text(make_account(1, entry=entry), 80, now=now).plain
         assert "5h" in card and "usage unknown" in card and " 0%" not in card
         mini = mini_account_text(make_account(2, entry=entry), now).plain
-        assert "5h ? · 7d 12%" in mini
+        assert "5h ? · 7d(" in mini and "):12%" in mini  # the fork's chip carries the reset
 
     @pytest.mark.parametrize("key", ["five_hour", "seven_day"])
     @pytest.mark.parametrize("width", [60, 70, 80])

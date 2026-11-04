@@ -402,7 +402,8 @@ def test_format_title_and_summary_with_a_null_five_hour_window():
     # Ultra accounts have no 5-hour limit; the usage API reports the window as null.
     usage = oauth.build_usage_result({"five_hour": None, "seven_day": {"utilization": 25.0}})
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@x.com", usage, s) == "⇄ 25%"
+    # "both" labels each number here, so a lone 7d figure never reads as the 5h one.
+    assert menubar.format_title("loc@x.com", usage, s) == "⇄ 7d 25%"
     assert menubar.usage_summary(usage) == "7d 25%"
 
 
