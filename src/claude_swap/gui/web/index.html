@@ -143,6 +143,8 @@ label.check { display: inline-flex; align-items: center; gap: 6px; cursor: point
 .desk-hint { font-size: 12px; margin: 0 0 10px; }
 .desk-live { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin: 0 0 10px; }
 .desc.warn { color: var(--warn); }
+.usage-src { font-size: 11.5px; color: var(--faint); margin: 2px 0 2px; }
+.usage-src a, .note a { color: var(--accent); cursor: pointer; text-decoration: underline; }
 .ui-card { padding: 10px 12px; margin-bottom: 10px; }
 .ui-card .help { font-size: 12px; color: var(--muted); margin-top: 3px; }
 body.simple .adv { display: none !important; }
@@ -754,9 +756,20 @@ function deskCard(a, i) {
   else if (!a.savedAt && !a.isLive) badges.push(`<span class="badge warn">未保存登录</span>`);
   const age = a.savedAt ? "登录保存于 " + new Date(a.savedAt * 1000).toLocaleString() : a.isLive ? "切走时会自动保存登录" : "";
   const canSwitch = !a.isLive && a.savedAt && !a.stale;
+  const u = a.usage;
+  let body = "";
+  if (u && (u.usage.fiveHour || u.usage.sevenDay)) {
+    const th = S.snap ? S.snap.threshold : null, wth = S.snap ? (S.snap.weeklyThreshold ?? th) : null;
+    body += `<div class="meters">${meter("5 小时", u.usage.fiveHour, th)}${meter("7 天", u.usage.sevenDay, wth)}</div>`;
+    if (u.source === "cli") body += `<div class="usage-src">实时额度，与 CLI 账号 ${esc(u.cliNumber)} 共享</div>`;
+    else body += `<div class="usage-src">Desktop 记录于 ${esc(fmtDur(u.ageS))}前 · <a data-dacc="cli-login">添加为 CLI 账号以获取实时额度</a></div>`;
+  } else {
+    body += `<div class="note">暂无额度数据 · <a data-dacc="cli-login">添加为 CLI 账号以获取实时额度</a></div>`;
+  }
   return `<div class="card acc ${a.isLive ? "active" : ""}" data-uuid="${esc(a.uuid)}">
     <div class="acc-head"><div class="slot">${i + 1}</div>
       <div class="acc-title"><div class="email" title="${esc(a.uuid)}">${esc(deskTitle(a))}</div><div class="badges">${badges.join("")}</div></div></div>
+    ${body}
     <div class="acc-foot"><span class="age">${esc(age)}</span>
       <button class="btn sm primary" data-dacc="switch" ${canSwitch ? "" : "disabled"}>切换</button>
       <button class="btn sm" data-dacc="rename">重命名</button>
@@ -864,6 +877,10 @@ document.addEventListener("click", async (e) => {
   const uuid = c.closest("[data-uuid]").dataset.uuid;
   const acc = D.state.accounts.find((x) => x.uuid === uuid); if (!acc) return;
   const act = c.dataset.dacc, title = deskTitle(acc);
+  if (act === "cli-login") {
+    if (!(await confirmBox("添加为 CLI 账号", `额度按账号共享。用浏览器登录 ${title}，把它加为 CLI 账号后，软件就能实时读取它的额度（不需要打开 Desktop）。`, { yes: "开始浏览器登录" }))) return;
+    return browserLogin();
+  }
   if (act === "switch") {
     if (!(await confirmBox("切换 Claude Desktop 账号",
       `将强制重启 Claude Desktop 并切换到 ${title}。Desktop 中未发送的内容会丢失。`,

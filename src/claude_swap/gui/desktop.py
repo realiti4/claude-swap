@@ -122,6 +122,43 @@ def key_fingerprint(data_dir: Path) -> str | None:
         return None
 
 
+USAGE_FILE = "plan-usage-history.json"
+
+
+def latest_usage(data_dir: Path) -> dict[str, dict]:
+    """Newest non-empty reading per organization from Desktop's own usage log.
+
+    Desktop samples the plan's limits every quarter hour while signed in:
+    ``{"t": <ms>, "org": <uuid>, "u": {"fh": <5h %>, "sd": <7d %>}}``. The
+    limits belong to the account, so they are the same numbers the CLI
+    reads; this is the source for accounts the CLI does not manage.
+    """
+    try:
+        data = json.loads((data_dir / USAGE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    newest: dict[str, dict] = {}
+    for sample in (data.get("samples") if isinstance(data, dict) else None) or []:
+        if not isinstance(sample, dict):
+            continue
+        org, t, u = sample.get("org"), sample.get("t"), sample.get("u")
+        if not isinstance(org, str) or not isinstance(t, (int, float)) or not isinstance(u, dict) or not u:
+            continue
+        if org not in newest or t >= newest[org]["t"]:
+            newest[org] = sample
+    return newest
+
+
+def usage_view(sample: dict) -> dict:
+    """A Desktop sample in the shape the page uses for CLI usage."""
+    view = {}
+    for key, name in (("fh", "fiveHour"), ("sd", "sevenDay")):
+        pct = sample["u"].get(key)
+        if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+            view[name] = {"pct": float(pct)}
+    return view
+
+
 def _remove(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)

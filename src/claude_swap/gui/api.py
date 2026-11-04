@@ -58,6 +58,16 @@ _UI_PREFS = {"simple": True, "view": "cli", "theme": "auto", "tray": True}
 _UI_PREF_CHOICES = {"view": ("cli", "desktop"), "theme": ("auto", "light", "dark")}
 
 
+def _usage_suffix(usage: dict | None) -> str:
+    """`` · 5h 16% / 7天 96%`` for a tray label; empty without a reading."""
+    parts = []
+    for key, label in (("fiveHour", "5h"), ("sevenDay", "7天")):
+        pct = ((usage or {}).get(key) or {}).get("pct")
+        if isinstance(pct, (int, float)):
+            parts.append(f"{label} {pct:.0f}%")
+    return "  ·  " + " / ".join(parts) if parts else ""
+
+
 def _valid_pref(key: str, value) -> bool:
     return value in _UI_PREF_CHOICES.get(key, (value,))
 
@@ -868,15 +878,33 @@ class GuiApi:
         finally:
             self._desktop_lock.release()
 
-    def _cli_emails(self) -> dict[str, str]:
+    def _cli_by_uuid(self) -> dict[str, dict]:
         data = self._switcher._get_sequence_data() or {}
         return {
-            acc["uuid"]: acc.get("email")
-            for acc in (data.get("accounts") or {}).values()
+            acc["uuid"]: {"number": str(number), "email": acc.get("email"), "org": acc.get("organizationUuid")}
+            for number, acc in (data.get("accounts") or {}).items()
             if isinstance(acc, dict) and acc.get("uuid")
         }
 
-    def _desktop_register(self, store: desktop.DesktopStore, uuid: str, name: str | None = None) -> dict:
+    def _cli_emails(self) -> dict[str, str]:
+        return {uuid: acc["email"] for uuid, acc in self._cli_by_uuid().items()}
+
+    def _cli_usage(self) -> dict[str, dict]:
+        """CLI usage per slot number, from the page's last pass or the store.
+
+        Store-only, so the tray and a hidden window never reach the network.
+        """
+        snap = self._last_snapshot
+        if snap is None or time.time() - (snap.get("takenAt") or 0) > 60:
+            try:
+                snap = self._serialize(self._source.take(full=False, store_only=True))
+            except Exception:
+                snap = snap or {}
+        return {a["number"]: a for a in snap.get("accounts", []) if a.get("usage")}
+
+    def _desktop_register(
+        self, store: desktop.DesktopStore, uuid: str, name: str | None = None, live_since: float | None = None
+    ) -> dict:
         accounts = store.load()
         record = accounts.setdefault(uuid, {"addedAt": time.time()})
         if name:
@@ -884,8 +912,43 @@ class GuiApi:
         email = self._cli_emails().get(uuid)
         if email:
             record["email"] = email
+        if live_since is not None:
+            record["liveSince"] = live_since
         store.save(accounts)
         return record
+
+    def _desktop_usage(self, data_dir: Path, store: desktop.DesktopStore, accounts: dict, live: str | None) -> dict:
+        """uuid -> usage for Desktop accounts: the CLI's reading when the CLI
+        manages the same account, else Desktop's own latest sample."""
+        cli = self._cli_by_uuid()
+        cli_usage = self._cli_usage()
+        samples = desktop.latest_usage(data_dir)
+        out: dict[str, dict] = {}
+        learned = False
+        for uuid, record in accounts.items():
+            known = cli.get(uuid)
+            if known and known["number"] in cli_usage:
+                acc = cli_usage[known["number"]]
+                out[uuid] = {"usage": acc["usage"], "source": "cli", "cliNumber": known["number"], "ageS": acc.get("ageS")}
+                continue
+            org = (known or {}).get("org") or record.get("orgUuid")
+            if not org and uuid == live and record.get("liveSince"):
+                # Only samples written since this account went live are its own.
+                mine = [s for s in samples.values() if s["t"] / 1000 > record["liveSince"]]
+                if mine:
+                    org = max(mine, key=lambda s: s["t"])["org"]
+                    record["orgUuid"] = org
+                    learned = True
+            sample = samples.get(org) if org else None
+            if sample:
+                out[uuid] = {
+                    "usage": desktop.usage_view(sample),
+                    "source": "desktop",
+                    "ageS": max(0.0, time.time() - sample["t"] / 1000),
+                }
+        if learned:
+            store.save(accounts)
+        return out
 
     def _desktop_capture(self, data_dir: Path, store: desktop.DesktopStore) -> str | None:
         """Save the live sign-in (Desktop closed); an unknown one is added."""
@@ -901,6 +964,7 @@ class GuiApi:
         emails = self._cli_emails()
         live = desktop.signed_in_uuid(desktop.read_config(data_dir)) if data_dir else None
         fingerprint = desktop.key_fingerprint(data_dir) if data_dir else None
+        usage = self._desktop_usage(data_dir, store, accounts, live) if data_dir else {}
         rows = []
         for uuid, record in accounts.items():
             meta = store.snapshot_meta(uuid)
@@ -912,6 +976,7 @@ class GuiApi:
                 "savedAt": meta.get("savedAt") if meta else None,
                 "stale": bool(meta) and meta.get("keyFingerprint") != fingerprint,
                 "addedAt": record.get("addedAt") or 0,
+                "usage": usage.get(uuid),
             })
         rows.sort(key=lambda r: r["addedAt"])
         return {
@@ -931,7 +996,8 @@ class GuiApi:
             uuid = desktop.signed_in_uuid(desktop.read_config(data_dir))
             if uuid is None:
                 raise desktop.DesktopError("Claude Desktop 当前没有登录")
-            record = self._desktop_register(store, uuid, name)
+            known = uuid in store.load()
+            record = self._desktop_register(store, uuid, name, live_since=None if known else time.time())
             if not desktop.running_pids():
                 store.capture(data_dir)  # closed: the files are settled, save now
             return {"uuid": uuid, "email": record.get("email")}
@@ -957,6 +1023,7 @@ class GuiApi:
                 raise
             finally:
                 desktop.launch_desktop(data_dir)
+            self._desktop_register(store, uuid, live_since=time.time())
             return {"same": False}
 
         return self._desktop_do(go)
@@ -969,7 +1036,7 @@ class GuiApi:
             previous = self._desktop_capture(data_dir, store)
             desktop.clear(data_dir)
             desktop.launch_desktop(data_dir)
-            self._desktop_login = {"dataDir": data_dir, "previous": previous}
+            self._desktop_login = {"dataDir": data_dir, "previous": previous, "started": time.time()}
             return {}
 
         return self._desktop_do(go)
@@ -995,8 +1062,9 @@ class GuiApi:
             uuid = desktop.signed_in_uuid(desktop.read_config(data_dir))
             if uuid is None:
                 raise desktop.DesktopError("Claude Desktop 还没有登录")
+            started = (self._desktop_login or {}).get("started")
             self._desktop_login = None
-            record = self._desktop_register(store, uuid, name)
+            record = self._desktop_register(store, uuid, name, live_since=started)
             return {"uuid": uuid, "email": record.get("email")}
 
         return self._desktop_do(go)
@@ -1057,16 +1125,18 @@ class GuiApi:
     def _tray_cli_accounts(self) -> list[dict]:
         data = self._switcher._get_sequence_data() or {}
         active = str(data.get("activeAccountNumber"))
+        usage = self._cli_usage()
         rows = []
         for number, acc in sorted((data.get("accounts") or {}).items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
             if not isinstance(acc, dict):
                 continue
-            label = f"{number}. {acc.get('email') or '?'}"
+            name = f"{number}. {acc.get('email') or '?'}"
             if acc.get("alias"):
-                label += f" (@{acc['alias']})"
+                name += f" (@{acc['alias']})"
             rows.append({
                 "number": str(number),
-                "label": label,
+                "name": name,
+                "label": name + _usage_suffix((usage.get(str(number)) or {}).get("usage")),
                 "active": str(number) == active,
                 "disabled": bool(acc.get("disabled")),
             })
@@ -1084,15 +1154,17 @@ class GuiApi:
         state = self.desktop_state()
         if not state["available"]:
             return None
-        return [
-            {
+        rows = []
+        for a in state["accounts"]:
+            name = a["name"] or a["email"] or f"未命名账号（{a['uuid'][:8]}）"
+            rows.append({
                 "uuid": a["uuid"],
-                "label": a["name"] or a["email"] or f"未命名账号（{a['uuid'][:8]}）",
+                "name": name,
+                "label": name + _usage_suffix((a["usage"] or {}).get("usage")),
                 "live": a["isLive"],
                 "switchable": not a["isLive"] and bool(a["savedAt"]) and not a["stale"],
-            }
-            for a in state["accounts"]
-        ]
+            })
+        return rows
 
     # -- desktop helpers ----------------------------------------------------------
 

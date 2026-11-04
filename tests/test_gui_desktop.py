@@ -289,3 +289,71 @@ def test_a_stale_instance_file_does_not_block_launch(tmp_path):
 
     (tmp_path / "gui-instance.json").write_text('{"port": 1, "token": "x"}')
     assert single.claim(tmp_path, lambda: None)
+
+
+def _usage_log(profile: Path, samples: list[tuple[float, str, dict]]) -> None:
+    (profile / desktop.USAGE_FILE).write_text(json.dumps(
+        {"version": 2, "samples": [{"t": int(t * 1000), "org": org, "u": u} for t, org, u in samples]}
+    ))
+
+
+def test_desktop_usage_prefers_the_cli_reading_then_desktops_log(desk, monkeypatch):
+    import time as _time
+
+    api, profile, calls = desk
+    api._switcher._accounts = {"1": {"uuid": UUID_A, "email": "a@example.com", "organizationUuid": "org-a"}}
+    _sign_in(profile, UUID_A, "a")
+    desktop.quit_desktop()
+    api.desktop_import_current()
+    # B goes live through a browser login; only samples after that are B's.
+    assert api.desktop_login_start()["ok"]
+    _sign_in(profile, UUID_B, "b")
+    started = api._desktop_login["started"]
+    assert api.desktop_login_finish("home")["ok"]
+    now = _time.time()
+    _usage_log(profile, [
+        (started - 600, "org-a", {"fh": 10, "sd": 20}),   # A's, written before B went live
+        (now, "org-b", {"fh": 30, "sd": 40}),
+    ])
+
+    rows = {r["uuid"]: r for r in api.desktop_state()["accounts"]}
+    assert rows[UUID_B]["usage"]["source"] == "desktop"
+    assert rows[UUID_B]["usage"]["usage"] == {"fiveHour": {"pct": 30.0}, "sevenDay": {"pct": 40.0}}
+    assert api._desktop_store().load()[UUID_B]["orgUuid"] == "org-b"  # learned, kept
+    # A has no CLI reading yet: Desktop's log, found through the CLI's org.
+    assert rows[UUID_A]["usage"]["usage"]["sevenDay"] == {"pct": 20.0}
+
+    cli = {"usage": {"fiveHour": {"pct": 11.0, "resetsAt": "x"}, "sevenDay": {"pct": 96.0}}, "ageS": 5}
+    monkeypatch.setattr(api, "_cli_usage", lambda: {"1": cli})
+    rows = {r["uuid"]: r for r in api.desktop_state()["accounts"]}
+    assert rows[UUID_A]["usage"] == {"usage": cli["usage"], "source": "cli", "cliNumber": "1", "ageS": 5}
+
+    labels = {a["uuid"]: a["label"] for a in api._tray_desktop_accounts()}
+    assert labels[UUID_A] == "a@example.com  ·  5h 11% / 7天 96%"
+    assert labels[UUID_B] == "home  ·  5h 30% / 7天 40%"
+
+
+def test_a_sample_from_before_going_live_is_not_claimed(desk):
+    import time as _time
+
+    api, profile, calls = desk
+    _sign_in(profile, UUID_B, "b")
+    api.desktop_import_current()  # B not in the CLI: its org is unknown
+    _usage_log(profile, [(_time.time() - 60, "org-prev", {"fh": 50, "sd": 50})])
+    row = api.desktop_state()["accounts"][0]
+    assert row["usage"] is None
+    assert "orgUuid" not in api._desktop_store().load()[UUID_B]
+
+
+def test_latest_usage_skips_empty_and_malformed_samples(tmp_path):
+    profile = _profile(tmp_path / "Claude")
+    (profile / desktop.USAGE_FILE).write_text(json.dumps({"samples": [
+        {"t": 1, "org": "o", "u": {"fh": 1, "sd": 2}},
+        {"t": 3, "org": "o", "u": {}},
+        {"t": "x", "org": "o", "u": {"fh": 9}},
+        "junk",
+        {"t": 2, "org": "o", "u": {"fh": 5, "sd": 6}},
+    ]}))
+    assert desktop.latest_usage(profile)["o"]["u"] == {"fh": 5, "sd": 6}
+    (profile / desktop.USAGE_FILE).write_text("not json")
+    assert desktop.latest_usage(profile) == {}

@@ -56,7 +56,7 @@ class Tray:
         desk = self._api._tray_desktop_accounts()
         if desk is not None:
             rows = [
-                Item(a["label"], lambda u=a["uuid"], lbl=a["label"]: self._switch_desktop(u, lbl),
+                Item(a["label"], lambda u=a["uuid"], lbl=a["name"]: self._switch_desktop(u, lbl),
                      checked=a["live"], enabled=a["switchable"])
                 for a in desk
             ]
@@ -69,7 +69,7 @@ class Tray:
             items.append(Item(f"Desktop：{live or '未登录'}", submenu=rows or [Item("（还没有账号）", enabled=False)]))
         cli_accounts = self._api._tray_cli_accounts()
         cli = [
-            Item(a["label"], lambda n=a["number"], lbl=a["label"]: self._switch_cli(n, lbl),
+            Item(a["label"], lambda n=a["number"], lbl=a["name"]: self._switch_cli(n, lbl),
                  checked=a["active"], enabled=not a["disabled"] and not a["active"])
             for a in cli_accounts
         ]
