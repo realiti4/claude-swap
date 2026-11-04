@@ -1,0 +1,106 @@
+name: Desktop release
+
+# Builds the desktop GUI for Windows and macOS and attaches the installers to
+# a GitHub Release.
+#
+#   git tag v0.30.0b1 && git push origin v0.30.0b1   -> build + publish release
+#   Actions tab -> "Desktop release" -> Run workflow  -> build only (artifacts)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+          - name: macos-x64
+            os: macos-15-intel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --locked --extra gui
+
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build
+        shell: bash
+        # --extra gui on `uv run` too: a bare `uv run` re-syncs without it.
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            uv run --locked --extra gui python packaging/build.py --installer
+          else
+            uv run --locked --extra gui python packaging/build.py
+          fi
+
+      - name: Smoke-test the CLI entry
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmd //c "build\\dist\\claude-swap\\cswap.cmd --version"
+          else
+            build/dist/claude-swap.app/Contents/MacOS/claude-swap --version
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-swap-${{ matrix.name }}
+          path: build/release/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # Publish whatever built: a platform stuck in a runner queue (macOS arm64
+    # capacity) must not hold back the others. Re-running the failed job
+    # later adds its files to the same release.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
+          generate_release_notes: true
+          body: |
+            ## 下载
+
+            | 系统 | 文件 |
+            |---|---|
+            | Windows 10/11 (x64) | `*-windows-x64-setup.exe`（安装版，推荐）或 `*-portable.zip`（解压即用） |
+            | macOS (Apple 芯片) | `*-macos-arm64.dmg` |
+            | macOS (Intel) | `*-macos-x64.dmg` |
+
+            **macOS 首次打开**：应用未经公证，请在「应用程序」中右键 claude-swap →「打开」，或执行
+            `xattr -dr com.apple.quarantine /Applications/claude-swap.app`。
+
+            **命令行**：Windows 安装时勾选「加入 PATH」后可在终端使用 `cswap`；macOS 可用
+            `/Applications/claude-swap.app/Contents/MacOS/claude-swap <命令>`。

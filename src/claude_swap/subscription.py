@@ -81,8 +81,12 @@ _TIER_LABELS = {
 
 # A seat on a Team organization is not a personal subscription, whatever rate
 # tier the seat carries, so the organization type wins where it is known.
+# Pro shares the free rate tier (observed: ``claude_pro`` with
+# ``default_claude_ai``, billed through Google Play), so only its organization
+# type tells it apart. Max is left to the tier, which carries 5x/20x.
 _ORG_TYPE_LABELS = {
     "claude_team": "Team",
+    "claude_pro": "Pro",
 }
 
 _KEPT_FIELDS = (
