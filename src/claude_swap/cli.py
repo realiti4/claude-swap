@@ -54,6 +54,27 @@ def _prog_name() -> str:
     return name
 
 
+_SWITCH_STRATEGIES = ("best", "next-available")
+
+
+def _switch_strategy(value: str) -> str:
+    """``type=`` for the one-shot ``switch --strategy``.
+
+    Runs before argparse's choices check, so an ``auto``-only strategy (e.g.
+    consume-first, which is about *staying* on an account over time and means
+    nothing for a single switch) gets pointed at the command that has it
+    rather than a bare "invalid choice". Anything else falls through to the
+    normal choices error.
+    """
+    if value not in _SWITCH_STRATEGIES and value in AUTOSWITCH_STRATEGIES:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is an auto-switch strategy; run "
+            f"'{_prog_name()} auto --strategy {value}' (or set it with "
+            f"'{_prog_name()} config set autoswitch.strategy {value}')"
+        )
+    return value
+
+
 # Memorable subcommand aliases → the long-standing flags they expand to. Lets
 # users type `cswap list`, `cswap status`, `cswap add`, etc. instead of `--list`
 # / `--status` / `--add-account`, which all still work. `switch` is special-cased
@@ -1329,7 +1350,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     )
     parser.add_argument(
         "--strategy",
-        choices=["best", "next-available"],
+        type=_switch_strategy,
+        choices=_SWITCH_STRATEGIES,
         metavar="{best,next-available}",
         help=(
             "With bare 'switch': pick the target by remaining 5h/7d quota. "
