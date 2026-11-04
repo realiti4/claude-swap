@@ -1973,6 +1973,36 @@ class TestAutoScreen:
             # 96%: #4 has room again and resets soonest of all
             assert self._order(self._candidates(screen), 2, 3, 4) == [4, 3, 2]
 
+    async def test_candidates_rerank_when_a_poll_brings_new_usage(
+        self, tmp_path, fake_engine
+    ):
+        """Usage burned on an alternate between polls (another machine, a
+        session-mode run) must re-rank the list on the next store read, with
+        no keypress."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "consume-first"},
+        }))
+        fake = FakeSwitcher(self._reset_fleet(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            screen = app.screen
+            assert self._order(self._candidates(screen), 2, 3, 4) == [3, 2, 4]
+            # #3 (soonest with room) gets burned to 95% elsewhere
+            fake._accounts = [
+                make_account(3, entry=make_entry(5.0, 95.0, reset7_s=26 * 3600))
+                if a.number == "3" else a
+                for a in fake._accounts
+            ]
+            app.request_refresh()  # what the app's 3s poll timer does
+            await settle(pilot)
+            plain = self._candidates(screen)
+            assert self._order(plain, 2, 3, 4) == [2, 3, 4]
+            assert "95% used" in plain
+
 
 class TestEventText:
     def test_switch_event_styling_and_content(self):
