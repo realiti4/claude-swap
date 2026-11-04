@@ -492,6 +492,12 @@ class AutoScreen(Screen):
                     )
                 else:
                     key = (0, -lh, 0.0)
+                # Alternates are refetched every 5-10 min (rate budget), so a
+                # ranking can rest on old numbers; say so, same rule as the
+                # active row (silent while fresh).
+                age = data.format_age(acc.usage.age_s)
+                if age:
+                    entry.append(f" {age}", style=palette.muted)
             ranked.append((key, acc.number))
             lines[acc.number] = entry
 

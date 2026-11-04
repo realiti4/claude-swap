@@ -2003,6 +2003,39 @@ class TestAutoScreen:
             assert self._order(plain, 2, 3, 4) == [2, 3, 4]
             assert "95% used" in plain
 
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    async def test_candidate_rows_show_the_age_of_stale_usage(
+        self, tmp_path, fake_engine, strategy
+    ):
+        """An alternate is refetched only every 5-10 min, so its row says how
+        old its numbers are — same rule as the active row (data.format_age:
+        silent while fresh)."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": strategy},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True),
+                make_account(2, entry=make_entry(5.0, 10.0, age_s=8 * 60 + 5)),
+                make_account(3, entry=make_entry(5.0, 50.0, age_s=5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            rows = {
+                n: line
+                for line in self._candidates(app.screen).splitlines()
+                for n in ("2", "3")
+                if f"user{n}@example.com" in line
+            }
+            assert rows["2"].endswith("· 8m ago")
+            assert "ago" not in rows["3"]
+
 
 class TestEventText:
     def test_switch_event_styling_and_content(self):
