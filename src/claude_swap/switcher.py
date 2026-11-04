@@ -192,12 +192,14 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
         if w:
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
             marker = _pace_marker(w, fetched_at) if label == "7d" else ""
+            # ``pct`` None (utilization unavailable) renders as ``?``, never 0%.
+            pct = f"{w['pct']:>3.0f}%" if isinstance(w.get("pct"), (int, float)) else "   ?"
             cell = oauth.fresh_reset_strings(w)
             if cell:
                 countdown, clock = cell
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
+                rows.append((label, f"{pct}   resets {clock:<12}  in {countdown}{marker}"))
             else:
-                rows.append((label, f"{w['pct']:>3.0f}%{marker}"))
+                rows.append((label, f"{pct}{marker}"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.

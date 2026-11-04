@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import menubar
+from claude_swap import menubar, oauth
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import USAGE_API_KEY
 
@@ -396,6 +396,14 @@ def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
     assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 5h 9%"
+
+
+def test_format_title_and_summary_with_a_null_five_hour_window():
+    # Ultra accounts have no 5-hour limit; the usage API reports the window as null.
+    usage = oauth.build_usage_result({"five_hour": None, "seven_day": {"utilization": 25.0}})
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    assert menubar.format_title("loc@x.com", usage, s) == "⇄ 25%"
+    assert menubar.usage_summary(usage) == "7d 25%"
 
 
 # --- reset-time helpers --------------------------------------------------------
