@@ -1422,6 +1422,33 @@ class TestAutoScreen:
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
+    async def test_auto_start_uses_cli_settings_and_mode(
+        self, tmp_path, fake_engine
+    ):
+        import dataclasses
+
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.app import CswapApp
+        from claude_swap.tui.autoview import AutoScreen
+        from claude_swap.tui.dashboard import DashboardScreen
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        settings = dataclasses.replace(load_settings(tmp_path), threshold=80.0)
+        app = CswapApp(
+            fake, start="auto", auto_settings=settings, auto_dry_run=False
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert isinstance(app.screen, AutoScreen)
+            assert fake_engine.instances[0].dry_run is False
+            assert fake_engine.instances[0].settings.threshold == 80.0
+            await pilot.press("escape")
+            await settle(pilot)
+            assert isinstance(app.screen, DashboardScreen)
+            assert fake_engine.instances[0].stopped is True
+
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path

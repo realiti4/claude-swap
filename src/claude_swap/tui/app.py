@@ -56,10 +56,14 @@ class CswapApp(App):
         *,
         start: str = "dashboard",
         detected: str | None = None,
+        auto_settings=None,
+        auto_dry_run: bool = True,
     ) -> None:
         super().__init__()
         self.switcher = switcher
-        self._start = start  # "dashboard" | "watch" (`cswap watch`)
+        self._start = start  # "dashboard" | "watch" (`cswap watch`) | "auto"
+        self._auto_settings = auto_settings
+        self._auto_dry_run = auto_dry_run
         self._detected = detected  # terminal background sensed pre-driver, or None
         self.source = SnapshotSource(switcher)
         self._store_only = False
@@ -97,6 +101,8 @@ class CswapApp(App):
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
+        elif self._start == "auto":
+            self.push_screen(AutoScreen(self._auto_settings, dry_run=self._auto_dry_run))
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()

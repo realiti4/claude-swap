@@ -793,6 +793,7 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --tui --strategy consume-first   # run the loop inside the dashboard
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -877,11 +878,18 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Run the loop inside the dashboard's auto-switch screen",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args(argv)
+    if args.tui and (args.once or args.json):
+        parser.error("--tui cannot be combined with --once or --json")
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
@@ -909,6 +917,17 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        if args.tui:
+            from claude_swap.tui import run as tui_run
+
+            sys.exit(
+                tui_run(
+                    switcher,
+                    start="auto",
+                    auto_settings=settings,
+                    auto_dry_run=args.dry_run,
+                )
+            )
         engine = AutoSwitchEngine(
             switcher,
             settings,

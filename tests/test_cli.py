@@ -1168,6 +1168,18 @@ class TestAutoCommand:
         self.FakeEngine.tick_outcome = TickOutcome.BLOCKED
         assert self._run(["--once"], temp_home) == 3
 
+    def test_tui_runs_dashboard_on_auto_screen(self, temp_home):
+        calls = []
+        with patch("claude_swap.tui.run", lambda *a, **k: calls.append(k) or 0):
+            assert self._run(["--tui", "--threshold", "80"], temp_home) == 0
+        assert calls[0]["start"] == "auto"
+        assert calls[0]["auto_settings"].threshold == 80
+        assert calls[0]["auto_dry_run"] is False
+        assert not self.FakeEngine.instances
+
+    def test_tui_rejects_once(self, temp_home):
+        assert self._run(["--tui", "--once"], temp_home) == 2
+
     def test_loop_mode_returns_loop_exit(self, temp_home):
         assert self._run([], temp_home) == 0
         assert self.FakeEngine.instances  # loop path constructed the engine

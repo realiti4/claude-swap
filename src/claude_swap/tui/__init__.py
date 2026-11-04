@@ -14,11 +14,18 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 
-def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
+def run(
+    switcher: "ClaudeAccountSwitcher",
+    start: str = "dashboard",
+    auto_settings=None,
+    auto_dry_run: bool = True,
+) -> int:
     """Run the TUI over an existing switcher. Returns the process exit code.
 
     ``start="watch"`` (the ``cswap watch`` command) opens directly on the
-    live watch page, stacked over the dashboard.
+    live watch page, stacked over the dashboard. ``start="auto"`` (``cswap
+    auto --tui``) opens on the auto-switch screen with the loop running,
+    using ``auto_settings`` and ``auto_dry_run``.
     """
     from claude_swap.appearance import detect_terminal_background, drain_stdin
     from claude_swap.tui.app import CswapApp
@@ -32,7 +39,13 @@ def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
         detected = detect_terminal_background()
     except Exception:
         detected = None
-    app = CswapApp(switcher, start=start, detected=detected)
+    app = CswapApp(
+        switcher,
+        start=start,
+        detected=detected,
+        auto_settings=auto_settings,
+        auto_dry_run=auto_dry_run,
+    )
     # Drain any late OSC reply immediately before Textual's driver starts,
     # so it isn't reissued as keystrokes once the app takes over the terminal.
     try:
