@@ -85,7 +85,7 @@ SHARED_ITEMS = (
 )
 
 # Conversation-history items linked additionally under --share-history.
-# POSIX symlinks only: Windows copy-mode would fork history, not share it.
+# Symlinks only: copy mode would fork history, not share it.
 HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
