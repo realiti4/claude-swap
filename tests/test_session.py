@@ -950,6 +950,120 @@ class TestSharingWindowsMode:
         assert not (session_dir / "skills").exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="emulates junctions with symlinks")
+class TestSharingWindowsJunctions:
+    """Directory items through junctions (issue #292). Junctions are emulated
+    with directory symlinks so this runs on any host; the code under test only
+    reaches them through _create_junction / _is_junction."""
+
+    @pytest.fixture
+    def junction_mgr(self, share_setup, monkeypatch):
+        source, session_dir, mgr = share_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        monkeypatch.setattr(
+            session_mod,
+            "_create_junction",
+            lambda target, link: os.symlink(target, link, target_is_directory=True),
+        )
+        monkeypatch.setattr(session_mod, "_is_junction", lambda p: p.is_symlink())
+        return source, session_dir, mgr
+
+    def test_dirs_are_junctions_files_are_copies(self, junction_mgr):
+        source, session_dir, mgr = junction_mgr
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "skills").is_symlink()
+        assert (session_dir / "settings.json").is_file()
+        assert not (session_dir / "settings.json").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "skills" in manifest["items"]
+
+    def test_junction_is_live(self, junction_mgr):
+        source, session_dir, mgr = junction_mgr
+        mgr._sync_sharing(session_dir, share=True)
+        (source / "skills" / "new.md").write_text("added later")
+
+        assert (session_dir / "skills" / "new.md").read_text() == "added later"
+
+    def test_resync_keeps_the_junction(self, junction_mgr):
+        source, session_dir, mgr = junction_mgr
+        mgr._sync_sharing(session_dir, share=True)
+        before = os.lstat(session_dir / "skills").st_ino
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert os.lstat(session_dir / "skills").st_ino == before
+
+    def test_managed_copy_migrates_to_junction(self, junction_mgr, monkeypatch):
+        source, session_dir, mgr = junction_mgr
+        real = session_mod._create_junction
+        monkeypatch.setattr(
+            session_mod, "_create_junction", lambda t, l: (_ for _ in ()).throw(OSError())
+        )
+        mgr._sync_sharing(session_dir, share=True)  # junction refused: a copy
+        assert (session_dir / "skills").is_dir()
+        assert not (session_dir / "skills").is_symlink()
+
+        monkeypatch.setattr(session_mod, "_create_junction", real)
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "skills").is_symlink()
+        assert (source / "skills" / "a.md").read_text() == "skill"
+
+    def test_hand_made_junction_to_same_place_is_adopted(self, junction_mgr):
+        source, session_dir, mgr = junction_mgr
+        (session_dir / "skills").symlink_to(source / "skills", target_is_directory=True)
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "skills" in manifest["items"]
+        assert (session_dir / "skills").is_symlink()
+
+    def test_foreign_junction_is_left_alone(self, junction_mgr, tmp_path, capsys):
+        source, session_dir, mgr = junction_mgr
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "mine.md").write_text("mine")
+        (session_dir / "skills").symlink_to(elsewhere, target_is_directory=True)
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert os.readlink(session_dir / "skills") == str(elsewhere)
+        assert "Not sharing skills" in capsys.readouterr().out
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "skills" not in manifest["items"]
+
+    def test_no_share_removes_only_the_junction(self, junction_mgr):
+        source, session_dir, mgr = junction_mgr
+        mgr._sync_sharing(session_dir, share=True)
+        mgr._sync_sharing(session_dir, share=False)
+
+        assert not (session_dir / "skills").exists()
+        assert not (session_dir / "skills").is_symlink()
+        assert (source / "skills" / "a.md").read_text() == "skill"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real junctions are Windows-only")
+class TestSharingRealJunctions:
+    def test_real_junction_share_and_removal(self, share_setup):
+        source, session_dir, mgr = share_setup
+        mgr.switcher.platform = Platform.WINDOWS  # seeded_switcher pins macOS
+        mgr._sync_sharing(session_dir, share=True)
+
+        skills = session_dir / "skills"
+        assert skills.is_junction()
+        (source / "skills" / "new.md").write_text("live")
+        assert (skills / "new.md").read_text() == "live"
+
+        mgr._sync_sharing(session_dir, share=True)
+        assert skills.is_junction()
+
+        mgr._sync_sharing(session_dir, share=False)
+        assert not skills.exists()
+        assert (source / "skills" / "a.md").read_text() == "skill"
+
+
 # ---------------------------------------------------------------------------
 # mcpServers mirror (issue #139)
 # ---------------------------------------------------------------------------
