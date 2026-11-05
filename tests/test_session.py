@@ -911,9 +911,12 @@ class TestSharingWindowsMode:
     """Copy mode, exercised by forcing the platform (runs on any host)."""
 
     @pytest.fixture
-    def windows_mgr(self, share_setup):
+    def windows_mgr(self, share_setup, monkeypatch):
         source, session_dir, mgr = share_setup
         mgr.switcher.platform = Platform.WINDOWS
+        monkeypatch.setattr(
+            session_mod, "windows_symlinks_available", lambda _dir: False
+        )
         return source, session_dir, mgr
 
     def test_copies_instead_of_links(self, windows_mgr):
@@ -2082,6 +2085,14 @@ class TestShareHistoryPosix:
 
 
 class TestShareHistoryWindows:
+    """Windows without symlinks (no Developer Mode): copy mode."""
+
+    @pytest.fixture(autouse=True)
+    def no_symlinks(self, monkeypatch):
+        monkeypatch.setattr(
+            session_mod, "windows_symlinks_available", lambda _dir: False
+        )
+
     def test_sync_never_links_history_in_copy_mode(self, history_setup):
         source, session_dir, mgr = history_setup
         mgr.switcher.platform = Platform.WINDOWS
@@ -2098,8 +2109,159 @@ class TestShareHistoryWindows:
             session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
         )
 
-        with pytest.raises(SessionError, match="Windows"):
+        with pytest.raises(SessionError, match="Developer Mode"):
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+
+
+def _host_can_symlink(where: Path) -> bool:
+    link = where / ".probe-link"
+    try:
+        link.symlink_to(where, target_is_directory=True)
+    except OSError:
+        return False
+    link.unlink()
+    return True
+
+
+class TestShareHistoryWindowsSymlinks:
+    """Windows with symlinks allowed: shares exactly as POSIX does."""
+
+    @pytest.fixture
+    def win_history(self, history_setup, monkeypatch, tmp_path):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        source, session_dir, mgr = history_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        monkeypatch.setattr(
+            session_mod, "windows_symlinks_available", lambda _dir: True
+        )
+        return source, session_dir, mgr
+
+    def test_links_history_items(self, win_history):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "projects").is_symlink()
+        assert (session_dir / "history.jsonl").is_symlink()
+        assert (
+            session_dir / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert manifest["mode"] == "symlink"
+        assert {"projects", "history.jsonl"} <= set(manifest["items"])
+
+    def test_merges_profile_history_before_linking(self, win_history):
+        source, session_dir, mgr = win_history
+        own = session_dir / "projects" / "-home-user-app"
+        own.mkdir(parents=True)
+        (own / "bbb.jsonl").write_text("profile-b\n")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "projects").is_symlink()
+        assert (
+            source / "projects" / "-home-user-app" / "bbb.jsonl"
+        ).read_text() == "profile-b\n"
+
+    def test_replaces_copies_with_links(self, win_history, monkeypatch):
+        source, session_dir, mgr = win_history
+        monkeypatch.setattr(
+            session_mod, "windows_symlinks_available", lambda _dir: False
+        )
+        mgr._sync_sharing(session_dir, share=True)
+        assert not (session_dir / "skills").is_symlink()
+
+        monkeypatch.setattr(
+            session_mod, "windows_symlinks_available", lambda _dir: True
+        )
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "settings.json").is_symlink()
+        assert (session_dir / "skills").is_symlink()
+        assert (session_dir / "skills" / "a.md").read_text() == "skill"
+
+    def test_resync_keeps_correct_links(self, win_history, monkeypatch):
+        source, session_dir, mgr = win_history
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        unlinked = []
+        real_unlink = Path.unlink
+
+        def tracking(self, missing_ok=False):
+            unlinked.append(self.name)
+            real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", tracking)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert "projects" not in unlinked
+        assert "history.jsonl" not in unlinked
+
+    def test_run_accepts_flag(self, win_history, monkeypatch):
+        source, session_dir, mgr = win_history
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
+        )
+
+        def reached(_identifier):
+            raise RuntimeError("past the share-history guard")
+
+        monkeypatch.setattr(mgr.switcher, "resolve_account", reached)
+        with pytest.raises(RuntimeError, match="past the share-history guard"):
+            mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+
+
+class TestWindowsSymlinkProbe:
+    @pytest.fixture(autouse=True)
+    def fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(session_mod, "_symlink_probe_results", {})
+
+    def test_refused_symlink_reads_as_unavailable(self, tmp_path, monkeypatch):
+        def refuse(self, target, target_is_directory=False):
+            raise OSError(1314, "A required privilege is not held by the client")
+
+        monkeypatch.setattr(Path, "symlink_to", refuse)
+
+        assert session_mod.windows_symlinks_available(tmp_path) is False
+        assert not list(tmp_path.iterdir())
+
+    def test_answer_is_probed_once(self, tmp_path, monkeypatch):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        calls = []
+        real = Path.symlink_to
+
+        def counting(self, target, target_is_directory=False):
+            calls.append(self)
+            real(self, target, target_is_directory)
+
+        monkeypatch.setattr(Path, "symlink_to", counting)
+
+        assert session_mod.windows_symlinks_available(tmp_path) is True
+        assert session_mod.windows_symlinks_available(tmp_path) is True
+        assert len(calls) == 1
+        assert not list(tmp_path.iterdir())
+
+
+class TestLinkPointsAt:
+    def test_ignores_the_windows_long_path_prefix(self, monkeypatch):
+        target = Path("C:\\Users\\me\\.claude\\projects")
+        monkeypatch.setattr(
+            session_mod.os, "readlink",
+            lambda _p: "\\\\?\\C:\\Users\\me\\.claude\\projects",
+        )
+        assert session_mod._link_points_at(Path("link"), target)
+
+    def test_unc_prefix_maps_back_to_a_share_path(self, monkeypatch):
+        target = Path("\\\\server\\share\\projects")
+        monkeypatch.setattr(
+            session_mod.os, "readlink",
+            lambda _p: "\\\\?\\UNC\\server\\share\\projects",
+        )
+        assert session_mod._link_points_at(Path("link"), target)
+
+    def test_other_target_does_not_match(self, monkeypatch):
+        monkeypatch.setattr(session_mod.os, "readlink", lambda _p: "/elsewhere")
+        assert not session_mod._link_points_at(Path("link"), Path("/target"))
 
 
 class TestReadSessionCredentials:

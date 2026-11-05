@@ -17,18 +17,20 @@ mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
-them into the session profile — symlinks on macOS/Linux (Claude's settings writer
-detects symlinks and writes through to the target, so in-session ``/config``
-changes land in ``~/.claude``), copies re-synced on every launch on Windows.
-A manifest records what cswap created so removal never touches user data.
+them into the session profile — symlinks on macOS/Linux, and on Windows
+when this process may create them (Developer Mode or an elevated terminal).
+Claude's settings writer detects symlinks and writes through to the target,
+so in-session ``/config`` changes land in ``~/.claude``. Windows without
+symlinks gets copies re-synced on every launch. A manifest records what cswap
+created so removal never touches user data.
 
 History sharing (``--share-history``, opt-in): additionally links
 ``projects/`` (conversation transcripts — what ``claude --resume`` lists) and
 ``history.jsonl`` (prompt history) from ``~/.claude``, so all accounts see one
-unified conversation history. POSIX-only: Windows shares by re-synced copy,
-which would fork history rather than share it. If the profile already
-accumulated its own history, it is merged into ``~/.claude`` first so nothing
-disappears from ``--resume``.
+unified conversation history. Needs symlinks: a re-synced copy would fork
+history rather than share it. If the profile already accumulated its own
+history, it is merged into ``~/.claude`` first so nothing disappears from
+``--resume``.
 
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
@@ -204,6 +206,43 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # timeout) plus auth-status probes, so it needs more headroom than the
 # default 10s acquire used by the switch paths.
 _BOOTSTRAP_LOCK_TIMEOUT = 30.0
+
+_symlink_probe_results: dict[str, bool] = {}
+
+
+def windows_symlinks_available(probe_dir: Path) -> bool:
+    """Whether this process can create symlinks in ``probe_dir`` on Windows.
+
+    Windows grants symlink creation only with Developer Mode on or to an
+    elevated token. The answer cannot change within a process, so it is
+    probed once per directory.
+    """
+    key = str(probe_dir)
+    if key not in _symlink_probe_results:
+        link = probe_dir / f".cswap-symlink-probe-{os.getpid()}"
+        try:
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            link.unlink(missing_ok=True)
+            link.symlink_to(probe_dir, target_is_directory=True)
+            link.unlink()
+            _symlink_probe_results[key] = True
+        except OSError:
+            _symlink_probe_results[key] = False
+    return _symlink_probe_results[key]
+
+
+def _link_points_at(link: Path, target: Path) -> bool:
+    """Whether the symlink ``link`` stores ``target`` itself.
+
+    Windows reports the stored path with its ``\\\\?\\`` prefix, so a plain
+    comparison would never match and every launch would recreate the link.
+    """
+    stored = os.readlink(link)
+    if stored.startswith("\\\\?\\UNC\\"):
+        stored = "\\\\" + stored[8:]
+    elif stored.startswith("\\\\?\\"):
+        stored = stored[4:]
+    return os.path.normcase(stored) == os.path.normcase(str(target))
 
 
 def slugify_email(email: str) -> str:
@@ -556,6 +595,12 @@ class SessionManager:
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
 
+    def _use_symlinks(self) -> bool:
+        """Share into profiles by symlink, else by re-synced copy."""
+        if self.switcher.platform != Platform.WINDOWS:
+            return True
+        return windows_symlinks_available(self.switcher.backup_dir)
+
     # -- launch ----------------------------------------------------------
 
     def run(
@@ -579,11 +624,12 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        if share_history and self.switcher.platform == Platform.WINDOWS:
+        if share_history and not self._use_symlinks():
             raise SessionError(
-                "--share-history is not supported on Windows yet: sharing uses "
-                "re-synced copies there, which would fork the history instead "
-                "of sharing it."
+                "--share-history is not supported on Windows without symlinks: "
+                "sharing uses re-synced copies there, which would fork the "
+                "history instead of sharing it. Turn on Developer Mode "
+                "(Settings > System > For developers) and run it again."
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -1089,9 +1135,10 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
-        if self.switcher.platform == Platform.WINDOWS:
+        use_symlinks = self._use_symlinks()
+        # History needs links (run() rejects the flag without them); this also
+        # drops any history links left by a move from a host that had them.
+        if not use_symlinks:
             share_history = False
         active_items = (SHARED_ITEMS if share else ()) + (
             HISTORY_ITEMS if share_history else ()
@@ -1115,7 +1162,6 @@ class SessionManager:
             manifest_path.unlink(missing_ok=True)
             return
 
-        use_symlinks = self.switcher.platform != Platform.WINDOWS
         new_managed: list[str] = []
 
         for name in active_items:
@@ -1146,14 +1192,18 @@ class SessionManager:
                     managed = [*managed, name]  # adopt: only cswap links here
                 if use_symlinks:
                     try:
-                        if dest.readlink() != link_target:
+                        if not _link_points_at(dest, link_target):
                             dest.unlink()
-                            dest.symlink_to(link_target)
+                            dest.symlink_to(
+                                link_target,
+                                target_is_directory=link_target.is_dir(),
+                            )
                     except OSError:
                         continue
                     new_managed.append(name)
                     continue
-                # Platform moved POSIX → Windows: replace link with a copy.
+                # Symlinks unavailable here (Windows without Developer Mode):
+                # replace the link with a copy.
                 dest.unlink()
             elif dest.exists() and name not in managed:
                 # Pre-existing user data in the profile — never touch it.
@@ -1169,7 +1219,11 @@ class SessionManager:
                 if use_symlinks:
                     if dest.exists():
                         self._remove_managed(dest)
-                    dest.symlink_to(link_target)
+                    # Windows needs the kind up front: a file link to a
+                    # directory does not open as one.
+                    dest.symlink_to(
+                        link_target, target_is_directory=link_target.is_dir()
+                    )
                 else:
                     if dest.exists():
                         self._remove_managed(dest)
@@ -1502,7 +1556,7 @@ class SessionManager:
             return []
 
     def _write_manifest(self, manifest_path: Path, items: list[str]) -> None:
-        mode = "symlink" if self.switcher.platform != Platform.WINDOWS else "copy"
+        mode = "symlink" if self._use_symlinks() else "copy"
         payload = json.dumps({"items": items, "mode": mode}, indent=2)
         try:
             atomic_write_text(manifest_path, payload)

@@ -174,7 +174,8 @@ Examples:
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
             "per-account history (the default, unless `cswap config set "
-            "run.shareHistory true`). Not supported on Windows."
+            "run.shareHistory true`). On Windows it needs Developer Mode, "
+            "which allows symlinks."
         ),
     )
     parser.add_argument(
@@ -244,7 +245,8 @@ Examples:
 
 
 def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
-    """The flag wins; otherwise run.shareHistory, which Windows can't honor.
+    """The flag wins; otherwise run.shareHistory, which Windows can honor
+    only where it may create symlinks.
 
     An explicit --share-history still reaches SessionManager.run and errors
     there; a setting-derived one just warns and falls back to per-account
@@ -255,11 +257,14 @@ def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
         return args.share_history
     enabled = load_run_settings(switcher.backup_dir).share_history
     if enabled and switcher.platform == Platform.WINDOWS:
-        warning(
-            "run.shareHistory is not supported on Windows yet — "
-            "using per-account history."
-        )
-        return False
+        from claude_swap import session
+
+        if not session.windows_symlinks_available(switcher.backup_dir):
+            warning(
+                "run.shareHistory is not supported on Windows without "
+                "Developer Mode — using per-account history."
+            )
+            return False
     return enabled
 
 

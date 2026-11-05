@@ -135,7 +135,7 @@ cswap run 2 --share-history     # share your chat history with this account too
 cswap run 2 --require-session   # refuse rather than run plain claude if 2 is the default login
 ```
 
-Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations, or make it the default for every `cswap run` with `cswap config set run.shareHistory true` (`--no-share-history` still opts out per launch; on Windows the setting is ignored with a warning, while an explicit `--share-history` errors).
+Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations, or make it the default for every `cswap run` with `cswap config set run.shareHistory true` (`--no-share-history` still opts out per launch). On Windows, sharing uses symlinks when Windows allows them, which needs Developer Mode (Settings > System > For developers) or an elevated terminal. Without them, settings and skills are copied into each profile on every launch, and history stays per account: the setting is ignored with a warning, while an explicit `--share-history` errors.
 
 Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
   
