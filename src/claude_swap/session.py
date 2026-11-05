@@ -19,7 +19,9 @@ Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
 them into the session profile — symlinks on macOS/Linux (Claude's settings writer
 detects symlinks and writes through to the target, so in-session ``/config``
-changes land in ``~/.claude``), copies re-synced on every launch on Windows.
+changes land in ``~/.claude``). On Windows, directories are shared through
+junctions (no privilege needed, live like a symlink; a copy where a junction
+can't be made) and files are copies re-synced on every launch.
 A manifest records what cswap created so removal never touches user data.
 
 History sharing (``--share-history``, opt-in): additionally links
@@ -88,6 +90,39 @@ HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
 )
+
+# Windows has no unprivileged directory symlink, but a junction needs no
+# privilege and Claude's writes go through it (issue #292). Directory items
+# are shared through one, live like a POSIX symlink; files are still copied.
+# Module-level so tests can emulate them on any host.
+def _create_junction(target: Path, link: Path) -> None:
+    import _winapi  # Windows-only stdlib module; private but stable since 3.5
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def _is_junction(path: Path) -> bool:
+    try:
+        return path.is_junction()
+    except OSError:
+        return False
+
+
+def _junction_points_to(link: Path, target: Path) -> bool:
+    """True when junction `link` resolves to `target`. readlink gives a
+    long-path-prefixed path on Windows, so both sides are normalised."""
+    try:
+        got = os.readlink(link)
+    except OSError:
+        return False
+    if got.startswith("\\\\?\\"):
+        got = got[4:]
+    return _norm(got) == _norm(str(target))
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
+
 
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
@@ -1141,6 +1176,20 @@ class SessionManager:
             # (anthropics/claude-code#78162).
             link_target = src.resolve() if src.is_symlink() else src
 
+            if not use_symlinks and _is_junction(dest):
+                if _junction_points_to(dest, link_target):
+                    # ours, or one made by hand to the same place: adopt it
+                    new_managed.append(name)
+                    continue
+                if name not in managed:
+                    print(
+                        dimmed(
+                            f"Not sharing {name}: the session profile already "
+                            "has its own junction."
+                        )
+                    )
+                    continue
+                self._remove_managed(dest)  # ours, but stale: re-made below
             if dest.is_symlink():
                 if name not in managed:
                     managed = [*managed, name]  # adopt: only cswap links here
@@ -1174,7 +1223,12 @@ class SessionManager:
                     if dest.exists():
                         self._remove_managed(dest)
                     if src.is_dir():
-                        shutil.copytree(src, dest)
+                        try:
+                            _create_junction(link_target, dest)
+                        except (OSError, ImportError):
+                            # no junction here (another volume, FAT, ...):
+                            # a copy, refreshed on each launch
+                            shutil.copytree(src, dest)
                     else:
                         shutil.copy2(src, dest)
             except OSError as e:
@@ -1514,7 +1568,13 @@ class SessionManager:
         """Remove a cswap-created share entry (link or copy), never user data
         beyond it — callers guarantee `dest` is manifest-listed or a symlink."""
         try:
-            if dest.is_symlink() or dest.is_file():
+            if _is_junction(dest):
+                # removes the junction only, never its target
+                try:
+                    dest.unlink()
+                except OSError:
+                    os.rmdir(dest)
+            elif dest.is_symlink() or dest.is_file():
                 dest.unlink(missing_ok=True)
             elif dest.is_dir():
                 shutil.rmtree(dest, ignore_errors=True)
