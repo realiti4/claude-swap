@@ -7,8 +7,9 @@ import json
 import os
 import shutil
 import sys
+import threading
 import unicodedata
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2046,7 +2047,7 @@ class TestShareHistoryPosix:
         # off-by-1000 that still lands in a plausible-looking date would slip
         # past a loose "2026-" substring check.
         expected_started = datetime.fromtimestamp(
-            blocker.started_at / 1000, tz=timezone.utc
+            blocker.started_at / 1000, tz=UTC
         ).astimezone()
         assert f"{expected_started:%Y-%m-%d %H:%M}" in out
 
@@ -2138,12 +2139,12 @@ class TestShareHistoryPosix:
         assert run_dir is not None, "the quarantine directory must not be lost"
 
     def test_migration_lock_timeout_degrades_instead_of_raising(
-        self, history_setup, monkeypatch
+        self, history_setup, monkeypatch, capsys
     ):
-        """A LockError from the per-profile migration lock must degrade like
-        every other failure in this function (dimmed message, return False)
-        rather than escape and abort the launch — a lock timeout means a
-        peer is still working on this profile, which is expected, not broken.
+        """A LockError from the migration lock must degrade like every other
+        failure in this function (a message, return False) rather than
+        escape and abort the launch — a lock timeout means a peer is still
+        merging into the shared tree, which is expected, not broken.
         """
         source, session_dir, mgr = history_setup
         proj = session_dir / "projects" / "-home-user-app"
@@ -2153,14 +2154,18 @@ class TestShareHistoryPosix:
         # Fail fast instead of waiting out the real 30s timeout.
         monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
 
-        # Hold the per-profile migration lock open, simulating a peer already
-        # migrating this same profile.
-        with FileLock(session_dir / session_mod.MIGRATION_LOCK):
+        # Hold the migration lock open, simulating a peer already merging
+        # some profile — any profile — into the same shared tree.
+        with FileLock(mgr.switcher.backup_dir / session_mod.MIGRATION_LOCK):
             mgr._sync_sharing(session_dir, share=True, share_history=True)
 
         # Degraded, not raised: no migration happened, nothing linked.
         assert (proj / "bbb.jsonl").exists()
         assert not (session_dir / "projects").is_symlink()
+        # And the reason given is the peer, not a session in this profile.
+        out = capsys.readouterr().out
+        assert "merging history into" in out
+        assert "cswap run 2 --share-history" in out
 
     def _lock_that_lets_a_peer_finish_first(self, monkeypatch, on_acquire):
         """Stand in for the migration lock a peer is already holding.
@@ -2493,6 +2498,164 @@ class TestShareHistoryPosix:
         assert "/profile/" in str(quarantine_path)
         assert "/shared/" not in str(quarantine_path)
         assert "2026-07-21" in quarantine_path.read_text()
+
+
+def _parked_bodies(mgr: SessionManager, name: str) -> list[str]:
+    root = mgr.switcher.backup_dir / "history-conflicts"
+    return sorted(p.read_text() for p in root.rglob(name)) if root.exists() else []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
+class TestHistoryMergeSharesTheDestination:
+    """``~/.claude`` has other writers than the profile being merged: other
+    profiles merge into it too."""
+
+    # -- one lock for the destination -------------------------------------
+
+    def test_two_profiles_merging_one_path_do_not_overwrite_each_other(
+        self, history_setup, seeded_switcher, monkeypatch
+    ):
+        """With a lock per profile, two DIFFERENT profiles each find the same
+        shared path missing, and the second move lands on top of the first:
+        a file is gone without a collision ever having been seen. One lock
+        on the destination makes the second merge wait, and meet one."""
+        source, first_dir, first = history_setup
+        second_dir = first.sessions_dir / "3-account3_example.com"
+        second = SessionManager(seeded_switcher)
+        rel = Path("-home-user-app") / "memory" / "MEMORY.md"
+        for profile, body in ((first_dir, "first\n"), (second_dir, "second\n")):
+            (profile / "projects" / rel).parent.mkdir(parents=True)
+            (profile / "projects" / rel).write_text(body)
+
+        first_is_moving = threading.Event()
+        second_had_its_chance = threading.Event()
+        real_move = shutil.move
+
+        def move(src_path, dst_path):
+            # Hold the first profile at the exact point the race needs: it
+            # has seen the shared path missing and has not moved onto it yet.
+            if str(first_dir) in str(src_path) and not first_is_moving.is_set():
+                first_is_moving.set()
+                assert second_had_its_chance.wait(timeout=10)
+            return real_move(src_path, dst_path)
+
+        class WatchedLock(FileLock):
+            def acquire(self, timeout=None):
+                if threading.current_thread().name == "second":
+                    if super().acquire(timeout=0.3):
+                        return True
+                    # Still shut out after a wait: its chance was spent
+                    # queueing behind the first, which is the point.
+                    second_had_its_chance.set()
+                return super().acquire(timeout)
+
+        monkeypatch.setattr(session_mod.shutil, "move", move)
+        monkeypatch.setattr(session_mod, "FileLock", WatchedLock)
+
+        def launch(mgr, profile):
+            try:
+                mgr._sync_sharing(profile, share=True, share_history=True)
+            finally:
+                if threading.current_thread().name == "second":
+                    second_had_its_chance.set()
+
+        a = threading.Thread(target=launch, args=(first, first_dir), name="first")
+        b = threading.Thread(target=launch, args=(second, second_dir), name="second")
+        a.start()
+        assert first_is_moving.wait(timeout=10)
+        b.start()
+        a.join(timeout=30)
+        b.join(timeout=30)
+
+        assert not a.is_alive() and not b.is_alive()
+        shared = source / "projects" / rel
+        assert sorted([shared.read_text(), *_parked_bodies(first, "MEMORY.md")]) == [
+            "first\n",
+            "second\n",
+        ], "one profile's file was overwritten by the other's"
+        assert (first_dir / "projects").readlink() == source / "projects"
+        assert (second_dir / "projects").readlink() == source / "projects"
+
+    def test_the_link_is_installed_before_the_lock_is_released(
+        self, history_setup, monkeypatch
+    ):
+        """Released in between, a peer finds the profile with its history
+        moved out and nothing linked, and takes it for one with nothing to
+        share."""
+        _, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+        linked_at_release: list[bool] = []
+
+        class WatchedLock(FileLock):
+            def release(self):
+                linked_at_release.append((session_dir / "projects").is_symlink())
+                super().release()
+
+        monkeypatch.setattr(session_mod, "FileLock", WatchedLock)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert linked_at_release == [True]
+
+    def test_a_profile_with_nothing_to_merge_does_not_wait_on_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        """Linking moves nothing, so a new profile must not queue behind
+        another profile's merge (and be told it "keeps its own" history)."""
+        source, session_dir, mgr = history_setup
+        monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
+
+        with FileLock(mgr.switcher.backup_dir / session_mod.MIGRATION_LOCK):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "projects").readlink() == source / "projects"
+        assert (session_dir / "history.jsonl").readlink() == source / "history.jsonl"
+
+    # -- what the user is told ----------------------------------------------
+
+    def test_a_deferral_is_explained_once_per_launch(
+        self, history_setup, monkeypatch, capsys
+    ):
+        """Both history items defer for the same reason; a second copy of
+        the block only buries the first."""
+        _, session_dir, mgr = history_setup
+        (session_dir / "projects").mkdir()
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+        blocker = ClaudeSession(
+            pid=63802,
+            session_id="live",
+            cwd="/tmp",
+            started_at=0,
+            kind="interactive",
+            entrypoint="cli",
+        )
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda _dir: ([blocker], 0)
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        assert out.count("keeps its own") == 1
+        assert out.count("63802") == 1
+        assert not (session_dir / "projects").is_symlink()
+        assert not (session_dir / "history.jsonl").is_symlink()
+
+    def test_an_unreadable_record_is_not_reported_as_a_peer_migration(
+        self, history_setup, monkeypatch, capsys
+    ):
+        _, session_dir, mgr = history_setup
+        (session_dir / "projects").mkdir()
+        (session_dir / "projects" / "x.jsonl").write_text("mine\n")
+        monkeypatch.setattr(session_mod, "scan_live_sessions", lambda _dir: ([], 1))
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        assert "could not be read" in out
+        assert "merging history" not in out
+        assert (session_dir / "projects" / "x.jsonl").read_text() == "mine\n"
 
 
 class TestShareHistoryWindows:

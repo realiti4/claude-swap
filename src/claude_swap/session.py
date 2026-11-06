@@ -44,7 +44,7 @@ import subprocess
 import sys
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -118,10 +118,12 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
 
-# Per-profile lock serializing concurrent history migrations of the same
-# profile. Permanent once created (like the markers above), so it is a named
-# constant rather than an inline literal — a later rename would orphan it.
-MIGRATION_LOCK = ".cswap-migration.lock"
+# The one lock every history migration takes. It lives in the backup dir, not
+# in a profile, because what a migration races is another writer to the SHARED
+# tree: two different profiles merging into ~/.claude at once are exactly
+# that. A named constant rather than an inline literal — after a rename, old
+# and new launches would serialize on different files.
+MIGRATION_LOCK = ".history-migration.lock"
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -630,6 +632,9 @@ class SessionManager:
         # Filled by the most recent merge so the launch can report counts
         # without re-deriving them from the filesystem.
         self._last_merge_counts: tuple[int, int, Path | None] = (0, 0, None)
+        # A deferred migration is explained once per launch, not once per
+        # history item.
+        self._deferral_reported = False
 
     # -- launch ----------------------------------------------------------
 
@@ -1158,8 +1163,9 @@ class SessionManager:
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
         is set in the invoking environment. File/dir sharing is lock-free on
         the reuse path — concurrent runs with different flags are last-writer-
-        wins and self-heal on the next launch; only the MCP mirror takes
-        Claude's config lock, and only when it needs to write.
+        wins and self-heal on the next launch. The MCP mirror takes Claude's
+        config lock, and only when it needs to write; merging a profile's own
+        history into ``~/.claude`` takes ``MIGRATION_LOCK``.
         """
         if not session_dir.is_dir():
             return
@@ -1167,6 +1173,7 @@ class SessionManager:
         # runs (once per HISTORY_ITEMS entry), so a launch with nothing to
         # migrate must not report counts left over from a previous one.
         self._last_merge_counts = (0, 0, None)
+        self._deferral_reported = False
         self._sync_mcp_servers(session_dir, share)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).
@@ -1468,128 +1475,189 @@ class SessionManager:
         (created empty so there is something to link). Real history is merged
         even when the manifest claims the entry is managed: a stale manifest
         (lock-free launches race) must never let the generic loop delete it.
+
+        A merge runs under ``MIGRATION_LOCK`` together with everything it
+        depends on: the path and liveness checks are read again inside the
+        lock, and the link is installed before it is released (see
+        ``_migrate_under_lock``). A profile with nothing to merge never
+        takes it.
         """
-        merged = False
         if dest.exists() and not dest.is_symlink():
             # Real per-account history accumulated before the flag existed.
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
+            # This first look is a cheap early out — a profile that is always
+            # busy should not queue on the lock every launch for a merge that
+            # cannot run. The look that counts is taken under the lock.
             if not profile_is_quiescent(session_dir):
                 self._report_deferral(session_dir, dest)
                 return False
-            # The pre-check above is a cheap early out; the authoritative one
-            # runs under the lock, so a launch that starts in between cannot
-            # have its transcripts moved mid-write.
-            #
-            # A per-profile lock, not switcher.lock_file: the risk being
-            # serialized here is two concurrent migrations of the *same*
-            # profile racing target.exists() against shutil.move. A
-            # per-profile lock covers exactly that, is finer-grained than the
-            # global lock (an unrelated account's migration is never
-            # blocked), and cannot deadlock against setup_session's bootstrap
-            # lock (which is still held across this call on some paths)
-            # because it is a different file. The bootstrap lock protects
-            # credential and profile setup — a different concern from moving
-            # transcripts.
             try:
                 with FileLock(
-                    session_dir / MIGRATION_LOCK, timeout=_MIGRATION_LOCK_TIMEOUT
+                    self.switcher.backup_dir / MIGRATION_LOCK,
+                    timeout=_MIGRATION_LOCK_TIMEOUT,
                 ):
-                    if not profile_is_quiescent(session_dir):
-                        self._report_deferral(session_dir, dest)
+                    if not self._migrate_under_lock(src, dest, session_dir):
                         return False
-                    # Re-check the precondition too, not just liveness: it was
-                    # evaluated before the wait, and the peer we queued behind
-                    # may have migrated this very item. Merging a dest it
-                    # removed raises FileNotFoundError and reports a peer's
-                    # success as our failure; merging one it replaced with a
-                    # symlink is worse, since dest.is_dir() follows the link
-                    # and the walk would quarantine every shared transcript
-                    # against itself. Either way there is nothing left to
-                    # merge, and the generic loop can link as normal.
-                    if dest.exists() and not dest.is_symlink():
-                        try:
-                            moved, quarantined, run_dir = (
-                                self._merge_history_into_source(src, dest)
-                            )
-                        except (OSError, ValueError) as e:
-                            # ValueError covers UnicodeDecodeError: a
-                            # byte-corrupt history file is "nothing readable
-                            # to merge", and losing a launch to a stray byte
-                            # in ~/.claude/history.jsonl would strand every
-                            # account that has not migrated yet.
-                            self._logger.warning(
-                                f"Could not merge {dest.name} into {src}: {e}"
-                            )
-                            print(
-                                dimmed(
-                                    f"Not sharing {dest.name}: merging the "
-                                    "profile's existing history failed "
-                                    "(see log)."
-                                )
-                            )
-                            return False
-                        # HISTORY_ITEMS holds two entries (projects,
-                        # history.jsonl), so this runs up to twice per launch —
-                        # accumulate rather than overwrite, and keep the first
-                        # quarantine dir a run produces (the file-merge branch
-                        # never quarantines, so at most one of the two calls
-                        # sets it).
-                        prev_moved, prev_quarantined, prev_run_dir = (
-                            self._last_merge_counts
-                        )
-                        self._last_merge_counts = (
-                            prev_moved + moved,
-                            prev_quarantined + quarantined,
-                            prev_run_dir if prev_run_dir is not None else run_dir,
-                        )
-                        merged = True
             except LockError:
-                # A peer is migrating this same profile right now — the
-                # timeout means "still busy", not "broken", so this degrades
-                # exactly like every other deferral instead of aborting the
-                # launch.
-                self._report_deferral(session_dir, dest)
+                # A peer is still merging — the timeout means "still busy",
+                # not "broken", so this degrades exactly like every other
+                # deferral instead of aborting the launch.
+                self._report_deferral(session_dir, dest, lock_busy=True)
                 return False
-            if merged:
-                print(
-                    dimmed(
-                        f"Merged the profile's existing {dest.name} into "
-                        f"{src} — conversation history is now shared."
-                    )
-                )
-        if not src.exists():
-            # Fresh ~/.claude (or first run): seed an empty share target so
-            # the generic loop below has something to link.
-            try:
-                # 0o600/0o700 to match Claude Code's own modes for history
-                # data — its mode= applies only at creation, so a loose seed
-                # here would stay world-readable forever.
-                if dest.name.endswith(".jsonl"):
-                    src.parent.mkdir(parents=True, exist_ok=True)
-                    src.touch(mode=0o600)
-                else:
-                    _mkdir_private(src)
-            except OSError as e:
-                self._logger.warning(f"Could not create {src}: {e}")
-                return False
+        return self._seed_history_source(src, dest)
+
+    def _seed_history_source(self, src: Path, dest: Path) -> bool:
+        """Create an empty share target when ``~/.claude`` has none yet."""
+        if src.exists():
+            return True
+        # Fresh ~/.claude (or first run): seed an empty share target so
+        # there is something to link.
+        try:
+            # 0o600/0o700 to match Claude Code's own modes for history
+            # data — its mode= applies only at creation, so a loose seed
+            # here would stay world-readable forever.
+            if dest.name.endswith(".jsonl"):
+                src.parent.mkdir(parents=True, exist_ok=True)
+                src.touch(mode=0o600)
+            else:
+                _mkdir_private(src)
+        except OSError as e:
+            self._logger.warning(f"Could not create {src}: {e}")
+            return False
         return True
 
-    def _report_deferral(self, session_dir: Path, dest: Path) -> None:
+    def _migrate_under_lock(
+        self, src: Path, dest: Path, session_dir: Path
+    ) -> bool:
+        """Merge the profile's history into ``src`` and link it, as one step.
+
+        Runs with ``MIGRATION_LOCK`` held. That lock is keyed on the shared
+        destination rather than on the profile, because the destination is
+        what two migrations contend for: with a lock per profile, two
+        DIFFERENT profiles can each find a shared path missing, and the
+        second move lands on top of the first. It is its own file, so it
+        cannot deadlock against ``setup_session``'s bootstrap lock — still
+        held across this call on some paths, and never taken from in here.
+
+        Nothing decided before the wait is trusted. The peer we queued
+        behind may have merged this very item (``dest`` is gone: merging it
+        raises FileNotFoundError and reports a peer's success as our
+        failure), or linked it (``dest.is_dir()`` follows the link, so the
+        walk would file every shared transcript against itself), or a claude
+        may have started in the profile. Each is read again here.
+
+        The link goes in before the lock is released, so no peer ever finds
+        the profile in between — history moved out, nothing linked yet — and
+        takes that for a profile with nothing to share.
+        """
+        if not dest.exists() or dest.is_symlink():
+            return True  # a peer finished this item; the generic loop links
+        if not profile_is_quiescent(session_dir):
+            self._report_deferral(session_dir, dest)
+            return False
+        try:
+            moved, quarantined, run_dir = self._merge_history_into_source(
+                src, dest
+            )
+        except (OSError, ValueError) as e:
+            # ValueError covers UnicodeDecodeError: a byte-corrupt history
+            # file is "nothing readable to merge", and losing a launch to a
+            # stray byte in ~/.claude/history.jsonl would strand every
+            # account that has not migrated yet.
+            self._logger.warning(f"Could not merge {dest.name} into {src}: {e}")
+            print(
+                dimmed(
+                    f"Not sharing {dest.name}: merging the profile's "
+                    "existing history failed (see log)."
+                )
+            )
+            return False
+        # HISTORY_ITEMS holds two entries (projects, history.jsonl), so this
+        # runs up to twice per launch — accumulate rather than overwrite, and
+        # keep the first quarantine dir a run produces (the file-merge branch
+        # never quarantines, so at most one of the two calls sets it).
+        prev_moved, prev_quarantined, prev_run_dir = self._last_merge_counts
+        self._last_merge_counts = (
+            prev_moved + moved,
+            prev_quarantined + quarantined,
+            prev_run_dir if prev_run_dir is not None else run_dir,
+        )
+        try:
+            if not self._seed_history_source(src, dest):
+                raise OSError(f"no {src} to link to")
+            # The same target the generic loop links to (see its note on a
+            # ~/.claude entry that is itself a symlink).
+            dest.symlink_to(src.resolve() if src.is_symlink() else src)
+        except OSError as e:
+            self._logger.warning(f"Failed to share {dest.name} into session: {e}")
+            print(
+                dimmed(
+                    f"Merged the profile's existing {dest.name} into {src}, "
+                    "but linking it back failed (see log) — retrying on the "
+                    "next launch."
+                )
+            )
+            return False
+        print(
+            dimmed(
+                f"Merged the profile's existing {dest.name} into "
+                f"{src} — conversation history is now shared."
+            )
+        )
+        return True
+
+    def _report_deferral(
+        self, session_dir: Path, dest: Path, lock_busy: bool = False
+    ) -> None:
         """Explain a skipped migration loudly enough to be noticed.
 
         The old one-line dimmed print was scrolled away by Claude's startup
         banner and never logged, so a profile could sit unshared for days
-        with the flag passed on every launch and no visible signal.
+        with the flag passed on every launch and no visible signal. Printed
+        once per launch: both history items defer for the same reason, and a
+        second copy of the block only buries the first.
+
+        ``lock_busy`` is the one deferral that has nothing to do with this
+        profile's own sessions: a peer cswap launch held ``MIGRATION_LOCK``
+        past the timeout, merging some profile's history (not necessarily
+        this one's) into the same shared tree.
         """
-        blockers, _ = scan_live_sessions(session_dir)
         account = session_dir.name
         slot = account.split("-")[0]
+        blockers: list[ClaudeSession] = []
+        if lock_busy:
+            why = "the migration lock is held by a peer process"
+        else:
+            blockers, _ = scan_live_sessions(session_dir)
+            why = (
+                f"{len(blockers)} live session(s): "
+                + ", ".join(f"pid {b.pid} ({b.cwd})" for b in blockers)
+                if blockers
+                else "a session record could not be read"
+            )
+        self._logger.warning(
+            f"History migration of {dest.name} deferred for {account}: {why}"
+        )
+        if self._deferral_reported:
+            return
+        self._deferral_reported = True
         warning(f"share-history: {account} keeps its own {dest.name} for now.")
-        if blockers:
+        retry = f"cswap run {slot} --share-history"
+        if lock_busy:
+            # Nothing to close; the only useful action is to retry once the
+            # peer is done.
+            print(
+                dimmed(
+                    "   Another cswap launch is merging history into "
+                    "~/.claude right now."
+                )
+            )
+            print(dimmed(f"   Once it finishes, relaunch:  {retry}"))
+        elif blockers:
             for live in blockers:
                 started = datetime.fromtimestamp(
-                    live.started_at / 1000, tz=timezone.utc
+                    live.started_at / 1000, tz=UTC
                 ).astimezone()
                 print(
                     dimmed(
@@ -1603,36 +1671,18 @@ class SessionManager:
                     "`claude --resume` under other accounts."
                 )
             )
-            print(
-                dimmed(
-                    f"   Close them, then relaunch:  cswap run {slot} --share-history"
-                )
-            )
+            print(dimmed(f"   Close them, then relaunch:  {retry}"))
         else:
-            # No live session in *this* profile — the migration lock is held
-            # by a peer cswap process instead (e.g. a concurrent launch
-            # already merging this same profile's history). Nothing to
-            # close; the only useful action is to retry once it is done.
+            # Not quiescent, yet nobody to name: a record in the profile's
+            # sessions/ could not be read, and "cannot tell" is never
+            # treated as "nobody there".
             print(
                 dimmed(
-                    "   Another process is migrating this profile's "
-                    "history right now."
+                    "   A session record in this profile could not be read, "
+                    "so it may still be in use."
                 )
             )
-            print(
-                dimmed(
-                    f"   Once it finishes, relaunch:  cswap run {slot} --share-history"
-                )
-            )
-        self._logger.warning(
-            f"History migration deferred for {account}: "
-            f"{len(blockers)} live session(s)"
-            + (
-                ": " + ", ".join(f"pid {b.pid} ({b.cwd})" for b in blockers)
-                if blockers
-                else " (migration lock held by a peer process)"
-            )
-        )
+            print(dimmed(f"   Close anything using it, then relaunch:  {retry}"))
 
     def _quarantine(self, path: Path, rel: Path, run_dir: Path, side: str) -> Path:
         """Move a losing copy under ``run_dir``, never over an existing file.
@@ -1683,7 +1733,7 @@ class SessionManager:
         def quarantine_root() -> Path:
             nonlocal run_dir
             if run_dir is None:
-                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+                stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S")
                 run_dir = self.switcher.backup_dir / QUARANTINE_DIRNAME / stamp
                 _mkdir_private(run_dir)
             return run_dir
