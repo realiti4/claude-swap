@@ -1911,10 +1911,14 @@ class CredentialStore:
             #
             # The honest position is that the true previous generation is
             # unrecoverable here, and a checkpoint that can silently outrank a
-            # real one is worse than the absence it was meant to fill. Warn and
+            # real one is worse than the absence it was meant to fill. Log and
             # decline. `upstream/main` has no `.prev` at all, so this is no
             # worse there; what it is not is a cushion that lies.
-            self._host._logger.warning(
+            #
+            # INFO, not WARNING: the reader already reported the read failure
+            # (or the Keychain cooldown announced it once), the write proceeds
+            # and the slot's existing `.prev` is left untouched.
+            self._host._logger.info(
                 f"Could not retain previous credential generation for "
                 f"account {account_num}: the current backup exists but "
                 "could not be read (not absent) — no .prev recovery copy "
