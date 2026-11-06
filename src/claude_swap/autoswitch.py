@@ -367,19 +367,31 @@ def _unreadable_reason(entries: dict | None, num: str, now: float) -> str:
 
     A reading that merely aged past the trust window with no failure and no
     backoff is "overdue", not unreadable: nothing failed, whatever its poll
-    plan says, the next poll just has not landed. ``entries=None`` (the
-    engine, which collects no reasons) keeps the generic wording.
+    plan says, the next poll just has not landed. One that failed or is in
+    backoff while its last reading is still drawn names that reading's age and
+    the failure ("last read 10m ago, rate-limited until 20:00"). No reading at
+    all, or ``entries=None`` (the engine, which collects no reasons), keeps the
+    generic wording.
     """
     entry = (entries or {}).get(num)
-    if (
-        entry is not None
-        and entry.decision_value() is None
-        and entry.last_good is not None
-        and not entry.consecutive_failures
-        and not entry.in_backoff(now)
-    ):
+    if entry is None or entry.decision_value() is not None or entry.last_good is None:
+        return "usage unreadable"
+    if not entry.consecutive_failures and not entry.in_backoff(now):
         return "usage overdue for refresh"
-    return "usage unreadable"
+    why = entry.last_error or "last fetch failed"
+    if entry.in_backoff(now):
+        clock = oauth.reset_clock_string(
+            datetime.fromtimestamp(entry.backoff_until, tz=timezone.utc),
+            datetime.fromtimestamp(now, tz=timezone.utc),
+        )
+        why = (
+            f"rate-limited until {clock}" if entry.last_error == "http-429"
+            else f"{why}, retry at {clock}"
+        )
+    if entry.age_s is None:
+        return why
+    h, m = divmod(int(entry.age_s) // 60, 60)
+    return f"last read {f'{h}h {m}m' if h else f'{m}m'} ago, {why}"
 
 
 # The charge lands on `floor_headroom`, which includes a pinned model's scoped

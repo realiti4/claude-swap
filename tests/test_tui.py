@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import (
     USAGE_API_KEY,
@@ -2023,8 +2024,8 @@ class TestRankSwitchReasons:
     def test_an_overdue_reading_is_not_called_unreadable(self):
         """A row whose last good reading aged past `STALE_OK_S` with no failure
         says it is overdue, whatever its poll plan (its chips still show the
-        reading); a failure count alone, or a backoff alone, keeps "usage
-        unreadable", on both passes."""
+        reading); a failure count or a backoff names the reading's age and the
+        failure instead (below), on both passes."""
         now = time.time()
         stale = make_entry(61.0, 96.0, age_s=STALE_OK_S + 60)
         planned = dataclasses.replace(stale, next_poll_at=now - 5)
@@ -2045,8 +2046,51 @@ class TestRankSwitchReasons:
             assert reasons == {
                 "2": "usage overdue for refresh",
                 "3": "usage overdue for refresh",
+                "4": "last read 6m ago, last fetch failed",
+                "5": f"last read 6m ago, last fetch failed, retry at "
+                     f"{self._clock(backed_off.backoff_until)}",
+            }, (settings.strategy, reasons)
+
+    @staticmethod
+    def _clock(ts):
+        return oauth.reset_clock_string(
+            datetime.fromtimestamp(ts, tz=timezone.utc),
+            datetime.fromtimestamp(time.time(), tz=timezone.utc),
+        )
+
+    def test_a_failed_candidate_names_its_last_reading_and_the_retry(self):
+        """A failed or backed-off row still draws its last reading, so the
+        reason names that reading's age and the failure (the 429 case says
+        when the rate limit lifts); a row with no reading at all stays
+        "usage unreadable", failure or not."""
+        now = time.time()
+        read = make_entry(61.0, 94.0, age_s=600)
+        limited = dataclasses.replace(
+            read, consecutive_failures=1, last_error="http-429",
+            backoff_until=now + 1500,
+        )
+        broken = dataclasses.replace(
+            read, age_s=7500, consecutive_failures=2, last_error="http-500",
+        )
+        blind = UsageEntry(
+            consecutive_failures=3, last_error="http-429", backoff_until=now + 600
+        )
+        for settings in (
+            _WARM_ORDER_SETTINGS,
+            AutoSwitchSettings(strategy="consume-first", threshold=90.0),
+        ):
+            reasons = self._reasons(
+                settings,
+                make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=limited),
+                make_account(3, entry=broken),
+                make_account(4, entry=blind),
+            )
+            assert reasons == {
+                "2": f"last read 10m ago, rate-limited until "
+                     f"{self._clock(limited.backoff_until)}",
+                "3": "last read 2h 5m ago, http-500",
                 "4": "usage unreadable",
-                "5": "usage unreadable",
             }, (settings.strategy, reasons)
 
 
