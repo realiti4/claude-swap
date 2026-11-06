@@ -20,7 +20,6 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import oauth, usage_store
 from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import (
     USAGE_API_KEY,
@@ -2055,6 +2054,8 @@ class TestRankSwitchReasons:
 
     @staticmethod
     def _clock(ts, now):
+        from claude_swap import oauth
+
         return oauth.reset_clock_string(
             datetime.fromtimestamp(ts, tz=timezone.utc),
             datetime.fromtimestamp(now, tz=timezone.utc),
@@ -2103,6 +2104,8 @@ class TestRankSwitchReasons:
         reading by trust extension) to reach it: a sub-minute age and one
         ahead of the reader's clock (fetchedAt skew) read "<1m", never "0m"
         or "-1h 59m"."""
+        from claude_swap import usage_store
+
         monkeypatch.setattr(usage_store, "STALE_OK_S", -1e9)
         active = dataclasses.replace(make_entry(50.0, 50.0), trust_extended=True)
         for age_s in (30, -7140):
