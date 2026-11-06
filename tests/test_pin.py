@@ -3741,6 +3741,35 @@ class TestClearRunsWithTheExtraGone:
         assert raw["env"] == {"K": "v"}, "the wiring outlived the uninstall"
 
 
+class TestCswapKeepsTheHooksThePinReads:
+    """cswap-pin's `_affinity_rebuild` reads these off cswap by `getattr`
+    and degrades with a once-per-daemon "session affinity: this cswap has no
+    ..." warning when one is gone. The pin's own contract test checks them
+    against the PyPI release only, so a fork merge that drops one (f737c0ab
+    dropped `account_switch_thresholds`) goes uncaught there. Keep this list
+    and that function's reads in step.
+    """
+
+    @pytest.mark.parametrize("target", [
+        "switcher.ClaudeAccountSwitcher.account_policies",
+        "switcher.ClaudeAccountSwitcher.is_account_disabled",
+        "switcher.ClaudeAccountSwitcher.usage_entries_by_account",
+        "switcher.ClaudeAccountSwitcher.read_account_credentials",
+        "switcher.ClaudeAccountSwitcher._get_sequence_data",
+        "poll_policy.parse_reset_ts",
+    ])
+    def test_the_hook_exists_and_is_callable(self, target):
+        import importlib
+
+        module, *path = target.split(".")
+        hook = importlib.import_module(f"claude_swap.{module}")
+        for name in path:
+            hook = getattr(hook, name, None)
+        assert callable(hook), (
+            f"claude_swap.{target} is gone, and cswap-pin reads it by getattr"
+        )
+
+
 class TestAFailedClearIsNotReportedAsSuccess:
     """`--clear` must not say "Unpinned" while the pin survives.
 
