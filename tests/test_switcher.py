@@ -5599,6 +5599,24 @@ class TestPurgeQuarantineWarning:
 
         assert not run_dir.exists()
 
+    def test_purge_leaves_the_shared_history_lock(self, temp_home: Path):
+        """The lock in ``~/.claude`` is shared with every cswap store using
+        this home. Unlinking it under a launch that holds it lets the next
+        one take a fresh copy at the same time, so purge must not tidy it
+        away with the rest."""
+        from claude_swap.session import MIGRATION_LOCK
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        lock = temp_home / ".claude" / MIGRATION_LOCK
+        lock.touch()
+
+        with patch("builtins.input", return_value="y"):
+            switcher.purge()
+
+        assert not switcher.backup_dir.exists()  # purge did run
+        assert lock.exists()
+
 
 class TestAddAccountFromToken:
     """Tests for add_account_from_token (--add-token flow)."""

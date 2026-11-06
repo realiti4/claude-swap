@@ -119,12 +119,16 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
 
-# The one lock every history migration takes. It lives in the backup dir, not
-# in a profile, because what a migration races is another writer to the SHARED
-# tree: two different profiles merging into ~/.claude at once are exactly
-# that. A named constant rather than an inline literal — after a rename, old
-# and new launches would serialize on different files.
-MIGRATION_LOCK = ".history-migration.lock"
+# The one lock every history migration takes. It lives IN the shared
+# destination (``~/.claude``), the only place every launch that can merge into
+# that tree agrees on: on Linux the backup root follows ``XDG_DATA_HOME``, so
+# two cswap stores can share one ``~/.claude``, and a lock inside either store
+# is invisible to the other. Never deleted, not even by ``--purge``: unlinking
+# a flock'd file lets a newcomer create a fresh one and hold "the" lock next
+# to a process still holding the old inode. A named constant rather than an
+# inline literal — after a rename, old and new launches would serialize on
+# different files.
+MIGRATION_LOCK = ".cswap-history-migration.lock"
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -1516,8 +1520,12 @@ class SessionManager:
                 self._report_deferral(session_dir, dest)
                 return False
             try:
+                # The lock sits beside the shared history, so that directory
+                # has to exist first — and with Claude Code's own mode, not
+                # the default one FileLock would create it with.
+                _mkdir_private(src.parent)
                 with FileLock(
-                    self.switcher.backup_dir / MIGRATION_LOCK,
+                    src.parent / MIGRATION_LOCK,
                     timeout=_MIGRATION_LOCK_TIMEOUT,
                 ):
                     if not self._migrate_under_lock(src, dest, session_dir):
@@ -1527,6 +1535,20 @@ class SessionManager:
                 # not "broken", so this degrades exactly like every other
                 # deferral instead of aborting the launch.
                 self._report_deferral(session_dir, dest, lock_busy=True)
+                return False
+            except OSError as e:
+                # The lock file could not be created or opened (a read-only
+                # ~/.claude, say). No lock means no safe merge, and a history
+                # problem must not cost the launch.
+                self._logger.warning(
+                    f"Could not lock {src.parent} to merge {dest.name}: {e}"
+                )
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name}: the shared history could "
+                        "not be locked (see log)."
+                    )
+                )
                 return False
         return self._seed_history_source(src, dest)
 
@@ -1556,12 +1578,13 @@ class SessionManager:
         """Merge the profile's history into ``src`` and link it, as one step.
 
         Runs with ``MIGRATION_LOCK`` held. That lock is keyed on the shared
-        destination rather than on the profile, because the destination is
-        what two migrations contend for: with a lock per profile, two
-        DIFFERENT profiles can each find a shared path missing, and the
-        second move lands on top of the first. It is its own file, so it
-        cannot deadlock against ``setup_session``'s bootstrap lock — still
-        held across this call on some paths, and never taken from in here.
+        destination — it is a file in it — rather than on the profile or the
+        backup store, because the destination is what two migrations contend
+        for: with a lock per profile (or per store), two DIFFERENT profiles
+        can each find a shared path missing, and the second move lands on
+        top of the first. It is its own file, so it cannot deadlock against
+        ``setup_session``'s bootstrap lock — still held across this call on
+        some paths, and never taken from in here.
 
         Nothing decided before the wait is trusted. The peer we queued
         behind may have merged this very item (``dest`` is gone: merging it

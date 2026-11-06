@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -28,7 +29,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.paths import get_global_config_path
+from claude_swap.paths import get_backup_root, get_global_config_path
 from claude_swap.process_detection import ClaudeSession
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
@@ -2155,8 +2156,9 @@ class TestShareHistoryPosix:
         monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
 
         # Hold the migration lock open, simulating a peer already merging
-        # some profile — any profile — into the same shared tree.
-        with FileLock(mgr.switcher.backup_dir / session_mod.MIGRATION_LOCK):
+        # some profile — any profile, from any cswap store — into the same
+        # shared tree. The lock is a file in that tree.
+        with FileLock(source / session_mod.MIGRATION_LOCK):
             mgr._sync_sharing(session_dir, share=True, share_history=True)
 
         # Degraded, not raised: no migration happened, nothing linked.
@@ -2548,28 +2550,16 @@ class TestHistoryMergeSharesTheDestination:
 
     # -- one lock for the destination -------------------------------------
 
-    def test_two_profiles_merging_one_path_do_not_overwrite_each_other(
-        self, history_setup, seeded_switcher, monkeypatch
-    ):
-        """With a lock per profile, two DIFFERENT profiles each find the same
-        shared path missing, and the second move lands on top of the first:
-        a file is gone without a collision ever having been seen. One lock
-        on the destination makes the second merge wait, and meet one."""
-        source, first_dir, first = history_setup
-        second_dir = first.sessions_dir / "3-account3_example.com"
-        second = SessionManager(seeded_switcher)
-        rel = Path("-home-user-app") / "memory" / "MEMORY.md"
-        for profile, body in ((first_dir, "first\n"), (second_dir, "second\n")):
-            (profile / "projects" / rel).parent.mkdir(parents=True)
-            (profile / "projects" / rel).write_text(body)
-
+    def _race(self, monkeypatch, first, first_dir, second, second_dir) -> None:
+        """Run two merges in the order that loses a file when they do not
+        share a lock: the first is held once it has seen the shared path
+        missing and before it moves onto it, and the second gets its chance
+        in that gap."""
         first_is_moving = threading.Event()
         second_had_its_chance = threading.Event()
         real_move = shutil.move
 
         def move(src_path, dst_path):
-            # Hold the first profile at the exact point the race needs: it
-            # has seen the shared path missing and has not moved onto it yet.
             if str(first_dir) in str(src_path) and not first_is_moving.is_set():
                 first_is_moving.set()
                 assert second_had_its_chance.wait(timeout=10)
@@ -2590,7 +2580,7 @@ class TestHistoryMergeSharesTheDestination:
 
         def launch(mgr, profile):
             try:
-                mgr._sync_sharing(profile, share=True, share_history=True)
+                mgr._sync_sharing(profile, share=False, share_history=True)
             finally:
                 if threading.current_thread().name == "second":
                     second_had_its_chance.set()
@@ -2602,8 +2592,25 @@ class TestHistoryMergeSharesTheDestination:
         b.start()
         a.join(timeout=30)
         b.join(timeout=30)
-
         assert not a.is_alive() and not b.is_alive()
+
+    def test_two_profiles_merging_one_path_do_not_overwrite_each_other(
+        self, history_setup, seeded_switcher, monkeypatch
+    ):
+        """With a lock per profile, two DIFFERENT profiles each find the same
+        shared path missing, and the second move lands on top of the first:
+        a file is gone without a collision ever having been seen. One lock
+        on the destination makes the second merge wait, and meet one."""
+        source, first_dir, first = history_setup
+        second_dir = first.sessions_dir / "3-account3_example.com"
+        second = SessionManager(seeded_switcher)
+        rel = Path("-home-user-app") / "memory" / "MEMORY.md"
+        for profile, body in ((first_dir, "first\n"), (second_dir, "second\n")):
+            (profile / "projects" / rel).parent.mkdir(parents=True)
+            (profile / "projects" / rel).write_text(body)
+
+        self._race(monkeypatch, first, first_dir, second, second_dir)
+
         shared = source / "projects" / rel
         assert sorted([shared.read_text(), *_parked_bodies(first, "MEMORY.md")]) == [
             "first\n",
@@ -2611,6 +2618,70 @@ class TestHistoryMergeSharesTheDestination:
         ], "one profile's file was overwritten by the other's"
         assert (first_dir / "projects").readlink() == source / "projects"
         assert (second_dir / "projects").readlink() == source / "projects"
+
+    def test_two_stores_merging_into_one_home_share_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        """On Linux the backup root follows ``XDG_DATA_HOME``, so two cswap
+        stores can serve one ``~/.claude``. A lock inside either store is
+        invisible to the other; only one in the destination holds both."""
+        source, _, _ = history_setup
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.LINUX)
+        )
+        rel = Path("-home-user-app") / "memory" / "MEMORY.md"
+        stores = []
+        for n in (1, 2):
+            monkeypatch.setenv("XDG_DATA_HOME", str(source.parent / f"data-{n}"))
+            backup = get_backup_root()
+            profile = backup / "sessions" / f"{n + 1}-account{n + 1}_example.com"
+            (profile / "projects" / rel).parent.mkdir(parents=True)
+            (profile / "projects" / rel).write_text(f"store {n}\n")
+            mgr = SessionManager(
+                SimpleNamespace(
+                    backup_dir=backup,
+                    platform=Platform.LINUX,
+                    _logger=logging.getLogger("claude-swap-test"),
+                    lock_file=backup / ".lock",
+                )
+            )
+            stores.append((mgr, profile))
+        (first, first_dir), (second, second_dir) = stores
+        assert first.switcher.backup_dir != second.switcher.backup_dir
+
+        self._race(monkeypatch, first, first_dir, second, second_dir)
+
+        shared = source / "projects" / rel
+        survivors = [
+            shared.read_text(),
+            *_parked_bodies(first, "MEMORY.md"),
+            *_parked_bodies(second, "MEMORY.md"),
+        ]
+        assert sorted(survivors) == ["store 1\n", "store 2\n"], (
+            "one store's file was overwritten by the other's"
+        )
+
+    def test_a_lock_that_cannot_be_opened_skips_the_merge_not_the_launch(
+        self, history_setup, monkeypatch, capsys
+    ):
+        """The lock is a file in ``~/.claude``, which cswap does not own. A
+        read-only one must cost this launch its history sharing, not the
+        launch."""
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        class Unopenable(FileLock):
+            def acquire(self, timeout=None):
+                raise PermissionError("read-only file system")
+
+        monkeypatch.setattr(session_mod, "FileLock", Unopenable)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (proj / "bbb.jsonl").read_text() == "profile-b\n"
+        assert not (session_dir / "projects").is_symlink()
+        assert "could not be locked" in capsys.readouterr().out
 
     def test_the_link_is_installed_before_the_lock_is_released(
         self, history_setup, monkeypatch
@@ -2642,7 +2713,7 @@ class TestHistoryMergeSharesTheDestination:
         source, session_dir, mgr = history_setup
         monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
 
-        with FileLock(mgr.switcher.backup_dir / session_mod.MIGRATION_LOCK):
+        with FileLock(source / session_mod.MIGRATION_LOCK):
             mgr._sync_sharing(session_dir, share=True, share_history=True)
 
         assert (session_dir / "projects").readlink() == source / "projects"

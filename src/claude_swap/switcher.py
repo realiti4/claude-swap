@@ -7770,6 +7770,10 @@ class ClaudeAccountSwitcher:
         - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
+
+        One file is left on purpose: ``session.MIGRATION_LOCK`` in ``~/.claude``,
+        an empty lock file. Deleting a lock another launch may be holding lets
+        a third one take a fresh copy of it at the same time.
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
