@@ -89,7 +89,7 @@ wheels = [
 
 [[package]]
 name = "claude-swap"
-version = "0.30.0b1"
+version = "0.30.0"
 source = { editable = "." }
 dependencies = [
     { name = "keyring", marker = "sys_platform == 'win32'" },

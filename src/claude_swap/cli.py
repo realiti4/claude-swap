@@ -16,7 +16,6 @@ from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
     ACCOUNT_THRESHOLD_MAX,
     ACCOUNT_THRESHOLD_MIN,
-    Platform,
 )
 from claude_swap.printer import (
     accent,
@@ -29,7 +28,6 @@ from claude_swap.printer import (
 )
 from claude_swap.settings import (
     AUTOSWITCH_STRATEGIES,
-    load_run_settings,
     load_ui_settings,
     load_update_settings,
 )
@@ -370,7 +368,7 @@ Examples:
   cswap run 2
   cswap run user@example.com
   cswap run 2 --no-share
-  cswap run 2 --share-history
+  cswap run 2 --no-share-history
   cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
@@ -388,7 +386,8 @@ Examples:
         help=(
             "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
             "from ~/.claude into the session profile (and remove previously "
-            "shared items)"
+            "shared items). Chat history is not affected: see "
+            "--no-share-history"
         ),
     )
     parser.add_argument(
@@ -398,10 +397,12 @@ Examples:
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
-            "unified history. History the profile already accumulated is "
-            "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default, unless `cswap config set "
-            "run.shareHistory true`). Not supported on Windows."
+            "unified history. This is the default; history the profile "
+            "already accumulated is merged into ~/.claude first. "
+            "--no-share-history keeps this account's history separate for "
+            "this launch, `cswap config set run.shareHistory false` for "
+            "every launch. Not supported on Windows, where each account "
+            "keeps its own history."
         ),
     )
     parser.add_argument(
@@ -428,12 +429,14 @@ Examples:
 
         manager = SessionManager(switcher)
 
+        # share_history goes through as given: None (neither flag) leaves it
+        # to run.shareHistory, which SessionManager.run resolves.
         if args.account is not None:
             manager.run(
                 args.account,
                 tail,
                 share=not args.no_share,
-                share_history=_resolve_share_history(args, switcher),
+                share_history=args.share_history,
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -445,7 +448,7 @@ Examples:
                 slot,
                 tail,
                 share=not args.no_share,
-                share_history=_resolve_share_history(args, switcher),
+                share_history=args.share_history,
                 require_session=args.require_session,
             )
             return  # only reachable in tests
@@ -480,26 +483,6 @@ def _is_refused_root(switcher: ClaudeAccountSwitcher) -> bool:
     if sys.platform == "win32":  # no euid; the guard does not apply
         return False
     return os.geteuid() == 0 and not switcher._is_running_in_container()
-
-
-def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
-    """The flag wins; otherwise run.shareHistory, which Windows can't honor.
-
-    An explicit --share-history still reaches SessionManager.run and errors
-    there; a setting-derived one just warns and falls back to per-account
-    history. Only called on account-targeting paths, so a bare unmapped run
-    (plain claude) stays silent.
-    """
-    if args.share_history is not None:
-        return args.share_history
-    enabled = load_run_settings(switcher.backup_dir).share_history
-    if enabled and switcher.platform == Platform.WINDOWS:
-        warning(
-            "run.shareHistory is not supported on Windows yet — "
-            "using per-account history."
-        )
-        return False
-    return enabled
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
