@@ -99,18 +99,12 @@ def test_set_password_small_payload_uses_security_i_stdin():
         assert '-a "acct"' in stdin and '-s "svc"' in stdin
 
 
-def test_set_password_large_payload_falls_back_to_argv():
-    big = "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT  # hex doubles the length
+def test_set_password_large_payload_refuses_argv():
+    big = "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT
     with patch("claude_swap.macos_keychain.subprocess.run") as run:
-        run.return_value = _completed(0)
-        macos_keychain.set_password("svc", "acct", big)
-
-        args = run.call_args.args[0]
-        assert args[:3] == ["/usr/bin/security", "add-generic-password", "-U"]  # argv path
-        assert "input" not in run.call_args.kwargs  # not via stdin
-        # Hex value passed as a raw list element (no shell, no quoting).
-        assert big.encode().hex() in args
-        assert "acct" in args and "svc" in args
+        with pytest.raises(macos_keychain.KeychainError, match="refusing to expose"):
+            macos_keychain.set_password("svc", "acct", big)
+        run.assert_not_called()
 
 
 def test_set_password_raises_on_nonzero():
@@ -210,3 +204,11 @@ def test_keychain_account_name_no_user_env_avoids_legacy_default(monkeypatch):
 
 # The real-Keychain round-trip test lives in test_macos_keychain_contract.py,
 # next to the `tmp_keychain` fixture it depends on.
+
+
+def test_keychain_write_error_does_not_repeat_backend_secret():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(45, stderr="sensitive-token-from-backend")
+        with pytest.raises(macos_keychain.KeychainError) as exc:
+            macos_keychain.set_password("svc", "acct", "secret")
+        assert "sensitive-token" not in str(exc.value)

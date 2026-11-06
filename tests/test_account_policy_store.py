@@ -327,7 +327,7 @@ class TestExportImportIgnorePolicy(PolicyStoreBase):
         s.set_account_threshold("1", 85.0)
 
         out_file = temp_home / "backup.cswap"
-        export_accounts(s, str(out_file))
+        export_accounts(s, str(out_file), plaintext=True)
         envelope = json.loads(out_file.read_text(encoding="utf-8"))
 
         for entry in envelope["accounts"]:
@@ -347,7 +347,7 @@ class TestExportImportIgnorePolicy(PolicyStoreBase):
 
         s = self._fleet(temp_home, count=2)
         out_file = temp_home / "backup.cswap"
-        export_accounts(s, str(out_file))
+        export_accounts(s, str(out_file), plaintext=True)
 
         envelope = json.loads(out_file.read_text(encoding="utf-8"))
         for entry in envelope["accounts"]:

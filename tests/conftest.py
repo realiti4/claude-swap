@@ -550,6 +550,8 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
     monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
     monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
+    from claude_swap import secret_files
+    monkeypatch.setattr(secret_files, "_backend", lambda: store)
     yield store
 
 

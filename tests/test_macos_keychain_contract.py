@@ -355,8 +355,10 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         )
 
         # One active-credential write falls back to the file and pins.
-        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "sk-fb"}}')
-        assert store._file_mode_is_ours is True, "premise: the write pinned"
+        from claude_swap.exceptions import CredentialWriteError
+        with pytest.raises(CredentialWriteError):
+            store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "sk-fb"}}')
+        assert store._file_mode_is_ours is False
 
         _value, unreadable = store._read_account_credentials_ex("3", "c@e.com")
         assert unreadable is True, (
@@ -397,8 +399,10 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             monkeypatch.setattr(_kc, fn, locked)
 
         assert store._read_active_credentials().degraded is True, "premise"
-        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "x"}}')
-        assert store._file_mode_is_ours is True, "premise: the write pinned"
+        from claude_swap.exceptions import CredentialWriteError
+        with pytest.raises(CredentialWriteError):
+            store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "x"}}')
+        assert store._file_mode_is_ours is False
 
         assert store._read_active_credentials().degraded is True, (
             "the Keychain is still locked; a write fallback for the active "

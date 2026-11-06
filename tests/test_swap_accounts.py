@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap.secret_files import unseal
 from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -239,7 +240,7 @@ class TestSwapAccounts:
         # the wrong material (restore failed), but the staged copy has it.
         assert switcher._read_account_credentials("1", email) == "creds-org"
         staged = switcher.credentials_dir / ".swap-staging-creds-2.json"
-        assert staged.read_text(encoding="utf-8") == "creds-personal"
+        assert unseal(staged, staged.read_text(encoding="utf-8")) == "creds-personal"
         if sys.platform != "win32":
             assert staged.stat().st_mode & 0o777 == 0o600
 

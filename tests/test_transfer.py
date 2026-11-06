@@ -16,7 +16,12 @@ from claude_swap.exceptions import TransferError
 from claude_swap.models import Platform
 from claude_swap.oauth import credential_fingerprint
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.transfer import export_accounts, import_accounts
+from claude_swap.transfer import export_accounts as _export_accounts, import_accounts
+
+
+def export_accounts(*args, **kwargs):
+    """These legacy transfer cases explicitly exercise the plaintext format."""
+    return _export_accounts(*args, plaintext=True, **kwargs)
 from claude_swap.usage_store import FetchRecord
 
 
@@ -579,7 +584,7 @@ class TestValidation:
         f = temp_home / "e.cswap"
         f.write_text(json.dumps(env))
 
-        with pytest.raises(TransferError, match="encrypted exports are not supported"):
+        with pytest.raises(TransferError, match="Unsupported backup encryption algorithm"):
             import_accounts(s, str(f))
 
     def test_malformed_top_level_json_rejected(self, temp_home: Path):

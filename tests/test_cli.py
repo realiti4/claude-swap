@@ -366,7 +366,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         export_fn.assert_called_once_with(
-            switcher_cls.return_value, "/tmp/x", account="2", full=False
+            switcher_cls.return_value, "/tmp/x", account="2", full=False, plaintext=False
         )
 
     def test_full_flag_requires_export(self, capsys):
@@ -388,7 +388,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         export_fn.assert_called_once_with(
-            switcher_cls.return_value, "/tmp/x", account=None, full=True
+            switcher_cls.return_value, "/tmp/x", account=None, full=True, plaintext=False
         )
 
     def test_import_dispatch_calls_transfer(self):
@@ -769,7 +769,7 @@ class TestRunCommand:
                 self,
                 identifier,
                 claude_args,
-                share=True,
+                share=False,
                 share_history=False,
                 require_session=False,
             ):
@@ -789,11 +789,11 @@ class TestRunCommand:
 
     def test_run_dispatches_with_defaults(self):
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], False, False, False) in calls
 
     def test_run_by_email(self):
         calls = self._dispatch(["run", "user@example.com"])
-        assert ("run", "user@example.com", [], True, False, False) in calls
+        assert ("run", "user@example.com", [], False, False, False) in calls
 
     def test_no_share_flag(self):
         calls = self._dispatch(["run", "2", "--no-share"])
@@ -801,16 +801,16 @@ class TestRunCommand:
 
     def test_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--share-history"])
-        assert ("run", "2", [], True, True, False) in calls
+        assert ("run", "2", [], False, True, False) in calls
 
     def test_no_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--no-share-history"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], False, False, False) in calls
 
     def test_share_history_setting_is_the_default(self):
         set_setting(self.backup_dir, "run.shareHistory", "true")
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, True, False) in calls
+        assert ("run", "2", [], False, True, False) in calls
 
     def _windows_dispatch(self, argv):
         from claude_swap.models import Platform
@@ -820,32 +820,32 @@ class TestRunCommand:
 
     def test_share_history_setting_warns_and_falls_back_on_windows(self, capsys):
         calls = self._windows_dispatch(["run", "2"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], False, False, False) in calls
         assert "run.shareHistory is not supported on Windows" in capsys.readouterr().out
 
     def test_explicit_share_history_still_forwarded_on_windows(self, capsys):
         # SessionManager.run raises for it; the CLI must not swallow it.
         calls = self._windows_dispatch(["run", "2", "--share-history"])
-        assert ("run", "2", [], True, True, False) in calls
+        assert ("run", "2", [], False, True, False) in calls
         assert "not supported on Windows" not in capsys.readouterr().out
 
     def test_no_share_history_flag_overrides_setting(self):
         set_setting(self.backup_dir, "run.shareHistory", "true")
         calls = self._dispatch(["run", "2", "--no-share-history"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], False, False, False) in calls
 
     def test_require_session_flag(self):
         calls = self._dispatch(["run", "2", "--require-session"])
-        assert ("run", "2", [], True, False, True) in calls
+        assert ("run", "2", [], False, False, True) in calls
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
-        assert ("run", "2", ["--resume", "--model", "x"], True, False, False) in calls
+        assert ("run", "2", ["--resume", "--model", "x"], False, False, False) in calls
 
     def test_tail_may_contain_run_flags(self):
         """Args after `--` are NOT parsed by cswap, even if they look like ours."""
         calls = self._dispatch(["run", "2", "--", "--no-share"])
-        assert ("run", "2", ["--no-share"], True, False, False) in calls
+        assert ("run", "2", ["--no-share"], False, False, False) in calls
 
     def test_run_unknown_flag_errors(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
@@ -889,7 +889,7 @@ class TestRunCommand:
                 self,
                 identifier,
                 claude_args,
-                share=True,
+                share=False,
                 share_history=False,
                 require_session=False,
             ):
@@ -999,7 +999,7 @@ class TestSubcommandAliases:
                 self,
                 identifier,
                 claude_args,
-                share=True,
+                share=False,
                 share_history=False,
                 require_session=False,
             ):
@@ -1011,7 +1011,7 @@ class TestSubcommandAliases:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "2"]):
             cli.main()
-        assert calls == [("2", [], True)]
+        assert calls == [("2", [], False)]
 
     def test_help_subcommand_prints_help(self):
         """`cswap help` exits 0 and prints help (with subcommand docs)."""
@@ -1637,7 +1637,7 @@ class TestRunAutoResolve:
                 self,
                 identifier,
                 claude_args,
-                share=True,
+                share=False,
                 share_history=False,
                 require_session=False,
             ):
@@ -1685,7 +1685,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], False, False) in calls
 
     def test_mapped_subdir_inherits(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1709,7 +1709,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], False, False) in calls
 
     def test_unmapped_dir_falls_back_to_default(self, tmp_path, monkeypatch, capsys):
         backup = tmp_path / "backup"
@@ -1758,7 +1758,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "3"]):
             cli.main()
-        assert ("run", "3", [], True, False) in calls
+        assert ("run", "3", [], False, False) in calls
 
     def test_no_account_forwards_tail(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1781,7 +1781,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "--", "--resume"]):
             cli.main()
-        assert ("run", "2", ["--resume"], True, False) in calls
+        assert ("run", "2", ["--resume"], False, False) in calls
 
     def test_no_account_forwards_share_history(self, tmp_path, monkeypatch):
         """--share-history survives the mapped-account resolution path."""
@@ -1805,7 +1805,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "--share-history"]):
             cli.main()
-        assert ("run", "2", [], True, True) in calls
+        assert ("run", "2", [], False, True) in calls
 
     def _mapped_run(self, tmp_path, monkeypatch, argv, platform):
         from claude_swap.mappings import MappingStore
@@ -1838,7 +1838,7 @@ class TestRunAutoResolve:
         from claude_swap.models import Platform
 
         calls = self._mapped_run(tmp_path, monkeypatch, ["run"], Platform.WINDOWS)
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], False, False) in calls
         assert "run.shareHistory is not supported on Windows" in capsys.readouterr().out
 
     def test_unmapped_run_is_silent_on_windows(self, tmp_path, monkeypatch, capsys):
