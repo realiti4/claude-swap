@@ -258,10 +258,11 @@ class TestModelsRemainsALeaf:
         assert not hasattr(models_module, "AutoSwitchSettings")
 
 
-def test_the_pin_finds_the_two_fork_only_names_it_reads():
-    """cswap-pin calls `autoswitch.proactive_switch_bar_pct` and reads
-    `AccountPolicy.weekly_cap` at run time. Neither is on upstream main, so the
-    pin's own contract test cannot see them; keep the names in step with the
-    pin's reads."""
+def test_the_pin_finds_the_fork_only_names_it_reads():
+    """cswap-pin calls `autoswitch.proactive_switch_bar_pct` and
+    `autoswitch.last_engine_switch` and reads `AccountPolicy.weekly_cap` at run
+    time. None is on upstream main, so the pin's own contract test cannot see
+    them; keep the names in step with the pin's reads."""
     assert callable(autoswitch.proactive_switch_bar_pct)
+    assert callable(autoswitch.last_engine_switch)
     assert "weekly_cap" in {f.name for f in dataclasses.fields(AccountPolicy)}

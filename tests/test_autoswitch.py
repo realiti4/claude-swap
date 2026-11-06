@@ -37,6 +37,7 @@ from claude_swap.autoswitch import (
     _SYSTEMIC_MESSAGES,
     _seven_day_reset_ts,
     classify_candidate_block,
+    last_engine_switch,
     pct_label,
     proactive_switch_bar_pct,
 )
@@ -7927,6 +7928,26 @@ class TestWarmthAndAlternation375:
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "alternation", sw.trigger
+
+    def test_last_engine_switch_is_the_later_of_the_engine_and_the_hand(self, temp_home):
+        """The pin reads one answer: a hand switch is `manual` and leaves the
+        no-return family alone; an engine switch after it wins again."""
+        h = self._harness(temp_home)
+        backup = h.switcher.backup_dir
+        assert last_engine_switch(backup) is None
+        assert h.tick_with_usage({"1": _usage(97.0), "2": _usage(10.0)}) is TickOutcome.SWITCHED
+        assert last_engine_switch(backup) == ("2", "proactive")
+        engine_keys = ("lastSwitchAt", "lastSwitchTo", "lastSwitchFrom", "leftTrigger")
+        before = h.engine._read_state()
+        h.clock.advance(270.0)
+        h.switcher.switch_to("1", json_output=True, manual_source="tui")
+        assert last_engine_switch(backup) == ("1", "manual")
+        after = h.engine._read_state()
+        assert [after[k] for k in engine_keys] == [before[k] for k in engine_keys]
+        h.clock.advance(h.engine.settings.alternation_chunk_seconds)
+        usage = {"1": _usage(30.0), "2": _usage(30.0)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert last_engine_switch(backup) == (str(h.active_number()), "alternation")
 
     def test_t1850_a_hand_record_is_opt_in_and_never_the_engines(self, temp_home):
         """Controls: the engine's own call (no `manual_source`) writes no hand line
@@ -17660,6 +17681,28 @@ class TestHeaderProbeReadings:
         assert h.active_number() == 3
 
 
+_ENG = {"lastSwitchAt": 5, "lastSwitchTo": "2", "leftTrigger": "failover"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (_ENG, ("2", "failover")),  # written before lastSwitchTrigger existed
+        ({**_ENG, "lastManualSwitchAt": 6, "lastManualSwitchTo": 3}, ("3", "manual")),
+        ({**_ENG, "lastManualSwitchAt": 4, "lastManualSwitchTo": "3"}, ("2", "failover")),
+        ({**_ENG, "lastManualSwitchAt": "x", "lastManualSwitchTo": "3"}, ("2", "failover")),
+        ({"lastSwitchAt": 5, "lastSwitchTo": "2"}, None),  # no trigger recorded
+        ({**_ENG, "lastSwitchAt": "x"}, None),
+        ({**_ENG, "lastSwitchTo": None}, None),
+        ([], None),
+        ("{not json", None),
+    ],
+)
+def test_last_engine_switch_drops_a_malformed_entry_and_never_raises(tmp_path, raw, expected):
+    (tmp_path / "autoswitch_state.json").write_text(raw if isinstance(raw, str) else json.dumps(raw))
+    assert last_engine_switch(tmp_path) == expected
+
+
 # -- an expiring 7d window pulls the switch (T3310) --------------------------
 
 _H = 3600.0
@@ -17728,6 +17771,15 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert _xw_switch(h).trigger == "expiring-window"
+
+    def test_the_pin_reads_the_pull_while_every_gate_keeps_alternation(self, temp_home):
+        """cswap-pin's session-affinity keep yields to `expiring-window`, which
+        only the decisions log named; `leftTrigger` stays the gate trigger."""
+        h = _xw_harness(temp_home)
+        assert last_engine_switch(h.switcher.backup_dir) is None
+        assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
+        assert last_engine_switch(h.switcher.backup_dir) == ("2", "expiring-window")
+        assert h.engine._read_state()["leftTrigger"] == "alternation"
 
     def test_it_is_the_sooner_expiring_window_and_the_active_then_holds_it(
         self, temp_home

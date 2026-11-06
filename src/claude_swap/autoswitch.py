@@ -760,6 +760,30 @@ def _read_state_file(path: Path) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def last_engine_switch(backup_dir: Path) -> tuple[str, str] | None:
+    """The newest switch on record as (target slot, trigger): the engine's
+    (``lastSwitchTrigger``, else ``leftTrigger``) or a hand's (``manual``).
+    cswap-pin's session-affinity keep reads it and yields its keep to
+    ``expiring-window`` and ``manual``. A missing or malformed field drops that
+    entry; ``None`` when neither is left. No lock: the writers are atomic."""
+    state = _read_state_file(backup_dir / STATE_FILENAME)
+    engine_trigger = state.get("lastSwitchTrigger") or state.get("leftTrigger")
+    entries = []
+    for at, to, trigger in (
+        ("lastManualSwitchAt", "lastManualSwitchTo", "manual"),
+        ("lastSwitchAt", "lastSwitchTo", engine_trigger),
+    ):
+        when, slot = state.get(at), state.get(to)
+        if (
+            isinstance(when, (int, float))
+            and isinstance(slot, (str, int))
+            and isinstance(trigger, str)
+        ):
+            entries.append((when, str(slot), trigger))
+    # max keeps the first of equal times, so a tie reads as the hand switch.
+    return max(entries, key=lambda e: e[0])[1:] if entries else None
+
+
 def pct_label(value: float) -> str:
     """A percentage for display, as configured: 85.555555 stays itself
     (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
@@ -1586,6 +1610,9 @@ def record_manual_switch(
                         stamps[str(ref["number"])] = now
                 state["schemaVersion"] = STATE_SCHEMA_VERSION
                 state["lastActiveAt"] = stamps
+                if to_ref and to_ref.get("number") is not None:
+                    state["lastManualSwitchAt"] = now
+                    state["lastManualSwitchTo"] = str(to_ref["number"])
                 atomic_write_json(path, state)
     except Exception:  # noqa: BLE001 -- a record must never fail the switch
         _logger.warning("could not record the manual switch", exc_info=True)
@@ -5326,6 +5353,8 @@ class AutoSwitchEngine:
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
             state["leftTrigger"] = trigger
+            # What the pin reads (`last_engine_switch`); `leftTrigger` stays the gate's.
+            state["lastSwitchTrigger"] = logged_trigger or trigger
             # #375: per-account "last touched" epoch — the outgoing account
             # (so a LATER tick can tell its cache has gone cold) and the
             # incoming one (`number`, so alternation's chunk timer knows
