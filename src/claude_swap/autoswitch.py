@@ -444,7 +444,10 @@ def expiring_order(
         wall = _wall_headroom(bars.get(n))
         room = 100.0 - pct - wall
         if caps.get(n) is not None:
-            weekly = max(p for w, p, _ in oauth.relevant_windows(usage[n], ("all",)) if w != "5h")
+            weekly = max(  # a header-probe reading shows no `all` window: its 7d is what is known
+                (p for w, p, _ in oauth.relevant_windows(usage[n], ("all",)) if w != "5h"),
+                default=pct,
+            )
             room = min(room, caps[n] - weekly)
         cost = landing_cost(n)
         five = _window_pcts(usage[n], ()).get("5h")

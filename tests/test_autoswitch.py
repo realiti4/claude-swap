@@ -17984,3 +17984,13 @@ def test_a_weekly_cap_leaves_room_to_the_fullest_weekly_window():
     plain = dict(usage["2"])
     assert order(plain) == ["2"]  # cap 80, 7d 60: 20 points, due at 1 pt/h
     assert order({**plain, "scoped": [scoped]}) == []  # cap 80, scoped 79: 1 point, not due
+
+
+def test_a_header_probe_reading_under_a_weekly_cap_keeps_its_seven_day_room():
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (60.0, 8 * _H)})
+    usage["2"].update(source="headers", five_hour={"pct": 10.0})  # `all` is never complete
+    headroom = {"1": 0.0, "2": 40.0}
+    assert expiring_order(["1", "2"], usage, headroom, {}, {"2": 80.0}, {}, lambda n: 0.0, now) == ["2"]
