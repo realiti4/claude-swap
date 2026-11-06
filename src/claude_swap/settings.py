@@ -26,7 +26,9 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-# "dynamic" is consume-first's ranking with a fixed ~97% switch bar.
+# "dynamic": a fixed ~97% switch bar, a 20-point rotation, and its own ranking
+# (leaving at its bar, a recently used account first; then a weekly reset
+# within a day, else the most headroom).
 AUTOSWITCH_STRATEGIES = (
     "best", "weekly-first", "consume-first", "dynamic", "priority-consume-first",
 )
