@@ -2,8 +2,8 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch``, ``ui``, ``run``, ``updates`` and ``usage`` sections; other sections can
-be added additively.
+``autoswitch``, ``ui``, ``run``, ``updates``, ``usage`` and ``resume`` sections;
+other sections can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -71,6 +71,11 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Ping idle accounts (no 5h window running) with one 1-token request so
+    # their window starts early and resets sooner: reserves, and the live
+    # account (read-only on Claude Code's credential).
+    pre_warm_reserves: bool = False
+    pre_warm_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,12 +116,43 @@ class UsageSettings:
     header_probe: bool = False
 
 
+@dataclass(frozen=True)
+class ResumeSettings:
+    """Auto-continue (``resume`` section, ``cswap resume``): how a Claude Code
+    session that a usage limit stopped is told to carry on once capacity is
+    back.
+
+    ``slack_seconds`` waits past the limit's own reset before resuming (clock
+    skew; room for Claude Code's built-in auto-continue to act first).
+    ``on_switch`` resumes as soon as the session's account changed instead of
+    waiting for the reset. ``max_consecutive`` stops after that many resumes
+    in a row that ran straight back into the limit without doing any work.
+    """
+
+    slack_seconds: float = 90.0
+    on_switch: bool = True
+    max_consecutive: int = 3
+    notify: bool = True
+    # Master switch for automatic continues (`cswap resume off|on`). Off,
+    # stops are still tracked and `cswap resume now` still works.
+    enabled: bool = True
+    # A session stopped longer ago than this is held, not continued
+    # automatically: the plan may have changed (the same 24h line Claude
+    # Code's built-in auto-continue draws). 0 = no cap.
+    max_wait_hours: float = 24.0
+    # `cswap auto` leaves the active account as soon as a session reports it
+    # stopped on that account's limit, without waiting for the usage endpoint
+    # to confirm (it is often what's failing when this matters).
+    switch_on_stop: bool = True
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "run": RunSettings,
     "updates": UpdateSettings,
     "usage": UsageSettings,
+    "resume": ResumeSettings,
 }
 
 
@@ -129,9 +165,9 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui", "updates", "usage")
+    section: str  # top-level JSON section ("autoswitch", "ui", "updates", "usage", ...)
     json_key: str  # camelCase key inside the section
-    field: str  # snake_case AutoSwitchSettings field
+    field: str  # snake_case field of the section's settings dataclass
     kind: str  # "float" | "int" | "bool" | "choice"
     lo: float | None = None
     hi: float | None = None
@@ -190,6 +226,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
         SettingSpec(
+            "autoswitch", "preWarmReserves", "pre_warm_reserves", "bool",
+            help="Ping idle reserve accounts to start their 5h window early",
+        ),
+        SettingSpec(
+            "autoswitch", "preWarmActive", "pre_warm_active", "bool",
+            help="Also ping the active account when it has no 5h window running",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -205,7 +249,47 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "usage", "headerProbe", "header_probe", "bool",
             help="Read setup-token usage from a 1-token Haiku request's rate-limit headers (opt-in: uses quota)",
         ),
+        SettingSpec(
+            "resume", "slackSeconds", "slack_seconds", "float", 0.0, 3600.0,
+            help="Wait this long past a limit's reset before auto-continuing",
+        ),
+        SettingSpec(
+            "resume", "onSwitch", "on_switch", "bool",
+            help="Auto-continue as soon as an account switch lands (no reset wait)",
+        ),
+        SettingSpec(
+            "resume", "maxConsecutive", "max_consecutive", "int", 1, 20,
+            help="Stop after this many resumes in a row that hit the limit again",
+        ),
+        SettingSpec(
+            "resume", "notify", "notify", "bool",
+            help="Desktop notification when a session is auto-continued",
+        ),
+        SettingSpec(
+            "resume", "enabled", "enabled", "bool",
+            help="Continue stopped sessions automatically (cswap resume off|on)",
+        ),
+        SettingSpec(
+            "resume", "maxWaitHours", "max_wait_hours", "float", 0.0, 720.0,
+            help="Hold (don't auto-continue) sessions stopped longer ago than this; 0 = no cap",
+        ),
+        SettingSpec(
+            "resume", "switchOnStop", "switch_on_stop", "bool",
+            help="cswap auto leaves an account the moment a session stops on its limit",
+        ),
     )
+}
+
+# Bundles of settings for `cswap config apply-preset NAME`, single source of
+# truth for the values docs/SETUP.md and docs/WINDOWS.md walk users through.
+PRESETS: dict[str, dict[str, str]] = {
+    "max-drain": {
+        "autoswitch.threshold": "99.9",
+        "autoswitch.hysteresisPct": "0",
+        "autoswitch.cooldownSeconds": "60",
+        "autoswitch.intervalSeconds": "30",
+        "autoswitch.strategy": "best",
+    },
 }
 
 _AUTOSWITCH_KEYS: dict[str, str] = {
@@ -233,8 +317,9 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
-def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+def _clamped(settings):
+    """Clamp a section's values into the SETTING_SPECS ranges; bad types →
+    the default. Takes any section dataclass and returns the same type."""
 
     def num(value, default: float | None, lo: float, hi: float) -> float | None:
         # json.loads accepts NaN/Infinity literals and min/max pass NaN
@@ -250,9 +335,12 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             return default
         return float(min(max(value, lo), hi))
 
+    section = next(
+        name for name, cls in _SECTION_DEFAULT_SOURCES.items() if isinstance(settings, cls)
+    )
     kwargs = {}
     for spec in SETTING_SPECS.values():
-        if spec.section != "autoswitch":
+        if spec.section != section:
             continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
@@ -272,7 +360,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 )
                 value = spec.default
             kwargs[spec.field] = value
-    return AutoSwitchSettings(**kwargs)
+    return type(settings)(**kwargs)
 
 
 def _read_raw(path: Path) -> dict:
@@ -303,6 +391,23 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
         settings = AutoSwitchSettings(**kwargs)
     except TypeError:
         settings = AutoSwitchSettings()
+    return _clamped(settings)
+
+
+def load_resume_settings(backup_root: Path) -> ResumeSettings:
+    """Load the resume section; missing/corrupt file or fields → defaults."""
+    section = _read_raw(settings_path(backup_root)).get("resume")
+    if not isinstance(section, dict):
+        return ResumeSettings()
+    kwargs = {
+        spec.field: section[spec.json_key]
+        for spec in SETTING_SPECS.values()
+        if spec.section == "resume" and spec.json_key in section
+    }
+    try:
+        settings = ResumeSettings(**kwargs)
+    except TypeError:
+        settings = ResumeSettings()
     return _clamped(settings)
 
 
@@ -510,6 +615,17 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     return value
 
 
+def apply_preset(backup_root: Path, name: str) -> list[tuple[str, object]]:
+    """Validate and persist every key in a named preset; returns (key, value)
+    pairs. An unknown name raises ConfigError before anything is written."""
+    if name not in PRESETS:
+        raise ConfigError(f"unknown preset '{name}'\nValid presets: {', '.join(PRESETS)}")
+    return [
+        (dotted_key, set_setting(backup_root, dotted_key, raw_value))
+        for dotted_key, raw_value in PRESETS[name].items()
+    ]
+
+
 def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     """Remove one key from settings.json; False if it wasn't set (no write)."""
     spec = setting_spec(dotted_key)
@@ -540,6 +656,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
         "usage": load_usage_settings(backup_root),
+        "resume": load_resume_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

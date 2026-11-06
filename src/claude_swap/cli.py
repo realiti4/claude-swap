@@ -877,6 +877,15 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--notify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Send desktop notifications on account switches and when all accounts "
+            "are exhausted (default: on).  Use --no-notify to disable."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -884,11 +893,30 @@ Defaults live in settings.json in the backup root; flags override them.
     args = parser.parse_args(argv)
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
+    from claude_swap.notifications import (
+        notify_all_exhausted,
+        notify_quarantined,
+        notify_switch,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
+    def _maybe_notify(event: AutoSwitchEvent) -> None:
+        """Fire a desktop notification for events the user should know about."""
+        if not args.notify or args.dry_run:
+            return
+        if event.kind == "switch":
+            from_email = (event.from_ref or {}).get("email")
+            to_email = (event.to_ref or {}).get("email")
+            notify_switch(from_email, to_email)
+        elif event.kind == "all-exhausted":
+            notify_all_exhausted(event.earliest_reset_at)
+        elif event.kind == "account-quarantined":
+            notify_quarantined(event.number, event.email, event.reason)
+
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
+        _maybe_notify(event)
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
@@ -900,6 +928,7 @@ Defaults live in settings.json in the backup root; flags override them.
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
         print(f"{stamp}  {line}", flush=True)
+        _maybe_notify(event)
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -959,7 +988,9 @@ def _config_command(argv: list[str]) -> None:
     loudly here instead of silently degrading at `cswap auto` time.
     """
     from claude_swap.settings import (
+        PRESETS,
         SETTING_SPECS,
+        apply_preset,
         effective_settings,
         format_setting_value,
         set_setting,
@@ -972,6 +1003,10 @@ def _config_command(argv: list[str]) -> None:
         f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
         for spec in SETTING_SPECS.values()
     )
+    preset_lines = "\n".join(
+        f"  {name:<34}" + ", ".join(f"{k}={v}" for k, v in values.items())
+        for name, values in PRESETS.items()
+    )
     parser = argparse.ArgumentParser(
         prog="cswap config",
         description=(
@@ -983,12 +1018,16 @@ def _config_command(argv: list[str]) -> None:
 Keys:
 {key_lines}
 
+Presets:
+{preset_lines}
+
 Examples:
   cswap config                              # list effective settings
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
   cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config unset autoswitch.threshold   # back to the default
+  cswap config apply-preset max-drain       # squeeze 99.9% out of each account
   cswap config path                         # where settings.json lives
         """,
     )
@@ -1002,7 +1041,7 @@ Examples:
         action="store_true",
         help="Enable debug logging",
     )
-    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,path}")
+    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,apply-preset,path}")
 
     p_list = sub.add_parser("list", help="Show all effective settings (the default)")
     p_get = sub.add_parser("get", help="Print one setting's effective value")
@@ -1021,6 +1060,10 @@ Examples:
     p_set.add_argument("value", metavar="VALUE")
     p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
     p_unset.add_argument("key", metavar="KEY")
+    p_preset = sub.add_parser(
+        "apply-preset", help="Set every key in a named bundle (see Presets below)"
+    )
+    p_preset.add_argument("name", metavar="NAME", choices=list(PRESETS))
     sub.add_parser("path", help="Print the settings.json location")
 
     args = parser.parse_args(argv)
@@ -1081,6 +1124,9 @@ Examples:
                 print(f"{args.key} unset (default: {format_setting_value(default)})")
             else:
                 print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+        elif action == "apply-preset":
+            for key, value in apply_preset(root, args.name):
+                print(f"{key} = {format_setting_value(value)}")
     except ClaudeSwitchError as e:
         if json_mode:
             print(json.dumps(error_envelope(e), indent=2))
@@ -1093,6 +1139,170 @@ Examples:
             file=sys.stderr if json_mode else sys.stdout,
         )
         sys.exit(130)
+
+
+def _resume_hook_entry(action: str, argv: list[str]) -> None:
+    """Internal entry points: ``arm`` (the StopFailure hook) and ``wait``
+    (the detached waiter it spawns). Never print, never fail loudly — a hook
+    must not disturb the Claude Code session it runs under."""
+    from claude_swap.logging_config import setup_logging
+    from claude_swap.notifications import notify_continue_stopped, notify_session_continued
+    from claude_swap.paths import get_backup_root
+    from claude_swap.resume import Waiter, arm, valid_session_id
+
+    backup_root = get_backup_root()
+    logger = setup_logging(backup_root)
+    try:
+        if action == "arm":
+            raw = sys.stdin.read()
+            try:
+                hook_input = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                hook_input = {}
+            if not isinstance(hook_input, dict):
+                hook_input = {}
+            outcome = arm(backup_root, hook_input, os.environ, on_gave_up=notify_continue_stopped)
+            logger.debug("auto-continue: arm -> %s", outcome)
+        elif argv and valid_session_id(argv[0]):
+            Waiter(
+                backup_root,
+                argv[0],
+                on_resumed=notify_session_continued,
+                on_gave_up=notify_continue_stopped,
+            ).run()
+    except Exception:
+        logger.exception("auto-continue: %s failed", action)
+    sys.exit(0)
+
+
+def _resume_command(argv: list[str]) -> None:
+    """Handle `cswap resume [install|uninstall|status|now]`.
+
+    Auto-continue: when a usage limit stops a Claude Code session, carry it on
+    automatically once there is capacity again (an account switch landed, or
+    the limit reset). Pre-dispatched like `auto` and `config`.
+    """
+    if argv and argv[0] in ("arm", "wait"):
+        _resume_hook_entry(argv[0], argv[1:])
+        return
+
+    parser = argparse.ArgumentParser(
+        prog="cswap resume",
+        description=(
+            "Auto-continue Claude Code sessions that a usage limit stopped, as "
+            "soon as there is capacity again (an account switch landed or the "
+            "limit reset)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+How it works:
+  install adds a StopFailure hook to Claude Code's settings.json. When a turn
+  ends on a usage limit, the hook arms a small background waiter for that
+  session; once capacity is back it sends the session a "continue" message
+  through Claude Code's own cross-session inbox, which starts a new turn.
+  Requires Claude Code 2.1.234+ (cross-session messaging).
+
+Examples:
+  cswap resume install       # enable auto-continue (snapshots settings.json first)
+  cswap resume status        # sessions waiting, resumed, or stopped on a limit
+  cswap resume now --all     # continue every waiting session right away
+  cswap resume cancel --all  # don't continue any of them (e.g. done for the day)
+  cswap resume off | on      # pause / re-enable auto-continue entirely
+  cswap resume test          # (ask Claude to run it) rehearse on that session
+  cswap resume uninstall     # remove the hook again
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(
+        dest="action", metavar="{install,uninstall,status,now,cancel,off,on,test}"
+    )
+    p_install = sub.add_parser("install", help="Add the StopFailure hook (enables auto-continue)")
+    p_install.add_argument(
+        "--command",
+        metavar="CMD",
+        help="Hook command to register (default: this cswap's absolute path + 'resume arm')",
+    )
+    sub.add_parser("uninstall", help="Remove the hook (disables auto-continue)")
+    sub.add_parser(
+        "test",
+        help="Rehearse auto-continue on this session (ask Claude to run it, then end the turn)",
+    )
+    p_status = sub.add_parser("status", help="Show waiting/resumed sessions (the default)")
+    p_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    p_now = sub.add_parser("now", help="Continue waiting/stopped sessions right away")
+    p_now.add_argument("sessions", nargs="*", metavar="SESSION", help="Session id (prefix) or name")
+    p_now.add_argument("--all", action="store_true", help="Every session stopped on a limit")
+    p_cancel = sub.add_parser("cancel", help="Don't auto-continue these sessions")
+    p_cancel.add_argument("sessions", nargs="*", metavar="SESSION", help="Session id (prefix) or name")
+    p_cancel.add_argument("--all", action="store_true", help="Every waiting session")
+    sub.add_parser("off", help="Pause auto-continue (stops are still tracked)")
+    sub.add_parser("on", help="Re-enable auto-continue")
+    args = parser.parse_args(argv)
+    action = args.action or "status"
+
+    from claude_swap.resume_cli import (
+        resume_cancel,
+        resume_install,
+        resume_now,
+        resume_set_enabled,
+        resume_status,
+        resume_test,
+        resume_uninstall,
+    )
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        root = switcher.backup_dir
+        if action == "install":
+            resume_install(root, args.command)
+        elif action == "uninstall":
+            resume_uninstall(root)
+        elif action == "test":
+            resume_test(root)
+        elif action in ("off", "on"):
+            resume_set_enabled(root, action == "on")
+        elif action == "cancel":
+            if not args.sessions and not args.all:
+                parser.error("name a SESSION or pass --all")
+            sys.exit(resume_cancel(root, args.sessions, all_sessions=args.all))
+        elif action == "status":
+            resume_status(root, json_output=getattr(args, "json", False))
+        elif action == "now":
+            if not args.sessions and not args.all:
+                parser.error("name a SESSION or pass --all")
+            sys.exit(resume_now(root, args.sessions, all_sessions=args.all))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _add_accounts_batch(switcher: ClaudeAccountSwitcher, count: int) -> None:
+    """Register `count` accounts in a row, pausing between each one.
+
+    `add_account` always captures whichever account Claude Code is currently
+    logged into, so a tight loop would just re-capture the same account
+    `count` times. Pausing for an Enter keypress between iterations gives the
+    user a chance to log into Claude Code with the next account first.
+    """
+    from claude_swap.exceptions import ValidationError
+
+    for i in range(count):
+        print(
+            dimmed(
+                f"[{i + 1}/{count}] Log into Claude Code with account {i + 1}, "
+                "then press Enter to continue (Ctrl+C to stop)..."
+            )
+        )
+        try:
+            input()
+        except EOFError:
+            raise ValidationError(
+                "cswap add --count needs an interactive terminal (stdin is not a TTY)"
+            ) from None
+        switcher.add_account(slot=None)
 
 
 def _use_native_tls() -> None:
@@ -1204,6 +1414,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "resume":
+        _resume_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
@@ -1272,6 +1485,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s resume [install|status]    auto-continue sessions a usage limit stopped
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
@@ -1351,6 +1565,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         type=int,
         metavar="NUM",
         help="Specify slot number when adding account (use with 'add' or 'add-token')",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        metavar="N",
+        help=(
+            "Add N accounts in a row (use with bare 'add'); pauses between "
+            "each one so you can log into Claude Code with the next account"
+        ),
     )
     parser.add_argument(
         "--email",
@@ -1565,6 +1788,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
+    if args.count is not None:
+        if not args.add_account:
+            parser.error("--count can only be used with bare 'add'")
+        if args.slot is not None:
+            parser.error("--count cannot be combined with --slot")
+        if args.alias is not None:
+            parser.error("--count cannot be combined with --alias")
+        if args.count < 1:
+            parser.error("--count must be at least 1")
+
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
@@ -1622,7 +1855,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot, alias=args.alias)
+            if args.count is not None:
+                _add_accounts_batch(switcher, args.count)
+            else:
+                switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,

@@ -707,14 +707,19 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
 
 
 def _log_usage_failure(
-    context: str, e: Exception, kind: str, retry_after_s: float | None = None
+    context: str,
+    e: Exception,
+    kind: str,
+    retry_after_s: float | None = None,
+    op: str = "Usage fetch",
 ) -> None:
     """One WARNING line with the cause so it lands in the default log file
     (issue #85 was undiagnosable with failures swallowed at DEBUG); the full
     exception repr stays at DEBUG. The line is what users paste into public
     issues, so ``context`` must not carry the email, and the server's
     Retry-After rides along when present (it answers the backoff-tuning
-    question without a second ask)."""
+    question without a second ask). ``op`` names the operation that failed
+    (usage fetch vs. pre-warm ping share the same error plumbing)."""
     where = f" {context}" if context else ""
     cause = kind if retry_after_s is None else f"{kind}, retry-after {retry_after_s:.0f}s"
     if kind == "http-429":
@@ -726,8 +731,8 @@ def _log_usage_failure(
         # cumulative polling across surfaces and machines can saturate it,
         # and backoff plus the adaptive cadence are the recovery.
         cause += " (usage-endpoint budget reached; backing off)"
-    _logger.warning("Usage fetch failed%s: %s", where, cause)
-    _logger.debug("Usage fetch failure detail%s: %r", where, e)
+    _logger.warning("%s failed%s: %s", op, where, cause)
+    _logger.debug("%s failure detail%s: %r", op, where, e)
 
 
 
@@ -1132,3 +1137,87 @@ def _persist(
             f"If the next refresh fails, re-run `cswap --add-account` after logging in.",
             file=sys.stderr,
         )
+
+
+# Cheapest current model; max_tokens=1 keeps the real cost to a handful of
+# tokens either way. Only the auth path matters here, not the reply.
+PREWARM_MODEL = "claude-haiku-4-5-20251001"
+_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+
+
+@dataclass(frozen=True)
+class PingOutcome:
+    """Result of one pre-warm attempt. ``error`` reuses the usage-fetch
+    vocabulary (``_classify_usage_error``) so callers share one backoff path."""
+
+    ok: bool
+    error: str | None = None
+    retry_after_s: float | None = None
+
+
+def try_prewarm_account(
+    account_num: str,
+    email: str,
+    credentials: str,
+    persist_credentials: Callable[[str, str, str], None] | None = None,
+    is_active: bool = False,
+) -> PingOutcome:
+    """Fire one minimal real request to start an idle account's 5h window early.
+
+    A window only starts on a real message-consuming request — the usage
+    endpoint (``request_usage_data``) is read-only and never starts one. This
+    is that real request, kept to ``max_tokens=1`` on the cheapest model so
+    the actual cost is negligible. Caller guarantees the account is not owned
+    by a live ``cswap run`` session (pinging under one would duplicate a
+    request the user is about to send for real anyway).
+
+    ``is_active``: the credential is the live login Claude Code owns, so it
+    is used read-only — never refreshed (a refresh would rotate the token
+    family out from under a running Claude Code). An expired active token
+    fails fast with ``token-expired`` instead of making a request that would
+    just 401.
+    """
+    context = f"for account {account_num}"
+    oauth_data = extract_oauth_data(credentials)
+    access_token = oauth_data.get("accessToken") if oauth_data else None
+    if not access_token:
+        return PingOutcome(False, error="no-access-token")
+
+    if is_active:
+        if is_oauth_token_expired(oauth_data.get("expiresAt")):
+            return PingOutcome(False, error="token-expired")
+    elif oauth_data.get("refreshToken") and is_oauth_token_expired(oauth_data.get("expiresAt")):
+        refreshed = refresh_oauth_credentials(credentials)
+        if refreshed:
+            credentials = refreshed
+            _persist(persist_credentials, account_num, email, credentials)
+            oauth_data = extract_oauth_data(credentials) or oauth_data
+            access_token = oauth_data.get("accessToken") or access_token
+
+    body = json.dumps(
+        {
+            "model": PREWARM_MODEL,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    ).encode()
+    req = urllib.request.Request(
+        _MESSAGES_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-swap/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()  # drain; the reply text carries nothing we need
+        return PingOutcome(True)
+    except Exception as e:
+        kind, retry_after = _classify_usage_error(e)
+        _log_usage_failure(context, e, kind, retry_after, op="Pre-warm ping")
+        return PingOutcome(False, error=kind, retry_after_s=retry_after)

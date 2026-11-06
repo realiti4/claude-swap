@@ -15,12 +15,16 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
+    PRESETS,
     AutoSwitchSettings,
+    ResumeSettings,
     RunSettings,
     UiSettings,
     UpdateSettings,
     UsageSettings,
+    apply_preset,
     effective_settings,
+    load_resume_settings,
     load_run_settings,
     load_settings,
     load_ui_settings,
@@ -246,6 +250,9 @@ class TestSettingSpecs:
         assert by_section["usage"] == {
             f.name for f in UsageSettings.__dataclass_fields__.values()
         }
+        assert by_section["resume"] == {
+            f.name for f in ResumeSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
         sources = {
@@ -254,6 +261,7 @@ class TestSettingSpecs:
             "run": RunSettings(),
             "updates": UpdateSettings(),
             "usage": UsageSettings(),
+            "resume": ResumeSettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
@@ -524,3 +532,69 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+class TestApplyPreset:
+    def test_max_drain_writes_every_documented_key(self, tmp_path: Path):
+        applied = apply_preset(tmp_path, "max-drain")
+        assert dict(applied) == {
+            "autoswitch.threshold": 99.9,
+            "autoswitch.hysteresisPct": 0.0,
+            "autoswitch.cooldownSeconds": 60.0,
+            "autoswitch.intervalSeconds": 30.0,
+            "autoswitch.strategy": "best",
+        }
+        settings = load_settings(tmp_path)
+        assert settings.threshold == 99.9
+        assert settings.hysteresis_pct == 0.0
+        assert settings.cooldown_seconds == 60.0
+        assert settings.interval_seconds == 30.0
+        assert settings.strategy == "best"
+
+    def test_unknown_preset_raises_without_writing(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="unknown preset"):
+            apply_preset(tmp_path, "bogus")
+        assert not settings_path(tmp_path).exists()
+
+    def test_every_preset_key_is_a_real_setting(self):
+        for values in PRESETS.values():
+            for dotted_key in values:
+                assert dotted_key in SETTING_SPECS
+
+
+class TestResumeSection:
+    def test_missing_file_gives_defaults(self, tmp_path: Path):
+        assert load_resume_settings(tmp_path) == ResumeSettings()
+
+    def test_set_and_load_round_trip(self, tmp_path: Path):
+        set_setting(tmp_path, "resume.slackSeconds", "300")
+        set_setting(tmp_path, "resume.onSwitch", "false")
+        set_setting(tmp_path, "resume.maxConsecutive", "5")
+        loaded = load_resume_settings(tmp_path)
+        assert loaded.slack_seconds == 300.0
+        assert loaded.on_switch is False
+        assert loaded.max_consecutive == 5
+        # The autoswitch section is untouched by resume keys.
+        assert load_settings(tmp_path) == AutoSwitchSettings()
+
+    def test_hand_edited_out_of_range_values_clamp(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"resume": {"slackSeconds": -5, "maxConsecutive": 999, "notify": 0}})
+        )
+        loaded = load_resume_settings(tmp_path)
+        assert loaded.slack_seconds == 0.0
+        assert loaded.max_consecutive == 20
+        assert loaded.notify is False
+
+    def test_strict_set_rejects_out_of_range(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between"):
+            set_setting(tmp_path, "resume.maxConsecutive", "0")
+
+    def test_effective_settings_reports_both_sections(self, tmp_path: Path):
+        set_setting(tmp_path, "resume.notify", "false")
+        rows = {
+            spec.dotted: (value, is_set) for spec, value, is_set in effective_settings(tmp_path)
+        }
+        assert rows["resume.notify"] == (False, True)
+        assert rows["resume.slackSeconds"] == (90.0, False)
+        assert rows["autoswitch.preWarmActive"] == (False, False)
