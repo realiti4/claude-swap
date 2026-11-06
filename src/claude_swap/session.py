@@ -732,10 +732,11 @@ class SessionManager:
                     "default login — launching claude directly."
                 )
             )
-            env = dict(os.environ)
-            # Run on the default login, not on the preset profile.
-            env.pop("CLAUDE_CONFIG_DIR", None)
-            self._exec(claude_bin, claude_args, env=env)
+            # Run on the default login, not on the preset profile. Out of
+            # os.environ too, not just the child's copy: `_exec` never returns,
+            # and the pin wiring it runs follows os.environ.
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self._exec(claude_bin, claude_args, env=dict(os.environ))
         if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
@@ -769,7 +770,8 @@ class SessionManager:
         `_live_login_identity` un-splices, but every live input it reads
         follows ``CLAUDE_CONFIG_DIR``, so it is asked with that variable out
         of the way. None when it cannot say: a session is built, as for an
-        unreadable default config.
+        unreadable default config. ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` wins for
+        the store and stays; under a pin the recorded slot can answer instead.
         """
         preset = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         try:

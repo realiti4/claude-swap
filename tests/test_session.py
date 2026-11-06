@@ -1439,13 +1439,59 @@ class TestRun:
             manager.run("1", [])
         assert "CLAUDE_CONFIG_DIR" not in serving.value.env
         assert "already the active default login" in capsys.readouterr().out
-        assert os.environ["CLAUDE_CONFIG_DIR"] == "/somewhere/else"
 
+        # The fast path leaves for good, taking the preset with it.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
         with pytest.raises(_ExecCalled) as pinned:
             manager.run("2", [])
         session_dir = session_dir_for(sw.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         assert pinned.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
         assert "/somewhere/else" in capsys.readouterr().out
+
+    def test_preset_config_dir_is_gone_from_the_pin_wiring_on_the_fast_path(
+        self, manager, capture_exec, monkeypatch, temp_home
+    ):
+        # `_exec` wires the pin into `get_global_config_path()`, which follows
+        # os.environ, while the child boots on the default profile.
+        wired = []
+
+        def fake_exec(self, claude_bin, claude_args, env):
+            wired.append(get_global_config_path())
+            raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
+
+        monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert wired == [temp_home / ".claude.json"]
+
+    def test_unreadable_login_builds_a_session_and_keeps_the_preset(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        def unreadable():
+            raise OSError("config unreadable")
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        monkeypatch.setattr(manager.switcher, "_live_login_identity", unreadable)
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+        assert os.environ["CLAUDE_CONFIG_DIR"] == "/somewhere/else"
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
