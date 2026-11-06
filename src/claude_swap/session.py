@@ -22,14 +22,16 @@ detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
 
-History sharing (``--share-history``, opt-in): additionally links
-``projects/`` (conversation transcripts — what ``claude --resume`` lists) and
-``history.jsonl`` (prompt history) from ``~/.claude``, so all accounts see one
-unified conversation history. POSIX-only: Windows shares by re-synced copy,
-which would fork history rather than share it. If the profile already
-accumulated its own history, it is merged into ``~/.claude`` first so nothing
-disappears from ``--resume``. A file that differs on both sides is never
-deleted: the copy not kept is parked under ``<backup_dir>/history-conflicts/``.
+History sharing (on by default; ``--no-share-history`` or ``run.shareHistory
+false`` turns it off): additionally links ``projects/`` (conversation
+transcripts — what ``claude --resume`` lists) and ``history.jsonl`` (prompt
+history) from ``~/.claude``, so all accounts see one unified conversation
+history. POSIX-only: Windows shares by re-synced copy, which would fork
+history rather than share it, so there every account keeps its own. If the
+profile already accumulated its own history, it is merged into ``~/.claude``
+first so nothing disappears from ``--resume``. A file that differs on both
+sides is never deleted: the copy not kept is parked under
+``<backup_dir>/history-conflicts/``.
 
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
@@ -65,7 +67,11 @@ from claude_swap.oauth import ERROR_NOTES
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
-from claude_swap.settings import atomic_write_json
+from claude_swap.settings import (
+    atomic_write_json,
+    explicit_share_history,
+    load_run_settings,
+)
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -73,8 +79,8 @@ if TYPE_CHECKING:
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: plugins/,
 # sessions/, ide/, .claude.json, .credentials.json, statsig/ and other
-# telemetry. projects/ and history.jsonl are per-account by default and move
-# to HISTORY_ITEMS sharing only with the opt-in --share-history flag.
+# telemetry. projects/ and history.jsonl are shared too, but as HISTORY_ITEMS:
+# they have their own switch (run.shareHistory) and their own rules.
 # .claude.json stays excluded as a file, but its one user-scoped key —
 # top-level mcpServers — is mirrored separately by _sync_mcp_servers.
 SHARED_ITEMS = (
@@ -87,7 +93,7 @@ SHARED_ITEMS = (
     "rules",
 )
 
-# Conversation-history items linked additionally under --share-history.
+# Conversation-history items, linked unless history sharing is turned off.
 # POSIX symlinks only: Windows copy-mode would fork history, not share it.
 HISTORY_ITEMS = (
     "projects",
@@ -688,6 +694,9 @@ class SessionManager:
         # A deferred migration is explained once per launch, not once per
         # history item.
         self._deferral_reported = False
+        # Whether this launch met history the profile holds on its own (and
+        # so tried to merge it), whatever came of the attempt.
+        self._own_history_found = False
 
     def _warn(self, msg: str) -> None:
         """Print for this terminal, log to survive the exec that clears it."""
@@ -715,10 +724,14 @@ class SessionManager:
         identifier: str,
         claude_args: list[str],
         share: bool = True,
-        share_history: bool = False,
+        share_history: bool | None = None,
         require_session: bool = False,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal.
+
+        ``share_history`` is the launch's own choice (``--share-history`` /
+        ``--no-share-history``); ``None`` leaves it to ``run.shareHistory``
+        (see ``_resolve_share_history``).
 
         ``require_session`` turns the same-account fast path (a plain claude
         launch on the default login) into a refusal: a wrapper that hands a
@@ -731,12 +744,9 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        if share_history and self.switcher.platform == Platform.WINDOWS:
-            raise SessionError(
-                "--share-history is not supported on Windows yet: sharing uses "
-                "re-synced copies there, which would fork the history instead "
-                "of sharing it."
-            )
+        # Before the fast path below: it never reaches setup_session, and it
+        # has to refuse the same request and handle the same history.
+        share_history = self._resolve_share_history(share_history)
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
@@ -768,6 +778,10 @@ class SessionManager:
             self._note(
                 f"Account-{account_num} ({email}) is already the active "
                 "default login — launching claude directly."
+            )
+            self._history_on_the_fast_path(
+                session_dir_for(self.switcher.backup_dir, account_num, email),
+                share_history,
             )
             env = dict(os.environ)
             # Run on the default login, not on the preset profile.
@@ -810,6 +824,67 @@ class SessionManager:
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
+
+    def _history_on_the_fast_path(
+        self, session_dir: Path, share_history: bool
+    ) -> None:
+        """Deal with history the profile holds, on the launch that skips it.
+
+        The fast path is plain claude on ``~/.claude``, so what the account's
+        sessions wrote into its profile is not in front of the user (#239).
+        With sharing on it is merged now, by the steps a session launch
+        takes: an account that stays the default login would otherwise never
+        be migrated, however often it is run. With sharing off it stays
+        apart, and the launch says which history it is about to use.
+
+        History only. Nothing here seeds, validates or refreshes the
+        profile's credentials — a second live copy of the default login's
+        credential is what the fast path exists to avoid. A profile with no
+        history of its own (never used, or already linked) is left alone.
+        """
+        if not any(
+            (session_dir / name).exists() and not (session_dir / name).is_symlink()
+            for name in HISTORY_ITEMS
+        ):
+            return
+        if share_history:
+            self._sync_items(session_dir, HISTORY_ITEMS, scope=HISTORY_ITEMS)
+        else:
+            self._note(
+                "   This launch uses the default login's chat history "
+                "(~/.claude), not the account's own."
+            )
+
+    def _resolve_share_history(self, requested: bool | None) -> bool:
+        """Whether this launch shares chat history across accounts.
+
+        ``requested`` is the launch's own choice and wins. ``None`` defers to
+        ``run.shareHistory``, which is on unless the user turned it off.
+        Resolved here rather than by the caller so every launcher gets the
+        same answer from the same ``None``.
+
+        History links are POSIX-only (see the module docstring), so on
+        Windows the answer is always no, and what differs is how loudly:
+        asking on the command line is refused, having asked in settings is
+        worth a warning, and the built-in default simply does not apply.
+        """
+        windows = self.switcher.platform == Platform.WINDOWS
+        if requested is not None:
+            if requested and windows:
+                raise SessionError(
+                    "--share-history is not supported on Windows yet: sharing "
+                    "uses re-synced copies there, which would fork the history "
+                    "instead of sharing it."
+                )
+            return requested
+        if not windows:
+            return load_run_settings(self.switcher.backup_dir).share_history
+        if explicit_share_history(self.switcher.backup_dir):
+            self._warn(
+                "run.shareHistory is not supported on Windows yet — "
+                "using per-account history."
+            )
+        return False
 
     @staticmethod
     def _default_login_identity() -> tuple[str, str] | None:
@@ -874,9 +949,14 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self, identifier: str, share: bool, share_history: bool | None = None
     ) -> tuple[Path, str, str]:
-        """Ensure a valid session profile exists; returns (dir, num, email)."""
+        """Ensure a valid session profile exists; returns (dir, num, email).
+
+        ``share_history`` is read like ``run``'s: ``None`` means
+        ``run.shareHistory`` decides.
+        """
+        share_history = self._resolve_share_history(share_history)
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
@@ -1366,8 +1446,9 @@ class SessionManager:
         ``share`` governs SHARED_ITEMS (customizations) and the mcpServers
         mirror (see ``_sync_mcp_servers`` — its --no-share removal is gated
         on the adoption marker); ``share_history`` governs HISTORY_ITEMS
-        (conversation history) — independent concerns, so ``--no-share
-        --share-history`` gives a bare profile with unified history.
+        (conversation history) — independent concerns, so ``--no-share``
+        alone gives a bare profile that still has the unified history. Both
+        arrive here already decided (``_resolve_share_history`` for history).
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
@@ -1379,22 +1460,41 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return
+        self._sync_mcp_servers(session_dir, share)
+        # History links are POSIX-only. _resolve_share_history already says
+        # no on Windows; repeated here for a caller that skipped it, and it
+        # also drops any links left by a POSIX→Windows profile move.
+        if self.switcher.platform == Platform.WINDOWS:
+            share_history = False
+        self._sync_items(
+            session_dir,
+            (SHARED_ITEMS if share else ())
+            + (HISTORY_ITEMS if share_history else ()),
+        )
+
+    def _sync_items(
+        self,
+        session_dir: Path,
+        active_items: tuple[str, ...],
+        scope: tuple[str, ...] = SHARED_ITEMS + HISTORY_ITEMS,
+    ) -> None:
+        """Link (or copy) ``active_items`` into the profile; undo the others.
+
+        ``scope`` is what this call decides about. An entry in it that is not
+        active is removed, and a managed entry outside it stays exactly as it
+        is, on disk and in the manifest. Everything by default; the fast
+        path passes the history items alone (``_history_on_the_fast_path``).
+        """
         # Reset per call: _prepare_history_share accumulates into this as it
         # runs (once per HISTORY_ITEMS entry), so a launch with nothing to
         # migrate must not report counts left over from a previous one.
         self._last_merge_counts = (0, 0, None)
         self._deferral_reported = False
-        self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
-        if self.switcher.platform == Platform.WINDOWS:
-            share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
-        )
+        self._own_history_found = False
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
+        out_of_scope = [name for name in managed if name not in scope]
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
@@ -1402,17 +1502,17 @@ class SessionManager:
         # a stale manifest (lock-free launches race) must never be able to
         # delete real conversation history — only ever unlink symlinks.
         for name in managed:
-            if name not in active_items:
+            if name in scope and name not in active_items:
                 dest = session_dir / name
                 if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
                     continue
                 self._remove_managed(dest)
-        if not active_items:
+        if not active_items and not out_of_scope:
             manifest_path.unlink(missing_ok=True)
             return
 
         use_symlinks = self.switcher.platform != Platform.WINDOWS
-        new_managed: list[str] = []
+        new_managed: list[str] = list(out_of_scope)
 
         for name in active_items:
             src = source_root / name
@@ -1481,6 +1581,7 @@ class SessionManager:
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
         self._report_quarantine()
+        self._report_sharing_is_the_default()
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:
         """Mirror the default profile's user-scope ``mcpServers`` (issue #139).
@@ -1690,7 +1791,9 @@ class SessionManager:
         takes it.
         """
         if dest.exists() and not dest.is_symlink():
-            # Real per-account history accumulated before the flag existed.
+            # Real per-account history: the profile kept its own while
+            # sharing was off (before it became the default, or by choice).
+            self._own_history_found = True
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
             # This first look is a cheap early out — a profile that is always
@@ -1820,7 +1923,7 @@ class SessionManager:
 
         The old one-line dimmed print was scrolled away by Claude's startup
         banner and never logged, so a profile could sit unshared for days
-        with the flag passed on every launch and no visible signal. Printed
+        with sharing asked for on every launch and no visible signal. Printed
         once per launch: both history items defer for the same reason, and a
         second copy of the block only buries the first.
 
@@ -1849,7 +1952,7 @@ class SessionManager:
             return
         self._deferral_reported = True
         self._warn(f"share-history: {account} keeps its own {dest.name} for now.")
-        retry = f"cswap run {slot} --share-history"
+        retry = self._sharing_relaunch_command(slot)
         if lock_busy:
             # Nothing to close; the only useful action is to retry once the
             # peer is done.
@@ -1881,6 +1984,32 @@ class SessionManager:
                 "so it may still be in use."
             )
             self._note(f"   Close anything using it, then relaunch:  {retry}")
+
+    def _sharing_relaunch_command(self, slot: str) -> str:
+        """The ``cswap run`` that shares history next time, as the user would
+        type it: the flag only where their settings turn sharing off."""
+        if load_run_settings(self.switcher.backup_dir).share_history:
+            return f"cswap run {slot}"
+        return f"cswap run {slot} --share-history"
+
+    def _report_sharing_is_the_default(self) -> None:
+        """Name the opt-out when the default reaches history a profile holds.
+
+        Sharing no longer has to be asked for, and for a profile with history
+        of its own that is not a silent change: this launch merged it into
+        ``~/.claude``, or explained why it could not yet. One line, and only
+        for a user who never chose — with ``run.shareHistory`` in the file
+        either way, there is nothing to tell them. It goes quiet by itself:
+        once the profile is linked there is no history of its own to meet.
+        """
+        if not self._own_history_found:
+            return
+        if explicit_share_history(self.switcher.backup_dir) is not None:
+            return
+        self._note(
+            "Chat history is shared between accounts by default now "
+            "(turn off: cswap config set run.shareHistory false)."
+        )
 
     def _note_merge_progress(
         self, moved: int, quarantined: int, run_dir: Path | None
