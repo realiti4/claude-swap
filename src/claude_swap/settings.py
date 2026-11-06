@@ -88,9 +88,14 @@ class UiSettings:
 
 @dataclass(frozen=True)
 class RunSettings:
-    """Defaults for ``cswap run`` (``run`` section); its flags override them."""
+    """Defaults for ``cswap run`` (``run`` section); its flags override them.
 
-    share_history: bool = False
+    ``share_history``: sessions of every account read and write the one chat
+    history in ``~/.claude``, so the account only decides whose quota is
+    used. Off gives each account a history of its own.
+    """
+
+    share_history: bool = True
 
 
 @dataclass(frozen=True)
@@ -208,7 +213,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
-            help="cswap run shares chat history unless --no-share-history",
+            help="cswap run shares one chat history across accounts; not on Windows yet",
         ),
         SettingSpec(
             "updates", "check", "check", "bool",
@@ -339,11 +344,22 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
 
 def load_run_settings(backup_root: Path) -> RunSettings:
     """Load the run section; missing/corrupt file or non-bool value → default."""
+    chosen = explicit_share_history(backup_root)
+    return RunSettings() if chosen is None else RunSettings(share_history=chosen)
+
+
+def explicit_share_history(backup_root: Path) -> bool | None:
+    """``run.shareHistory`` as the user set it; None when they never did.
+
+    ``load_run_settings`` answers "what applies"; this answers "who decided".
+    The two differ where it matters: a default that cannot be honored (history
+    sharing on Windows) is dropped silently while a setting someone wrote
+    earns a warning, and only a user who never chose is told that sharing is
+    the default. A value that is not a boolean counts as never set.
+    """
     section = _read_raw(settings_path(backup_root)).get("run")
     value = section.get("shareHistory") if isinstance(section, dict) else None
-    if not isinstance(value, bool):
-        return RunSettings()
-    return RunSettings(share_history=value)
+    return value if isinstance(value, bool) else None
 
 
 def load_update_settings(backup_root: Path) -> UpdateSettings:

@@ -23,6 +23,7 @@ from claude_swap.settings import (
     UpdateSettings,
     UsageSettings,
     effective_settings,
+    explicit_share_history,
     load_run_settings,
     load_settings,
     load_ui_settings,
@@ -269,16 +270,37 @@ class TestUiSettings:
 
 
 class TestRunSettings:
-    def test_missing_file_defaults_to_per_account_history(self, tmp_path: Path):
-        assert load_run_settings(tmp_path) == RunSettings(share_history=False)
+    def test_missing_file_defaults_to_shared_history(self, tmp_path: Path):
+        assert load_run_settings(tmp_path) == RunSettings(share_history=True)
 
     def test_reads_share_history(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": True}}))
-        assert load_run_settings(tmp_path).share_history is True
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": False}}))
+        assert load_run_settings(tmp_path).share_history is False
 
     def test_non_bool_falls_back_to_default(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "yes"}}))
-        assert load_run_settings(tmp_path).share_history is False
+        # "no" is truthy as a string and falsy in intent: neither reading is
+        # taken, the default is.
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "no"}}))
+        assert load_run_settings(tmp_path).share_history is True
+
+    def test_explicit_value_is_none_until_the_user_sets_one(self, tmp_path: Path):
+        """The loader answers "what applies"; this one, "who decided"."""
+        assert explicit_share_history(tmp_path) is None
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "no"}}))
+        assert explicit_share_history(tmp_path) is None  # not a choice either
+
+    @pytest.mark.parametrize("chosen", [True, False])
+    def test_explicit_value_is_the_one_in_the_file(self, tmp_path: Path, chosen):
+        # True included: equal to the default, and still the user's own.
+        set_setting(tmp_path, "run.shareHistory", str(chosen).lower())
+        assert explicit_share_history(tmp_path) is chosen
+        assert load_run_settings(tmp_path).share_history is chosen
+
+    def test_unset_goes_back_to_the_default(self, tmp_path: Path):
+        set_setting(tmp_path, "run.shareHistory", "false")
+        assert unset_setting(tmp_path, "run.shareHistory") is True
+        assert explicit_share_history(tmp_path) is None
+        assert load_run_settings(tmp_path).share_history is True
 
     def test_set_share_history(self, tmp_path: Path):
         assert set_setting(tmp_path, "run.shareHistory", "true") is True
