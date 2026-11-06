@@ -384,8 +384,9 @@ def _perish_then_room_key(usage: dict | str | None, headroom: float, now: float)
     return (1, 0.0, -headroom)
 
 
-# Whole-window margin: the rate reads ~2x high on a fill-then-idle fleet (6.9 vs 4.64 pts/h, 7 d).
-EXPIRING_RATE_MARGIN = 2.0
+# The window-read rate overstates the real one on a fill-then-idle fleet: 6.9 against
+# 4.64 pts/h over 7 d of usage.jsonl, 1.49x (2026-11-06). Start that much early.
+EXPIRING_RATE_MARGIN = 1.5
 _SEVEN_DAYS_S = 7 * 24 * 3600.0
 
 
@@ -400,8 +401,9 @@ def expiring_order(
     now: float,
 ) -> list[str]:
     """The accounts whose 7d room must be spent now to be spent at all (T3310):
-    the whole queue, soonest reset first, once any deadline has come; ``[]``
-    when every deadline can be met or no burn rate is measurable.
+    soonest reset first, up to and including the last account whose deadline has
+    come (one after it is not expiring); ``[]`` when every deadline can be met
+    or no burn rate is measurable.
 
     ``accounts[0]`` is the active, the rest the admissible OAuth candidates (an
     equal reset keeps the active ahead). Room is what is left under the
@@ -438,12 +440,12 @@ def expiring_order(
     rate = spent / elapsed
     walked: list[str] = []
     need = 0.0
-    due = False
+    last_due = 0
     for n in sorted((n for n in accounts if n in seen), key=lambda n: seen[n][1]):
         pct, reset = seen[n]
         wall = _wall_headroom(bars.get(n))
         room = 100.0 - pct - wall
-        if caps.get(n) is not None:
+        if caps.get(n) is not None and caps[n] < 100.0:  # 100 is no cap (models.py)
             weekly = max(  # a header-probe reading shows no `all` window: its 7d is what is known
                 (p for w, p, _ in oauth.relevant_windows(usage[n], ("all",)) if w != "5h"),
                 default=pct,
@@ -459,8 +461,9 @@ def expiring_order(
             continue
         walked.append(n)
         need += room * weight(n)
-        due = due or need * EXPIRING_RATE_MARGIN / rate >= reset - now
-    return walked if due else []
+        if need * EXPIRING_RATE_MARGIN / rate >= reset - now:
+            last_due = len(walked)
+    return walked[:last_due]
 
 
 def _stay_progress(
@@ -2823,6 +2826,21 @@ class AutoSwitchEngine:
                 _landing_cost, now,
             )
 
+        # On a healthy active, the expiring accounts ahead of its own window pull the
+        # switch. An active walled on its own model-gated axis leaves by the walled
+        # escape below (#403), which prices the landing and breaks ties by warmth.
+        ahead: list[str] = []
+        spend_first = False
+        if (
+            trigger == "dynamic-healthy"
+            and expiring
+            and not _about_to_wall(raw_active_headroom, self._active_wall)
+        ):
+            ahead = expiring[: expiring.index(current)] if current in expiring else expiring
+            # The active is itself the soonest expiring window: it spends it, and
+            # only a candidate whose own window perishes sooner may take over.
+            spend_first = not ahead
+
         dynamic_ordered: list[str] | None = None
         dynamic_any_known = True
         if settings.strategy == "dynamic" and trigger == "proactive":
@@ -2919,29 +2937,7 @@ class AutoSwitchEngine:
                 dynamic_any_known = any(
                     floor_headroom.get(n) is not None for n in oauth_candidates
                 )
-        elif (
-            settings.strategy == "dynamic"
-            and trigger == "dynamic-healthy"
-            and expiring
-            # An active walled on its own model-gated axis leaves by the walled
-            # escape below (#403), which prices the landing and breaks ties by warmth.
-            and not _about_to_wall(raw_active_headroom, self._active_wall)
-        ):
-            ahead = expiring[: expiring.index(current)] if current in expiring else expiring
-            if not ahead:
-                # The active is itself the soonest expiring window: spend it
-                # before the alternation below can rotate away from it.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="below-threshold",
-                        detail=(
-                            f"active account is healthy ({pct_label(active_headroom)}"
-                            "% headroom, not about to wall); spending its expiring "
-                            "window first"
-                        ),
-                    )
-                )
-                return TickOutcome.NO_ACTION
+        elif ahead:
             if self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
@@ -3097,6 +3093,13 @@ class AutoSwitchEngine:
                     active_headroom=active_headroom, cold_cost=_cold_cost,
                 )
             partner = next(iter(alternation_admissible), None)
+            # T3310: an active spending its own expiring window yields only to a
+            # candidate that perishes sooner; `partner` (unfiltered) still labels a hold.
+            if spend_first:
+                alternation_admissible = [
+                    n for n in alternation_admissible
+                    if _perishes_before_active(usage.get(n), usage.get(current), now)
+                ]
             # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
             # NEVER-widened model-gated reading — the widen above can call
             # this active "healthy" (dynamic-healthy, not at-limit) purely
@@ -3248,7 +3251,7 @@ class AutoSwitchEngine:
                 # is already `warm_ordered + [floor-clearing cold]` for the
                 # same reason).
                 dynamic_ordered = escapees
-            elif partner is None or not rotation_due:
+            elif not alternation_admissible or not rotation_due:
                 # One label per story (item 5): a warm partner not yet
                 # dwelt on, or a cold one below the floor. T0758:
                 # `partner is not None` (a perishing candidate, or now
@@ -3282,7 +3285,13 @@ class AutoSwitchEngine:
                         detail=(
                             f"active account is healthy ({pct_label(active_headroom)}"
                             "% headroom, not about to wall)"
-                            + ("; the alternation step is not reached" if step_holds else "")
+                            + (
+                                "; spending its expiring window first"
+                                if spend_first and not alternation_admissible
+                                else "; the alternation step is not reached"
+                                if step_holds
+                                else ""
+                            )
                         ),
                     )
                 )
@@ -3800,6 +3809,7 @@ class AutoSwitchEngine:
                         f"active account is healthy ({pct_label(active_headroom)}% headroom, "
                         f"not about to wall); {len(ordered)} expiring account(s) "
                         "could not be landed on"
+                        + (f"; {_SYSTEMIC_MESSAGES[systemic]}" if systemic else "")
                     ),
                 )
             )

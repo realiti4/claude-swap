@@ -103,10 +103,12 @@ def test_the_step_on_a_mixed_fleet(temp_home, case):
     if five == "running":
         b["five_hour"]["resets_at"] = _iso_at(h.clock.now + 7200.0)
     if seven != "reset_from_full":
-        b["seven_day"]["resets_at"] = _iso_at(h.clock.now + 6 * 86400.0)
+        b["seven_day"]["resets_at"] = _iso_at(h.clock.now + 3 * 86400.0)
     if pinned != "none":
         b["scoped"] = [{"name": "Fable", "pct": 10.0 if pinned == "open" else 100.0}]
-    c = _u(20.0, 60.0, reset7=h.clock.now + 6 * 86400.0)
+    # 4 d, not 3: where b has no reset only c is read, at 60 points over 4 d (0.63 pts/h), and
+    # its 37 points of room are due at 3 d out (89 h of spending) but not at 4 d (67 h of 96).
+    c = _u(20.0, 60.0, reset7=h.clock.now + 4 * 86400.0)
     c["five_hour"]["resets_at"] = _iso_at(h.clock.now + 7200.0)
     plans = {"1": "Ultra", "2": PLAN[plan], "3": PLAN[partner_plan]} if HAS_PLAN else None
     _stamp(h, **{"1": 60.0, **({"2": 120.0} if partner == "warm" else {})})
