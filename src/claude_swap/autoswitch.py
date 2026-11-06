@@ -369,9 +369,11 @@ def _unreadable_reason(entries: dict | None, num: str, now: float) -> str:
     backoff is "overdue", not unreadable: nothing failed, whatever its poll
     plan says, the next poll just has not landed. One that failed or is in
     backoff while its last reading is still drawn names that reading's age and
-    the failure ("last read 10m ago, rate-limited until 20:00"). No reading at
-    all, or ``entries=None`` (the engine, which collects no reasons), keeps the
-    generic wording.
+    the failure ("last read 10m ago, rate-limited until 20:00"); a backoff with
+    no failure behind it (a successful fetch carrying a probe rejection's
+    Retry-After) says when polling resumes, not that a fetch failed. No reading
+    at all, or ``entries=None`` (the engine, which collects no reasons), keeps
+    the generic wording.
     """
     entry = (entries or {}).get(num)
     if entry is None or entry.decision_value() is not None or entry.last_good is None:
@@ -384,14 +386,17 @@ def _unreadable_reason(entries: dict | None, num: str, now: float) -> str:
             datetime.fromtimestamp(entry.backoff_until, tz=timezone.utc),
             datetime.fromtimestamp(now, tz=timezone.utc),
         )
-        why = (
-            f"rate-limited until {clock}" if entry.last_error == "http-429"
-            else f"{why}, retry at {clock}"
-        )
+        if entry.last_error == "http-429":
+            why = f"rate-limited until {clock}"
+        elif entry.consecutive_failures or entry.last_error:
+            why = f"{why}, retry at {clock}"
+        else:  # a successful fetch whose probe rejection set a Retry-After
+            why = f"no poll before {clock}"
     if entry.age_s is None:
         return why
-    h, m = divmod(int(entry.age_s) // 60, 60)
-    return f"last read {f'{h}h {m}m' if h else f'{m}m'} ago, {why}"
+    h, m = divmod(max(int(entry.age_s), 0) // 60, 60)
+    age = f"{h}h {m}m" if h else f"{m}m" if m else "<1m"
+    return f"last read {age} ago, {why}"
 
 
 # The charge lands on `floor_headroom`, which includes a pinned model's scoped

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import oauth
+from claude_swap import oauth, usage_store
 from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import (
     USAGE_API_KEY,
@@ -2024,8 +2024,10 @@ class TestRankSwitchReasons:
     def test_an_overdue_reading_is_not_called_unreadable(self):
         """A row whose last good reading aged past `STALE_OK_S` with no failure
         says it is overdue, whatever its poll plan (its chips still show the
-        reading); a failure count or a backoff names the reading's age and the
-        failure instead (below), on both passes."""
+        reading); a failure count names the reading's age and the failure
+        instead (below), on both passes. A backoff with no failure behind it (a
+        successful fetch carrying a probe rejection's Retry-After) names the
+        age and when polling resumes, never "last fetch failed"."""
         now = time.time()
         stale = make_entry(61.0, 96.0, age_s=STALE_OK_S + 60)
         planned = dataclasses.replace(stale, next_poll_at=now - 5)
@@ -2047,15 +2049,15 @@ class TestRankSwitchReasons:
                 "2": "usage overdue for refresh",
                 "3": "usage overdue for refresh",
                 "4": "last read 6m ago, last fetch failed",
-                "5": f"last read 6m ago, last fetch failed, retry at "
-                     f"{self._clock(backed_off.backoff_until)}",
+                "5": f"last read 6m ago, no poll before "
+                     f"{self._clock(backed_off.backoff_until, now)}",
             }, (settings.strategy, reasons)
 
     @staticmethod
-    def _clock(ts):
+    def _clock(ts, now):
         return oauth.reset_clock_string(
             datetime.fromtimestamp(ts, tz=timezone.utc),
-            datetime.fromtimestamp(time.time(), tz=timezone.utc),
+            datetime.fromtimestamp(now, tz=timezone.utc),
         )
 
     def test_a_failed_candidate_names_its_last_reading_and_the_retry(self):
@@ -2088,10 +2090,32 @@ class TestRankSwitchReasons:
             )
             assert reasons == {
                 "2": f"last read 10m ago, rate-limited until "
-                     f"{self._clock(limited.backoff_until)}",
+                     f"{self._clock(limited.backoff_until, now)}",
                 "3": "last read 2h 5m ago, http-500",
                 "4": "usage unreadable",
             }, (settings.strategy, reasons)
+
+    def test_an_age_under_a_minute_or_skewed_reads_under_one_minute(
+        self, monkeypatch
+    ):
+        """The trust window (300s) keeps a reading younger than a minute out
+        of this wording, so the window is dropped (the active keeps its
+        reading by trust extension) to reach it: a sub-minute age and one
+        ahead of the reader's clock (fetchedAt skew) read "<1m", never "0m"
+        or "-1h 59m"."""
+        monkeypatch.setattr(usage_store, "STALE_OK_S", -1e9)
+        active = dataclasses.replace(make_entry(50.0, 50.0), trust_extended=True)
+        for age_s in (30, -7140):
+            entry = dataclasses.replace(
+                make_entry(61.0, 94.0, age_s=age_s),
+                consecutive_failures=2, last_error="http-500",
+            )
+            reasons = self._reasons(
+                AutoSwitchSettings(strategy="consume-first", threshold=90.0),
+                make_account(1, active=True, entry=active),
+                make_account(2, entry=entry),
+            )
+            assert reasons == {"2": "last read <1m ago, http-500"}, (age_s, reasons)
 
 
 class TestRankSwitchOwnBars:
