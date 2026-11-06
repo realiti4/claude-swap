@@ -173,9 +173,14 @@ def error(msg: str) -> None:
     print(_style(msg, _pal("red")), file=sys.stderr)
 
 
-def warning(msg: str) -> None:
-    """Print a warning message (yellow)."""
-    print(_style(msg, _pal("yellow")))
+def warning(msg: str, *, file=None) -> None:
+    """Print a warning message (yellow).
+
+    ``file`` routes it elsewhere than stdout — stderr for anything a
+    long-running process emits, since stderr stays line-buffered when it is
+    redirected to a file and stdout does not.
+    """
+    print(_style(msg, _pal("yellow")), file=file)
 
 
 # --- Display helpers for process detection ---

@@ -8,9 +8,8 @@ JSON envelope. No encryption is built in — users compose their own
 from __future__ import annotations
 
 import json
-import os
+import math
 import sys
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,7 +20,9 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
+from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
+from claude_swap.json_output import usage_from_json
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -105,28 +106,20 @@ def _atomic_write_file(path: Path, content: str) -> None:
     the export payload carries live OAuth refresh tokens, and a write-then-
     chmod sequence leaves the temp file at the umask-derived default mode
     (typically world-readable) for the window between creation and the chmod
-    call. Same pattern as ``credentials.py``/``settings.py``/``migrations.py``.
+    call. The shared ``fsutil.atomic_write_text`` is that pattern.
+
+    ``follow_symlinks=False``: the destination is a path the user typed, often
+    under a shared directory such as ``/tmp``, and a symlink planted there by
+    another local user must not redirect an export full of refresh tokens onto
+    a file of their choosing. The rename replaces the link itself (in a sticky
+    directory a foreign entry makes that rename fail, which is the right
+    outcome).
     """
     if path.is_dir():
         raise TransferError(
             f"export destination must be a file path, not a directory: {path}"
         )
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        os.write(fd, content.encode("utf-8"))
-        os.close(fd)
-        fd = -1
-        replace_with_retry(tmp_path, str(path))
-        if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, content, follow_symlinks=False)
 
 
 def _slim_config(config_obj: dict, label: str) -> dict:
@@ -249,7 +242,7 @@ def export_accounts(
         if not full:
             config_obj = _slim_config(config_obj, f"config for {email}")
 
-        # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
+        # API-key accounts store the credential as a raw ``sk-ant-…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
         is_api_key = looks_like_api_key(creds_text)
@@ -389,7 +382,8 @@ def import_accounts(
         if is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
-                    f"API-key credentials for {email} must be a raw sk-ant-api… string"
+                    f"API-key credentials for {email} must be a raw sk-ant-… key "
+                    "(not an OAuth token)"
                 )
             creds_text = creds_obj.strip()
         else:
@@ -643,3 +637,110 @@ def import_accounts(
                 f"Note: {identity[0]} is your current live login — activate the "
                 f"imported credentials with: cswap --switch-to {live_slot} --force"
             )
+
+
+def import_usage(
+    switcher: ClaudeAccountSwitcher,
+    source: str,
+    hold_s: float | None = None,
+) -> None:
+    """Adopt usage readings another machine took, from its ``cswap list --json``.
+
+    For machines that hold the same accounts: when they share a login (moved
+    with ``export``/``import``) or the account is budgeted per account rather
+    than per token (see poll_policy), every machine polling it spends one
+    usage-endpoint budget, so a script can let one machine poll and hand its
+    readings to the rest.
+
+    Each row with decision-grade usage (``usageStatus`` "ok") is matched to a
+    local slot by (email, organizationUuid), the key ``import`` uses, and
+    handed to :meth:`UsageStore.adopt` with ``usageAgeSeconds`` as its age.
+    Rows without usage, and accounts not managed here, are skipped. With
+    ``hold_s``, no local collector fetches the matched accounts for that long
+    (bounded; see ``adopt``); 0 lifts an earlier hold, ``None`` keeps it.
+
+    Args:
+        switcher: Initialized ClaudeAccountSwitcher.
+        source: File path, or "-" for stdin.
+        hold_s: Seconds no local collector may fetch the matched accounts,
+            0 to lift an earlier hold, None to leave it as it is.
+
+    Raises:
+        TransferError: malformed document or unsupported schema version.
+    """
+    if source == "-":
+        text = sys.stdin.read()
+    else:
+        in_path = Path(source).expanduser()
+        if not in_path.exists():
+            raise TransferError(f"usage file not found: {in_path}")
+        text = in_path.read_text(encoding="utf-8")
+
+    document = _parse_payload(text, "usage document")
+    version = document.get("schemaVersion")
+    if version != JSON_SCHEMA_VERSION:
+        raise TransferError(
+            f"unsupported usage document schemaVersion: {version!r} "
+            f"(expected {JSON_SCHEMA_VERSION}, as printed by 'cswap list --json')"
+        )
+    rows = document.get("accounts")
+    if not isinstance(rows, list):
+        raise TransferError("usage document has no accounts list")
+
+    # Validate every row before writing any, as import_accounts does: a
+    # malformed row later in the list must not leave earlier ones adopted.
+    local_data = switcher._get_sequence_data_migrated() or {}
+    readings: dict[str, tuple[dict, float]] = {}
+    identities: dict[str, tuple[str, str]] = {}
+    skipped = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            raise TransferError("each account row must be a JSON object")
+        email = row.get("email")
+        org_uuid = row.get("organizationUuid") or ""
+        if not isinstance(email, str) or not email or not isinstance(org_uuid, str):
+            raise TransferError("each account row needs an email and an organizationUuid")
+        if row.get("usageStatus") != "ok":
+            skipped += 1
+            continue
+        age_s = row.get("usageAgeSeconds")
+        if (
+            not isinstance(age_s, (int, float))
+            or isinstance(age_s, bool)
+            or not math.isfinite(age_s)
+            or age_s < 0
+        ):
+            raise TransferError(
+                f"usageAgeSeconds for {email} must be a non-negative number"
+            )
+        try:
+            usage = usage_from_json(row.get("usage"))
+        except ValueError as exc:
+            raise TransferError(f"usage for {email}: {exc}")
+        num = switcher._find_account_slot(local_data, email, org_uuid)
+        if num is None:
+            skipped += 1
+            continue
+        if num in readings:
+            raise TransferError(
+                f"duplicate account in usage document: {email} "
+                f"(org={org_uuid or 'personal'})"
+            )
+        readings[num] = (usage, float(age_s))
+        identities[num] = (email, org_uuid)
+
+    adopted = switcher._usage_store.adopt(readings, identities, hold_s=hold_s)
+    for num, (email, _org_uuid) in identities.items():
+        if num in adopted:
+            _eprint(f"Adopted usage for {email} → slot {num}")
+        else:
+            _eprint(f"Kept slot {num}'s own reading for {email}: it is newer")
+    summary = (
+        f"Done: {len(adopted)} adopted, {len(readings) - len(adopted)} kept, "
+        f"{skipped} skipped"
+    )
+    if hold_s is not None and readings:
+        summary += (
+            f"; fetching held for up to {hold_s:.0f}s" if hold_s > 0 else "; holds lifted"
+        )
+    _eprint(summary)
