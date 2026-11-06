@@ -3235,6 +3235,80 @@ class TestShareHistoryDecision:
             manager.exec_default([])
         assert capsys.readouterr().out == ""
 
+    # -- the same-account fast path (#239) --------------------------------
+    #
+    # Plain claude on the default login reads and writes ``~/.claude``'s
+    # history, while every other launch of the account uses its profile's.
+    # These are the launches that do not share; the ones that do merge the
+    # profile's history instead (TestShareHistoryIsTheDefault).
+
+    @staticmethod
+    def _profile_with_its_own_history(mgr: SessionManager) -> Path:
+        session_dir = session_dir_for(
+            mgr.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        transcript = session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("profile-b\n")
+        return session_dir
+
+    @staticmethod
+    def _not_sharing(mgr: SessionManager, how: str) -> bool | None:
+        """Put ``mgr`` in one of the three states that do not share history;
+        returns what the launch itself has to pass."""
+        if how == "setting":
+            _turn_sharing(mgr, "false")
+        elif how == "windows":
+            mgr.switcher.platform = Platform.WINDOWS
+        return False if how == "flag" else None
+
+    def test_fast_path_has_nothing_to_add_when_history_is_shared(
+        self, manager, capture_exec, monkeypatch, capsys
+    ):
+        _active_default_login(monkeypatch, manager)
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+        out = capsys.readouterr().out
+        assert "already the active default login" in out
+        assert "chat history" not in out
+
+    @pytest.mark.parametrize("how", ["flag", "setting", "windows"])
+    def test_fast_path_says_whose_history_it_uses_when_the_account_has_its_own(
+        self, manager, capture_exec, monkeypatch, capsys, how
+    ):
+        """The one launch of the account whose conversations ``--resume``
+        will not find among the others, and the reverse. On Windows too:
+        nothing can be shared there yet, so this line is all the user gets."""
+        _active_default_login(monkeypatch, manager)
+        session_dir = self._profile_with_its_own_history(manager)
+        requested = self._not_sharing(manager, how)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], share_history=requested)
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "default login's chat history" in capsys.readouterr().out
+        # Said, not acted on: the history stays where the user keeps it.
+        assert (
+            session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
+        ).read_text() == "profile-b\n"
+
+    @pytest.mark.parametrize("how", ["flag", "setting", "windows"])
+    def test_fast_path_has_nothing_to_add_without_a_history_of_its_own(
+        self, manager, capture_exec, monkeypatch, capsys, how
+    ):
+        """No profile, or one that never held a conversation: there is no
+        second history for this launch to be mistaken for."""
+        _active_default_login(monkeypatch, manager)
+        requested = self._not_sharing(manager, how)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [], share_history=requested)
+
+        out = capsys.readouterr().out
+        assert "already the active default login" in out
+        assert "chat history" not in out
+
     def test_fast_path_refuses_the_flag_on_windows_too(
         self, manager, capture_exec, monkeypatch
     ):
@@ -3339,6 +3413,156 @@ class TestShareHistoryIsTheDefault:
         # And never again: nothing of its own is left to meet.
         launch()
         assert OPT_OUT not in capsys.readouterr().out
+
+    # -- the account that is the default login (the fast path) ------------
+
+    def test_default_login_account_gets_its_own_history_merged_too(
+        self, launch, manager, monkeypatch, temp_home, capsys
+    ):
+        """The account's sessions wrote into its profile; then it became the
+        default login, and ``cswap run`` for it is plain claude on
+        ``~/.claude``. Without a merge on that path the old conversations
+        stay out of ``--resume`` for as long as the account stays the
+        default, however often it is run."""
+        session_dir = launch(share_history=False)  # as the old default left it
+        self._give_own_history(session_dir)
+        credentials = (session_dir / ".credentials.json").read_bytes()
+        _active_default_login(monkeypatch, manager)
+        capsys.readouterr()
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env  # still plain claude
+        shared = temp_home / ".claude"
+        assert (
+            shared / "projects" / "-home-user-app" / "bbb.jsonl"
+        ).read_text() == "profile-b\n"
+        assert '{"p": "profile"}' in (shared / "history.jsonl").read_text()
+        assert self._is_linked(session_dir, shared)
+        out = capsys.readouterr().out
+        assert "already the active default login" in out
+        assert out.count(OPT_OUT) == 1
+        # History only: the profile's credential copy is what the fast path
+        # exists to leave alone.
+        assert (session_dir / ".credentials.json").read_bytes() == credentials
+
+    def test_fast_path_merge_touches_history_and_nothing_else(
+        self, launch, manager, monkeypatch, temp_home
+    ):
+        """It is the history half of a session launch, run for a profile the
+        launch does not use. ``--no-share`` on such a launch must not strip
+        the profile's customizations: that is the next session launch's
+        business, and its flags may differ."""
+        (temp_home / ".claude" / "settings.json").write_text("{}")
+        session_dir = launch(share_history=False)
+        assert (session_dir / "settings.json").is_symlink()
+        self._give_own_history(session_dir)
+        _active_default_login(monkeypatch, manager)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [], share=False)
+
+        shared = temp_home / ".claude"
+        assert self._is_linked(session_dir, shared)
+        assert (session_dir / "settings.json").readlink() == shared / "settings.json"
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert set(manifest["items"]) == {"settings.json", "projects", "history.jsonl"}
+
+    def test_links_made_on_the_fast_path_are_undone_by_a_later_opt_out(
+        self, launch, manager, monkeypatch, temp_home
+    ):
+        """They are recorded like any other link cswap makes. Unrecorded,
+        ``--no-share-history`` would leave the profile on the shared history."""
+        session_dir = launch(share_history=False)
+        self._give_own_history(session_dir)
+        _active_default_login(monkeypatch, manager)
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+        assert self._is_linked(session_dir, temp_home / ".claude")
+
+        monkeypatch.setattr(manager.switcher, "_get_current_account", lambda: None)
+        assert launch(share_history=False) == session_dir
+        assert not (session_dir / "projects").exists()
+        assert not (session_dir / "history.jsonl").exists()
+        # What was merged stays shared; only the links go.
+        assert (
+            temp_home / ".claude" / "projects" / "-home-user-app" / "bbb.jsonl"
+        ).exists()
+
+    def test_fast_path_merge_waits_for_a_session_still_in_the_profile(
+        self, launch, manager, monkeypatch, temp_home, capsys
+    ):
+        """A session started before the account became the default login is
+        still writing the profile's history. The launch goes ahead on the
+        default login and says why the old conversations are not there."""
+        session_dir = launch(share_history=False)
+        self._give_own_history(session_dir)
+        _active_default_login(monkeypatch, manager)
+        make_live(session_dir)
+        capsys.readouterr()
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        out = capsys.readouterr().out
+        assert out.count("keeps its own") == 1
+        assert "then relaunch:  cswap run 2\n" in out
+        assert (
+            session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
+        ).read_text() == "profile-b\n"
+        assert not (temp_home / ".claude" / "projects" / "-home-user-app").exists()
+
+    def test_fast_path_launches_even_when_the_merge_cannot_run(
+        self, launch, manager, monkeypatch, capsys
+    ):
+        session_dir = launch(share_history=False)
+        self._give_own_history(session_dir)
+        _active_default_login(monkeypatch, manager)
+
+        class Unopenable(FileLock):
+            def acquire(self, timeout=None):
+                raise PermissionError("read-only file system")
+
+        monkeypatch.setattr(session_mod, "FileLock", Unopenable)
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert "could not be locked" in capsys.readouterr().out
+        assert not (session_dir / "projects").is_symlink()
+
+    def test_a_partial_sync_leaves_the_rest_of_the_manifest_alone(
+        self, history_setup
+    ):
+        """``scope`` is the whole contract of a partial sync: entries outside
+        it survive on disk and in the manifest, whatever happens inside it —
+        including when nothing inside it is left active."""
+        _, session_dir, mgr = history_setup
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        before = json.loads((session_dir / SHARE_MANIFEST).read_text())["items"]
+        assert {"settings.json", "projects"} <= set(before)
+
+        mgr._sync_items(session_dir, (), scope=session_mod.HISTORY_ITEMS)
+
+        assert not (session_dir / "projects").exists()
+        assert not (session_dir / "history.jsonl").exists()
+        assert (session_dir / "settings.json").is_symlink()
+        after = json.loads((session_dir / SHARE_MANIFEST).read_text())["items"]
+        assert set(after) == set(before) - set(session_mod.HISTORY_ITEMS)
+
+    def test_fast_path_never_creates_a_profile(
+        self, manager, capture_exec, monkeypatch, temp_home
+    ):
+        """No profile means no history to bring in, and no reason to make
+        one: a second copy of the default login's credential is what this
+        path exists to avoid."""
+        _active_default_login(monkeypatch, manager)
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert not manager.sessions_dir.exists()
+        assert not (temp_home / ".claude" / "projects").exists()
 
     def test_a_profile_with_nothing_of_its_own_is_told_nothing(
         self, history_setup, capsys

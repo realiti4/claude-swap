@@ -699,7 +699,7 @@ class SessionManager:
                 "'claude' was not found on PATH. Install Claude Code first."
             )
         # Before the fast path below: it never reaches setup_session, and it
-        # has to refuse the same request (--share-history on Windows).
+        # has to refuse the same request and handle the same history.
         share_history = self._resolve_share_history(share_history)
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -735,6 +735,10 @@ class SessionManager:
                     "default login — launching claude directly."
                 )
             )
+            self._history_on_the_fast_path(
+                session_dir_for(self.switcher.backup_dir, account_num, email),
+                share_history,
+            )
             env = dict(os.environ)
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
@@ -765,6 +769,38 @@ class SessionManager:
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
+
+    def _history_on_the_fast_path(
+        self, session_dir: Path, share_history: bool
+    ) -> None:
+        """Deal with history the profile holds, on the launch that skips it.
+
+        The fast path is plain claude on ``~/.claude``, so what the account's
+        sessions wrote into its profile is not in front of the user (#239).
+        With sharing on it is merged now, by the steps a session launch
+        takes: an account that stays the default login would otherwise never
+        be migrated, however often it is run. With sharing off it stays
+        apart, and the launch says which history it is about to use.
+
+        History only. Nothing here seeds, validates or refreshes the
+        profile's credentials — a second live copy of the default login's
+        credential is what the fast path exists to avoid. A profile with no
+        history of its own (never used, or already linked) is left alone.
+        """
+        if not any(
+            (session_dir / name).exists() and not (session_dir / name).is_symlink()
+            for name in HISTORY_ITEMS
+        ):
+            return
+        if share_history:
+            self._sync_items(session_dir, HISTORY_ITEMS, scope=HISTORY_ITEMS)
+        else:
+            print(
+                dimmed(
+                    "   This launch uses the default login's chat history "
+                    "(~/.claude), not the account's own."
+                )
+            )
 
     def _resolve_share_history(self, requested: bool | None) -> bool:
         """Whether this launch shares chat history across accounts.
@@ -1259,24 +1295,41 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return
-        # Reset per call: _prepare_history_share accumulates into this as it
-        # runs (once per HISTORY_ITEMS entry), so a launch with nothing to
-        # migrate must not report counts left over from a previous one.
-        self._last_merge_counts = (0, 0, None)
-        self._deferral_reported = False
-        self._own_history_found = False
         self._sync_mcp_servers(session_dir, share)
         # History links are POSIX-only. _resolve_share_history already says
         # no on Windows; repeated here for a caller that skipped it, and it
         # also drops any links left by a POSIX→Windows profile move.
         if self.switcher.platform == Platform.WINDOWS:
             share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
+        self._sync_items(
+            session_dir,
+            (SHARED_ITEMS if share else ())
+            + (HISTORY_ITEMS if share_history else ()),
         )
+
+    def _sync_items(
+        self,
+        session_dir: Path,
+        active_items: tuple[str, ...],
+        scope: tuple[str, ...] = SHARED_ITEMS + HISTORY_ITEMS,
+    ) -> None:
+        """Link (or copy) ``active_items`` into the profile; undo the others.
+
+        ``scope`` is what this call decides about. An entry in it that is not
+        active is removed, and a managed entry outside it stays exactly as it
+        is, on disk and in the manifest. Everything by default; the fast
+        path passes the history items alone (``_history_on_the_fast_path``).
+        """
+        # Reset per call: _prepare_history_share accumulates into this as it
+        # runs (once per HISTORY_ITEMS entry), so a launch with nothing to
+        # migrate must not report counts left over from a previous one.
+        self._last_merge_counts = (0, 0, None)
+        self._deferral_reported = False
+        self._own_history_found = False
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
+        out_of_scope = [name for name in managed if name not in scope]
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
@@ -1284,17 +1337,17 @@ class SessionManager:
         # a stale manifest (lock-free launches race) must never be able to
         # delete real conversation history — only ever unlink symlinks.
         for name in managed:
-            if name not in active_items:
+            if name in scope and name not in active_items:
                 dest = session_dir / name
                 if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
                     continue
                 self._remove_managed(dest)
-        if not active_items:
+        if not active_items and not out_of_scope:
             manifest_path.unlink(missing_ok=True)
             return
 
         use_symlinks = self.switcher.platform != Platform.WINDOWS
-        new_managed: list[str] = []
+        new_managed: list[str] = list(out_of_scope)
 
         for name in active_items:
             src = source_root / name
