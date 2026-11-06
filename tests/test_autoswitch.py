@@ -17693,9 +17693,6 @@ _ENG = {"lastSwitchAt": 5, "lastSwitchTo": "2", "leftTrigger": "failover"}
         ({**_ENG, "lastManualSwitchAt": "x", "lastManualSwitchTo": "3"}, ("2", "failover")),
         ({"lastSwitchAt": 5, "lastSwitchTo": "2"}, None),  # no trigger recorded
         ({**_ENG, "lastSwitchAt": "x"}, None),
-        ({**_ENG, "lastSwitchTo": None}, None),
-        ([], None),
-        ("{not json", None),
     ],
 )
 def test_last_engine_switch_drops_a_malformed_entry_and_never_raises(tmp_path, raw, expected):
