@@ -69,3 +69,13 @@ def test_readme_verb_is_a_real_command(verb, capsys):
     assert verb not in _unrecognized(capsys, verb), (
         f"README documents `cswap {verb}`, which this build's CLI rejects"
     )
+
+
+def test_the_readme_strategy_table_matches_the_settings():
+    """One row per strategy the CLI accepts, and `(default)` on the real default."""
+    from claude_swap.settings import AUTOSWITCH_STRATEGIES, AutoSwitchSettings
+
+    table = README.read_text(encoding="utf-8").split("| Strategy |", 1)[1].split("\n\n", 1)[0]
+    rows = re.findall(r"^\| `([a-z-]+)`( \(default\))? \|", table, re.M)
+    assert {name for name, _ in rows} == set(AUTOSWITCH_STRATEGIES)
+    assert [name for name, mark in rows if mark] == [AutoSwitchSettings().strategy]

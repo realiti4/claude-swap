@@ -89,19 +89,28 @@ cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
 cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
+cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first (more strategies below)
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
-cswap auto --strategy weekly-first    # switch at the threshold, onto the soonest weekly reset
-cswap auto --strategy consume-first   # burn the soonest-resetting account first
-cswap auto --strategy priority-consume-first   # your own tiers first, then soonest weekly reset
 ```
 
 <details>
 <summary>How it behaves & advanced usage</summary>
 
+**Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`):
+
+| Strategy | Switches | Lands on |
+|---|---|---|
+| `best` | when the active account reaches its threshold | the account with the most quota left |
+| `weekly-first` | same as `best` | the account whose weekly window resets soonest |
+| `consume-first` (default) | at the threshold, and earlier whenever an account that resets sooner has room | the account whose weekly window resets soonest |
+| `dynamic` | like `consume-first`, and re-checks each tick whether a `--model` window is really what's binding | the soonest weekly reset, never an account with no room on the window in force |
+| `priority-consume-first` | whenever a higher-tier account is usable | your highest tier (`cswap priority`), then the soonest weekly reset |
+
+The weekly ones exist because weekly quota left unused at its reset is lost.
+
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is already over its switch lines, it moves to the one with the most quota left before a limit (the lowest usage on its fullest window, whatever line that window carries) whatever the strategy, once that account has twice the current one's remaining quota or 3 points more than it, whichever is less. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
-- **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `consume-first` (default) proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `best` stays put until the active account nears its limit, then moves to the account with the most quota left. `weekly-first` switches at the same lines as `best`, with the same landing rules and hysteresis margin, but among the accounts that qualify it lands on the one whose **weekly window resets soonest** (most quota left breaks ties), so weekly quota that would otherwise expire unused gets spent first; its at-limit and failover escapes, and the all-over-the-lines case, rank by quota left exactly as `best` does. `dynamic` ranks like `consume-first` but also re-checks whether a `--model` window is really what's binding each tick, and never lands on an account that has no room on the window actually in force. `priority-consume-first` follows your own ranking first (see *Account priority tiers* below), then the soonest weekly reset within a tier.
 - **A separate line for the weekly windows** (`--weekly-threshold 97`, or `cswap config set autoswitch.weeklyThreshold 97`): one threshold compared against the busiest window forces the same number on windows that want different ones — the 5-hour window recycles in hours (an overshoot costs one interrupted turn), while the weekly window is the budget (quota unspent before its reset is gone). With a weekly line, the 7-day window and any per-model window (`--model`) are judged against it and the threshold keeps governing the 5-hour window; every window is compared against its own line, so 7d 93% under a 97 line holds while 5h 95% under an 85 line switches, and the log names the window it measured (`7d 93% < 97%`). Points on different windows are not the same amount of work — the lines are comparable, the clocks are not.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
@@ -132,21 +141,19 @@ cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
 cswap run 2 --share-history     # share your chat history with this account too
-cswap run 2 --require-session   # refuse rather than run plain claude on the default login
 ```
 
-Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations, or make it the default for every `cswap run` with `cswap config set run.shareHistory true` (`--no-share-history` still opts out per launch; on Windows the setting is ignored with a warning, while an explicit `--share-history` errors).
-
-Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead — both there and when no account is named and the directory maps to none, the other way `cswap run` reaches the default login.
-
-A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account. While a session runs, its account's usage is read with the session's own credential and never refreshed by cswap; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
+Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history unless you pass `--share-history`.
 
 <details>
-<summary>Sharing details — MCP servers & chat history</summary>
+<summary>How it behaves — chat history, MCP servers, tokens</summary>
 
-- With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
-- User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
+- **Chat history.** With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost. `cswap config set run.shareHistory true` makes it the default for every `cswap run`; `--no-share-history` opts out per launch. Not supported on Windows: the setting is ignored with a warning, and an explicit `--share-history` errors.
+- **MCP servers.** User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
+- **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead, and also refuses when no account is named and the directory maps to no usable account (the other way `cswap run` reaches the default login).
+- **Tokens.** A session refreshes its own copy of the account's token; once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses it. While the session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail) — exit the session first, or pick another account.
+- **Usage.** While a session runs, its account's usage is read with the session's own credential, which cswap never refreshes. A read the server refuses shows as token expired, and isn't retried, until the session renews the credential on its next call.
 
 </details>
 
