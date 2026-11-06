@@ -744,6 +744,16 @@ class AutoSwitchEngine:
 
     # -- quarantine -----------------------------------------------------------
 
+    def quarantine(self) -> dict[str, dict]:
+        """Persisted quarantine entries: slot number -> ``{"email", "reason", ...}``.
+
+        Read-only and lock-free (the state file is written atomically), so a
+        host UI may call it from any thread while the loop runs. Entries are
+        released by the loop itself once the slot's credential is replaced.
+        """
+        quarantine = self._read_state().get("quarantine")
+        return quarantine if isinstance(quarantine, dict) else {}
+
     def _quarantine(self, number: str, email: str, reason: str) -> None:
         creds = self.switcher.read_account_credentials(number, email)
         fingerprint = _refresh_fingerprint(creds) if creds else None
