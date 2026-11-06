@@ -7359,6 +7359,28 @@ class TestHeaderProbeReadings:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
 
+    def test_weekly_only_active_reading_does_not_fail_over(self, harness):
+        # No 5h header (Ultra): the 7d reading decides, not unknown three ticks.
+        for _ in range(3):
+            outcome = harness.tick_with_usage({
+                "1": _header_usage(seven_day={"pct": 50.0}),
+                "2": _usage(10),
+                "3": _usage(10),
+            })
+            assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"] * 3
+
+    def test_weekly_only_reading_is_a_target(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(seven_day={"pct": 0.0}),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
     def test_rejected_probe_is_not_a_target(self, harness):
         outcome = harness.tick_with_usage({
             "1": _usage(95),
