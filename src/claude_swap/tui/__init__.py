@@ -8,6 +8,7 @@ for them.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -39,5 +40,9 @@ def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
         drain_stdin()
     except Exception:
         pass
-    app.run()
+    # After an SSH transport failure, remote cleanup cannot reach the local
+    # terminal. Leaving mouse reporting enabled turns movement into shell
+    # input. Avoid enabling it over SSH; keyboard navigation still works.
+    over_ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"))
+    app.run(mouse=not over_ssh)
     return app.return_code or 0
