@@ -3349,6 +3349,134 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "at-limit"
 
 
+class TestWeeklyFirstStrategy:
+    """`best`'s departure line, landing gates, hysteresis and escapes, with
+    consume-first's ranking among the candidates `best` would accept: the
+    soonest weekly reset first, headroom breaking ties."""
+
+    def _harness(self, temp_home: Path, n: int = 3, **settings) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="weekly-first", **settings)
+        for num in range(1, n + 1):
+            h.seed(num, f"{num}@example.com")
+        h.make_live("1@example.com", 1)
+        return h
+
+    def _switch(self, h: EngineHarness) -> SwitchEvent:
+        return next(e for e in h.events if isinstance(e, SwitchEvent))
+
+    def test_is_a_valid_setting(self, tmp_path: Path):
+        from claude_swap.settings import load_settings, set_setting
+
+        set_setting(tmp_path, "autoswitch.strategy", "weekly-first")
+        assert load_settings(tmp_path).strategy == "weekly-first"
+
+    def test_holds_below_the_line_even_with_a_sooner_reset(self, temp_home):
+        """The difference from consume-first: nothing moves below the line."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(50, 20, _R_LATEST),   # active, under 90, resets last
+            "2": _usage7(10, 10, _R_SOON),     # would be consume-first's pick
+            "3": _usage7(10, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_at_the_line_takes_the_soonest_reset_over_more_headroom(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),    # active, over the 5h line
+            "2": _usage7(50, 40, _R_SOON),     # less room, weekly resets first
+            "3": _usage7(10, 10, _R_LATEST),   # most room (best's pick)
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert self._switch(h).trigger == "proactive"
+
+    def test_weekly_line_departure_also_ranks_by_weekly_reset(self, temp_home):
+        h = self._harness(temp_home, weekly_threshold=97.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 98, _R_LATER),    # active, over its weekly line
+            "2": _usage7(30, 60, _R_SOON),
+            "3": _usage7(5, 5, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_headroom_breaks_a_reset_tie(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(50, 40, _R_SOON),
+            "3": _usage7(20, 30, _R_SOON),     # same reset, more room
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_respects_the_hysteresis_margin(self, temp_home):
+        """Active 91% (9 pts); the margin is 10, so a target needs 19 pts.
+        #2 resets soonest but has 15; #3 resets next and clears it; #4 has
+        the most room and resets last."""
+        h = self._harness(temp_home, n=4)
+        outcome = h.tick_with_usage({
+            "1": _usage7(91, 20, _R_LATEST),
+            "2": _usage7(85, 20, _R_SOON),
+            "3": _usage7(75, 20, _R_LATER),
+            "4": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_skips_ineligible_sooner_resets(self, temp_home):
+        """Sooner-resetting accounts `best` would not land on are skipped:
+        one over its own (weekly) line, one unreadable."""
+        h = self._harness(temp_home, n=5)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATEST),
+            "2": _usage7(10, 95, _R_SOON),     # weekly over the line, resets first
+            "3": None,                         # unreadable
+            "4": _usage7(50, 40, _R_LATER),
+            "5": _usage7(5, 5, _R_LATEST),     # most room
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+
+    def test_all_over_the_lines_falls_back_to_the_most_room(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, _R_LATER),    # active, 5 pts
+            "2": _usage7(97, 50, _R_SOON),     # 3 pts, weekly soonest
+            "3": _usage7(91, 50, _R_LATEST),   # 9 pts, weekly last
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_at_limit_escape_ranks_like_best(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(97, 50, _R_SOON),     # over the line, resets first
+            "3": _usage7(60, 50, _R_LATEST),   # most room
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert self._switch(h).trigger == "at-limit"
+        assert h.active_number() == 3
+
+    def test_failover_ranks_like_best(self, temp_home):
+        h = self._harness(temp_home)
+        usage = {
+            "1": None,
+            "2": _usage7(50, 40, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert self._switch(h).trigger == "failover"
+        assert h.active_number() == 3
+
+
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
     """A `consume-first` departure's phase-2 refetch can write
     `(leftHeadroom, leftRecoveryAt) = (None, None)`, the exact snapshot
@@ -7200,3 +7328,63 @@ class TestWeeklyThreshold:
         h.engine.apply_threshold(72.0)
         assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
         assert h.engine.settings.weekly_threshold == 97.0
+
+
+def _header_usage(**windows) -> dict:
+    """A setup-token header-probe reading (``source: headers``)."""
+    return {**windows, "source": oauth.USAGE_SOURCE_HEADERS}
+
+
+class TestHeaderProbeReadings:
+    """Setup-token readings from rate-limit headers decide only when complete,
+    and a refused probe never becomes a healthy landing spot."""
+
+    def test_partial_reading_is_not_a_target(self, harness):
+        # #2 shows only a 5h window at 5% (no 7d header): unknown, not 95%
+        # headroom, so the switch lands on the measured #3.
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(five_hour={"pct": 5.0}),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_complete_reading_is_a_target(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(five_hour={"pct": 5.0}, seven_day={"pct": 5.0}),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_rejected_probe_is_not_a_target(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(
+                five_hour={"pct": 5.0},
+                seven_day={"pct": 5.0},
+                rejected={"retry_after_s": 600.0, "resets_at": _iso_at(
+                    harness.clock.now + 600
+                )},
+            ),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_fable_switching_needs_the_fable_bucket(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            # No 7d_oi header: Fable headroom unknown, so not a target.
+            "2": _header_usage(five_hour={"pct": 5.0}, seven_day={"pct": 0.0}),
+            "3": _model_usage(5, 60),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3

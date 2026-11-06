@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, subscription
 from claude_swap.models import AccountPolicy
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
@@ -131,6 +131,16 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    # A setup-token header-probe reading: its completeness and any refusal
+    # decide whether it may gate auto-switching, so both survive export.
+    if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        out["source"] = oauth.USAGE_SOURCE_HEADERS
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        out["rejected"] = {
+            "retryAfterS": rejected.get("retry_after_s"),
+            "resetsAt": rejected.get("resets_at"),
+        }
     return out
 
 
@@ -142,14 +152,24 @@ def _is_number(value: object) -> bool:
     )
 
 
-def _window_from_json(window: object, label: str) -> dict:
-    """One JSON window back to the internal shape, fetch-time strings rebuilt."""
+def _window_from_json(window: object, label: str, nullable: bool = False) -> dict:
+    """One JSON window back to the internal shape, fetch-time strings rebuilt.
+
+    ``nullable`` admits ``"pct": null``, which :func:`usage_to_json` emits for
+    a 5h/7d window the API reported without a utilization figure.
+    """
     if not isinstance(window, dict):
         raise ValueError(f"{label} must be an object")
     pct = window.get("pct")
-    if not _is_number(pct) or pct < 0:
-        raise ValueError(f"{label}.pct must be a non-negative number")
-    out: dict = {"pct": float(pct)}
+    if nullable and "pct" in window and pct is None:
+        pct_value = None
+    elif _is_number(pct) and pct >= 0:
+        pct_value = float(pct)
+    else:
+        raise ValueError(
+            f"{label}.pct must be a non-negative number{' or null' if nullable else ''}"
+        )
+    out: dict = {"pct": pct_value}
     resets_at = window.get("resetsAt")
     if resets_at is not None:
         if not isinstance(resets_at, str):
@@ -169,17 +189,23 @@ def usage_from_json(usage: object) -> dict:
     ``resetsAt``, the spend amounts and the scoped model names. Everything
     derived at serialization (countdown, clock, pace fields) is dropped, and
     the fetch-time strings are rebuilt from ``resets_at``, which gives the
-    shape :func:`oauth.build_usage_result` stores. Raises ``ValueError`` on
-    anything malformed, so an importer can refuse a document before writing
-    any of it.
+    shape :func:`oauth.build_usage_result` stores. A 5h/7d window's ``pct``
+    may be ``null`` (reported without a figure), except in a ``source:
+    headers`` document, which the probe never produces that way. Raises
+    ``ValueError`` on anything malformed, so an importer can refuse a
+    document before writing any of it.
     """
     if not isinstance(usage, dict):
         raise ValueError("usage must be an object")
     out: dict = {}
     if "fiveHour" in usage:
-        out["five_hour"] = _window_from_json(usage["fiveHour"], "fiveHour")
+        out["five_hour"] = _window_from_json(
+            usage["fiveHour"], "fiveHour", nullable=True
+        )
     if "sevenDay" in usage:
-        out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
+        out["seven_day"] = _window_from_json(
+            usage["sevenDay"], "sevenDay", nullable=True
+        )
     if "spend" in usage:
         spend = usage["spend"]
         out_spend = _window_from_json(spend, "spend")
@@ -203,8 +229,26 @@ def usage_from_json(usage: object) -> dict:
                 raise ValueError(f"{label}.name must be a non-empty string")
             scoped.append({"name": name, **entry})
         out["scoped"] = scoped
+    if "rejected" in usage:
+        rejected = usage["rejected"]
+        if not isinstance(rejected, dict):
+            raise ValueError("rejected must be an object")
+        retry_after = rejected.get("retryAfterS")
+        if retry_after is not None and not _is_number(retry_after):
+            raise ValueError("rejected.retryAfterS must be a number or null")
+        resets_at = rejected.get("resetsAt")
+        if resets_at is not None and not isinstance(resets_at, str):
+            raise ValueError("rejected.resetsAt must be an ISO-8601 string or null")
+        out["rejected"] = {"retry_after_s": retry_after, "resets_at": resets_at}
     if not out:
         raise ValueError("usage carries no windows")
+    if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        # The header probe never reports a window without a figure, and one
+        # would pass the completeness check while contributing no window.
+        for key, label in (("five_hour", "fiveHour"), ("seven_day", "sevenDay")):
+            if key in out and out[key]["pct"] is None:
+                raise ValueError(f"{label}.pct cannot be null in a headers reading")
+        out["source"] = oauth.USAGE_SOURCE_HEADERS
     return out
 
 
@@ -303,6 +347,26 @@ def last_good_usage_fields(
     return out
 
 
+def subscription_plan_fields(record: dict) -> dict:
+    """JSON for a stored plan record: label, raw fields, expiry, and age.
+
+    ``fetchedAt`` is always present, so a script can tell a plan fetched this
+    morning from one that has not refreshed in days and decide for itself how
+    far to trust ``expired``.
+    """
+    plan = record["plan"]
+    fields = {
+        "label": subscription.plan_label(plan),
+        "tier": plan["tier"],
+    }
+    for key in ("organizationType", "billingType", "subscriptionStatus"):
+        if key in plan:
+            fields[key] = plan[key]
+    fields["expired"] = subscription.is_expired(plan)
+    fields["fetchedAt"] = _timestamp(record["fetchedAt"])
+    return fields
+
+
 def account_row(
     number: int,
     email: str,
@@ -320,6 +384,7 @@ def account_row(
     disabled: bool = False,
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
+    subscription_plan: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -350,6 +415,10 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive field: the slot's subscription plan once one has been fetched
+    # (see ``subscription``); a slot never fetched emits no key at all.
+    if subscription_plan:
+        row["plan"] = subscription_plan_fields(subscription_plan)
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
