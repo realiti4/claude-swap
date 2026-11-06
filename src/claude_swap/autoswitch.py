@@ -384,6 +384,73 @@ def _perish_then_room_key(usage: dict | str | None, headroom: float, now: float)
     return (1, 0.0, -headroom)
 
 
+# How close to its latest possible start an expiring account pulls the switch:
+# the rate below is an average, so it needs room for a slow hour.
+EXPIRING_SLACK_S = 2 * 3600.0
+_SEVEN_DAYS_S = 7 * 24 * 3600.0
+
+
+def expiring_order(
+    accounts: Sequence[str],
+    usage: Mapping[str, dict | str | None],
+    headroom: Mapping[str, float | None],
+    bars: Mapping[str, float],
+    caps: Mapping[str, float | None],
+    plans: Mapping[str, str | None],
+    landing_cost: Callable[[str], float],
+    now: float,
+) -> list[str]:
+    """The accounts whose 7d room must be spent now to be spent at all (T3310):
+    soonest reset first, cut after the first whose latest start has come; ``[]``
+    when every deadline can be met or no burn rate is measurable.
+
+    ``accounts[0]`` is the active, the rest the admissible OAuth candidates (an
+    equal reset keeps the active ahead). Room is what is left under the
+    account's own bar and weekly cap; one that cannot serve now (``headroom`` at
+    its wall) or whose room does not exceed ``landing_cost`` (7d points) is not
+    walked. Rooms add up in reset order, in Ultra points (``_PLAN_COST_SCALE``),
+    and are spent at the fleet's rate: an account is due once ``need / rate +
+    EXPIRING_SLACK_S`` reaches its reset. The rate is every readable account's
+    7d level over their mean elapsed time: account-global and stateless, so a
+    restart, a dry run and the panel read one number.
+
+    shortcut: the rate is read off the current windows, not sampled; upgrade to a
+    rolling sample if a burst makes it misjudge a deadline. Checked against the
+    live 6.9 pts/h: 6.17 (24 h) and 4.64 (7 d) measured from usage.jsonl, 2026-11-06.
+    """
+    def weight(n: str) -> float:
+        return 1.0 / _PLAN_COST_SCALE.get(plans.get(n), 1.0)
+
+    seen: dict[str, tuple[float, float]] = {}
+    for n, value in usage.items():
+        pct = _window_pcts(value if isinstance(value, dict) else None, ()).get("7d")
+        reset = _seven_day_reset_ts(value, now)
+        if pct is not None and reset is not None:
+            seen[n] = (pct, reset)
+    if not seen:
+        return []
+    elapsed = sum(max(_SEVEN_DAYS_S - (r - now), 0.0) for _, r in seen.values()) / len(seen)
+    spent = sum(pct * weight(n) for n, (pct, _) in seen.items())
+    if spent <= 0 or elapsed <= 0:
+        return []
+    rate = spent / elapsed
+    walked: list[str] = []
+    need = 0.0
+    for n in sorted((n for n in accounts if n in seen), key=lambda n: seen[n][1]):
+        pct, reset = seen[n]
+        wall = _wall_headroom(bars.get(n))
+        room = 100.0 - pct - wall
+        if caps.get(n) is not None:
+            room = min(room, caps[n] - pct)
+        if (headroom.get(n) or 0.0) <= wall or room <= landing_cost(n):
+            continue
+        walked.append(n)
+        need += room * weight(n)
+        if need / rate + EXPIRING_SLACK_S >= reset - now:
+            return walked
+    return []
+
+
 def _stay_progress(
     saved: object, account: str, since: float | None, levels: dict[str, float]
 ) -> dict:
@@ -863,7 +930,7 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     # proactive | at-limit | failover | consume-first | priority | alternation
-    # | disabled-active | weekly-capped
+    # | expiring-window | disabled-active | weekly-capped
     trigger: str
     from_ref: dict | None
     to_ref: dict | None
@@ -2721,6 +2788,28 @@ class AutoSwitchEngine:
                 bar_active = False
             return warm, cold, bar_active
 
+        # T3310: an account whose 7d window expires with room left pulls the
+        # switch (`expiring_order`); its logged trigger is `expiring-window`,
+        # while every gate downstream keeps reading `alternation`.
+        expiring: list[str] = []
+        logged_trigger: str | None = None
+        if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
+            now = self.clock()
+
+            def _landing_cost(n: str) -> float:
+                """A landing's cost in the account's 7d points."""
+                if n == current or _is_warm(n, last_active_at, now, settings.cache_ttl_seconds):
+                    return 0.0
+                cost = _cold_cost(n)
+                return cost if _has_no_five_hour(usage.get(n)) else cost / WEEKLY_OVER_FIVE_HOUR
+
+            expiring = expiring_order(
+                [current, *oauth_candidates], usage, headroom, self._bars,
+                {n: p.weekly_cap for n, p in policies.items()},
+                {n: getattr(e, "plan", None) for n, e in entries.items()},
+                _landing_cost, now,
+            )
+
         dynamic_ordered: list[str] | None = None
         dynamic_any_known = True
         if settings.strategy == "dynamic" and trigger == "proactive":
@@ -2794,6 +2883,9 @@ class AutoSwitchEngine:
                     key=lambda n: floor_headroom.get(n, 0.0) < _cold_cost(n),
                 )
             dynamic_ordered = warm_ordered + cold_clears_floor
+            dynamic_ordered = [n for n in expiring if n in dynamic_ordered] + [
+                n for n in dynamic_ordered if n not in expiring
+            ]
             if not dynamic_ordered and bar_active:
                 # The no-return bar (item 2) is holding this, not a
                 # genuinely viable-free fleet -- a deliberate hold pending
@@ -2814,6 +2906,35 @@ class AutoSwitchEngine:
                 dynamic_any_known = any(
                     floor_headroom.get(n) is not None for n in oauth_candidates
                 )
+        elif (
+            settings.strategy == "dynamic"
+            and trigger == "dynamic-healthy"
+            and expiring
+            # An active walled on its own model-gated axis leaves by the walled
+            # escape below (#403), which prices the landing and breaks ties by warmth.
+            and not _about_to_wall(raw_active_headroom, self._active_wall)
+        ):
+            ahead = expiring[: expiring.index(current)] if current in expiring else expiring
+            if not ahead:
+                # The active is itself the soonest expiring window: spend it
+                # before the alternation below can rotate away from it.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="below-threshold",
+                        detail=(
+                            f"active account is healthy ({pct_label(active_headroom)}"
+                            "% headroom, not about to wall); spending its expiring "
+                            "window first"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if self._in_cooldown(state):
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+            trigger = "alternation"
+            logged_trigger = "expiring-window"
+            dynamic_ordered = ahead
         elif settings.strategy == "dynamic" and trigger == "dynamic-healthy":
             now = self.clock()
             # NOT `_dynamic_rank`: the no-return bar would permanently
@@ -3615,7 +3736,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, logged_trigger)
             status = self._freshen_target(num, email)
             if self._stop.is_set():
                 # `_freshen_target` POSTs the consume-gate refresh, the one
@@ -3655,7 +3776,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, logged_trigger)
 
         if systemic or transient_failure:
             self._emit(
@@ -5058,7 +5179,10 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        logged_trigger: str | None = None,
     ) -> TickOutcome:
+        # `trigger` keys every gate here and the recorded `leftTrigger`;
+        # `logged_trigger`, when given, is only what the SwitchEvent names.
         # ASK `_stop`, NOT `dry_run`. `stop()` sets `dry_run = True` so the
         # badge cannot read " LIVE " for a dead engine; that is a DISPLAY
         # fact, and reading it here as "the user asked for dry-run" makes a
@@ -5073,7 +5197,7 @@ class AutoSwitchEngine:
             current_email = self.switcher.account_email(current) if current else ""
             self._emit(
                 SwitchEvent(
-                    trigger=trigger,
+                    trigger=logged_trigger or trigger,
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
@@ -5208,7 +5332,7 @@ class AutoSwitchEngine:
                 )
         self._emit(
             SwitchEvent(
-                trigger=trigger,
+                trigger=logged_trigger or trigger,
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=warnings,
