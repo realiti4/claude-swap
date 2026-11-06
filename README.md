@@ -107,7 +107,7 @@ cswap auto --dry-run           # log what it would do, never switch
 | `best` | when the active account reaches its threshold | the account with the most quota left |
 | `weekly-first` | same as `best` | the account whose weekly window resets soonest |
 | `consume-first` (default) | at the threshold, and earlier whenever an account that resets sooner has room | the account whose weekly window resets soonest |
-| `dynamic` | at a fixed ~97% used on the window in force, whatever `--threshold` says | like `consume-first`, never an account with no room on that window |
+| `dynamic` | at a fixed ~97% used on the window in force, whatever `--threshold` says, and after 20 points of use on a healthy account | a weekly reset within a day first, else the most quota left; never an account with no room on that window |
 | `priority-consume-first` | whenever a higher-tier account is usable | your highest tier (`cswap priority`), then the soonest weekly reset |
 
 The weekly ones exist because weekly quota left unused at its reset is lost.
@@ -120,7 +120,7 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 
 **Good to know**
 
-- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling. The one hard stop is a per-account weekly cap: auto-switch never lands on an account at or past it, and moves off it when another account can take over.
+- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling. `dynamic` holds too, unless the active account is at its limit. The one hard stop is a per-account weekly cap: auto-switch never lands on an account at or past it, and moves off it when another account can take over.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping between accounts near the threshold.
 - `--weekly-threshold 97` gives the 7-day and per-model windows their own line, so the weekly budget can run higher than the 5-hour window. `--threshold`, and any per-account threshold, then governs the 5-hour window only (`dynamic` keeps its own switch point and ignores the weekly line).
 - `--model Fable` folds that model's weekly limit into the decision, for when you hit a per-model limit before the account-wide ones. Names are the per-model rows in `cswap list` (e.g. `Fable: 100%`), matched case-insensitively.

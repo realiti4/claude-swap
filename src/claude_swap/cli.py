@@ -906,9 +906,10 @@ Defaults live in settings.json in the backup root; flags override them.
             "'weekly-first' (switch at the threshold like best, onto the "
             "account whose weekly window resets soonest), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest; default), 'dynamic' (consume-first's ranking "
-            "plus a re-picked model basis and a landing rule that never lands "
-            "on an account with no room on the window in force), or "
+            "resets soonest; default), 'dynamic' (leaves at a fixed ~97%%, and "
+            "rotates after 20 points of use; lands on an account whose weekly "
+            "window resets within a day first, else the one with the most quota "
+            "left; never on one with no room on the window in force), or "
             "'priority-consume-first' (highest account priority, then soonest "
             "weekly reset; only targets below all switch lines)"
         ),
