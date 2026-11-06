@@ -33,6 +33,9 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# Local proxy that rotates Claude Code sessions between subscriptions and an API
+# key per request: `cswap rotator ...` delegates to it.
+rotator = ["cswap-rotator>=0.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

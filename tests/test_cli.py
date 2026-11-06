@@ -1966,3 +1966,31 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+class TestRotatorCommand:
+    """`cswap rotator ...` only delegates to the optional cswap-rotator package."""
+
+    def test_delegates_arguments_to_the_companion(self):
+        import types
+
+        calls = []
+        companion_cli = types.ModuleType("cswap_rotator.cli")
+        companion_cli.main = lambda argv: calls.append(argv) or 0
+        companion = types.ModuleType("cswap_rotator")
+        companion.cli = companion_cli
+        with patch.dict(sys.modules, {"cswap_rotator": companion,
+                                      "cswap_rotator.cli": companion_cli}), \
+             patch.object(sys, "argv", ["cswap", "rotator", "status", "--x"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        assert calls == [["status", "--x"]]
+
+    def test_without_the_extra_explains_how_to_install_it(self, capsys):
+        with patch.dict(sys.modules, {"cswap_rotator": None, "cswap_rotator.cli": None}), \
+             patch.object(sys, "argv", ["cswap", "rotator", "status"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        assert "claude-swap[rotator]" in capsys.readouterr().err
