@@ -574,7 +574,8 @@ class TestUsageRows:
         card = account_card_text(make_account(1, entry=entry), 80, now=now).plain
         assert "5h" in card and "usage unknown" in card and " 0%" not in card
         mini = mini_account_text(make_account(2, entry=entry), now).plain
-        assert "5h ? · 7d 12%" in mini
+        # This branch's chips carry the reset countdown: `7d(⟳2d23h):12%`.
+        assert re.search(r"5h \? · 7d\S*:12%", mini), mini
 
     @pytest.mark.parametrize("key", ["five_hour", "seven_day"])
     @pytest.mark.parametrize("width", [60, 70, 80])
@@ -1984,8 +1985,12 @@ class TestAutoScreen:
             assert plain.index("user2@example.com") < plain.index(
                 "user3@example.com"
             )
-            assert re.search(r"7d\S*:\s*93% \(line 97%\)", plain), plain
-            assert re.search(r"5h\S*:\s*95% \(line 85%\)", plain), plain
+            row2, row3 = (
+                next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
+                for n in (2, 3)
+            )
+            assert re.search(r"7d\S*:\s*93%", row2) and row2.endswith("threshold 97%"), plain
+            assert re.search(r"5h\S*:\s*95%", row3) and row3.endswith("threshold 85%"), plain
             summary = app.screen.query_one("#auto-summary", Static).render().plain
             assert "threshold 85%" in summary and "weekly 97%" in summary
             assert app.weekly_threshold_pct == 97.0
@@ -2019,14 +2024,19 @@ class TestAutoScreen:
 
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user3@example.com") < plain.index("user2@example.com")
-            assert re.search(r"5h\S*:\s*83% \(line 85%\)", plain), plain
+            row2 = next(ln for ln in plain.splitlines() if "user2@" in ln)
+            assert re.search(r"5h\S*:\s*83%", row2) and row2.endswith("threshold 85%"), plain
             await pilot.press("t", "right", "right", "right")
             await pilot.pause()
             assert app.screen._settings.threshold == 88.0
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user2@example.com") < plain.index("user3@example.com")
-            assert re.search(r"5h\S*:\s*83% \(line 88%\)", plain), plain
-            assert re.search(r"7d\S*:\s*93% \(line 97%\)", plain), plain
+            row2, row3 = (
+                next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
+                for n in (2, 3)
+            )
+            assert re.search(r"5h\S*:\s*83%", row2) and row2.endswith("threshold 88%"), plain
+            assert re.search(r"7d\S*:\s*93%", row3) and row3.endswith("threshold 97%"), plain
 
     async def test_candidates_show_no_line_without_a_weekly_one(
         self, tmp_path, fake_engine
@@ -2046,7 +2056,7 @@ class TestAutoScreen:
 
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert re.search(r"5h\S*:\s*42%", plain), plain
-            assert "(line" not in plain
+            assert "threshold" not in plain
             summary = app.screen.query_one("#auto-summary", Static).render().plain
             assert "weekly" not in summary
             assert app.weekly_threshold_pct is None
@@ -2054,10 +2064,10 @@ class TestAutoScreen:
     async def test_the_line_note_keeps_the_chip_columns_and_the_block_label_on_one_line_set(
         self, tmp_path, fake_engine
     ):
-        """The `(line N%)` note belongs to its chip's column, so the chips after
-        it start where the other rows' do, and the block label reads the same
-        lines the chips are judged against: 7d 93% under a 97 line is no block,
-        5h 95% over an 85 line is."""
+        """The `threshold N%` note is the row's last cell, outside every chip
+        column, so the chips start where the other rows' do, and the block label
+        reads the same lines the chips are judged against: 7d 93% under a 97
+        line is no block, 5h 95% over an 85 line is."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -2082,6 +2092,8 @@ class TestAutoScreen:
             rows = [ln for ln in plain.splitlines() if "@example.com" in ln]
             assert len(rows) == 2
             assert len({ln.index("7d(") for ln in rows}) == 1, plain
+            assert rows[0].endswith("threshold 97%"), plain
+            assert rows[1].endswith("threshold 85%"), plain
             assert "5h full" in rows[1] and "7d full" not in plain, plain
 
     async def test_candidates_ranking_honors_configured_model(

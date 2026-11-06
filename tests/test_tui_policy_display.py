@@ -209,10 +209,9 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h:50% (line 60%)" in golden_form(
-                self._row(plain, "user2@example.com")
-            )
-            assert "(line" not in self._row(plain, "user3@example.com")
+            row2 = golden_form(self._row(plain, "user2@example.com"))
+            assert "5h:50%" in row2 and row2.endswith("threshold 60%"), row2
+            assert "threshold" not in self._row(plain, "user3@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
         self, tmp_path, fake_engine
@@ -232,9 +231,53 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h:50% (line 60%)" in golden_form(
-                self._row(plain, "user2@example.com")
-            )
+            row2 = golden_form(self._row(plain, "user2@example.com"))
+            assert "5h:50%" in row2 and row2.endswith("threshold 60%"), row2
+
+
+    async def test_the_threshold_note_ends_the_row_and_moves_no_column(
+        self, tmp_path, fake_engine
+    ):
+        """The per-account threshold is the row's LAST cell, so it never sits
+        between two window columns: the 7d and Fable chips of a row with one
+        start where a row without one starts them, and a row without one gains
+        no trailing padding for it."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "strategy": "best", "model": "Fable"},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(
+                        2, entry=make_entry(60.0, 48.0, scoped=[("Fable", 0.0)])
+                    ),
+                    threshold=70.0,
+                ),
+                make_account(
+                    3, entry=make_entry(60.0, 87.0, scoped=[("Fable", 0.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            with_note = self._row(plain, "user2@example.com")
+            without = self._row(plain, "user3@example.com")
+            assert with_note.endswith("  threshold 70%"), with_note
+            assert "(line" not in plain
+            assert "threshold" not in without
+            assert without == without.rstrip(), repr(without)
+            chips = with_note[: with_note.index("  threshold")]
+            for column in ("7d", "Fable"):
+                assert chips.index(column) == without.index(column), plain
+            assert chips.count("%") == without.count("%") == 3, plain
 
 
 @pytest.mark.asyncio

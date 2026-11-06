@@ -78,13 +78,13 @@ _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 
 def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
-    """The "(line 97%)" note after the BINDING window's chip, once a weekly line
-    or the account's own threshold makes the lines differ: the raw pct stays,
-    and the line it is judged against is named only where it is not the one
-    number in the header."""
+    """The "threshold 97%" note that ends the row, once a weekly line or the
+    account's own threshold makes the lines differ: the chip's raw pct stays,
+    and the threshold it is judged against is named only where it is not the one
+    number in the header. Empty unless `label` is the BINDING window's."""
     if not noted or binding is None or label != binding.label:
         return ""
-    return f" (line {pct_label(binding.line)}%)"
+    return f"threshold {pct_label(binding.line)}%"
 
 
 class AutoScreen(Screen):
@@ -234,7 +234,7 @@ class AutoScreen(Screen):
         self._update_summary()
         # The Next best list ranks by the lines in force, so it must follow
         # the session value now rather than at the next snapshot: under a
-        # weekly line the order and the 5h rows' "(line N%)" both move.
+        # weekly line the order and the 5h rows' "threshold N%" both move.
         self._on_snapshot(self.app.snapshot)
 
     def action_cycle_strategy(self) -> None:
@@ -469,22 +469,20 @@ class AutoScreen(Screen):
             row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
         # The column set is the union of window names over every chip row, in
         # first-seen order; a row without a window gets a blank cell, so no
-        # later column moves. (label text, pct text, `(line X%)` note) widths per
-        # column; the note is part of its column so the chips after it stay put.
-        chip_width: dict[str, tuple[int, int, int]] = {}
+        # later column moves. (label text, pct text) widths per column; the
+        # threshold note is the row's last cell, so it takes no column.
+        chip_width: dict[str, tuple[int, int]] = {}
         for acc in snap.accounts:
             windows = row_windows.get(acc.number)
             if windows is None:
                 continue
-            bound = binding_window(windows, line_of(acc), weekly, scale=threshold)
             for label, wpct, resets_at in windows:
-                label_w, pct_w, note_w = chip_width.get(label, (0, 0, 0))
+                label_w, pct_w = chip_width.get(label, (0, 0))
                 chip_width[label] = (
                     max(label_w, len(data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now)
                     ))),
                     max(pct_w, len(f"{wpct:.0f}%")),
-                    max(note_w, len(_line_note(bound, label, noted(acc)))),
                 )
         # 5h and 7d lead whatever row came first (sorted is stable, so the
         # rest keep first-seen order).
@@ -566,12 +564,12 @@ class AutoScreen(Screen):
                 windows = row_windows[acc.number]
                 have = {label: (wpct, resets_at) for label, wpct, resets_at in windows}
                 shown = False
-                for i, (label, (label_w, pct_w, note_w)) in enumerate(
+                for i, (label, (label_w, pct_w)) in enumerate(
                     chip_width.items() if windows else ()
                 ):
                     sep = "  " if i == 0 else " · " if shown else "   "
                     if label not in have:
-                        entry.append(" " * (len(sep) + label_w + pct_w + note_w))
+                        entry.append(" " * (len(sep) + label_w + pct_w))
                         continue
                     wpct, resets_at = have[label]
                     label_text = data.chip_label(
@@ -586,10 +584,6 @@ class AutoScreen(Screen):
                         style=palette.muted,
                     )
                     entry.append(pct_text, style=palette.severity(wpct))
-                    entry.append(
-                        _line_note(binding, label, noted(acc)).ljust(note_w),
-                        style=palette.muted,
-                    )
                     shown = True
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
@@ -609,6 +603,12 @@ class AutoScreen(Screen):
                     entry.append(f"  {blocked_model}-only", style=palette.muted)
                 elif kind == "full":
                     entry.append(f"  {blocked_model} full", style=palette.muted)
+                # The last cell, and only when the binding window's chip was
+                # drawn above.
+                if binding.label in have:
+                    note = _line_note(binding, binding.label, noted(acc))
+                    if note:
+                        entry.append(f"  {note}", style=palette.muted)
                 rank_binding = binding_window(
                     oauth.relevant_windows(acc.usage.last_good, rank_models),
                     line,
