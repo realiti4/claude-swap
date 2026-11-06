@@ -257,8 +257,8 @@ def test_a_zero_percent_account_with_no_reset_is_not_ranked_last(temp_home, rese
     now = h.clock.now + 360.0
     outcome = _tick(h, {
         "1": _u(98.0),                                  # walled
-        # 7d 70, not 40: at 40 its room could not be spent at the fleet's rate before the reset, so expiring_order moves it first (another case)
-        "2": _u(30.0, 70.0, reset7=now + reset_b),      # cold, headroom 30
+        # 7d 80: with less used its room could not be spent at the fleet's rate before the reset, so expiring_order moves it first (another case)
+        "2": _u(30.0, 80.0, reset7=now + reset_b),      # cold, headroom 20
         "3": _u(0.0, 0.0),                              # cold, reset-from-full: no resets_at
     })
     assert outcome is TickOutcome.SWITCHED

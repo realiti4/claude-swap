@@ -384,9 +384,8 @@ def _perish_then_room_key(usage: dict | str | None, headroom: float, now: float)
     return (1, 0.0, -headroom)
 
 
-# How close to its latest possible start an expiring account pulls the switch:
-# the rate below is an average, so it needs room for a slow hour.
-EXPIRING_SLACK_S = 2 * 3600.0
+# Whole-window margin: the rate reads ~2x high on a fill-then-idle fleet (6.9 vs 4.64 pts/h, 7 d).
+EXPIRING_RATE_MARGIN = 2.0
 _SEVEN_DAYS_S = 7 * 24 * 3600.0
 
 
@@ -401,18 +400,21 @@ def expiring_order(
     now: float,
 ) -> list[str]:
     """The accounts whose 7d room must be spent now to be spent at all (T3310):
-    soonest reset first, cut after the first whose latest start has come; ``[]``
+    the whole queue, soonest reset first, once any deadline has come; ``[]``
     when every deadline can be met or no burn rate is measurable.
 
     ``accounts[0]`` is the active, the rest the admissible OAuth candidates (an
     equal reset keeps the active ahead). Room is what is left under the
-    account's own bar and weekly cap; one that cannot serve now (``headroom`` at
-    its wall) or whose room does not exceed ``landing_cost`` (7d points) is not
-    walked. Rooms add up in reset order, in Ultra points (``_PLAN_COST_SCALE``),
-    and are spent at the fleet's rate: an account is due once ``need / rate +
-    EXPIRING_SLACK_S`` reaches its reset. The rate is every readable account's
-    7d level over their mean elapsed time: account-global and stateless, so a
-    restart, a dry run and the panel read one number.
+    account's own bar and the weekly cap on its fullest weekly window. An
+    account is not walked now when it cannot serve (``headroom`` at its wall),
+    when its 5h window cannot absorb ``landing_cost`` (5h points, 0 for the
+    active or a warm one: it lands once that window rolls), or when its room
+    does not exceed that cost in 7d points. Rooms add up in reset order, in
+    Ultra points (``_PLAN_COST_SCALE``), and are spent at the fleet's rate: an
+    account is due once ``need * EXPIRING_RATE_MARGIN / rate`` reaches its
+    reset. The rate is every readable account's 7d level over their mean
+    elapsed time: account-global and stateless, so a restart, a dry run and the
+    panel read one number.
 
     shortcut: the rate is read off the current windows, not sampled; upgrade to a
     rolling sample if a burst makes it misjudge a deadline. Checked against the
@@ -436,19 +438,26 @@ def expiring_order(
     rate = spent / elapsed
     walked: list[str] = []
     need = 0.0
+    due = False
     for n in sorted((n for n in accounts if n in seen), key=lambda n: seen[n][1]):
         pct, reset = seen[n]
         wall = _wall_headroom(bars.get(n))
         room = 100.0 - pct - wall
         if caps.get(n) is not None:
-            room = min(room, caps[n] - pct)
-        if (headroom.get(n) or 0.0) <= wall or room <= landing_cost(n):
+            weekly = max(p for w, p, _ in oauth.relevant_windows(usage[n], ("all",)) if w != "5h")
+            room = min(room, caps[n] - weekly)
+        cost = landing_cost(n)
+        five = _window_pcts(usage[n], ()).get("5h")
+        if (
+            (headroom.get(n) or 0.0) <= wall
+            or room <= cost / WEEKLY_OVER_FIVE_HOUR
+            or (five is not None and 100.0 - five - cost <= wall)
+        ):
             continue
         walked.append(n)
         need += room * weight(n)
-        if need / rate + EXPIRING_SLACK_S >= reset - now:
-            return walked
-    return []
+        due = due or need * EXPIRING_RATE_MARGIN / rate >= reset - now
+    return walked if due else []
 
 
 def _stay_progress(
@@ -2797,11 +2806,12 @@ class AutoSwitchEngine:
             now = self.clock()
 
             def _landing_cost(n: str) -> float:
-                """A landing's cost in the account's 7d points."""
+                """A cold landing's cost in 5h points, scaled by plan."""
                 if n == current or _is_warm(n, last_active_at, now, settings.cache_ttl_seconds):
                     return 0.0
-                cost = _cold_cost(n)
-                return cost if _has_no_five_hour(usage.get(n)) else cost / WEEKLY_OVER_FIVE_HOUR
+                return _cold_landing_cost_pct(
+                    None, settings.cold_switch_cost_pct, getattr(entries.get(n), "plan", None)
+                )
 
             expiring = expiring_order(
                 [current, *oauth_candidates], usage, headroom, self._bars,
@@ -3778,6 +3788,19 @@ class AutoSwitchEngine:
                 continue
             return self._perform(num, email, trigger, left_snapshot, logged_trigger)
 
+        if logged_trigger:
+            # A discretionary pull never blocks or fails a healthy active.
+            self._emit(
+                NoSwitchEvent(
+                    reason="below-threshold",
+                    detail=(
+                        f"active account is healthy ({pct_label(active_headroom)}% headroom, "
+                        f"not about to wall); {len(ordered)} expiring account(s) "
+                        "could not be landed on"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
         if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
