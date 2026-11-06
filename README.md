@@ -91,6 +91,7 @@ cswap auto --weekly-threshold 97   # let the weekly window run higher before swi
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
+cswap auto --tui               # run the loop inside the dashboard's auto-switch screen
 cswap auto --strategy weekly-first    # switch at the threshold, onto the soonest weekly reset
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
 cswap auto --strategy priority-consume-first   # your own tiers first, then soonest weekly reset

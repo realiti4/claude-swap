@@ -1,8 +1,10 @@
 """Live auto-switch screen: the real engine, visualized.
 
 Runs :class:`AutoSwitchEngine` in a thread worker and renders its typed
-events. Opens in **dry-run** — opening a view must never start switching
-accounts on its own; going live is an explicit, confirmed action. The
+events. Opens in **dry-run** from the dashboard (``g``) — opening a view must
+never start switching accounts on its own; going live is an explicit,
+confirmed action. ``cswap auto --tui`` starts in the mode requested on the
+command line. The
 engine's own state file semantics (shared cooldown, quarantine list, state
 lock) make it safe to run alongside an external ``cswap auto``.
 
@@ -75,8 +77,10 @@ class AutoScreen(Screen):
 
     app: "CswapApp"
 
-    def __init__(self) -> None:
+    def __init__(self, settings=None, *, dry_run: bool = True) -> None:
         super().__init__()
+        self._cli_settings = settings
+        self._initial_dry_run = dry_run
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
         # Session-only threshold adjustment (t, then arrows). Never written
@@ -102,7 +106,7 @@ class AutoScreen(Screen):
 
     def on_mount(self) -> None:
         self.app.set_store_only(True)
-        self._settings = load_settings(self.app.switcher.backup_dir)
+        self._settings = self._cli_settings or load_settings(self.app.switcher.backup_dir)
         # The bar tick everywhere reads app.threshold_pct, loaded once at app
         # startup — sync it to the fresh file value so bars and engine agree,
         # and remember that value: unmount restores it (only the session
@@ -115,7 +119,7 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        self._start_engine(dry_run=self._initial_dry_run)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
