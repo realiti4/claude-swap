@@ -155,12 +155,14 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
         if w:
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
             marker = _pace_marker(w, fetched_at) if label == "7d" else ""
+            # ``pct`` None (utilization unavailable) renders as ``?``, never 0%.
+            pct = f"{w['pct']:>3.0f}%" if isinstance(w.get("pct"), (int, float)) else "   ?"
             cell = oauth.fresh_reset_strings(w)
             if cell:
                 countdown, clock = cell
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
+                rows.append((label, f"{pct}   resets {clock:<12}  in {countdown}{marker}"))
             else:
-                rows.append((label, f"{w['pct']:>3.0f}%{marker}"))
+                rows.append((label, f"{pct}{marker}"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
@@ -9091,6 +9093,23 @@ class ClaudeAccountSwitcher:
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
 
+    def _quarantined_history_files(self) -> int:
+        """How many collided transcripts are parked under the backup dir.
+
+        Only counted for purge's confirm prompt, so a full walk is fine: the
+        tree holds one file per collision a migration hit, not a profile's
+        worth of transcripts.
+        """
+        from claude_swap.session import QUARANTINE_DIRNAME
+
+        root = self.backup_dir / QUARANTINE_DIRNAME
+        if not root.is_dir():
+            return 0
+        try:
+            return sum(1 for p in root.rglob("*") if p.is_file())
+        except OSError:
+            return 0
+
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
 
@@ -9102,6 +9121,10 @@ class ClaudeAccountSwitcher:
         - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
+
+        One file is left on purpose: ``session.MIGRATION_LOCK`` in ``~/.claude``,
+        an empty lock file. Deleting a lock another launch may be holding lets
+        a third one take a fresh copy of it at the same time.
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
@@ -9155,6 +9178,32 @@ class ClaudeAccountSwitcher:
             print("  - All stored account credential files")
         if session_dirs:
             print("  - All session profiles and their Keychain entries")
+        # The quarantine tree sits inside the backup dir, so rmtree below takes
+        # it with everything else. Every file in it is the losing half of a
+        # transcript collision that history migration deliberately refused to
+        # delete — nothing anywhere else holds a copy, so this bullet gets its
+        # own count and its own warning colour.
+        from claude_swap.session import QUARANTINE_DIRNAME
+
+        quarantined = self._quarantined_history_files()
+        if quarantined:
+            warning(
+                f"  - {quarantined} quarantined conversation transcript(s) in "
+                f"{self.backup_dir / QUARANTINE_DIRNAME}"
+            )
+            print(
+                dimmed(
+                    "    These are the ONLY remaining copy of the losing half "
+                    "of each collided"
+                )
+            )
+            print(
+                dimmed(
+                    "    session — history migration parked them here rather "
+                    "than deleting them."
+                )
+            )
+            print(dimmed("    Copy them somewhere else first if you want them."))
         print()
         print(dimmed("Note: This does NOT affect your current Claude Code login."))
         print()

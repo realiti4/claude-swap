@@ -27,11 +27,12 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
 # The header probe: a 1-output-token Haiku request whose response headers
-# carry the account's unified 5h/7d utilization. Pinned to a model snapshot,
-# so it needs updating when that snapshot retires (the probe then fails with
-# http-404 and the account shows its usage as unavailable, as before).
+# carry the account's unified 5h/7d utilization. The undated id names the
+# current Haiku generation rather than a dated snapshot, which retires
+# sooner; once a model is gone the probe fails with http-404 and the account
+# shows its usage as unavailable until the id is updated.
 USAGE_PROBE_URL = "https://api.anthropic.com/v1/messages"
-USAGE_PROBE_MODEL = "claude-haiku-4-5-20251001"
+USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -607,6 +608,9 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
     The result is marked ``source: headers`` and keeps the probe's
     ``rejected`` entry, so a refused probe is stored (and decided on) as an
     account at its limit until the refusal ends, never as a healthy reading.
+    That rejection outranks a window that fails to normalise: the reading
+    then keeps only ``rejected`` (readable windows go with the unreadable
+    one) instead of failing as ``bad-response``.
     """
     try:
         data = request_usage_via_probe(access_token)
@@ -616,7 +620,20 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
         _logger.warning("Usage header probe failed %s: %s", context, cause)
         _logger.debug("Usage header probe failure detail %s: %r", context, e)
         return UsageOutcome(None, error=kind, retry_after_s=retry_after)
-    usage = build_usage_result(data) or {}
+    try:
+        usage = build_usage_result(data) or {}
+    except Exception as e:
+        kind, _ = _classify_usage_error(e)
+        _logger.debug("Usage header probe failure detail %s: %r", context, e)
+        if not (isinstance(e, _InvalidUsageResponse) and "rejected" in data):
+            _logger.warning("Usage header probe failed %s: %s", context, kind)
+            return UsageOutcome(None, error=kind)
+        # A rejection outranks its unreadable windows: the refusal and its
+        # Retry-After are kept, so the account stays at its limit.
+        _logger.warning(
+            "Usage header probe %s: %s, keeping the rejection", context, kind
+        )
+        usage = {}
     if "rejected" in data:
         usage["rejected"] = data["rejected"]
         _logger.warning(
@@ -631,6 +648,61 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
         return UsageOutcome(None, error="bad-response")
     usage["source"] = USAGE_SOURCE_HEADERS
     return UsageOutcome(usage)
+
+
+class _InvalidUsageResponse(ValueError):
+    """A reported window that cannot be read as a measurement (``bad-response``)."""
+
+
+def _reported_window(data: dict, key: str) -> dict | None:
+    """The raw ``five_hour``/``seven_day`` window, or None when absent.
+
+    Absent means missing or ``null``: from the usage endpoint, a limit the
+    account does not have (a verified Ultra account reports ``five_hour:
+    null``); from the header probe, a window it did not carry, which
+    :func:`relevant_windows` treats as incomplete. ``{}`` counts as absent
+    too, a compatibility exception for the falsy check this replaces. Any
+    other non-object value is a malformed response.
+    """
+    if key not in data or data[key] is None:
+        return None
+    window = data[key]
+    if isinstance(window, dict):
+        return window if window else None
+    raise _InvalidUsageResponse(f"{key} must be an object or null")
+
+
+def _window_entry(key: str, window: dict) -> dict:
+    """Normalise one reported window to ``{"pct", "resets_at", ...}``.
+
+    ``utilization: null`` (allowed by Claude Code's usage schema) keeps the
+    window with ``pct`` None, unavailable rather than zero, and any
+    ``resets_at``. A missing, boolean, string, non-finite or negative
+    ``utilization`` raises ``_InvalidUsageResponse``: dropping the window
+    would let the other one pass as a complete reading.
+    """
+    if "utilization" not in window:
+        raise _InvalidUsageResponse(f"{key}.utilization is missing")
+    pct = window["utilization"]
+    if pct is not None:
+        try:
+            valid = (
+                isinstance(pct, (int, float))
+                and not isinstance(pct, bool)
+                and math.isfinite(pct)
+                and pct >= 0
+            )
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise _InvalidUsageResponse(
+                f"{key}.utilization must be null or a finite non-negative number"
+            )
+    entry: dict = {"pct": pct}
+    if window.get("resets_at"):
+        entry["resets_at"] = window["resets_at"]
+        entry["countdown"], entry["clock"] = format_reset(window["resets_at"])
+    return entry
 
 
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
@@ -667,7 +739,7 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
         if isinstance(e.reason, ssl.SSLCertVerificationError):
             return "tls-cert", None
         return "network", None
-    if isinstance(e, json.JSONDecodeError):
+    if isinstance(e, (json.JSONDecodeError, _InvalidUsageResponse)):
         return "bad-response", None
     return type(e).__name__, None
 
@@ -698,26 +770,22 @@ def _log_usage_failure(
 
 
 def build_usage_result(data: dict) -> dict | None:
-    """Normalize raw usage API data into the structure used by the CLI."""
+    """Normalize raw usage API data into the structure used by the CLI.
+
+    ``five_hour``/``seven_day`` go through :func:`_reported_window` and
+    :func:`_window_entry`: an absent window stays absent, ``utilization:
+    null`` keeps the window with ``pct`` None, and a malformed one fails
+    the whole fetch as ``bad-response`` (a refused header probe keeps its
+    rejection instead, see :func:`_usage_from_probe`).
+    """
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
 
     result = {}
 
-    h5 = data.get("five_hour")
-    if h5:
-        h5_entry = {"pct": h5["utilization"]}
-        if h5.get("resets_at"):
-            h5_entry["resets_at"] = h5["resets_at"]
-            h5_entry["countdown"], h5_entry["clock"] = format_reset(h5["resets_at"])
-        result["five_hour"] = h5_entry
-
-    d7 = data.get("seven_day")
-    if d7:
-        d7_entry = {"pct": d7["utilization"]}
-        if d7.get("resets_at"):
-            d7_entry["resets_at"] = d7["resets_at"]
-            d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
-        result["seven_day"] = d7_entry
+    for key in ("five_hour", "seven_day"):
+        window = _reported_window(data, key)
+        if window is not None:
+            result[key] = _window_entry(key, window)
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):
@@ -809,8 +877,10 @@ def relevant_windows(
 ) -> list[tuple[str, float, str | None]]:
     """Every ``(label, pct, resets_at)`` window that gates this account.
 
-    Always the 5-hour ("5h") and 7-day ("7d") windows. When ``models`` is
-    non-empty, each named per-model weekly ``scoped`` window is included too
+    The reported 5-hour ("5h") and 7-day ("7d") windows: an Ultra account
+    has no 5-hour one, and a window without a figure (``pct`` None) is
+    skipped. When ``models`` is non-empty, each named per-model weekly
+    ``scoped`` window is included too
     (matched case-insensitively on display name, e.g. "Fable"; the sentinel
     ``all`` matches every scoped window the account reports). The single
     canonical window source for decisions, scheduling, and reset math — so a
@@ -860,8 +930,9 @@ def account_headroom(
 ) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
-    Considers the 5-hour and 7-day utilization windows — the two that always
-    gate requests. When ``models`` is non-empty, each named per-model weekly
+    Considers the 5-hour and 7-day windows the account reports (Ultra has
+    no 5-hour one; a window without a figure does not count). When
+    ``models`` is non-empty, each named per-model weekly
     ``scoped`` window (see :func:`relevant_windows`) is folded in too: a model
     maxed at 100% blocks that model's work even with 5h/7d headroom, so for
     someone pinned to that model it binds just as hard. Returns the headroom
