@@ -2793,6 +2793,40 @@ class TestHistoryMergeSharesTheDestination:
         assert shared.read_text() == OLDER
         assert _parked_bodies(mgr, "aaa.jsonl") == [NEWER]
 
+    def test_a_session_that_resumes_mid_merge_keeps_its_transcript(
+        self, history_setup, monkeypatch
+    ):
+        """The live sessions are read before every swap, not once per merge:
+        a claude that ``/resume``s another conversation while the merge is
+        busy with other files is writing that one by the time its turn
+        comes."""
+        _, session_dir, mgr, first = self._collide(
+            history_setup, "-home-user-app/zzz.jsonl", OLDER, NEWER
+        )
+        source, _, _, second = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", OLDER, NEWER
+        )
+        _live_record(source, "some-other-session")
+        real_quarantine = mgr._quarantine
+
+        def resume_after_the_first_swap(path, rel, run_dir, side):
+            landed = real_quarantine(path, rel, run_dir, side)
+            if rel.name == "zzz.jsonl":
+                # The same claude, now on ``aaa``: its record follows.
+                _live_record(source, "aaa")
+            return landed
+
+        monkeypatch.setattr(mgr, "_quarantine", resume_after_the_first_swap)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # The walk is reverse-sorted: zzz was idle and is swapped, aaa went
+        # live in between and stays where its session will append to it.
+        assert first.read_text() == NEWER
+        assert second.read_text() == OLDER
+        assert _parked(mgr, "aaa.jsonl") == [
+            Path("profile") / "-home-user-app" / "aaa.jsonl"
+        ]
+
     def test_a_live_session_on_another_transcript_does_not_block_the_swap(
         self, history_setup
     ):

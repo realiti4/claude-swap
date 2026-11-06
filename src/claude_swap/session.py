@@ -1752,18 +1752,28 @@ class SessionManager:
         )
 
     def _shared_side_sessions(self, shared_root: Path) -> tuple[set[str], bool]:
-        """Ids of the sessions that may be writing the shared history now.
+        """Ids of the sessions that appear to be writing the shared history.
 
         A claude on the default login writes ``shared_root``'s history
         directly, and one in a linked profile writes it through the link, so
-        every config dir cswap knows of is read. Claude Code keeps the
-        ``sessionId`` in its record current across ``--resume`` and
-        ``/clear`` (read from the 2.1.319 bundle), so a live record names the
-        transcript being written. The flag is False when the answer cannot
-        be trusted — a record that could not be read, or a live session that
-        names no transcript — and the caller must then treat every shared
-        file as in use: not knowing is not the same as knowing nothing is
-        there.
+        ``shared_root`` and every profile of THIS store are read. The flag is
+        False when the answer cannot be trusted — a record that could not be
+        read, or a live session that names no transcript — and the caller
+        must then treat every shared file as in use: not knowing is not the
+        same as knowing nothing is there.
+
+        Best effort, not a guarantee. What is read is the ``sessionId``
+        Claude Code keeps in ``sessions/<pid>.json``. It follows ``--resume``
+        and ``/clear`` (read from the 2.1.319 bundle), but it is rewritten in
+        the background after the switch and a failed rewrite is only logged,
+        so a record read a moment ago can already be behind. Two kinds of
+        writer are not seen at all: a process that never registers a record
+        (a teammate or subagent process), and a session running in a profile
+        of ANOTHER cswap store that shares this ``~/.claude`` (a second
+        ``XDG_DATA_HOME``), whose records are kept where this store cannot
+        find them. Such a session goes undetected, and a transcript it is
+        writing can be replaced by a later profile copy — the copy it was
+        writing is then in the quarantine, not gone.
         """
         roots = [shared_root]
         try:
@@ -1784,6 +1794,26 @@ class SessionManager:
                 else:
                     complete = False
         return ids, complete
+
+    def _shared_copy_in_use(self, shared_root: Path, rel: Path) -> bool:
+        """Whether a live session appears to be writing the shared ``rel``.
+
+        Read fresh on every call and never kept for the rest of a merge: a
+        session can ``/resume`` another conversation while the merge is busy
+        with other files, and a snapshot taken at the first collision would
+        wave the newly live transcript through. What remains open is the
+        moment between this read and the rename, and the limits of the
+        records themselves (see ``_shared_side_sessions``).
+        """
+        live_ids, known = self._shared_side_sessions(shared_root)
+        if not known:
+            return True
+        # ``<slug>/<id>.jsonl`` is a session's transcript and ``<slug>/<id>/``
+        # holds its subagents: the id is a path component either way. Claude
+        # appends to both by path, so a file swapped in under a live session
+        # gets its next message.
+        names = {*rel.parts[:-1], rel.name.removesuffix(".jsonl")}
+        return not names.isdisjoint(live_ids)
 
     def _quarantine(self, path: Path, rel: Path, run_dir: Path, side: str) -> Path:
         """Move a losing copy under ``run_dir``, never over an existing file.
@@ -1822,8 +1852,10 @@ class SessionManager:
           continues it): the profile's is a true duplicate and is dropped.
         - A transcript whose profile copy is the later one
           (``_profile_copy_wins``) replaces the shared copy, which is
-          quarantined — unless a live session is writing that shared copy,
-          in which case it stays where the session expects it.
+          quarantined — unless a live session appears to be writing that
+          shared copy, in which case it stays where the session expects it.
+          That check is best effort (``_shared_side_sessions`` says what it
+          cannot see).
         - Everything else keeps the shared copy and quarantines the
           profile's. That covers every non-transcript file: nothing ties a
           ``MEMORY.md`` to one session, so it can never be shown to be idle,
@@ -1852,8 +1884,6 @@ class SessionManager:
         run_dir: Path | None = None
         moved = 0
         quarantined = 0
-        live_ids: set[str] | None = None
-        live_known = True
 
         def quarantine_root() -> Path:
             nonlocal run_dir
@@ -1869,19 +1899,6 @@ class SessionManager:
                 )
                 _mkdir_private(run_dir)
             return run_dir
-
-        def shared_copy_in_use(rel: Path) -> bool:
-            nonlocal live_ids, live_known
-            if live_ids is None:  # scanned once, and only if a collision asks
-                live_ids, live_known = self._shared_side_sessions(src.parent)
-            if not live_known:
-                return True
-            # ``<slug>/<id>.jsonl`` is a session's transcript and
-            # ``<slug>/<id>/`` holds its subagents: the id is a path
-            # component either way. Claude appends to both by path, so a
-            # file swapped in under a live session gets its next message.
-            names = {*rel.parts[:-1], rel.name.removesuffix(".jsonl")}
-            return not names.isdisjoint(live_ids)
 
         if dest.is_dir():
             _mkdir_private(src)
@@ -1899,7 +1916,7 @@ class SessionManager:
                         path.suffix == ".jsonl"
                         and target.is_file()
                         and _profile_copy_wins(target, path)
-                        and not shared_copy_in_use(rel)
+                        and not self._shared_copy_in_use(src.parent, rel)
                     ):
                         # Park the incumbent first: a crash between the two
                         # leaves the shared path empty, and the next run moves
