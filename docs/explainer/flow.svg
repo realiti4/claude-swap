@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1110 550" width="1110" height="550" role="img" aria-labelledby="t d">
+  <title id="t">The moment claude-swap switches you to a fresh account</title>
+  <desc id="d">Four example accounts shown as tanks. The active account, work, is at 93 percent and has crossed the 90 percent switch line. Team at 85 percent is skipped because it does not have 10 points more room than the active account. Personal at 34 percent has the most headroom and is picked. Side at 62 percent is eligible but has less room. claude-swap then switches to personal before the old account runs dry. Numbers are illustrative.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .ttl { font-size: 24px; font-weight: 700; fill: #f0f6fc; }
+    .sub { font-size: 13px; fill: #8b949e; }
+    .name { font-size: 16px; font-weight: 700; fill: #f0f6fc; }
+    .stat { font-size: 12.5px; fill: #8b949e; }
+    .lbl { font-size: 12px; font-weight: 700; }
+    .mark { font-size: 13px; font-weight: 700; }
+    .head { font-size: 11px; letter-spacing: 1.6px; fill: #8b949e; font-weight: 700; }
+    .step { font-size: 14px; font-weight: 600; fill: #f0f6fc; }
+    .step2 { font-size: 12px; fill: #8b949e; }
+    .cap { font-size: 12.5px; fill: #8b949e; }
+    .num { font-size: 12px; font-weight: 700; fill: #0d1117; }
+
+    /* Base state = the END of the story, so reduced-motion readers see the full picture. */
+    .markB, .markC, .markD, .pickRing { opacity: 1; }
+    .activeA, .activeC { opacity: 0; }
+    .arc { stroke-dasharray: 1; stroke-dashoffset: 0; }
+    .fillA { transform-box: fill-box; transform-origin: bottom; }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .fillA   { animation: growA 10s ease-in-out infinite; }
+      .alertA  { animation: alertA 10s ease-in-out infinite; }
+      .markB, .markD { animation: showMark 10s ease-out infinite; }
+      .markC   { animation: showPick 10s ease-out infinite; }
+      .pickRing{ animation: showRing 10s ease-in-out infinite; }
+      .arc     { animation: drawArc 10s ease-in-out infinite; }
+      .activeA { animation: leaveA 10s ease-in-out infinite; }
+      .activeC { animation: enterC 10s ease-in-out infinite; }
+    }
+    @keyframes growA   { 0% { transform: scaleY(.84); } 26% { transform: scaleY(1); } 100% { transform: scaleY(1); } }
+    @keyframes alertA  { 0%, 24% { opacity: 0; } 30% { opacity: 1; } 38% { opacity: .35; } 46%, 94% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes showMark{ 0%, 44% { opacity: 0; } 50%, 94% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes showPick{ 0%, 56% { opacity: 0; } 62%, 82% { opacity: 1; } 86%, 100% { opacity: 0; } }
+    @keyframes showRing{ 0%, 56% { opacity: 0; } 64% { opacity: 1; } 72% { opacity: .55; } 80%, 94% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes drawArc { 0%, 62% { stroke-dashoffset: 1; opacity: 1; } 78%, 94% { stroke-dashoffset: 0; opacity: 1; } 100% { stroke-dashoffset: 0; opacity: 0; } }
+    @keyframes leaveA  { 0%, 78% { opacity: 1; } 84%, 100% { opacity: 0; } }
+    @keyframes enterC  { 0%, 84% { opacity: 0; } 90%, 94% { opacity: 1; } 100% { opacity: 0; } }
+  </style>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#3fb950"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="1108" height="548" rx="16" fill="#0d1117" stroke="#30363d"/>
+  <text class="ttl" x="40" y="48">The moment claude-swap switches you</text>
+  <text class="sub" x="40" y="72">Illustrative numbers. Each tank shows an account's busiest window (5h or 7d).</text>
+
+  <!-- tanks: 100% = y150, 0% = y450 (3px per %) -->
+  <g>
+    <rect x="70"  y="150" width="110" height="300" rx="10" fill="#161b22" stroke="#30363d"/>
+    <rect x="225" y="150" width="110" height="300" rx="10" fill="#161b22" stroke="#30363d"/>
+    <rect x="380" y="150" width="110" height="300" rx="10" fill="#161b22" stroke="#30363d"/>
+    <rect x="535" y="150" width="110" height="300" rx="10" fill="#161b22" stroke="#30363d"/>
+  </g>
+  <!-- fills -->
+  <rect class="fillA" x="73"  y="171" width="104" height="276" rx="7" fill="#f85149"/>
+  <rect x="228" y="195" width="104" height="252" rx="7" fill="#d29922"/>
+  <rect x="383" y="348" width="104" height="99"  rx="7" fill="#3fb950"/>
+  <rect x="538" y="264" width="104" height="183" rx="7" fill="#4493c9"/>
+
+  <!-- the two lines -->
+  <line x1="55" y1="180" x2="660" y2="180" stroke="#f85149" stroke-width="1.8" stroke-dasharray="7 5"/>
+  <line x1="55" y1="201" x2="660" y2="201" stroke="#d29922" stroke-width="1.8" stroke-dasharray="7 5"/>
+  <text class="lbl" x="668" y="176" fill="#f85149">90% <tspan class="stat" font-weight="400">switch point</tspan></text>
+  <text class="lbl" x="668" y="198" fill="#d29922">83% <tspan class="stat" font-weight="400">to qualify</tspan></text>
+
+  <!-- alert ring on the active tank -->
+  <rect class="alertA" x="70" y="150" width="110" height="300" rx="10" fill="none" stroke="#f85149" stroke-width="3"/>
+
+  <!-- pick ring on the chosen tank -->
+  <rect class="pickRing" x="377" y="147" width="116" height="306" rx="12" fill="none" stroke="#3fb950" stroke-width="3.5"/>
+
+  <!-- handoff arc: work -> personal -->
+  <path class="arc" pathLength="1" d="M 158 120 C 210 66, 380 62, 435 106" fill="none" stroke="#3fb950" stroke-width="3" stroke-linecap="round" marker-end="url(#ah)"/>
+
+  <!-- marks above tanks -->
+  <g class="activeA"><rect x="97" y="112" width="56" height="20" rx="10" fill="#f85149"/><text class="mark" x="125" y="126" text-anchor="middle" fill="#0d1117">ACTIVE</text></g>
+  <g class="markB"><text class="mark" x="280" y="140" text-anchor="middle" fill="#d29922">✕ skipped</text></g>
+  <g class="markC"><rect x="395" y="112" width="80" height="22" rx="11" fill="#3fb950"/><text class="mark" x="435" y="128" text-anchor="middle" fill="#0d1117">✓ PICKED</text></g>
+  <g class="markD"><text class="mark" x="590" y="140" text-anchor="middle" fill="#4493c9">✓ eligible</text></g>
+  <g class="activeC"><rect x="395" y="112" width="80" height="22" rx="11" fill="#3fb950"/><text class="mark" x="435" y="128" text-anchor="middle" fill="#0d1117">ACTIVE</text></g>
+
+  <!-- labels under tanks -->
+  <text class="name" x="125" y="476" text-anchor="middle">work</text>
+  <text class="stat" x="125" y="495" text-anchor="middle">93% · over the line</text>
+  <text class="name" x="280" y="476" text-anchor="middle">team</text>
+  <text class="stat" x="280" y="495" text-anchor="middle">85% · not 10 pts better</text>
+  <text class="name" x="435" y="476" text-anchor="middle">personal</text>
+  <text class="stat" x="435" y="495" text-anchor="middle">34% · most headroom</text>
+  <text class="name" x="590" y="476" text-anchor="middle">side</text>
+  <text class="stat" x="590" y="495" text-anchor="middle">62% · room, but less</text>
+
+  <!-- how it decides -->
+  <text class="head" x="792" y="160">HOW IT DECIDES</text>
+  <g>
+    <circle cx="800" cy="196" r="11" fill="#f85149"/><text class="num" x="800" y="200" text-anchor="middle">1</text>
+    <text class="step" x="820" y="196">Active account crosses 90%</text>
+    <text class="step2" x="820" y="214">default threshold, busiest of 5h/7d</text>
+
+    <circle cx="800" cy="268" r="11" fill="#d29922"/><text class="num" x="800" y="272" text-anchor="middle">2</text>
+    <text class="step" x="820" y="268">Needs 10 pts more room than work</text>
+    <text class="step2" x="820" y="286">so near-equal accounts never flap</text>
+
+    <circle cx="800" cy="340" r="11" fill="#3fb950"/><text class="num" x="800" y="344" text-anchor="middle">3</text>
+    <text class="step" x="820" y="340">Pick the most headroom</text>
+    <text class="step2" x="820" y="358">here: personal, 34% used</text>
+
+    <circle cx="800" cy="412" r="11" fill="#4493c9"/><text class="num" x="800" y="416" text-anchor="middle">4</text>
+    <text class="step" x="820" y="412">Swap before the old one runs dry</text>
+    <text class="step2" x="820" y="430">a running Claude Code picks it up</text>
+  </g>
+
+  <text class="cap" x="40" y="531">Before the swap it refreshes the pick's token if that expires within 10 minutes, then switches while holding a lock.</text>
+</svg>
