@@ -46,6 +46,7 @@ from claude_swap.session import (
     slugify_email,
     stale_marker_for,
 )
+from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 ACCOUNT_EMAIL = "account2@example.com"
@@ -1903,7 +1904,7 @@ class TestGuards:
 
 
 # ---------------------------------------------------------------------------
-# history sharing (--share-history)
+# history sharing (run.shareHistory / --share-history / --no-share-history)
 # ---------------------------------------------------------------------------
 
 
@@ -1920,9 +1921,9 @@ def history_setup(share_setup, temp_home: Path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
 class TestShareHistoryPosix:
-    def test_not_shared_by_default(self, history_setup):
+    def test_not_shared_when_turned_off(self, history_setup):
         source, session_dir, mgr = history_setup
-        mgr._sync_sharing(session_dir, share=True)
+        mgr._sync_sharing(session_dir, share=True, share_history=False)
 
         assert not (session_dir / "projects").exists()
         assert not (session_dir / "history.jsonl").exists()
@@ -2071,7 +2072,8 @@ class TestShareHistoryPosix:
         out = capsys.readouterr().out
         assert "63802" in out
         assert "soribashi" in out
-        assert "cswap run 2 --share-history" in out
+        # Sharing is the default, so the command to repeat is the plain one.
+        assert "then relaunch:  cswap run 2\n" in out
         # Pin the epoch-ms -> local-time conversion itself, not just the
         # surrounding text — a timezone bug (UTC mislabeled as local) or an
         # off-by-1000 that still lands in a plausible-looking date would slip
@@ -2196,7 +2198,7 @@ class TestShareHistoryPosix:
         # And the reason given is the peer, not a session in this profile.
         out = capsys.readouterr().out
         assert "merging history into" in out
-        assert "cswap run 2 --share-history" in out
+        assert "relaunch:  cswap run 2\n" in out
 
     def _lock_that_lets_a_peer_finish_first(self, monkeypatch, on_acquire):
         """Stand in for the migration lock a peer is already holding.
@@ -3137,6 +3139,282 @@ class TestShareHistoryWindows:
 
         with pytest.raises(SessionError, match="Windows"):
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+
+
+def _turn_sharing(mgr: SessionManager, value: str) -> None:
+    """Write ``run.shareHistory`` the way ``cswap config set`` does."""
+    set_setting(mgr.switcher.backup_dir, "run.shareHistory", value)
+
+
+def _active_default_login(monkeypatch, mgr: SessionManager) -> None:
+    """Make account 2 the default login, so ``run`` takes its fast path."""
+    monkeypatch.setattr(
+        mgr.switcher, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID)
+    )
+
+
+OPT_OUT = "cswap config set run.shareHistory false"
+
+
+class TestShareHistoryDecision:
+    """Who decides whether a launch shares history: the launch's own flag,
+    then ``run.shareHistory``, then the default — which is to share."""
+
+    def test_shared_unless_turned_off(self, manager):
+        assert manager._resolve_share_history(None) is True
+        _turn_sharing(manager, "false")
+        assert manager._resolve_share_history(None) is False
+
+    @pytest.mark.parametrize("stored", [None, "true", "false"])
+    def test_the_flag_wins_over_the_setting(self, manager, stored):
+        if stored:
+            _turn_sharing(manager, stored)
+        assert manager._resolve_share_history(True) is True
+        assert manager._resolve_share_history(False) is False
+
+    # -- Windows: history cannot be shared there yet ----------------------
+
+    def test_windows_default_is_per_account_and_says_nothing(self, manager, capsys):
+        """The default applies to every user who never touched the setting.
+        Where it cannot be honored it must not turn into a warning on every
+        launch about something they never asked for."""
+        manager.switcher.platform = Platform.WINDOWS
+        assert manager._resolve_share_history(None) is False
+        assert capsys.readouterr().out == ""
+
+    def test_windows_setting_the_user_wrote_warns_and_falls_back(
+        self, manager, capsys
+    ):
+        manager.switcher.platform = Platform.WINDOWS
+        _turn_sharing(manager, "true")
+        assert manager._resolve_share_history(None) is False
+        assert "run.shareHistory is not supported on Windows" in capsys.readouterr().out
+
+    def test_windows_setting_turned_off_says_nothing(self, manager, capsys):
+        manager.switcher.platform = Platform.WINDOWS
+        _turn_sharing(manager, "false")
+        assert manager._resolve_share_history(None) is False
+        assert capsys.readouterr().out == ""
+
+    def test_windows_flag_is_refused_whatever_the_setting(self, manager):
+        manager.switcher.platform = Platform.WINDOWS
+        _turn_sharing(manager, "false")
+        with pytest.raises(SessionError, match="--share-history is not supported"):
+            manager._resolve_share_history(True)
+        assert manager._resolve_share_history(False) is False
+
+    def test_windows_warning_is_given_once_per_launch(
+        self, manager, capture_exec, monkeypatch, capsys
+    ):
+        """``run`` decides, then hands ``setup_session`` the decision rather
+        than the question — asked twice, the setting would warn twice."""
+        manager.switcher.platform = Platform.WINDOWS
+        _turn_sharing(manager, "true")
+        handed_over = []
+
+        def setup_session(identifier, share, share_history=None):
+            handed_over.append(share_history)
+            raise SessionError("stop here")
+
+        monkeypatch.setattr(manager, "setup_session", setup_session)
+        with pytest.raises(SessionError, match="stop here"):
+            manager.run("2", [])
+
+        assert handed_over == [False]
+        assert capsys.readouterr().out.count("not supported on Windows") == 1
+        # And a decision passes through the resolver untouched and unremarked.
+        assert manager._resolve_share_history(False) is False
+        assert capsys.readouterr().out == ""
+
+    def test_plain_claude_launch_never_asks(self, manager, capture_exec, capsys):
+        """A bare unmapped ``cswap run`` is plain claude: no profile, so no
+        history question, and nothing to warn a Windows user about."""
+        manager.switcher.platform = Platform.WINDOWS
+        _turn_sharing(manager, "true")
+        with pytest.raises(_ExecCalled):
+            manager.exec_default([])
+        assert capsys.readouterr().out == ""
+
+    def test_fast_path_refuses_the_flag_on_windows_too(
+        self, manager, capture_exec, monkeypatch
+    ):
+        # SessionError, not _ExecCalled: the fast path never reaches
+        # setup_session, so the refusal has to come before it.
+        _active_default_login(monkeypatch, manager)
+        manager.switcher.platform = Platform.WINDOWS
+        with pytest.raises(SessionError, match="Windows"):
+            manager.run("2", [], share_history=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
+class TestShareHistoryIsTheDefault:
+    """A launch that names no preference shares history, and a profile that
+    kept its own until now is told what happened to it."""
+
+    @pytest.fixture
+    def launch(self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates):
+        """``cswap run 2`` up to the exec; returns the profile it launched into."""
+
+        def run(**kwargs) -> Path:
+            with pytest.raises(_ExecCalled) as exc:
+                manager.run("2", [], **kwargs)
+            return Path(exc.value.env["CLAUDE_CONFIG_DIR"])
+
+        return run
+
+    @staticmethod
+    def _is_linked(session_dir: Path, shared: Path) -> bool:
+        return all(
+            (session_dir / name).is_symlink()
+            and (session_dir / name).readlink() == shared / name
+            for name in session_mod.HISTORY_ITEMS
+        )
+
+    @staticmethod
+    def _give_own_history(session_dir: Path) -> None:
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+    def test_a_plain_run_shares_history(self, launch, temp_home):
+        session_dir = launch()
+        assert self._is_linked(session_dir, temp_home / ".claude")
+
+    def test_setting_it_off_keeps_history_in_the_profile(
+        self, launch, manager, temp_home
+    ):
+        _turn_sharing(manager, "false")
+        session_dir = launch()
+        assert not (session_dir / "projects").exists()
+        assert not (session_dir / "history.jsonl").exists()
+        # Customizations are a separate switch and stay shared.
+        assert not (temp_home / ".claude" / "projects").exists()
+
+    def test_no_share_history_flag_opts_one_launch_out(self, launch, temp_home):
+        session_dir = launch(share_history=False)
+        assert not (session_dir / "projects").exists()
+        # The next launch without it is back on the default.
+        assert launch() == session_dir
+        assert self._is_linked(session_dir, temp_home / ".claude")
+
+    def test_share_history_flag_opts_one_launch_in(self, launch, manager, temp_home):
+        _turn_sharing(manager, "false")
+        session_dir = launch(share_history=True)
+        assert self._is_linked(session_dir, temp_home / ".claude")
+
+    def test_setup_session_reads_the_default_too(
+        self, manager, auth_status_tracks_seed, refresh_rotates, temp_home
+    ):
+        """``run`` is not the only way into a profile. A launcher that calls
+        ``setup_session`` and forwards "no flag" as None must land on the
+        same default, not on a falsy None."""
+        session_dir, _, _ = manager.setup_session("2", share=True)
+        assert self._is_linked(session_dir, temp_home / ".claude")
+
+        _turn_sharing(manager, "false")
+        manager.setup_session("2", share=True, share_history=None)
+        assert not (session_dir / "projects").exists()
+
+    def test_first_plain_run_after_the_upgrade_merges_the_accounts_own_history(
+        self, launch, temp_home, capsys
+    ):
+        """The upgrade itself: a profile bootstrapped while history was per
+        account, launched by a user who never set anything."""
+        session_dir = launch(share_history=False)  # as the old default left it
+        self._give_own_history(session_dir)
+        capsys.readouterr()
+
+        assert launch() == session_dir
+
+        shared = temp_home / ".claude"
+        assert (
+            shared / "projects" / "-home-user-app" / "bbb.jsonl"
+        ).read_text() == "profile-b\n"
+        assert '{"p": "profile"}' in (shared / "history.jsonl").read_text()
+        assert self._is_linked(session_dir, shared)
+        # Told once, although two items were merged.
+        assert capsys.readouterr().out.count(OPT_OUT) == 1
+
+        # And never again: nothing of its own is left to meet.
+        launch()
+        assert OPT_OUT not in capsys.readouterr().out
+
+    def test_a_profile_with_nothing_of_its_own_is_told_nothing(
+        self, history_setup, capsys
+    ):
+        _, session_dir, mgr = history_setup
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        assert (session_dir / "projects").is_symlink()
+        assert OPT_OUT not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("stored", ["true", "false"])
+    def test_a_user_who_chose_is_told_nothing(self, history_setup, capsys, stored):
+        """``false`` reaches a merge only through an explicit --share-history;
+        either way the setting is theirs and they know where it is."""
+        _, session_dir, mgr = history_setup
+        _turn_sharing(mgr, stored)
+        self._give_own_history(session_dir)
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        assert "conversation history is now shared" in out  # the merge ran
+        assert OPT_OUT not in out
+
+    def test_a_merge_that_has_to_wait_names_the_opt_out_too(
+        self, history_setup, monkeypatch, capsys
+    ):
+        """Deferred is where the opt-out matters most: until the sessions
+        are closed the warning repeats on every launch, and this is the one
+        line that says how to make it stop."""
+        _, session_dir, mgr = history_setup
+        self._give_own_history(session_dir)
+        blocker = ClaudeSession(
+            pid=63802,
+            session_id="abc",
+            cwd="/tmp",
+            started_at=0,
+            kind="interactive",
+            entrypoint="cli",
+        )
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda p: ([blocker], 0)
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        assert out.count("keeps its own") == 1
+        assert out.count(OPT_OUT) == 1
+        assert not (session_dir / "projects").is_symlink()
+
+    def test_deferral_repeats_the_flag_where_settings_turn_sharing_off(
+        self, history_setup, monkeypatch, capsys
+    ):
+        """The command to repeat has to share history when it is repeated.
+        With ``run.shareHistory false`` a plain ``cswap run 2`` would not."""
+        _, session_dir, mgr = history_setup
+        _turn_sharing(mgr, "false")
+        self._give_own_history(session_dir)
+        blocker = ClaudeSession(
+            pid=63802,
+            session_id="abc",
+            cwd="/tmp",
+            started_at=0,
+            kind="interactive",
+            entrypoint="cli",
+        )
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda p: ([blocker], 0)
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (
+            "then relaunch:  cswap run 2 --share-history\n"
+            in capsys.readouterr().out
+        )
 
 
 class TestReadSessionCredentials:
