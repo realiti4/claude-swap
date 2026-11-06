@@ -1603,9 +1603,7 @@ class SessionManager:
             self._report_deferral(session_dir, dest)
             return False
         try:
-            moved, quarantined, run_dir = self._merge_history_into_source(
-                src, dest
-            )
+            self._merge_history_into_source(src, dest)
         except (OSError, ValueError) as e:
             # ValueError covers UnicodeDecodeError: a byte-corrupt history
             # file is "nothing readable to merge", and losing a launch to a
@@ -1619,16 +1617,6 @@ class SessionManager:
                 )
             )
             return False
-        # HISTORY_ITEMS holds two entries (projects, history.jsonl), so this
-        # runs up to twice per launch — accumulate rather than overwrite, and
-        # keep the first quarantine dir a run produces (the file-merge branch
-        # never quarantines, so at most one of the two calls sets it).
-        prev_moved, prev_quarantined, prev_run_dir = self._last_merge_counts
-        self._last_merge_counts = (
-            prev_moved + moved,
-            prev_quarantined + quarantined,
-            prev_run_dir if prev_run_dir is not None else run_dir,
-        )
         try:
             if not self._seed_history_source(src, dest):
                 raise OSError(f"no {src} to link to")
@@ -1730,12 +1718,30 @@ class SessionManager:
             )
             print(dimmed(f"   Close anything using it, then relaunch:  {retry}"))
 
+    def _note_merge_progress(
+        self, moved: int, quarantined: int, run_dir: Path | None
+    ) -> None:
+        """Add one merge's counts to this launch's total.
+
+        HISTORY_ITEMS holds two entries (projects, history.jsonl), so a
+        launch merges up to twice — accumulate rather than overwrite, and
+        keep the first quarantine dir a run produces (the file-merge branch
+        never quarantines, so at most one of the two sets it).
+        """
+        prev_moved, prev_quarantined, prev_run_dir = self._last_merge_counts
+        self._last_merge_counts = (
+            prev_moved + moved,
+            prev_quarantined + quarantined,
+            prev_run_dir if prev_run_dir is not None else run_dir,
+        )
+
     def _report_quarantine(self) -> None:
         """Say where a merge parked the copies it did not keep.
 
         One line per launch, after both history items. Without it the only
         trace of a conflict is an INFO log line per file, and nothing tells
-        the user a second copy of anything exists.
+        the user a second copy of anything exists. Printed after a merge that
+        failed halfway too: what it parked before failing is still parked.
         """
         _, quarantined, run_dir = self._last_merge_counts
         if not quarantined or run_dir is None:
@@ -1871,7 +1877,9 @@ class SessionManager:
         collision; ``quarantined`` counts losers parked instead of dropped. A
         collision where the profile copy wins increments *both* for the one
         file pair (the winner is moved, the incumbent is quarantined), so
-        callers must not sum the two counters as "files handled".
+        callers must not sum the two counters as "files handled". The same
+        counts are added to ``_last_merge_counts`` however the walk ends,
+        so a merge that raises halfway still leaves what it parked on record.
         """
         # Never merge the shared history into itself. ``is_dir()`` and
         # ``rglob`` both follow a link, so a ``dest`` that is one — or that
@@ -1902,36 +1910,50 @@ class SessionManager:
 
         if dest.is_dir():
             _mkdir_private(src)
-            for path in sorted(dest.rglob("*"), reverse=True):
-                rel = path.relative_to(dest)
-                target = src / rel
-                if path.is_dir():
-                    path.rmdir()  # children already moved (reverse walk)
-                    continue
-                if target.exists():
-                    if _adds_nothing(target, path):
-                        path.unlink()
+            try:
+                for path in sorted(dest.rglob("*"), reverse=True):
+                    rel = path.relative_to(dest)
+                    target = src / rel
+                    if path.is_dir():
+                        path.rmdir()  # children already moved (reverse walk)
                         continue
-                    if (
-                        path.suffix == ".jsonl"
-                        and target.is_file()
-                        and _profile_copy_wins(target, path)
-                        and not self._shared_copy_in_use(src.parent, rel)
-                    ):
-                        # Park the incumbent first: a crash between the two
-                        # leaves the shared path empty, and the next run moves
-                        # the profile copy in cleanly.
-                        self._quarantine(target, rel, quarantine_root(), "shared")
-                        _mkdir_private(target.parent)
-                        shutil.move(str(path), str(target))
-                        moved += 1
-                    else:
-                        self._quarantine(path, rel, quarantine_root(), "profile")
-                    quarantined += 1
-                    continue
-                _mkdir_private(target.parent)
-                shutil.move(str(path), str(target))
-                moved += 1
+                    if target.exists():
+                        if _adds_nothing(target, path):
+                            path.unlink()
+                            continue
+                        if (
+                            path.suffix == ".jsonl"
+                            and target.is_file()
+                            and _profile_copy_wins(target, path)
+                            and not self._shared_copy_in_use(src.parent, rel)
+                        ):
+                            # Park the incumbent first: a crash between the
+                            # two leaves the shared path empty, and the next
+                            # run moves the profile copy in cleanly. Counted
+                            # as parked right here, not after the move: if
+                            # the move fails, this is the copy the user has
+                            # to be pointed at.
+                            self._quarantine(
+                                target, rel, quarantine_root(), "shared"
+                            )
+                            quarantined += 1
+                            _mkdir_private(target.parent)
+                            shutil.move(str(path), str(target))
+                            moved += 1
+                        else:
+                            self._quarantine(
+                                path, rel, quarantine_root(), "profile"
+                            )
+                            quarantined += 1
+                        continue
+                    _mkdir_private(target.parent)
+                    shutil.move(str(path), str(target))
+                    moved += 1
+            finally:
+                # However the walk ends. A merge that stops halfway has
+                # still parked what it parked, and the launch must be able
+                # to say where.
+                self._note_merge_progress(moved, quarantined, run_dir)
             dest.rmdir()
         else:
             existing_text = ""

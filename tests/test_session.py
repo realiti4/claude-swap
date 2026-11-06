@@ -2667,7 +2667,7 @@ class TestHistoryMergeSharesTheDestination:
         """The lock is a file in ``~/.claude``, which cswap does not own. A
         read-only one must cost this launch its history sharing, not the
         launch."""
-        source, session_dir, mgr = history_setup
+        _, session_dir, mgr = history_setup
         proj = session_dir / "projects" / "-home-user-app"
         proj.mkdir(parents=True)
         (proj / "bbb.jsonl").write_text("profile-b\n")
@@ -2938,7 +2938,7 @@ class TestHistoryMergeSharesTheDestination:
         ).read_text() == "main-a\n"
 
     def test_a_merge_cut_short_between_park_and_move_finishes_next_launch(
-        self, history_setup, monkeypatch
+        self, history_setup, monkeypatch, capsys
     ):
         source, session_dir, mgr, shared = self._collide(
             history_setup, "-home-user-app/aaa.jsonl", OLDER, NEWER
@@ -2958,6 +2958,17 @@ class TestHistoryMergeSharesTheDestination:
         assert not shared.exists()
         assert mine.read_text() == NEWER
         assert not (session_dir / "projects").is_symlink()
+        # The shared path is empty until the next launch, so this is the one
+        # failure where the user most needs to be told where the copy went:
+        # it counts as parked the moment it is parked, not once the pair is
+        # complete.
+        out = capsys.readouterr().out
+        _, quarantined, run_dir = mgr._last_merge_counts
+        assert quarantined == 1
+        assert f"Kept 1 conflicting history file aside in {run_dir}" in out
+        assert (
+            run_dir / "shared" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == OLDER
 
         monkeypatch.setattr(session_mod.shutil, "move", real_move)
         mgr._sync_sharing(session_dir, share=True, share_history=True)
@@ -2992,6 +3003,37 @@ class TestHistoryMergeSharesTheDestination:
             "MEMORY.md",
             "aaa.jsonl",
         ]
+
+    def test_a_merge_that_fails_later_still_reports_what_it_parked(
+        self, history_setup, monkeypatch, capsys
+    ):
+        """The counts used to live only in the merge's return value, so a
+        merge that raised halfway told the user "Not sharing projects" and
+        nothing about the copies it had already moved out of the profile."""
+        _, session_dir, mgr, _ = self._collide(
+            history_setup, "-home-user-app/zzz.md", "shared\n", "profile z\n"
+        )
+        self._collide(history_setup, "-home-user-app/aaa.md", "shared\n", "profile a\n")
+        real_quarantine = mgr._quarantine
+
+        def fail_on_the_second_file(path, rel, run_dir, side):
+            if rel.name == "aaa.md":
+                raise PermissionError("cannot move the second file")
+            return real_quarantine(path, rel, run_dir, side)
+
+        monkeypatch.setattr(mgr, "_quarantine", fail_on_the_second_file)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        assert "merging the profile's existing history failed" in out
+        _, quarantined, run_dir = mgr._last_merge_counts
+        assert quarantined == 1
+        assert f"Kept 1 conflicting history file aside in {run_dir}" in out
+        assert _parked_bodies(mgr, "zzz.md") == ["profile z\n"]
+        # The file that could not be parked is still the profile's.
+        mine = session_dir / "projects" / "-home-user-app"
+        assert not (mine / "zzz.md").exists()
+        assert (mine / "aaa.md").read_text() == "profile a\n"
 
     def test_a_clean_merge_reports_no_conflicts(self, history_setup, capsys):
         _, session_dir, mgr = history_setup
