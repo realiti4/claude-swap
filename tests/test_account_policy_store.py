@@ -310,6 +310,27 @@ class TestSnapshotCarriesPolicy(PolicyStoreBase):
         )
         assert row["threshold"] == pytest.approx(85.0)
 
+    def test_json_row_omits_priority_at_the_default_tier(self, temp_home: Path):
+        """Tier 0 is the default every account starts on, so it emits nothing."""
+        from claude_swap.json_output import account_row
+
+        row = account_row(
+            1, "a@example.test", "", "", True, None,
+            policy=AccountPolicy(priority=0),
+        )
+        assert "priority" not in row
+
+    def test_json_row_emits_priority_when_set(self, temp_home: Path):
+        """Scripts driving `priority-consume-first` can read the tiers back."""
+        from claude_swap.json_output import account_row
+
+        row = account_row(
+            1, "a@example.test", "", "", True, None,
+            policy=AccountPolicy(priority=300),
+        )
+        assert row["priority"] == 300
+        assert "threshold" not in row
+
 
 class TestExportImportIgnorePolicy(PolicyStoreBase):
     """Policy is machine-local, like `disabled`, and does not travel.
@@ -454,6 +475,15 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         row = self._row(self._payload(s), 1)
         assert row["threshold"] == pytest.approx(60.0)
 
+    def test_a_priority_only_account_carries_only_the_priority(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        s.set_account_priority("2", 300)
+        payload = self._payload(s)
+        row = self._row(payload, 2)
+        assert row["priority"] == 300
+        assert "threshold" not in row
+        assert "priority" not in self._row(payload, 1)
+
     def test_an_untouched_row_in_a_policied_fleet_stays_bare(self, temp_home: Path):
         """The negative half, and the one that makes the pair discriminating.
 
@@ -468,3 +498,4 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         payload = self._payload(self._fleet(temp_home))
         for row in payload["accounts"]:
             assert "threshold" not in row
+            assert "priority" not in row
