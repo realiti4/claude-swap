@@ -5446,10 +5446,12 @@ def _notices_before_exec(src: str) -> tuple[list[int], int]:
     offender_lines = set(_print_only_offenders(src)[0])
     found: list[int] = []
     execs = 0
-    for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if not isinstance(body, list):
-            continue
+    # EVERY statement list (body, orelse, finalbody, a handler's or a case's
+    # body), not `.body` alone: an exec in an `else:` is a statement of that
+    # list, and the first walk never looked there.
+    blocks = [b for n in ast.walk(tree) for _, b in ast.iter_fields(n)
+              if isinstance(b, list) and b and all(isinstance(s, ast.stmt) for s in b)]
+    for body in blocks:
         for i, stmt in enumerate(body):
             call = stmt.value if isinstance(stmt, ast.Expr) else None
             if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
@@ -5459,6 +5461,20 @@ def _notices_before_exec(src: str) -> tuple[list[int], int]:
             found += [c.lineno for prev in body[:i] for c in ast.walk(prev)
                       if isinstance(c, ast.Call) and c.lineno in offender_lines]
     return sorted(set(found)), execs
+
+
+def _unscanned_exec_sites(root: Path, scanned: set[Path]) -> list[str]:
+    """Files under `root`, outside `scanned`, that call `<x>.exec_default(...)`."""
+    import ast
+
+    return sorted(
+        str(p.relative_to(root))
+        for p in root.rglob("*.py")
+        if p not in scanned
+        and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "exec_default"
+                for n in ast.walk(ast.parse(p.read_text(encoding="utf-8"))))
+    )
 
 
 class TestEveryLaunchNoticeOutlivesTheBlank:
@@ -5557,6 +5573,43 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             f"screen blank erases it: {[f'cli.py:{n}' for n in offenders]}. "
             "Route it through the manager's `_warn`/`_note`."
         )
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            "if x:\n        pass\n    else:",
+            "try:\n        pass\n    finally:",
+            "for _ in x:\n        pass\n    else:",
+            "try:\n        pass\n    except OSError:\n        pass\n    else:",
+        ],
+        ids=["else", "finally", "for-else", "try-else"],
+    )
+    def test_an_exec_in_any_statement_list_is_seen(self, head):
+        """The walk keyed on `.body` alone, so an `exec_default` written as a
+        statement of an `else:` / `finally:` list was invisible, and a
+        print-only notice ahead of it shipped green."""
+        src = f"def f(m, x):\n    {head}\n        print('n')\n        m.exec_default([])\n"
+        offenders, execs = _notices_before_exec(src)
+        assert execs == 1, f"the exec in this list was not seen: {execs}"
+        assert len(offenders) == 1, f"the notice before it was missed: {offenders}"
+
+    def test_every_exec_default_site_in_src_is_scanned(self, tmp_path):
+        """A handover added in a third file is otherwise simply unscanned."""
+        import claude_swap.cli as cli_mod
+
+        root = Path(session_mod.__file__).parent
+        scanned = {Path(session_mod.__file__), Path(cli_mod.__file__)}
+        assert _unscanned_exec_sites(root, set()) != [], (
+            "premise: no `exec_default` call found under src/, so an empty "
+            "result below means the walk is blind, not the tree covered"
+        )
+        assert _unscanned_exec_sites(root, scanned) == []
+
+        (tmp_path / "scanned.py").write_text("m.exec_default([])\n")
+        (tmp_path / "third.py").write_text("def f(m):\n    m.exec_default([])\n")
+        assert _unscanned_exec_sites(tmp_path, {tmp_path / "scanned.py"}) == [
+            "third.py"
+        ]
 
     def test_the_derivation_does_not_depend_on_the_hash_seed(self):
         """The regression case for the seed defect was itself seed-dependent.
