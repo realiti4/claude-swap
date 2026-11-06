@@ -2500,6 +2500,42 @@ class TestShareHistoryPosix:
         assert "2026-07-21" in quarantine_path.read_text()
 
 
+OLDER = '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+NEWER = '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+
+
+def _live_record(config_dir: Path, session_id: str) -> None:
+    """The record a running claude leaves in its config dir's ``sessions/``.
+
+    Stamped with this process's pid, so the real liveness scan reads it as
+    live — no stub in between.
+    """
+    sessions = config_dir / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / f"{os.getpid()}.json").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "sessionId": session_id,
+                "cwd": "/home/user/app",
+                "startedAt": 0,
+                "kind": "interactive",
+                "entrypoint": "cli",
+            }
+        )
+    )
+
+
+def _parked(mgr: SessionManager, name: str) -> list[Path]:
+    """Quarantined copies of ``name``, as paths relative to their run dir."""
+    root = mgr.switcher.backup_dir / "history-conflicts"
+    return [
+        p.relative_to(run_dir)
+        for run_dir in sorted(root.iterdir())
+        for p in sorted(run_dir.rglob(name))
+    ] if root.exists() else []
+
+
 def _parked_bodies(mgr: SessionManager, name: str) -> list[str]:
     root = mgr.switcher.backup_dir / "history-conflicts"
     return sorted(p.read_text() for p in root.rglob(name)) if root.exists() else []
@@ -2508,7 +2544,7 @@ def _parked_bodies(mgr: SessionManager, name: str) -> list[str]:
 @pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
 class TestHistoryMergeSharesTheDestination:
     """``~/.claude`` has other writers than the profile being merged: other
-    profiles merge into it too."""
+    profiles merging into it, and live sessions already writing it."""
 
     # -- one lock for the destination -------------------------------------
 
@@ -2612,7 +2648,255 @@ class TestHistoryMergeSharesTheDestination:
         assert (session_dir / "projects").readlink() == source / "projects"
         assert (session_dir / "history.jsonl").readlink() == source / "history.jsonl"
 
+    # -- a shared copy that is in use stays where it is ---------------------
+
+    def _collide(self, history_setup, rel: str, shared_body: str, profile_body: str):
+        source, session_dir, mgr = history_setup
+        shared = source / "projects" / rel
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_text(shared_body)
+        mine = session_dir / "projects" / rel
+        mine.parent.mkdir(parents=True, exist_ok=True)
+        mine.write_text(profile_body)
+        return source, session_dir, mgr, shared
+
+    def test_a_transcript_a_live_default_login_session_is_writing_stays_in_place(
+        self, history_setup
+    ):
+        """The profile's copy is the later one and would normally replace
+        the shared one — but a running claude appends to that path, so
+        swapping the file under it splits the conversation in two."""
+        source, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", OLDER, NEWER
+        )
+        _live_record(source, "aaa")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == OLDER
+        assert _parked(mgr, "aaa.jsonl") == [
+            Path("profile") / "-home-user-app" / "aaa.jsonl"
+        ]
+        assert _parked_bodies(mgr, "aaa.jsonl") == [NEWER]
+        assert (session_dir / "projects").readlink() == source / "projects"
+
+    def test_a_session_in_a_linked_peer_profile_protects_the_shared_copy_too(
+        self, history_setup
+    ):
+        """A claude in another profile writes the shared tree through its
+        link, and its record is in that profile, not in ``~/.claude``."""
+        _, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", OLDER, NEWER
+        )
+        _live_record(mgr.sessions_dir / "3-account3_example.com", "aaa")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == OLDER
+        assert _parked_bodies(mgr, "aaa.jsonl") == [NEWER]
+
+    def test_a_live_sessions_subagent_transcript_stays_in_place(self, history_setup):
+        rel = "-home-user-app/aaa/subagents/agent-1.jsonl"
+        source, session_dir, mgr, shared = self._collide(
+            history_setup, rel, OLDER, NEWER
+        )
+        _live_record(source, "aaa")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == OLDER
+        assert _parked(mgr, "agent-1.jsonl") == [Path("profile") / rel]
+
+    def test_an_unreadable_session_record_keeps_every_shared_copy(
+        self, history_setup
+    ):
+        """Not knowing who is running is not knowing nobody is."""
+        source, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", OLDER, NEWER
+        )
+        (source / "sessions").mkdir()
+        (source / "sessions" / "4242.json").write_text("{not json")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == OLDER
+        assert _parked_bodies(mgr, "aaa.jsonl") == [NEWER]
+
+    def test_a_live_session_on_another_transcript_does_not_block_the_swap(
+        self, history_setup
+    ):
+        source, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", OLDER, NEWER
+        )
+        _live_record(source, "some-other-session")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == NEWER
+        assert _parked(mgr, "aaa.jsonl") == [
+            Path("shared") / "-home-user-app" / "aaa.jsonl"
+        ]
+
+    def test_a_diverged_memory_file_keeps_the_shared_copy(self, history_setup):
+        """Nothing ties ``MEMORY.md`` to one session, so it can never be
+        shown to be idle — and a claude rewriting it in place would write
+        over a copy swapped in beneath it. Longer does not win here."""
+        rel = "-home-user-app/memory/MEMORY.md"
+        _, session_dir, mgr, shared = self._collide(
+            history_setup, rel, "shared index\n", "profile index\nwith\nmore\nlines\n"
+        )
+        (session_dir / "projects" / "-home-user-app" / "memory" / "note.md").write_text(
+            "only in the profile\n"
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == "shared index\n"
+        assert _parked(mgr, "MEMORY.md") == [Path("profile") / rel]
+        assert _parked_bodies(mgr, "MEMORY.md") == ["profile index\nwith\nmore\nlines\n"]
+        # A name only the profile had still moves in.
+        assert (shared.parent / "note.md").read_text() == "only in the profile\n"
+
+    # -- a copy that adds nothing is the only one dropped -------------------
+
+    def test_an_identical_copy_is_dropped_not_parked(self, history_setup):
+        source, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", "main-a\n", "main-a\n"
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == "main-a\n"
+        assert mgr._last_merge_counts == (0, 0, None)
+        assert not (mgr.switcher.backup_dir / "history-conflicts").exists()
+        assert (session_dir / "projects").readlink() == source / "projects"
+
+    def test_a_copy_the_shared_one_continues_is_dropped_not_parked(
+        self, history_setup
+    ):
+        _, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", "a\nb\nc\n", "a\nb\n"
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == "a\nb\nc\n"
+        assert not (mgr.switcher.backup_dir / "history-conflicts").exists()
+
+    def test_a_copy_that_continues_the_shared_one_is_never_dropped(
+        self, history_setup
+    ):
+        """Issue #241 as reported: the shared copy was an old snapshot, the
+        profile's twelve days longer, and the longer one was deleted."""
+        _, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", "a\nb\n", "a\nb\nc\nd\n"
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == "a\nb\nc\nd\n"
+        assert _parked_bodies(mgr, "aaa.jsonl") == ["a\nb\n"]
+
+    # -- the merge never runs against the shared tree itself ----------------
+
+    def test_merge_refuses_a_dest_that_links_to_the_shared_tree(self, history_setup):
+        """``is_dir()`` and ``rglob`` follow the link, so every shared file
+        meets itself — and an identical copy is the one that gets dropped."""
+        source, session_dir, mgr = history_setup
+        (session_dir / "projects").symlink_to(source / "projects")
+
+        with pytest.raises(OSError):
+            mgr._merge_history_into_source(
+                source / "projects", session_dir / "projects"
+            )
+
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+        assert not (mgr.switcher.backup_dir / "history-conflicts").exists()
+
+    def test_merge_refuses_a_dest_that_reaches_the_shared_tree_another_way(
+        self, history_setup
+    ):
+        """Not a link itself, but the same directory through a linked
+        parent — ``is_symlink()`` alone does not see it."""
+        source, session_dir, mgr = history_setup
+        (session_dir / "alias").symlink_to(source)
+        dest = session_dir / "alias" / "projects"
+        assert not dest.is_symlink()
+
+        with pytest.raises(OSError):
+            mgr._merge_history_into_source(source / "projects", dest)
+
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+
+    def test_a_merge_cut_short_between_park_and_move_finishes_next_launch(
+        self, history_setup, monkeypatch
+    ):
+        source, session_dir, mgr, shared = self._collide(
+            history_setup, "-home-user-app/aaa.jsonl", OLDER, NEWER
+        )
+        mine = session_dir / "projects" / "-home-user-app" / "aaa.jsonl"
+        real_move = shutil.move
+
+        def fail_the_move_in(src_path, dst_path):
+            if Path(dst_path) == shared:
+                raise OSError("no space left on device")
+            return real_move(src_path, dst_path)
+
+        monkeypatch.setattr(session_mod.shutil, "move", fail_the_move_in)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # Incumbent parked, winner still in the profile, nothing linked.
+        assert not shared.exists()
+        assert mine.read_text() == NEWER
+        assert not (session_dir / "projects").is_symlink()
+
+        monkeypatch.setattr(session_mod.shutil, "move", real_move)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert shared.read_text() == NEWER
+        assert _parked_bodies(mgr, "aaa.jsonl") == [OLDER]
+        assert (session_dir / "projects").readlink() == source / "projects"
+
     # -- what the user is told ----------------------------------------------
+
+    def test_conflicts_are_reported_once_with_their_count_and_directory(
+        self, history_setup, capsys
+    ):
+        _, session_dir, mgr, _ = self._collide(
+            history_setup, "-home-user-app/memory/MEMORY.md", "shared\n", "profile\n"
+        )
+        (session_dir / "projects" / "-home-user-app" / "aaa.jsonl").write_text(
+            "diverged\n"
+        )
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        _, quarantined, run_dir = mgr._last_merge_counts
+        assert quarantined == 2
+        assert out.count("conflicting history file") == 1
+        assert f"Kept 2 conflicting history files aside in {run_dir}" in out
+        # Named for the profile: several migrate on the same day.
+        assert run_dir.name.endswith(session_dir.name)
+        assert sorted(p.name for p in run_dir.rglob("*") if p.is_file()) == [
+            "MEMORY.md",
+            "aaa.jsonl",
+        ]
+
+    def test_a_clean_merge_reports_no_conflicts(self, history_setup, capsys):
+        _, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert "conflicting" not in capsys.readouterr().out
 
     def test_a_deferral_is_explained_once_per_launch(
         self, history_setup, monkeypatch, capsys

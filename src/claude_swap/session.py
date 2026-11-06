@@ -28,7 +28,8 @@ History sharing (``--share-history``, opt-in): additionally links
 unified conversation history. POSIX-only: Windows shares by re-synced copy,
 which would fork history rather than share it. If the profile already
 accumulated its own history, it is merged into ``~/.claude`` first so nothing
-disappears from ``--resume``.
+disappears from ``--resume``. A file that differs on both sides is never
+deleted: the copy not kept is parked under ``<backup_dir>/history-conflicts/``.
 
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
@@ -613,6 +614,27 @@ def _profile_copy_wins(target: Path, candidate: Path) -> bool:
             return False
         return candidate_stamp > target_stamp
     return _line_count(candidate) > _line_count(target)
+
+
+def _adds_nothing(target: Path, candidate: Path) -> bool:
+    """Whether the shared ``target`` already holds every byte of ``candidate``.
+
+    True for a byte-identical pair, and for a target that merely continues
+    the candidate — an older snapshot of an append-only transcript is a
+    prefix of the newer one. Either way the profile's copy is a true
+    duplicate, the one collision that is safe to drop rather than
+    quarantine. Unreadable means unknown, which is never "safe to drop".
+    """
+    try:
+        if candidate.stat().st_size > target.stat().st_size:
+            return False
+        with candidate.open("rb") as profile, target.open("rb") as shared:
+            while chunk := profile.read(1 << 20):
+                if shared.read(len(chunk)) != chunk:
+                    return False
+        return True
+    except OSError:
+        return False
 
 
 def _probe_env(session_dir: Path) -> dict[str, str]:
@@ -1272,6 +1294,7 @@ class SessionManager:
         # write the manifest atomically so a concurrent reader never sees a
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
+        self._report_quarantine()
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:
         """Mirror the default profile's user-scope ``mcpServers`` (issue #139).
@@ -1684,6 +1707,61 @@ class SessionManager:
             )
             print(dimmed(f"   Close anything using it, then relaunch:  {retry}"))
 
+    def _report_quarantine(self) -> None:
+        """Say where a merge parked the copies it did not keep.
+
+        One line per launch, after both history items. Without it the only
+        trace of a conflict is an INFO log line per file, and nothing tells
+        the user a second copy of anything exists.
+        """
+        _, quarantined, run_dir = self._last_merge_counts
+        if not quarantined or run_dir is None:
+            return
+        noun = "file" if quarantined == 1 else "files"
+        print(
+            dimmed(
+                f"Kept {quarantined} conflicting history {noun} aside in "
+                f"{run_dir} — nothing was deleted."
+            )
+        )
+        self._logger.warning(
+            f"History merge kept {quarantined} conflicting {noun} in {run_dir}"
+        )
+
+    def _shared_side_sessions(self, shared_root: Path) -> tuple[set[str], bool]:
+        """Ids of the sessions that may be writing the shared history now.
+
+        A claude on the default login writes ``shared_root``'s history
+        directly, and one in a linked profile writes it through the link, so
+        every config dir cswap knows of is read. Claude Code keeps the
+        ``sessionId`` in its record current across ``--resume`` and
+        ``/clear`` (read from the 2.1.319 bundle), so a live record names the
+        transcript being written. The flag is False when the answer cannot
+        be trusted — a record that could not be read, or a live session that
+        names no transcript — and the caller must then treat every shared
+        file as in use: not knowing is not the same as knowing nothing is
+        there.
+        """
+        roots = [shared_root]
+        try:
+            roots.extend(p for p in self.sessions_dir.iterdir() if p.is_dir())
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return set(), False
+        ids: set[str] = set()
+        complete = True
+        for root in roots:
+            sessions, unreadable = scan_live_sessions(root)
+            if unreadable:
+                complete = False
+            for live in sessions:
+                if live.session_id:
+                    ids.add(live.session_id)
+                else:
+                    complete = False
+        return ids, complete
+
     def _quarantine(self, path: Path, rel: Path, run_dir: Path, side: str) -> Path:
         """Move a losing copy under ``run_dir``, never over an existing file.
 
@@ -1711,10 +1789,24 @@ class SessionManager:
     ) -> tuple[int, int, Path | None]:
         """Move the profile's own history at ``dest`` into ``src``.
 
-        Directories merge file-by-file. A name collision does *not* mean the
-        same session: a transcript that straddled an un-share event exists in
-        both trees under one UUID with different content, so the loser is
-        quarantined rather than dropped (see ``_profile_copy_wins``).
+        Directories merge file-by-file, and a name collision does *not* mean
+        the same content: stable names (``memory/MEMORY.md``) diverge between
+        accounts, and a transcript that straddled an un-share event exists in
+        both trees under one UUID. Neither side's copy is ever deleted unless
+        the other side holds every byte of it:
+
+        - The shared copy already contains the profile's (identical, or it
+          continues it): the profile's is a true duplicate and is dropped.
+        - A transcript whose profile copy is the later one
+          (``_profile_copy_wins``) replaces the shared copy, which is
+          quarantined — unless a live session is writing that shared copy,
+          in which case it stays where the session expects it.
+        - Everything else keeps the shared copy and quarantines the
+          profile's. That covers every non-transcript file: nothing ties a
+          ``MEMORY.md`` to one session, so it can never be shown to be idle,
+          and a claude rewriting it in place would write straight over a
+          copy swapped in beneath it.
+
         ``history.jsonl`` merges by appending lines not already present.
         ``dest`` is removed once empty; any failure — an OSError, or a
         UnicodeDecodeError on a byte-corrupt history file — propagates and
@@ -1726,17 +1818,47 @@ class SessionManager:
         file pair (the winner is moved, the incumbent is quarantined), so
         callers must not sum the two counters as "files handled".
         """
+        # Never merge the shared history into itself. ``is_dir()`` and
+        # ``rglob`` both follow a link, so a ``dest`` that is one — or that
+        # reaches ``src`` any other way — collides every shared file with
+        # itself. The caller already checks under the lock; it is repeated
+        # here because being wrong costs the whole shared history.
+        if dest.is_symlink() or (src.exists() and os.path.samefile(src, dest)):
+            raise OSError(f"{dest} is the shared history, not the profile's own")
+
         run_dir: Path | None = None
         moved = 0
         quarantined = 0
+        live_ids: set[str] | None = None
+        live_known = True
 
         def quarantine_root() -> Path:
             nonlocal run_dir
             if run_dir is None:
+                # Stamped per merge and named for the profile: several
+                # profiles migrate on the same day, and "profile" alone does
+                # not say whose MEMORY.md a parked copy is.
                 stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S")
-                run_dir = self.switcher.backup_dir / QUARANTINE_DIRNAME / stamp
+                run_dir = (
+                    self.switcher.backup_dir
+                    / QUARANTINE_DIRNAME
+                    / f"{stamp}-{dest.parent.name}"
+                )
                 _mkdir_private(run_dir)
             return run_dir
+
+        def shared_copy_in_use(rel: Path) -> bool:
+            nonlocal live_ids, live_known
+            if live_ids is None:  # scanned once, and only if a collision asks
+                live_ids, live_known = self._shared_side_sessions(src.parent)
+            if not live_known:
+                return True
+            # ``<slug>/<id>.jsonl`` is a session's transcript and
+            # ``<slug>/<id>/`` holds its subagents: the id is a path
+            # component either way. Claude appends to both by path, so a
+            # file swapped in under a live session gets its next message.
+            names = {*rel.parts[:-1], rel.name.removesuffix(".jsonl")}
+            return not names.isdisjoint(live_ids)
 
         if dest.is_dir():
             _mkdir_private(src)
@@ -1747,7 +1869,15 @@ class SessionManager:
                     path.rmdir()  # children already moved (reverse walk)
                     continue
                 if target.exists():
-                    if _profile_copy_wins(target, path):
+                    if _adds_nothing(target, path):
+                        path.unlink()
+                        continue
+                    if (
+                        path.suffix == ".jsonl"
+                        and target.is_file()
+                        and _profile_copy_wins(target, path)
+                        and not shared_copy_in_use(rel)
+                    ):
                         # Park the incumbent first: a crash between the two
                         # leaves the shared path empty, and the next run moves
                         # the profile copy in cleanly.
