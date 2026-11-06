@@ -112,9 +112,10 @@ def _pace_suffix(window: dict, fetched_at: float | None) -> str:
 
 def usage_rows(
     last_good: dict | None, now: float, fetched_at: float | None = None
-) -> list[tuple[str, float, str, str]]:
+) -> list[tuple[str, float | None, str, str]]:
     """(label, pct, suffix, suffix_full) rows mirroring the CLI's
-    ``_format_usage_lines``.
+    ``_format_usage_lines``. ``pct`` is None for a 5h/7d window reported
+    without a figure; ``usage_bar`` draws that row as ``usage unknown``.
 
     ``suffix_full`` extends the reset countdown with the absolute clock time
     (``resets 2h 13m · 20:39``) for rows that have room; otherwise it equals
@@ -127,7 +128,7 @@ def usage_rows(
     """
     if not isinstance(last_good, dict):
         return []
-    rows: list[tuple[str, float, str, str]] = []
+    rows: list[tuple[str, float | None, str, str]] = []
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
@@ -145,7 +146,13 @@ def usage_rows(
                 if marker:
                     suffix = f"{suffix}  {marker}" if suffix else marker
                     suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
-            rows.append((label, float(window["pct"]), suffix, suffix_full))
+            pct = window.get("pct")
+            rows.append((
+                label,
+                float(pct) if isinstance(pct, (int, float)) else None,
+                suffix,
+                suffix_full,
+            ))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
         suffix, suffix_full = _reset_parts(window, now)
@@ -272,9 +279,10 @@ def account_card_text(
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     label_width = max(len(label) for label, _pct, _suffix, _full in rows)
     bar_width = max(12, min(30, width - 42 - label_width))
-    # everything on a row except the suffix: indent, label, bar, " NNN%", gap
-    row_overhead = 4 + label_width + 1 + bar_width + 5 + 2
     for label, pct, suffix, suffix_full in rows:
+        # everything on a row except the suffix: indent, label, bar, " NNN%"
+        # (or "  usage unknown" on a row without a figure), gap
+        row_overhead = 4 + label_width + 1 + bar_width + (15 if pct is None else 5) + 2
         # per-row: show the absolute clock only where it fits, so a long
         # spend row degrading doesn't cost the 5h/7d rows their clocks
         if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
@@ -351,9 +359,15 @@ def mini_account_text(
         window = last_good.get(key) if isinstance(last_good, dict) else None
         if not window:
             continue
-        pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
+        if not isinstance(window.get("pct"), (int, float)):
+            # No figure: unknown, not 0%.
+            text.append(f"{label} ", style=palette.muted)
+            text.append("?", style=palette.muted)
+            parts += 1
+            continue
+        pct = float(window["pct"])
         color = palette.severity(pct)
         # Same chip the auto view's Next-best rows draw, from the same
         # helper — one account must not read two ways on two screens.

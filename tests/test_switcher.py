@@ -8687,6 +8687,25 @@ class TestFormatUsageLines:
         lines = _format_usage_lines(usage)
         assert lines == ["Fable: 100%  (!)"]
 
+    def test_window_without_a_figure_renders_as_unknown_not_zero(self):
+        # ``utilization: null`` keeps its row and reset, with ``?`` in the number's
+        # column.
+        usage = {
+            "five_hour": {"pct": None, "clock": "20:39", "countdown": "1h 30m"},
+            "seven_day": {"pct": 72.0},
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0] == "5h:    ?   resets 20:39         in 1h 30m"
+        assert lines[1] == "7d:  72%"
+        assert _format_usage_lines({"seven_day": {"pct": None}}) == ["7d:    ?"]
+        # No figure, no pace: a week-old unknown 7d window gets no marker.
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        weekly = {"pct": None, "resets_at": (now + timedelta(days=1)).isoformat()}
+        line = _format_usage_lines({"seven_day": weekly}, fetched_at=now.timestamp())[0]
+        assert line.startswith("7d:    ?") and "pace" not in line
+
     def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
         # A measurement served from the store hours after its fetch still
         # carries the countdown frozen at fetch time; rendering must derive
@@ -10102,21 +10121,16 @@ class TestStashAndRetentionStore:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
-    def test_unreadable_current_backup_warns_instead_of_silent_no_op(
+    def test_unreadable_current_backup_is_logged_distinguishably_at_info(
         self, temp_home, caplog,
     ):
-        """I-2: ``_retain_previous_backup`` used the plain reader, so an
-        UNREADABLE current backup (``.enc`` exists but cannot be read) and a
-        genuinely ABSENT one both hit ``if not current: return`` — the same
-        silent no-op. Retention is best-effort, but "the backup is intact
-        and merely unreadable this instant" must not look identical in the
-        logs to "there was never anything to retain".
+        """I-2: an UNREADABLE current backup (``.enc`` exists but cannot be
+        read) must not look identical in the logs to a genuinely ABSENT one.
 
-        The WARNING is the whole contract here. Rounds 8-9 additionally
-        checkpointed the incoming bytes as a ``.prev``; round 10 withdrew
-        that (it shadowed a real Keychain ``.prev`` on a locked keychain),
-        so this asserts only that the unreadable case is distinguishable
-        from the absent one in the log.
+        The retention line is INFO: the reader already warned about the read
+        failure, so the underlying event is still reported once at WARNING.
+        Rounds 8-9 checkpointed the incoming bytes as a ``.prev``; round 10
+        withdrew that (it shadowed a real Keychain ``.prev``).
         """
         import logging
 
@@ -10128,20 +10142,25 @@ class TestStashAndRetentionStore:
         caplog.clear()
         enc.chmod(0o000)
         try:
-            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with caplog.at_level(logging.INFO, logger="claude-swap"):
                 store._retain_previous_backup("1", "a@b.c", "gen-2")
         finally:
             enc.chmod(0o600)
 
-        assert any(
-            "could not be retained" in r.message.lower()
-            or "could not be read" in r.message.lower()
-            for r in caplog.records
-            if "retain" in r.message.lower()
-        ), (
+        retention = [
+            r for r in caplog.records
+            if "could not retain previous credential generation" in r.message.lower()
+        ]
+        assert retention, (
             "DEFECT: an unreadable current backup at retention time produced "
-            "no warning distinguishing it from a genuinely absent one"
+            "no line distinguishing it from a genuinely absent one"
         )
+        assert all(r.levelno == logging.INFO for r in retention)
+        assert any(
+            r.levelno == logging.WARNING
+            and "Failed to read credentials file" in r.message
+            for r in caplog.records
+        ), "the read failure itself must still be reported once at WARNING"
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
