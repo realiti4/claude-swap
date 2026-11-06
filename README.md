@@ -121,7 +121,7 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 
 - **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping between accounts near the threshold.
-- An API outage (a burst of server errors on the active account's requests) moves it off immediately, ignoring the cooldown and margin, and holds the account it left out of rotation for 15 minutes. Needs the `cswap-pin` request trace armed (off by default); a silent no-op without it.
+- An API outage (a burst of 529 overloaded responses on the active account's requests) moves it off immediately, ignoring the cooldown and margin, and holds the account it left out of rotation for 15 minutes. Needs the `cswap-pin` request trace armed (off by default); a silent no-op without it.
 - `--weekly-threshold 97` gives the 7-day and per-model windows their own line, so the weekly budget can run higher than the 5-hour window. `--threshold`, and any per-account threshold, then governs the 5-hour window only.
 - `--model Fable` folds that model's weekly limit into the decision, for when you hit a per-model limit before the account-wide ones. Names are the per-model rows in `cswap list` (e.g. `Fable: 100%`), matched case-insensitively.
 - Accounts with no 5-hour window (Ultra) are judged on their 7-day and `--model` windows alone.
@@ -383,9 +383,9 @@ cswap switch 2 --json
 
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
 
-Add `--read-only` to `list` or `status` to read the store exactly as the last pass left it: no usage fetch, no login adopt, no unclaimed-stash sweep — the right flag for a statusline or monitor probe that just wants `activeAccountNumber`/`active` without spending a refresh grant.
-
 </details>
+
+Add `--read-only` to `list` or `status` to read the store exactly as the last pass left it: no usage fetch, no login adopt, no unclaimed-stash sweep — the right flag for a statusline or monitor probe that just wants `activeAccountNumber`/`active` without spending a refresh grant.
 
 `cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 

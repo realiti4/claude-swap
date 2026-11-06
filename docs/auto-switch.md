@@ -17,7 +17,7 @@ A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near th
 
 ## API outages
 
-An API outage (a burst of server errors on the active account's requests) moves it off immediately, whether or not it's below the threshold — the cooldown and hysteresis above don't apply, since it's the API that's failing, not the account. The account it left is held out of rotation for 15 minutes so it isn't switched straight back onto while the outage continues. Needs the `cswap-pin` request trace armed (off by default) on cswap-pin 0.1.148 or newer; it's a silent no-op on an older pin, or with the trace off.
+An API outage (a burst of 529 overloaded responses on the active account's requests: 5 or more `/v1/messages` calls over two consecutive polls, at least half of them 529; a 500 or 502 storm does not fire it) moves it off immediately, whether or not it's below the threshold — the cooldown and hysteresis above don't apply, since it's the API that's failing, not the account. The account it left is held out of rotation for 15 minutes so it isn't switched straight back onto while the outage continues (a forced move for another reason, such as the active account hitting its limit, can still fall back onto it when no other candidate is left). Needs the `cswap-pin` request trace armed (off by default) on cswap-pin 0.1.148 or newer; it's a silent no-op on an older pin, or with the trace off.
 
 ## A separate line for the weekly windows
 
