@@ -810,38 +810,72 @@ def test_set_tooltip_reaches_the_native_item_and_tolerates_its_absence():
 
 def test_health_label_off():
     label, attention = menubar.health_label(
-        auto_enabled=False, engine_running=False, snapshot_age=90, refresh_interval=60
+        auto_enabled=False, engine_running=False, usage_age=90, refresh_interval=60
     )
-    assert label == "Auto-switch off · usage 1m ago"
+    assert label == "Auto-switch off · usage read 1m ago"
     assert attention is False
 
 
 def test_health_label_running():
     label, attention = menubar.health_label(
-        auto_enabled=True, engine_running=True, snapshot_age=30, refresh_interval=60
+        auto_enabled=True, engine_running=True, usage_age=30, refresh_interval=60
     )
-    assert label == "Auto-switch running · usage just now"
+    assert label == "Auto-switch running · usage read just now"
     assert attention is False
 
 
 def test_health_label_enabled_but_not_running_needs_attention():
     # The state that used to look healthy: the toggle on, no engine behind it.
     label, attention = menubar.health_label(
-        auto_enabled=True, engine_running=False, snapshot_age=30, refresh_interval=60
+        auto_enabled=True, engine_running=False, usage_age=30, refresh_interval=60
     )
     assert label.startswith("⚠ Auto-switch stopped, click to restart")
     assert attention is True
 
 
-def test_health_label_dates_a_stale_refresh_and_a_missing_one():
+def test_health_label_dates_a_stale_reading_and_a_missing_one():
     label, _ = menubar.health_label(
-        auto_enabled=False, engine_running=False, snapshot_age=241, refresh_interval=60
+        auto_enabled=False, engine_running=False, usage_age=2 * 3600, refresh_interval=60
     )
-    assert "usage stale, last 4m ago" in label  # past 3 intervals
+    assert "usage stale, read 2h 0m ago" in label
     label, _ = menubar.health_label(
-        auto_enabled=False, engine_running=False, snapshot_age=None, refresh_interval=60
+        auto_enabled=False, engine_running=False, usage_age=None, refresh_interval=60
     )
-    assert label.endswith("usage not refreshed yet")
+    assert label.endswith("no usage reading yet")
+
+
+def test_health_label_stale_threshold_has_a_floor():
+    # Three 30 s display intervals is not stale while the engine polls the
+    # active account every few minutes; the floor is fifteen minutes.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=600, refresh_interval=30
+    )
+    assert "stale" not in label
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=16 * 60, refresh_interval=30
+    )
+    assert "stale" in label
+    # With a long interval the multiple wins: 3 x 600 s = 30 min.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=20 * 60, refresh_interval=600
+    )
+    assert "stale" not in label
+
+
+def _row(num, is_active, fetched_at):
+    return (num, f"a{num}@x.com", is_active, {}, {}, None, False, fetched_at)
+
+
+def test_active_usage_age_dates_the_active_accounts_reading_not_the_snapshot():
+    # A store-only refresh is new; the reading it serves can be hours old.
+    snapshot = {"accounts": [_row(1, False, 1000.0), _row(2, True, 1000.0 - 2.5 * 3600)]}
+    assert menubar.active_usage_age(snapshot, now=1000.0) == 2.5 * 3600
+
+
+def test_active_usage_age_is_none_without_an_active_reading():
+    assert menubar.active_usage_age({"accounts": [_row(1, False, 10.0)]}, now=20.0) is None
+    assert menubar.active_usage_age({"accounts": [_row(1, True, None)]}, now=20.0) is None
+    assert menubar.active_usage_age(dict(menubar.EMPTY_SNAPSHOT), now=20.0) is None
 
 
 @pytest.mark.parametrize(

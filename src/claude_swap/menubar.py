@@ -235,8 +235,12 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
 
 MENU_NOTE_LIMIT = 40
 
-# A refresh older than this many intervals is called stale in the health row.
+# A reading older than this many display intervals is called stale in the
+# health row, but never sooner than STALE_USAGE_FLOOR_S: while the engine
+# runs, the display reads store-only and the engine polls the active account
+# on its own cadence, so three short display intervals would be too strict.
 STALE_REFRESH_INTERVALS = 3
+STALE_USAGE_FLOOR_S = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -279,21 +283,37 @@ def _age_text(seconds: float) -> str:
     return f"{days}d {hours % 24}h ago"
 
 
+def active_usage_age(snapshot: dict, now: float | None = None) -> float | None:
+    """Seconds since the active account's usage was last read, or None.
+
+    The health row dates the measurement, not the display's last look at the
+    store: a store-only refresh (the engine paces all fetching while it runs)
+    would otherwise call a two-hour-old reading "just now".
+    """
+    now = time.time() if now is None else now
+    for row in snapshot.get("accounts") or []:
+        if row[2]:  # is_active
+            fetched_at = row[7]
+            return max(0.0, now - fetched_at) if fetched_at else None
+    return None
+
+
 def health_label(
     *,
     auto_enabled: bool,
     engine_running: bool,
-    snapshot_age: float | None,
+    usage_age: float | None,
     refresh_interval: int,
 ) -> tuple[str, bool]:
     """The menu's first row: ``(label, attention)``.
 
     Four states hide behind "the icon is there": auto-switch off in settings,
     enabled with the engine running, enabled with no engine (it failed to
-    start or its thread died), and usage that stopped refreshing. The row
-    names the first three and dates the fourth; ``attention`` is True for the
-    state that needs a click, so the caller can wire a restart to the row and
-    flag the title.
+    start or its thread died), and usage that stopped being read. The row
+    names the first three and dates the fourth from the active account's last
+    reading (:func:`active_usage_age`); ``attention`` is True for the state
+    that needs a click, so the caller can wire a restart to the row and flag
+    the title.
     """
     if not auto_enabled:
         status, attention = "Auto-switch off", False
@@ -301,12 +321,13 @@ def health_label(
         status, attention = "Auto-switch running", False
     else:
         status, attention = "⚠ Auto-switch stopped, click to restart", True
-    if snapshot_age is None:
-        usage = "usage not refreshed yet"
-    elif snapshot_age > STALE_REFRESH_INTERVALS * refresh_interval:
-        usage = f"usage stale, last {_age_text(snapshot_age)}"
+    stale_after = max(STALE_REFRESH_INTERVALS * refresh_interval, STALE_USAGE_FLOOR_S)
+    if usage_age is None:
+        usage = "no usage reading yet"
+    elif usage_age > stale_after:
+        usage = f"usage stale, read {_age_text(usage_age)}"
     else:
-        usage = f"usage {_age_text(snapshot_age)}"
+        usage = f"usage read {_age_text(usage_age)}"
     return f"{status} · {usage}", attention
 
 
@@ -757,6 +778,8 @@ def run(switcher) -> int:
             self._engine_events: list = []
             self._event_lock = threading.Lock()
             self._engine_errors_surfaced: dict[str, float] = {}
+            self._health_item = None
+            self._health_attention = False
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -827,6 +850,32 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             self._detect_active_change()
             self._drain_engine_events()
+            self._refresh_health_row()
+
+        def _health(self):
+            return health_label(
+                auto_enabled=self.settings.auto_switch_enabled,
+                engine_running=self._engine is not None,
+                usage_age=active_usage_age(self.snapshot),
+                refresh_interval=self.settings.refresh_interval,
+            )
+
+        def _refresh_health_row(self):
+            """Keep the first row current between rebuilds.
+
+            Rebuilds follow successful refreshes; a refresh that keeps failing
+            never triggers one, so the row would say "read 2m ago" for hours,
+            which is the very state it exists to show. Text changes go in
+            place; a change of state (attention on or off) rebuilds, since the
+            row's action and the title change with it.
+            """
+            if self._health_item is None:
+                return
+            label, attention = self._health()
+            if attention != self._health_attention:
+                self.rebuild_menu()
+            elif label != self._health_item.title:
+                self._health_item.title = label
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -957,12 +1006,8 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
-            health, attention = health_label(
-                auto_enabled=self.settings.auto_switch_enabled,
-                engine_running=self._engine is not None,
-                snapshot_age=(time.time() - self._snapshot_at) if self._snapshot_at else None,
-                refresh_interval=self.settings.refresh_interval,
-            )
+            health, attention = self._health()
+            self._health_attention = attention
             self.title = format_title(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
@@ -1011,6 +1056,7 @@ def run(switcher) -> int:
             )
             if attention and self._engine_failure:
                 _set_tooltip(health_item, self._engine_failure)
+            self._health_item = health_item
 
             self.menu = [
                 health_item,
