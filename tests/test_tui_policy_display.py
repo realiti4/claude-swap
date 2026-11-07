@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 
 import pytest
 
@@ -27,6 +28,7 @@ from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
     FakeSwitcher,
+    _iso_in,
     fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
     make_account,
     make_app,
@@ -39,11 +41,13 @@ from tests.test_tui import (
 # through the same ``make_account`` fixture used below.  Only the header row and
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
-# instead (see ``test_the_card_bar_rows_are_untouched``).
+# instead (see ``test_the_card_bar_rows_are_untouched``).  The two mini rows were
+# re-captured on this branch, whose chips read ``5h:25%`` where the unmodified
+# engine printed ``5h 25%`` (see ``golden_form``).
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h 25% · 7d 10%"
+GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h:25% · 7d:10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h 25% · 7d 10%"
+GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h:25% · 7d:10%"
 
 NOW = 1000.0
 
@@ -64,6 +68,13 @@ def card(acc) -> str:
 
 def mini(acc) -> str:
     return mini_account_text(acc, NOW).plain
+
+
+def golden_form(plain: str) -> str:
+    """Drop the chips' reset countdown, `5h(⟳1h59m):25%` -> `5h:25%`: this
+    branch's mini row carries one, and ``make_entry`` derives it from the wall
+    clock, so a literal golden would rot daily."""
+    return re.sub(r"\(⟳[^)]*\)", "", plain)
 
 
 class TestThresholdBadge:
@@ -121,12 +132,12 @@ class TestUnpolicedAccountsRenderExactlyAsBefore:
         )
 
     def test_the_mini_row_is_byte_identical_to_the_golden(self):
-        assert mini(make_account(2, active=True, alias="dev")) == GOLDEN_MINI
+        assert golden_form(mini(make_account(2, active=True, alias="dev"))) == GOLDEN_MINI
 
     def test_a_disabled_account_is_byte_identical_to_the_golden(self):
         acc = make_account(3, disabled=True)
         assert card(acc).splitlines()[0] == GOLDEN_CARD_HEADER_DISABLED
-        assert mini(acc) == GOLDEN_MINI_DISABLED
+        assert golden_form(mini(acc)) == GOLDEN_MINI_DISABLED
 
     def test_an_explicit_empty_policy_renders_the_same_as_no_policy(self):
         # ``AccountPolicy()`` is the field default, but a store that wrote an
@@ -166,7 +177,9 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
     def _fleet(self, tmp_path):
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
-            "autoswitch": {"threshold": 90},
+            # `best` is the strategy whose key is room under each account's own
+            # line; this branch's default, consume-first, orders by weekly reset.
+            "autoswitch": {"threshold": 90, "strategy": "best"},
         }))
         return FakeSwitcher(
             [
@@ -196,8 +209,9 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
-            assert "(line" not in self._row(plain, "user3@example.com")
+            row2 = golden_form(self._row(plain, "user2@example.com"))
+            assert "5h:50%" in row2 and row2.endswith("threshold 60%"), row2
+            assert "threshold" not in self._row(plain, "user3@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
         self, tmp_path, fake_engine
@@ -217,4 +231,89 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            row2 = golden_form(self._row(plain, "user2@example.com"))
+            assert "5h:50%" in row2 and row2.endswith("threshold 60%"), row2
+
+
+    async def test_the_threshold_note_ends_the_row_and_moves_no_column(
+        self, tmp_path, fake_engine
+    ):
+        """The per-account threshold is the row's LAST cell, so it never sits
+        between two window columns: the 7d and Fable chips of a row with one
+        start where a row without one starts them, and a row without one gains
+        no trailing padding for it."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "strategy": "best", "model": "Fable"},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(
+                        2, entry=make_entry(60.0, 48.0, scoped=[("Fable", 0.0)])
+                    ),
+                    threshold=70.0,
+                ),
+                make_account(
+                    3, entry=make_entry(60.0, 87.0, scoped=[("Fable", 0.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            with_note = self._row(plain, "user2@example.com")
+            without = self._row(plain, "user3@example.com")
+            assert with_note.endswith("  threshold 70%"), with_note
+            assert "(line" not in plain
+            assert "threshold" not in without
+            assert without == without.rstrip(), repr(without)
+            chips = with_note[: with_note.index("  threshold")]
+            for column in ("7d", "Fable"):
+                assert chips.index(column) == without.index(column), plain
+            assert chips.count("%") == without.count("%") == 3, plain
+
+
+@pytest.mark.asyncio
+class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
+    """Under consume-first the panel's key reads each account against its own
+    line, as the engine's ranking does. Account 2 sits at 5h 92% under a 95%
+    line of its own with the sooner weekly reset; on the global 90 it read as
+    over and fell behind account 3."""
+
+    async def test_an_account_under_its_own_line_keeps_the_soonest_reset(
+        self, tmp_path, fake_engine
+    ):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "strategy": "consume-first"},
+        }))
+        later = make_entry(50.0, 10.0)
+        later.last_good["seven_day"]["resets_at"] = _iso_in(86400 * 5)
+        app = make_app(FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(99.0, 20.0)),
+                with_policy(
+                    make_account(2, entry=make_entry(92.0, 10.0)), threshold=95.0
+                ),
+                make_account(3, entry=later),
+            ],
+            tmp_path,
+        ))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
