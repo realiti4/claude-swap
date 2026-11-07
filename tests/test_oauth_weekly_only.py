@@ -234,12 +234,22 @@ def test_a_fable_bucket_header_is_not_a_7d_window_header(monkeypatch):
     assert "seven_day" not in outcome.usage
 
 
+@pytest.mark.parametrize("five_hour", [
+    pytest.param({"utilization": "1e308"}, id="overflow"),
+    pytest.param({"utilization": "nan"}, id="nan"),
+    pytest.param({"utilization": "inf"}, id="infinity"),
+    pytest.param({"utilization": "-0.1"}, id="negative"),
+    pytest.param({"utilization": ""}, id="empty-string"),
+    pytest.param({"utilization": "high"}, id="string"),
+    pytest.param({"status": "rejected"}, id="status-without-a-figure"),
+])
 def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, five_hour,
 ):
-    # A 429 rejection outranks its unreadable utilization header: the refusal
-    # and its Retry-After are kept, so a healthy cached reading cannot leave the
-    # refused account eligible for a switch.
+    # A 429 rejection outranks its unreadable 5h window, whether the figure
+    # overflows, fails to parse or is missing beside a 5h status header: the
+    # refusal and its Retry-After are kept, so a healthy cached reading cannot
+    # leave the refused account eligible for a switch.
     import email.message
     import time
 
@@ -257,7 +267,7 @@ def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
     headers = email.message.Message()
     for key, value in {
         "anthropic-ratelimit-unified-status": "rejected",
-        "anthropic-ratelimit-unified-5h-utilization": "1e308",
+        **{f"anthropic-ratelimit-unified-5h-{k}": v for k, v in five_hour.items()},
         "anthropic-ratelimit-unified-7d-utilization": "0.6",
         "anthropic-ratelimit-unified-reset": str(int(now + 1800)),
         "Retry-After": "600",
