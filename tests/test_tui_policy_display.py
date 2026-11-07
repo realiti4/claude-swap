@@ -324,12 +324,11 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             )
 
 
-class TestWaitingTailReadsEachAccountsOwnLine:
-    """Both screens order the refused candidates by the soonest binding
-    recovery, read on each account's own line as the engine reads it: "3" sits
-    over its own 60% five-hour line, so the 5h binds and recovers in 2h. Read
-    on the global 90 it would bind on the 7d and recover in 3 days, behind "2",
-    which is over the weekly line and recovers in 1."""
+class TestAFleetOverItsLinesListsTheAdmittedPeerFirstOnBothScreens:
+    """Every account is over its line: "3" over its own 60% five-hour line, "2"
+    over the weekly 97, the active over 90. The engine ranks by room and admits
+    only "3" (10 points against 2's 2); both screens list it first and the
+    refused "2" after it."""
 
     @staticmethod
     def _entry(five_hour, five_hour_resets, seven_day, seven_day_resets):
@@ -342,7 +341,7 @@ class TestWaitingTailReadsEachAccountsOwnLine:
             age_s=0.0,
         )
 
-    def test_the_tail_orders_by_recovery_on_the_accounts_own_line(self):
+    def test_both_screens_list_the_admitted_peer_before_the_refused_one(self):
         snap = AccountsSnapshot(
             accounts=[
                 make_account(1, active=True, entry=self._entry(95.0, 600, 20.0, 86400)),
