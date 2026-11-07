@@ -17,7 +17,8 @@ Measured shapes, one account each:
 
 2026-11-07: an Ultra account carries ``default_claude_max_20x``, organization
 type ``claude_max`` and ``plan_display_name`` "Ultra", so the tier alone does
-not name the plan.
+not name the plan. An Enterprise seat carries ``default_claude_zero`` and no
+plan name, so its organization type claims the label.
 
 ``subscription_status`` does not move at cancellation, only at lapse, so a
 cancelled-but-still-running subscription is indistinguishable from one that
@@ -85,10 +86,12 @@ _TIER_LABELS = {
     "default_claude_max_20x": "Max 20x",
 }
 
-# A seat on a Team organization is not a personal subscription, whatever rate
-# tier the seat carries, so the organization type wins where it is known.
+# A seat on a Team or Enterprise organization is not a personal subscription,
+# whatever rate tier the seat carries, so the organization type wins where it
+# is known.
 _ORG_TYPE_LABELS = {
     "claude_team": "Team",
+    "claude_enterprise": "Enterprise",
 }
 
 _KEPT_FIELDS = (

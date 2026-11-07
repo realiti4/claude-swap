@@ -41,6 +41,14 @@ TEAM = {
     "subscriptionStatus": "active",
     "planDisplayName": None,
 }
+# Measured on an Enterprise seat (2026-11-07): the profile sends no plan name.
+ENTERPRISE = {
+    "tier": "default_claude_zero",
+    "organizationType": "claude_enterprise",
+    "billingType": "stripe_subscription_contracted",
+    "subscriptionStatus": "active",
+    "planDisplayName": None,
+}
 # A plan stored before the name was kept: no key at all, unlike a null one.
 UNNAMED = {"tier": "default_claude_max_5x"}
 # Ultra shares the Max 20x tier string; only the server's plan name separates it.
@@ -178,9 +186,12 @@ class TestFetchPlan:
 
 
 class TestPlanLabel:
-    def test_team_organization_wins_over_the_seat_tier(self):
-        assert subscription.plan_label(TEAM) == "Team"
-        assert subscription.plan_label({**TEAM, "planDisplayName": "Ultra"}) == "Team"
+    @pytest.mark.parametrize(
+        "plan, label", [(TEAM, "Team"), (ENTERPRISE, "Enterprise")]
+    )
+    def test_organization_wins_over_the_seat_tier(self, plan, label):
+        assert subscription.plan_label(plan) == label
+        assert subscription.plan_label({**plan, "planDisplayName": "Ultra"}) == label
 
     @pytest.mark.parametrize(
         "tier, name, label",
