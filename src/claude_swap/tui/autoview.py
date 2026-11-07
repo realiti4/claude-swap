@@ -79,87 +79,153 @@ _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 
 def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
-    """The "threshold 97%" status piece, once a weekly line or the
-    account's own threshold makes the lines differ: the chip's raw pct stays,
-    and the threshold it is judged against is named only where it is not the one
-    number in the header. Empty unless `label` is the BINDING window's."""
+    """The line's pct ("97%") for the "limit 97%" status piece, once a weekly
+    line or the account's own threshold makes the lines differ: the chip's raw
+    pct stays, and the line it is judged against is named only where it is not
+    the one number in the header. Empty unless `label` is the BINDING window's."""
     if not noted or binding is None or label != binding.label:
         return ""
-    return f"threshold {pct_label(binding.line)}%"
+    return f"{pct_label(binding.line)}%"
 
 
 # Every per-account reason a Next best row is not a plain candidate, in the one
-# order they read. A new marker registers by adding its key here; only "block"
-# and "threshold" have a producer on this branch.
+# order they read: the limits reached, the other reasons, auto-swap off. A new
+# marker registers by adding its key here; only "block" and "threshold" have a
+# producer on this branch.
 STATUS_ORDER = (
-    "stale", "no-plan", "walled", "block", "capped", "threshold", "at-line",
+    "capped", "at-line", "block", "walled", "threshold", "stale", "no-plan",
     "not-candidate", "disabled",
 )
+
+EMAIL_FLOOR = 12  # display columns the email slot is cut to, at the least
 
 
 @dataclass
 class CandidateRow:
     """One Next best row as named slots. A producer fills a slot and never
-    pads it: `render_candidate_rows` owns every column."""
+    pads it: `render_candidate_rows` owns every column. `status` and `where`
+    render as ONE trailing note, `where` last."""
 
     number: Text
     email: Text
     usage: Text  # the chip block, the spend text, or the sentinel note
     login: Text = field(default_factory=Text)
     status: dict[str, Text] = field(default_factory=dict)  # keys of STATUS_ORDER
-    where: Text = field(default_factory=Text)  # where-in-use markers, last cell
+    # The short form of a status piece, for a narrow panel; a key without one
+    # keeps its long text.
+    short: dict[str, Text] = field(default_factory=dict)
+    where: Text = field(default_factory=Text)  # where-in-use markers, joined by " · "
     note: bool = False  # usage is free text (a sentinel note): it sizes no column
 
     def __post_init__(self) -> None:
-        if unknown := self.status.keys() - set(STATUS_ORDER):
-            raise ValueError(f"status key not in STATUS_ORDER: {sorted(unknown)}")
+        for pieces in (self.status, self.short):
+            if unknown := pieces.keys() - set(STATUS_ORDER):
+                raise ValueError(f"status key not in STATUS_ORDER: {sorted(unknown)}")
         # A marker never pads itself; usage is exempt, its chip blanks pad on purpose.
-        for cell in (self.login, self.where, *self.status.values()):
+        for cell in (self.login, self.where, *self.status.values(), *self.short.values()):
             if cell.plain != cell.plain.strip():
                 raise ValueError(
                     f"marker has leading or trailing whitespace: {cell.plain!r}"
                 )
 
 
-def render_candidate_rows(rows: list[CandidateRow], palette: Palette) -> Text:
+def _cut(cell: Text, width: int) -> Text:
+    """`cell` in at most `width` display columns, ending in `…` where it is cut."""
+    cell = cell.copy()
+    cell.truncate(width, overflow="ellipsis")
+    return cell
+
+
+def render_candidate_rows(
+    rows: list[CandidateRow], palette: Palette, width: int | None = None
+) -> Text:
     """The block's rows, each led by a newline, every slot starting in one
     display column on all of them. A slot is as wide as its widest cell over
     every row that fills it; a free-text usage note sizes nothing, and a slot
-    empty on every row takes no column at all."""
+    empty on every row takes no column at all. The status pieces and `where`
+    are one trailing note cell, joined by a dot, `where` last.
+
+    Over `width`, the block takes ONE form so its columns stay aligned. In
+    this order it gives up: the email slot, cut to a shared width no narrower
+    than EMAIL_FLOOR; the long status texts for their short ones; last, the
+    note itself, cut to the room left. The usage slot is never cut."""
     sep = Text(" \u00b7 ", style=palette.muted)
-    grid = []
-    for row in rows:
-        status = Text()
-        for key in STATUS_ORDER:
-            if key in row.status:
-                if status:
-                    status.append_text(sep)
-                status.append_text(row.status[key])
-        grid.append([row.number, row.email, row.login, row.usage, status, row.where])
-    usage = 3
-    widths = [2, 0, 0, 0, 0, 0]  # the number is right-aligned, two wide at least
-    used = [False] * len(widths)
-    for row, cells in zip(rows, grid):
-        for i, cell in enumerate(cells):
-            used[i] |= bool(cell)
-            if not (i == usage and row.note):
-                widths[i] = max(widths[i], cell.cell_len)
+
+    def note(row: CandidateRow, short: bool) -> Text:
+        pieces = [
+            (row.short.get(key) if short else None) or row.status[key]
+            for key in STATUS_ORDER if key in row.status
+        ]
+        if row.where:
+            # Each marker's leading glyph (`○ cloud` -> `○`).
+            pieces.append(Text(" ").join(
+                marker[: len(marker.plain.partition(" ")[0])]
+                for marker in row.where.split(" \u00b7 ")
+            ) if short else row.where)
+        out = Text()
+        for piece in pieces:
+            if out:
+                out.append_text(sep)
+            out.append_text(piece)
+        return out
+
+    def lines(email: int, short: bool, room: int | None = None) -> list[Text]:
+        """Every row at an email slot of at most `email` columns; with `room`,
+        a note is cut to end by that column."""
+        grid = [
+            [row.number, _cut(row.email, email), row.login, row.usage, note(row, short)]
+            for row in rows
+        ]
+        usage = 3
+        widths = [2, 0, 0, 0, 0]  # the number is right-aligned, two wide at least
+        used = [False] * len(widths)
+        for row, cells in zip(rows, grid):
+            for i, cell in enumerate(cells):
+                used[i] |= bool(cell)
+                if not (i == usage and row.note):
+                    widths[i] = max(widths[i], cell.cell_len)
+        out = []
+        for cells in grid:
+            line = Text()
+            for i, cell in enumerate(cells):
+                if i and not used[i]:
+                    continue
+                if room is not None and i == len(cells) - 1:
+                    if (left := room - line.cell_len - 2) < 1:
+                        continue
+                    cell = _cut(cell, left)
+                else:
+                    cell = cell.copy()
+                # A note wider than usage overflows on its own row; the next slot follows it.
+                pad = max(0, widths[i] - cell.cell_len)
+                if i:
+                    cell.pad_right(pad)
+                else:
+                    cell.pad_left(pad)
+                line.append("  ")  # the row's indent, then the gutter between slots
+                line.append_text(cell)
+            line.rstrip()
+            out.append(line)
+        return out
+
+    limit = 10**9 if width is None else width
+
+    def over(block: list[Text]) -> int:
+        return max((line.cell_len for line in block), default=0) - limit
+
+    widest = max((row.email.cell_len for row in rows), default=0)
+    for short in (False, True):
+        shown = lines(widest, short)
+        if over(shown) <= 0:
+            break
+        shown = lines(max(EMAIL_FLOOR, widest - over(shown)), short)
+        if over(shown) <= 0:
+            break
+    else:
+        shown = lines(EMAIL_FLOOR, True, room=limit)
     out = Text()
-    for cells in grid:
-        line = Text("\n")
-        for i, cell in enumerate(cells):
-            if i and not used[i]:
-                continue
-            cell = cell.copy()
-            # A note wider than usage overflows on its own row; the next slot follows it.
-            pad = max(0, widths[i] - cell.cell_len)
-            if i:
-                cell.pad_right(pad)
-            else:
-                cell.pad_left(pad)
-            line.append("  ")  # the row's indent, then the gutter between slots
-            line.append_text(cell)
-        line.rstrip()
+    for line in shown:
+        out.append("\n")
         out.append_text(line)
     return out
 
@@ -598,6 +664,7 @@ class AutoScreen(Screen):
             )
             usage = Text()
             status: dict[str, Text] = {}
+            short: dict[str, Text] = {}
             free_text = False
             if acc.usage.sentinel is not None:
                 free_text = True
@@ -673,15 +740,15 @@ class AutoScreen(Screen):
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows), line, weekly
                     )
-                if kind == "model":
-                    status["block"] = Text(f"{blocked_model}-only", style=palette.muted)
-                elif kind == "full":
-                    status["block"] = Text(f"{blocked_model} full", style=palette.muted)
+                if kind in ("model", "full"):
+                    status["block"] = Text(f"{blocked_model} limit reached", style=palette.muted)
+                    short["block"] = Text(f"{blocked_model} full", style=palette.muted)
                 # Only when the binding window's chip was drawn above.
                 if binding.label in have:
-                    note = _line_note(binding, binding.label, noted(acc))
-                    if note:
-                        status["threshold"] = Text(note, style=palette.muted)
+                    pct = _line_note(binding, binding.label, noted(acc))
+                    if pct:
+                        status["threshold"] = Text(f"limit {pct}", style=palette.muted)
+                        short["threshold"] = Text(f"lim {pct}", style=palette.muted)
                 rank_binding = binding_window(
                     oauth.relevant_windows(acc.usage.last_good, rank_models),
                     line,
@@ -706,6 +773,7 @@ class AutoScreen(Screen):
                 Text(acc.email, style=palette.foreground),
                 usage,
                 status=status,
+                short=short,
                 note=free_text,
             )
 
@@ -717,7 +785,15 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
+        # The box has no width before its first layout (the app's less its
+        # padding), and a screen built with `__new__` has no `_nodes` to query.
+        try:
+            box = self.query_one("#candidates", Static)
+        except AttributeError:
+            width = None
+        else:
+            width = box.size.width or self.app.size.width - 4
         text.append_text(render_candidate_rows(
-            [rows[number] for _key, number in sorted(ranked)], palette
+            [rows[number] for _key, number in sorted(ranked)], palette, width
         ))
         return text

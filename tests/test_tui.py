@@ -1989,8 +1989,8 @@ class TestAutoScreen:
                 next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
                 for n in (2, 3)
             )
-            assert re.search(r"7d\S*:\s*93%", row2) and row2.endswith("threshold 97%"), plain
-            assert re.search(r"5h\S*:\s*95%", row3) and row3.endswith("threshold 85%"), plain
+            assert re.search(r"7d\S*:\s*93%", row2) and row2.endswith("limit 97%"), plain
+            assert re.search(r"5h\S*:\s*95%", row3) and row3.endswith("limit 85%"), plain
             summary = app.screen.query_one("#auto-summary", Static).render().plain
             assert "threshold 85%" in summary and "weekly 97%" in summary
             assert app.weekly_threshold_pct == 97.0
@@ -2025,7 +2025,7 @@ class TestAutoScreen:
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user3@example.com") < plain.index("user2@example.com")
             row2 = next(ln for ln in plain.splitlines() if "user2@" in ln)
-            assert re.search(r"5h\S*:\s*83%", row2) and row2.endswith("threshold 85%"), plain
+            assert re.search(r"5h\S*:\s*83%", row2) and row2.endswith("limit 85%"), plain
             await pilot.press("t", "right", "right", "right")
             await pilot.pause()
             assert app.screen._settings.threshold == 88.0
@@ -2035,8 +2035,8 @@ class TestAutoScreen:
                 next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
                 for n in (2, 3)
             )
-            assert re.search(r"5h\S*:\s*83%", row2) and row2.endswith("threshold 88%"), plain
-            assert re.search(r"7d\S*:\s*93%", row3) and row3.endswith("threshold 97%"), plain
+            assert re.search(r"5h\S*:\s*83%", row2) and row2.endswith("limit 88%"), plain
+            assert re.search(r"7d\S*:\s*93%", row3) and row3.endswith("limit 97%"), plain
 
     async def test_candidates_show_no_line_without_a_weekly_one(
         self, tmp_path, fake_engine
@@ -2064,7 +2064,7 @@ class TestAutoScreen:
     async def test_the_line_note_keeps_the_chip_columns_and_the_block_label_on_one_line_set(
         self, tmp_path, fake_engine
     ):
-        """The `threshold N%` note is the row's last cell, outside every chip
+        """The `limit N%` note is the row's last cell, outside every chip
         column, so the chips start where the other rows' do, and the block label
         reads the same lines the chips are judged against: 7d 93% under a 97
         line is no block, 5h 95% over an 85 line is."""
@@ -2092,9 +2092,53 @@ class TestAutoScreen:
             rows = [ln for ln in plain.splitlines() if "@example.com" in ln]
             assert len(rows) == 2
             assert len({ln.index("7d(") for ln in rows}) == 1, plain
-            assert rows[0].endswith("threshold 97%"), plain
-            assert rows[1].endswith("threshold 85%"), plain
-            assert "5h full" in rows[1] and "7d full" not in plain, plain
+            assert rows[0].endswith("limit 97%"), plain
+            assert rows[1].endswith("limit 85%"), plain
+            assert "5h limit reached" in rows[1] and "7d limit reached" not in plain, plain
+
+    async def test_candidates_are_fitted_to_the_panel_width(
+        self, tmp_path, fake_engine
+    ):
+        """The rows are laid out at the width the panel has: the emails give
+        way first, then the notes take their short forms, and no row is wider
+        than the panel (a wider one wraps, and the wrapped pct reads wrong)."""
+        import json as _json
+
+        from rich.cells import cell_len
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 93.0),
+                             email="a.very.long.address.indeed@example-company.com"),
+                make_account(3, entry=make_entry(95.0, 47.0)),
+            ],
+            tmp_path,
+        )
+        seen = {}
+        for width in (100, 75):
+            app = make_app(fake)
+            async with app.run_test(size=(width, 40)) as pilot:
+                await self._open(pilot)
+                await settle(pilot)
+                from textual.widgets import Static
+
+                plain = app.screen.query_one("#candidates", Static).render().plain
+                seen[width] = [
+                    ln for ln in plain.splitlines() if re.match(r"\s+[23]  ", ln)
+                ]
+            assert len(seen[width]) == 2, plain
+            assert all(cell_len(ln) <= width - 4 for ln in seen[width]), seen[width]
+            assert all(re.search(r"(5h|7d)\S*:\s*\d+%", ln) for ln in seen[width])
+        assert seen[100][1].endswith("5h limit reached \u00b7 limit 85%"), seen[100]
+        assert seen[75][1].endswith("5h full \u00b7 lim 85%"), seen[75]
+        # The long address is cut at both widths; the short one only at the narrow.
+        assert "user3@example.com" in seen[100][1], seen[100]
+        assert "user3@example.com" not in seen[75][1], seen[75]
 
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
@@ -2841,7 +2885,7 @@ class TestUnswitchableRowsAreListed:
         assert order == sorted(order), f"column order: {order} in {row!r}"
 
     def test_markers_start_in_one_column_and_a_bare_row_has_no_trailing_pad(self):
-        """The `-only` / `full` marker follows the chips, so it started
+        """The `limit reached` marker follows the chips, so it started
         wherever the last chip happened to end. It must start at ONE column
         on every row that has one, including a row that lacks the trailing
         window (no Fable chip, so its block is shorter), and a row with no
@@ -2869,7 +2913,7 @@ class TestUnswitchableRowsAreListed:
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
         assert len(rows) == 3, rows
         starts = {
-            e: m.start(1) if (m := re.search(r"\s{2}(\S+-only|\S+ full)$", line)) else None
+            e: m.start(1) if (m := re.search(r"\s{2}(\S+ limit reached)$", line)) else None
             for e, line in rows.items()
         }
         assert starts["aaaa@x.com"] is not None, rows
@@ -2877,9 +2921,9 @@ class TestUnswitchableRowsAreListed:
         assert starts["cccc@x.com"] is None and rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows
 
     def test_the_threshold_note_starts_in_the_status_column_on_every_row(self):
-        """The `threshold N%` note used to trail whatever the row carried, so
-        it sat at the chips' end on one row and after `5h full` on the next.
-        It is a status piece: one column, with the block kind before it."""
+        """The `limit N%` note used to trail whatever the row carried, so
+        it sat at the chips' end on one row and after `5h limit reached` on the
+        next. It is a status piece: one column, with the block kind before it."""
         from rich.cells import cell_len
 
         from claude_swap.settings import AutoSwitchSettings
@@ -2894,10 +2938,10 @@ class TestUnswitchableRowsAreListed:
             }),
         ), active="1", settings=AutoSwitchSettings(threshold=90.0, weekly_threshold=70.0))
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
-        assert rows["noted@x.com"].endswith("threshold 70%"), rows
-        assert rows["much-longer@x.com"].endswith("5h full \u00b7 threshold 90%"), rows
+        assert rows["noted@x.com"].endswith("limit 70%"), rows
+        assert rows["much-longer@x.com"].endswith("5h limit reached \u00b7 limit 90%"), rows
         starts = {
-            cell_len(line[: line.index("5h full" if "5h full" in line else "threshold")])
+            cell_len(line[: line.index("5h limit reached" if "5h limit reached" in line else "limit 70%")])
             for line in rows.values()
         }
         assert len(starts) == 1, f"the status column moved: {rows!r}"
@@ -2927,8 +2971,8 @@ class TestUnswitchableRowsAreListed:
                 "scoped": [{"name": "Fable", "pct": 10.0}],
             }),
         ), active="1", settings=settings)
-        assert "Fable-only" in out, out
-        assert "  5h full" in out, out
+        assert "Fable limit reached" in out, out
+        assert "  5h limit reached" in out, out
 
     def test_the_block_label_judges_an_account_on_its_own_line(self):
         """5h 50% is under the global 90 but over this account's own 40, and
@@ -2943,14 +2987,14 @@ class TestUnswitchableRowsAreListed:
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True), own,
         ), active="1", settings=AutoSwitchSettings(threshold=90.0))
-        assert "  5h full" in out, out
+        assert "  5h limit reached" in out, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
         `model`-blocked row used to name the scoped window in its label
         while the chips, built from a literal 5h/7d pair, never printed it
         at all. Account #4's real values: 5h 28%, 7d 70%, Fable 91%,
-        threshold 90, model Fable — the label already read `Fable-only`;
+        threshold 90, model Fable — the label already read `Fable limit reached`;
         the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%`."""
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2962,7 +3006,7 @@ class TestUnswitchableRowsAreListed:
                 "scoped": [{"name": "Fable", "pct": 91.0}],
             }),
         ), active="1", settings=settings)
-        assert "Fable-only" in out, out
+        assert "Fable limit reached" in out, out
         assert "Fable:91%" in out, out
 
     def test_panel_top_matches_the_engines_pick_under_consume_first(
@@ -3060,9 +3104,9 @@ _SLOT_PAIRWISE = [
 ]
 _SLOT_STATUS_TEXT = {
     "stale": "stale", "no-plan": "no plan", "walled": "Fable-walled",
-    "block": "Fable-only", "capped": "7d capped", "threshold": "threshold 70%",
+    "block": "Fable limit reached", "capped": "7d capped", "threshold": "limit 70%",
     "at-line": "at switch line", "not-candidate": "not a candidate",
-    "disabled": "auto-swap disabled",
+    "disabled": "auto-swap off",
 }
 _SLOT_USAGE_TEXT = {
     "chip": "5h:25% · 7d:10%",
@@ -3073,11 +3117,12 @@ _SLOT_USAGE_TEXT = {
 
 class TestNextBestRowSlots:
     """`render_candidate_rows` is the one place a Next best row is padded:
-    every marker is a named slot (number | email | login | usage | status |
-    where), and a slot starts in the SAME display column on every row of the
-    block. Each PR that added a marker used to pad it itself, and the
-    integration build stitched the paddings with sweep edits, so the owner's
-    rows moved every time one landed."""
+    every marker is a named slot (number | email | login | usage | note), the
+    note being the status pieces then `where` in one cell, and a slot starts
+    in the SAME display column on every row of the block. Each PR that added a
+    marker used to pad it itself, and the integration build stitched the
+    paddings with sweep edits, so the owner's rows moved every time one
+    landed."""
 
     def _row(self, number, usage="chip", login=False, where=False, wide=False,
              on=()):
@@ -3096,15 +3141,15 @@ class TestNextBestRowSlots:
             note=usage not in ("chip", "spend"),
         )
 
-    def _render(self, rows):
+    def _render(self, rows, width=None):
         from claude_swap.tui.autoview import render_candidate_rows
         from claude_swap.tui.theme import CSWAP_DARK, Palette
 
         return render_candidate_rows(
-            rows, Palette.from_theme(CSWAP_DARK)
+            rows, Palette.from_theme(CSWAP_DARK), width
         ).plain.split("\n")[1:]
 
-    _SLOTS = ("number", "email", "login", "usage", "status", "where")
+    _SLOTS = ("number", "email", "login", "usage", "note")
 
     def _aligned(self, rows):
         """Render `rows` and assert every slot starts in one display column on
@@ -3120,14 +3165,15 @@ class TestNextBestRowSlots:
         ends: dict[str, set[int]] = {}
         for row, line in zip(rows, lines):
             assert line == line.rstrip(), f"trailing pad: {line!r}"
-            # Statuses read in STATUS_ORDER, joined by " · ", whatever subset.
-            status = " · ".join(
-                row.status[k].plain for k in STATUS_ORDER if k in row.status
+            # Statuses read in STATUS_ORDER, `where` last, joined by " · ".
+            note = " · ".join(
+                [row.status[k].plain for k in STATUS_ORDER if k in row.status]
+                + [row.where.plain] * bool(row.where)
             )
             pos = 0
             for slot, text in zip(self._SLOTS, (
                 row.number.plain, row.email.plain, row.login.plain,
-                row.usage.plain, status, row.where.plain,
+                row.usage.plain, note,
             )):
                 if not text:
                     continue
@@ -3151,23 +3197,26 @@ class TestNextBestRowSlots:
         # A new status key must be added to the table above, or this guard
         # would stop covering it.
         assert set(_SLOT_STATUS_TEXT) == set(STATUS_ORDER)
-        assert STATUS_ORDER.index("capped") == STATUS_ORDER.index("block") + 1
+        assert STATUS_ORDER == (
+            "capped", "at-line", "block", "walled", "threshold", "stale",
+            "no-plan", "not-candidate", "disabled",
+        )
         rows = [self._row(i, *case) for i, case in enumerate(_SLOT_PAIRWISE, 10)]
         rows += [self._row(i, on=(k,)) for i, k in enumerate(STATUS_ORDER, 30)]
         rows.append(self._row(40, login=True, where=True, on=tuple(STATUS_ORDER)))
         rows.append(self._row(41))
         self._aligned(rows)
 
-    def test_a_status_only_row_and_a_where_only_row_share_the_columns(self):
-        """A row ending in its status and a row holding only `where` (the
-        pinned account's cloud badge): the status column is as wide as the
-        status, so the badge starts clear of it, not two cells in."""
+    def test_a_status_only_row_and_a_where_only_row_share_the_note_column(self):
+        """A row holding a status and a row holding only `where` (the pinned
+        account's cloud badge) start their note in one column, and a row with
+        both ends in `where`, after the status and a dot."""
         lines = self._aligned([
             self._row(1, on=("block",)), self._row(2, where=True),
+            self._row(3, on=("block",), where=True),
         ])
-        assert lines[1].index("○ cloud") == (
-            lines[0].index("Fable-only") + len("Fable-only") + 2
-        )
+        assert lines[1].index("○ cloud") == lines[0].index("Fable limit reached")
+        assert lines[2].endswith("Fable limit reached \u00b7 ○ cloud")
 
     def test_a_spend_row_sizes_usage_beside_chip_rows(self):
         """The API-pay spend row is wider than a chip block. Whether it ends
@@ -3179,17 +3228,109 @@ class TestNextBestRowSlots:
             ])
 
     def test_an_empty_column_takes_no_space_and_a_free_text_note_sizes_nothing(self):
-        """No login or where anywhere: the usage slot sits two cells after the
+        """No login or note anywhere: the usage slot sits two cells after the
         email, as before. A free-text note (an unswitchable slot's sentinel)
         sizes no column, so a long one does not push the status column out,
         and the slot after it follows the note after the gutter."""
         short = [self._row(1, on=("threshold",)), self._row(2, usage="spend")]
         assert self._render(short)[0] == (
-            f"   1  u1@x.com  {_SLOT_USAGE_TEXT['chip']:<26}  threshold 70%"
+            f"   1  u1@x.com  {_SLOT_USAGE_TEXT['chip']:<26}  limit 70%"
         )
         long_note = self._row(3, usage="x" * 80, where=True)
         assert self._render(short + [long_note])[0] == self._render(short)[0]
         assert self._render([long_note])[0] == f"   3  u3@x.com  {'x' * 80}  ○ cloud"
+
+    # -- the fit: one form for the whole block, the email giving way first ----
+
+    _NOTES = {
+        "cloud": "○ cloud",
+        "limit": "limit 97% reached",
+        "own+off": "limit 70% reached · auto-swap off",
+        "off": "auto-swap off",
+        "cloud+limit": "limit 97% reached · ○ cloud",
+    }
+    _SHORT_NOTES = {
+        "cloud": "○", "limit": "lim 97%", "own+off": "lim 70% · auto-swap off",
+        "off": "auto-swap off", "cloud+limit": "lim 97% · ○",
+    }
+
+    def _note_rows(self):
+        """One row of each note kind, on 45-column emails and the 15-column
+        chip block, so a row is 25 + email + note columns wide."""
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        rows = []
+        for number, kind in enumerate(self._NOTES, 1):
+            status, short = {}, {}
+            if kind in ("limit", "own+off", "cloud+limit"):
+                pct = 70 if kind == "own+off" else 97
+                status["capped"] = Text(f"limit {pct}% reached")
+                short["capped"] = Text(f"lim {pct}%")
+            if kind in ("own+off", "off"):
+                status["disabled"] = Text("auto-swap off")
+            rows.append(CandidateRow(
+                number=Text(str(number)),
+                email=Text(f"someone.with.a.long.name{number}@example-company.com"),
+                usage=Text(_SLOT_USAGE_TEXT["chip"]),
+                status=status, short=short,
+                where=Text("○ cloud" if "cloud" in kind else ""),
+            ))
+        return rows
+
+    def _fit(self, width, notes):
+        """Render the note rows at `width`: every row's note is `notes[kind]`,
+        starts in one display column, and no row is wider than `width`.
+        Returns the lines and the email slot's width."""
+        from rich.cells import cell_len
+
+        lines = self._render(self._note_rows(), width)
+        assert len(lines) == len(notes)
+        starts = set()
+        for note, line in zip(notes.values(), lines):
+            assert cell_len(line) <= width, line
+            assert line.endswith(note), (note, line)
+            assert "5h:25% · 7d:10%" in line, line  # every pct whole
+            starts.add(cell_len(line) - cell_len(note))
+        assert len(starts) == 1, lines
+        slots = {line.index("5h:25%") - 2 - 6 for line in lines}  # indent, number, gutter
+        assert len(slots) == 1, lines
+        return lines, slots.pop()
+
+    def test_at_width_200_every_row_keeps_its_email_and_its_long_note(self):
+        lines, slot = self._fit(200, self._NOTES)
+        assert slot == 45
+        assert not any("…" in line for line in lines), lines
+
+    def test_at_width_80_the_email_is_cut_before_any_note_gives_a_word(self):
+        lines, slot = self._fit(80, self._NOTES)
+        assert slot == 22  # 25 + 33 for the widest long note, the email takes the rest
+        assert all(line[6:6 + slot].endswith("…") for line in lines), lines
+
+    def test_the_short_forms_come_only_when_the_long_ones_miss_the_email_floor(self):
+        from claude_swap.tui.autoview import EMAIL_FLOOR
+
+        assert EMAIL_FLOOR == 12
+        _lines, slot = self._fit(70, self._NOTES)  # 25 + 12 + 33
+        assert slot == EMAIL_FLOOR
+        # One column fewer: every row gives its long form up at once, and the
+        # email takes back what the short forms free (a piece without a short
+        # form keeps its long one).
+        _lines, slot = self._fit(69, self._SHORT_NOTES)
+        assert slot == 69 - 25 - 23
+
+    def test_the_note_is_cut_last_and_the_usage_slot_never(self):
+        notes = dict(self._SHORT_NOTES, **{"own+off": "lim 70% · au…"})
+        _lines, slot = self._fit(50, notes)  # the note column starts at 37
+        assert slot == 12
+        lines = self._render(self._note_rows(), 30)  # no room left for any note
+        assert all(line.endswith("5h:25% · 7d:10%") for line in lines), lines
+
+    def test_without_a_width_nothing_is_cut(self):
+        rows = self._note_rows()
+        assert self._render(rows) == self._render(rows, 10**6)
+        assert not any("…" in line for line in self._render(rows))
 
     def test_a_status_key_outside_the_order_is_refused(self):
         from rich.text import Text
@@ -3202,7 +3343,18 @@ class TestNextBestRowSlots:
                 status={"mystery": Text("m")},
             )
 
-    @pytest.mark.parametrize("cell", ["login", "where", "status"])
+    def test_a_short_key_outside_the_order_is_refused(self):
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        with pytest.raises(ValueError, match="mystery"):
+            CandidateRow(
+                Text("1"), Text("a@x.com"), Text("u"),
+                short={"mystery": Text("m")},
+            )
+
+    @pytest.mark.parametrize("cell", ["login", "where", "status", "short"])
     @pytest.mark.parametrize("text", [" pad", "pad ", " "])
     def test_a_marker_that_pads_itself_is_refused(self, cell, text):
         """The renderer owns every column: a producer's own blanks would
@@ -3211,7 +3363,7 @@ class TestNextBestRowSlots:
 
         from claude_swap.tui.autoview import CandidateRow
 
-        kwargs = {"status": {"block": Text(text)}} if cell == "status" else {
+        kwargs = {cell: {"block": Text(text)}} if cell in ("status", "short") else {
             cell: Text(text)
         }
         with pytest.raises(ValueError, match="whitespace"):

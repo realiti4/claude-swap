@@ -210,8 +210,8 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 "user2@example.com"
             )
             row2 = golden_form(self._row(plain, "user2@example.com"))
-            assert "5h:50%" in row2 and row2.endswith("threshold 60%"), row2
-            assert "threshold" not in self._row(plain, "user3@example.com")
+            assert "5h:50%" in row2 and row2.endswith("limit 60%"), row2
+            assert "limit" not in self._row(plain, "user3@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
         self, tmp_path, fake_engine
@@ -232,7 +232,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 "user2@example.com"
             )
             row2 = golden_form(self._row(plain, "user2@example.com"))
-            assert "5h:50%" in row2 and row2.endswith("threshold 60%"), row2
+            assert "5h:50%" in row2 and row2.endswith("limit 60%"), row2
 
 
     async def test_the_threshold_note_ends_the_row_and_moves_no_column(
@@ -270,11 +270,11 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             plain = app.screen.query_one("#candidates", Static).render().plain
             with_note = self._row(plain, "user2@example.com")
             without = self._row(plain, "user3@example.com")
-            assert with_note.endswith("  threshold 70%"), with_note
+            assert with_note.endswith("  limit 70%"), with_note
             assert "(line" not in plain
-            assert "threshold" not in without
+            assert "limit" not in without
             assert without == without.rstrip(), repr(without)
-            chips = with_note[: with_note.index("  threshold")]
+            chips = with_note[: with_note.index("  limit")]
             for column in ("7d", "Fable"):
                 assert chips.index(column) == without.index(column), plain
             assert chips.count("%") == without.count("%") == 3, plain
