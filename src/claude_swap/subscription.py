@@ -74,7 +74,8 @@ MAX_RETRY_S = 24 * 3600
 
 FREE_TIER = "default_claude_ai"
 
-# Fallback for a record with no planDisplayName, until PLAN_TTL_S renews it.
+# Used when a record has no planDisplayName (until PLAN_TTL_S renews it), and
+# when the server's name is only a prefix of the table label ("Max" vs "Max 5x").
 # Only values that have actually been observed. An unknown tier falls back to
 # the raw string rather than a guessed label — a wrong "Pro" is worse than an
 # honest "default_claude_pro".
@@ -191,7 +192,11 @@ def plan_label(plan: dict | None) -> str | None:
     # The server's name wins unless the table names the same plan more
     # precisely ("Max" vs "Max 5x"); Ultra shares the Max 20x tier string.
     name = plan.get("planDisplayName")
-    if isinstance(name, str) and name and not label.startswith(name):
+    if (
+        isinstance(name, str)
+        and name
+        and not (isinstance(label, str) and label.startswith(name))
+    ):
         return name
     return label
 

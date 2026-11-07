@@ -181,6 +181,7 @@ class TestPlanLabel:
             ("default_claude_max_5x", "Max", "Max 5x"),
             ("default_claude_max_5x", "", "Max 5x"),
             ("default_claude_pro", "Pro", "Pro"),
+            (None, "Ultra", "Ultra"),
         ],
     )
     def test_server_name_wins_unless_the_table_is_more_precise(
