@@ -461,8 +461,8 @@ def is_setup_token(oauth: dict | None) -> bool:
 
 
 # Marks a usage dict read from rate-limit headers (``usage["source"]``). The
-# headers can omit a window the endpoint always reports, so such a reading
-# gates decisions only when it is complete (see :func:`relevant_windows`).
+# headers can omit a window the endpoint reports, so such a reading gates
+# decisions only when it is complete (see :func:`relevant_windows`).
 USAGE_SOURCE_HEADERS = "headers"
 
 # Unified rate-limit header prefix → usage API window key.
@@ -487,6 +487,12 @@ def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
     return round(fraction * 100, 2), _epoch_header_iso(headers.get(f"{base}-reset"))
 
 
+def _unified_window_present(headers, prefix: str) -> bool:
+    """Whether any ``anthropic-ratelimit-unified-<prefix>-*`` header is sent."""
+    start = f"anthropic-ratelimit-unified-{prefix}-"
+    return any(k.lower().startswith(start) for k in headers.keys())
+
+
 def _epoch_header_iso(raw) -> str | None:
     """An epoch-seconds header value as ISO 8601, or None when unusable."""
     try:
@@ -504,7 +510,9 @@ def parse_unified_ratelimit_headers(headers) -> dict:
 
     ``-utilization`` is a 0-1 fraction (the API's ``utilization`` is a
     percentage) and ``-reset`` is epoch seconds (the API's ``resets_at`` is
-    ISO 8601). A window with a missing or unusable utilization is left out.
+    ISO 8601). A 5h or 7d window with no header at all is left out; one whose
+    headers are present without a usable utilization is kept so
+    :func:`build_usage_result` rejects it.
     Fable's ``7d_oi`` bucket becomes a ``weekly_scoped`` limit named "Fable";
     the headers carry no other per-model window and no ``extra_usage``.
     A ``rejected`` unified status adds a ``rejected`` entry (see
@@ -514,6 +522,8 @@ def parse_unified_ratelimit_headers(headers) -> dict:
     for prefix, key in _UNIFIED_WINDOWS:
         window = _unified_window(headers, prefix)
         if window is None:
+            if _unified_window_present(headers, prefix):
+                data[key] = {"utilization": math.nan}  # unusable: fail the reading
             continue
         pct, resets_at = window
         data[key] = {"utilization": pct}
@@ -653,10 +663,9 @@ def _reported_window(data: dict, key: str) -> dict | None:
 
     Absent means missing or ``null``: from the usage endpoint, a limit the
     account does not have (a verified Ultra account reports ``five_hour:
-    null``); from the header probe, a window it did not carry, which
-    :func:`relevant_windows` treats as incomplete. ``{}`` counts as absent
-    too, a compatibility exception for the falsy check this replaces. Any
-    other non-object value is a malformed response.
+    null``); from the header probe, a window it did not carry. ``{}`` counts
+    as absent too, a compatibility exception for the falsy check this
+    replaces. Any other non-object value is a malformed response.
     """
     if key not in data or data[key] is None:
         return None
@@ -837,11 +846,13 @@ REJECTED_LABEL = "rejected"
 def _header_reading_complete(usage: dict, models: Sequence[str]) -> bool:
     """Whether a header-probe reading carries every window a decision needs.
 
-    The 5h and 7d windows always, plus each configured per-model window; the
-    headers only carry Fable's, so ``all`` (every per-model window the
-    account has) can never be shown complete.
+    The 7d window always, plus each configured per-model window; the headers
+    only carry Fable's, so ``all`` (every per-model window the account has)
+    can never be shown complete. A missing 5h window is not a gap: an Ultra
+    account has none (a 5h header without a usable utilization fails the
+    reading instead, see :func:`parse_unified_ratelimit_headers`).
     """
-    if not all(isinstance(usage.get(k), dict) for k in ("five_hour", "seven_day")):
+    if not isinstance(usage.get("seven_day"), dict):
         return False
     if not models:
         return True
@@ -876,7 +887,8 @@ def relevant_windows(
     A header-probe reading (``source: headers``) missing any window the
     decision needs (:func:`_header_reading_complete`) yields none of its
     windows, so it reads as unknown — still shown, never ranked: one 5h
-    window at 5% must not pass for 95% headroom. A refused probe
+    window at 5% must not pass for 95% headroom. A reading without a 5h
+    window is complete unless a per-model window is needed. A refused probe
     (``rejected``) adds a 100% ``"rejected"`` window resetting when the
     refusal ends, so the account reads as at its limit until then.
     """
