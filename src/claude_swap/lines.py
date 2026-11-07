@@ -33,7 +33,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from claude_swap.oauth import FIVE_HOUR_LABEL
+from claude_swap.oauth import FIVE_HOUR_LABEL, relevant_windows
 
 
 def window_line(label: str, threshold: float, weekly_threshold: float | None) -> float:
@@ -43,6 +43,27 @@ def window_line(label: str, threshold: float, weekly_threshold: float | None) ->
     if weekly_threshold is None or label == FIVE_HOUR_LABEL:
         return threshold
     return weekly_threshold
+
+
+def weekly_capped(cap: float | None, usage: dict | str | None) -> tuple[str, float] | None:
+    """``(label, pct)`` of the fullest weekly-resetting window at or past the
+    account's weekly cap, else ``None`` (truthy means capped).
+
+    A veto on eligibility, not a line in the headroom math: ``binding_window``
+    and the lines above are untouched. Every weekly window the usage reports
+    counts (7d and all per-model ones, whatever ``autoswitch.model`` selects),
+    so the engine, ``cswap switch`` and the screens agree. ``None`` and 100 are
+    no cap, and the 5h window never counts."""
+    if cap is None or cap >= 100.0:
+        return None
+    over = [
+        (label, pct)
+        for label, pct, _ in relevant_windows(
+            usage if isinstance(usage, dict) else None, ("all",)
+        )
+        if label != FIVE_HOUR_LABEL and pct >= cap
+    ]
+    return max(over, key=lambda w: w[1]) if over else None
 
 
 def line_headroom(pct: float, line: float, threshold: float) -> float:

@@ -68,7 +68,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from claude_swap import oauth
-from claude_swap.lines import window_line
+from claude_swap.lines import weekly_capped, window_line
 
 # Freshness floor shared by every collector: an entry younger than this is
 # served from the store without any fetch, so the maximum sustained rate on
@@ -90,6 +90,14 @@ MIN_INTERVAL_S = 180.0
 # inside the measured ~28-30 request rolling-hour window; overshoot on top of
 # steady traffic is absorbed by the post-429 floor below.
 URGENT_INTERVAL_S = 60.0
+
+# The active account this close below its weekly cap polls at CAP_BAND_INTERVAL_S
+# while that reading keeps moving, even when a step is under urgent mode's bar: a
+# slow burn never trips urgent mode, a cap is a stop. A flat reading ends it (the
+# normal decay takes over), so an idle active cannot sit on the shared budget.
+CAP_BAND_PCT = 3.0
+# 120 s, not 60: 60 s is twice the budget above.
+CAP_BAND_INTERVAL_S = 120.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
 # stays reasonably fresh, an idle alternate drifts out to ten minutes.
@@ -209,6 +217,7 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     weekly_threshold: float | None = None,
+    weekly_cap: float | None = None,
     rng: Callable[[], float] = random.random,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
@@ -219,7 +228,10 @@ def plan_after_fetch(
     that much into the escalation band under its own line (``threshold`` for
     the 5h window, ``weekly_threshold`` when set for the weekly ones). No
     movement backs off ×1.5 toward the account's ceiling;
-    unknown utilization uses the default. A recent 429 on this token floors
+    unknown utilization uses the default. The active account within
+    ``CAP_BAND_PCT`` below its ``weekly_cap`` (under 100) drops to
+    ``CAP_BAND_INTERVAL_S`` while its weekly reading moved since the previous
+    poll. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
@@ -256,8 +268,16 @@ def plan_after_fetch(
         and pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
         for label, pct, _ in oauth.relevant_windows(new_usage, models)
     )
-    if is_active and rising_in_band and not recent_429:
-        interval = URGENT_INTERVAL_S
+    near_cap = (
+        weekly_cap is not None
+        and weekly_cap < 100.0
+        # Moved since the last poll: a flat reading decays like any other.
+        and (in_band := weekly_capped(weekly_cap - CAP_BAND_PCT, new_usage)) is not None
+        and in_band != weekly_capped(weekly_cap - CAP_BAND_PCT, prev_usage)
+        and weekly_capped(weekly_cap, new_usage) is None  # past it, the engine leaves
+    )
+    if is_active and (rising_in_band or near_cap) and not recent_429:
+        interval = URGENT_INTERVAL_S if rising_in_band else CAP_BAND_INTERVAL_S
     if recent_429:
         # AIMD additive-increase: grow the interval multiplicatively from the
         # last one toward the wider 429 ceiling, so machines sharing a
