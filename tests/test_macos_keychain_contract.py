@@ -124,6 +124,39 @@ class TestBackupCredentialsSecurity:
                 call("claude-swap", "account-None-bob@example.com.prev"),
             ])
 
+    def test_unbacked_slot_read_does_not_resweep_when_roster_is_unchanged(
+        self, macos_switcher: ClaudeAccountSwitcher, sample_sequence_data: dict
+    ):
+        """A read of a slot with no stored login costs one renumber-fallback
+        sweep (one `security` call per candidate slot) the first time. A
+        second read of the SAME unbacked slot, with the roster unchanged,
+        must not repeat the sweep — it converges nothing new every time."""
+        data = dict(sample_sequence_data)
+        data["accounts"] = {
+            "1": {"email": "account1@example.com"},
+            "2": {"email": "account2@example.com"},
+            "3": {"email": "account3@example.com"},
+        }
+        data["sequence"] = [1, 2, 3]
+        macos_switcher._setup_directories()
+        macos_switcher._write_json(macos_switcher.sequence_file, data)
+
+        with patch("claude_swap.credentials.macos_keychain") as mock_kc:
+            mock_kc.get_password.return_value = None
+
+            macos_switcher._read_account_credentials("3", "account3@example.com")
+            first_calls = mock_kc.get_password.call_count
+
+            mock_kc.get_password.reset_mock()
+            macos_switcher._read_account_credentials("3", "account3@example.com")
+            second_calls = mock_kc.get_password.call_count
+
+        assert first_calls > 1, "the sweep should probe more than one slot"
+        assert second_calls == 1, (
+            f"expected only the direct read (1 call) on a repeat read of an "
+            f"unchanged unbacked slot, got {second_calls}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Real-keychain integration tests. macOS GHA only.
