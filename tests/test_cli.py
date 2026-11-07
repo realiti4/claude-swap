@@ -529,7 +529,17 @@ class TestCLI:
         )
         monkeypatch.setattr(
             "claude_swap.launch_agent.uninstall",
-            _record("uninstall", {"label": "com.cswap.menubar", "was_loaded": True, "removed_plist": True}),
+            _record(
+                "uninstall",
+                {
+                    "label": "com.cswap.menubar",
+                    "was_loaded": True,
+                    "removed_plist": True,
+                    "removed": ["/tmp/p.plist", "/Applications/claude-swap Menubar.app"],
+                    "cleared_override": False,
+                    "bundle_error": None,
+                },
+            ),
         )
         monkeypatch.setattr(
             "claude_swap.launch_agent.status",
@@ -969,6 +979,77 @@ class TestCLI:
         assert "pipx install --force" in cli._menubar_extra_missing()
         monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
         assert cli._menubar_extra_missing() is None
+
+    def test_uninstall_service_lists_what_went(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--uninstall-service"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "Menu bar service removed." in out
+        assert "removed /tmp/p.plist" in out
+        assert "removed /Applications/claude-swap Menubar.app" in out
+
+    def _purge_harness(self, monkeypatch, platform):
+        calls = {}
+
+        class _FakeSwitcher:
+            backup_dir = Path("/tmp/backup-root")
+
+            def __init__(self, *a, **k):
+                pass
+
+            def _is_running_in_container(self):
+                return False
+
+            def purge(self):
+                calls["purged"] = True
+
+        def fake_uninstall(**kwargs):
+            calls["uninstall"] = kwargs
+            return {
+                "label": "com.cswap.menubar",
+                "was_loaded": True,
+                "removed_plist": True,
+                "removed": ["/tmp/p.plist"],
+                "cleared_override": False,
+                "bundle_error": None,
+            }
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", ["cswap", "purge"])
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr("claude_swap.launch_agent.uninstall", fake_uninstall)
+        monkeypatch.setattr("claude_swap.update_check.check_for_update", lambda *a, **k: None)
+        return calls
+
+    def test_purge_also_removes_the_menu_bar_service_on_macos(self, monkeypatch, capsys):
+        # The LaunchAgent, the wrapper app and the logs live outside the data
+        # directory; "remove all traces" has to reach them.
+        calls = self._purge_harness(monkeypatch, "darwin")
+
+        try:
+            cli.main()
+        except SystemExit as exc:
+            assert exc.code in (0, None)
+
+        assert calls["purged"] is True
+        assert calls["uninstall"] == {"backup_dir": Path("/tmp/backup-root")}
+        assert "Removed the menu bar service" in capsys.readouterr().out
+
+    def test_purge_leaves_launchd_alone_off_macos(self, monkeypatch):
+        calls = self._purge_harness(monkeypatch, "linux")
+
+        try:
+            cli.main()
+        except SystemExit as exc:
+            assert exc.code in (0, None)
+
+        assert calls["purged"] is True
+        assert "uninstall" not in calls
 
     def test_service_status_reports_the_login_state(self, monkeypatch, capsys):
         self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])

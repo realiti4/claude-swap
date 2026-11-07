@@ -1308,10 +1308,19 @@ def _menubar_service(args) -> int:
 
     if args.uninstall_service:
         result = launch_agent.uninstall()
-        if result["was_loaded"] or result["removed_plist"]:
+        if result["was_loaded"] or result["removed"]:
             print("Menu bar service removed.")
+            for path in result["removed"]:
+                print(dimmed(f"  removed {path}"))
+            if result["cleared_override"]:
+                print(dimmed("  cleared its switch under Login Items & Extensions"))
         else:
             print("Menu bar service was not installed.")
+        if result["bundle_error"]:
+            warning(
+                f"  the wrapper app could not be removed: {result['bundle_error']}",
+                file=sys.stderr,
+            )
         return 0
 
     result = launch_agent.status()
@@ -1894,6 +1903,19 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.status(json_output=args.json)
         elif args.purge:
             switcher.purge()
+            if sys.platform == "darwin":
+                # The menu bar's LaunchAgent, wrapper app and logs live outside
+                # the directory purge just removed; "all traces" means them too.
+                # After purge() so a refused purge leaves the menu bar alone.
+                from claude_swap import launch_agent
+
+                try:
+                    gone = launch_agent.uninstall(backup_dir=switcher.backup_dir)
+                except ClaudeSwitchError as e:
+                    warning(f"Menu bar service not removed: {e}", file=sys.stderr)
+                else:
+                    if gone["was_loaded"] or gone["removed"]:
+                        print("Removed the menu bar service, its app bundle and logs.")
         elif args.export:
             from claude_swap.transfer import export_accounts
 

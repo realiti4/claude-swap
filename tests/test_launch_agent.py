@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import launch_agent
+from claude_swap import app_bundle, launch_agent
 from claude_swap.exceptions import ClaudeSwitchError
 
 PROGRAM = ["/Users/x/.local/bin/cswap"]
@@ -31,6 +31,19 @@ def _on_macos():
     """The module refuses off-darwin; these tests exercise the darwin path."""
     with patch.object(launch_agent.sys, "platform", "darwin"):
         yield
+
+
+@pytest.fixture(autouse=True)
+def applications_dir(tmp_path, monkeypatch):
+    """Fence every uninstall here off the real /Applications.
+
+    uninstall() removes the wrapper bundle, and on a developer's Mac the real
+    one may be the very app drawing the menu bar while the suite runs.
+    """
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    monkeypatch.setattr(app_bundle, "APPLICATIONS_DIR", apps)
+    return apps
 
 
 def _completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -336,7 +349,9 @@ def test_uninstall_boots_out_and_removes_the_plist(tmp_path):
         run.side_effect = _router({"print": _completed(0)})
         result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
-    assert result == {"label": launch_agent.LABEL, "was_loaded": True, "removed_plist": True}
+    assert result["was_loaded"] is True
+    assert result["removed_plist"] is True
+    assert result["removed"] == [str(target)]
     assert not target.exists()
     assert ["launchctl", "bootout", f"gui/{UID}/{launch_agent.LABEL}"] in [
         c.args[0] for c in run.call_args_list
@@ -789,3 +804,53 @@ def test_status_reports_start_at_login_and_the_system_settings_switch(tmp_path):
     assert result["session_plist"] == str(session)
     assert result["disabled"] is True
     assert result["pid"] == 4242
+
+
+def test_uninstall_removes_the_bundle_the_logs_and_launchds_override(
+    tmp_path, applications_dir
+):
+    """Nothing of the menu bar may outlive --uninstall-service.
+
+    The "Allow in the Background" switch leaves a disabled override in
+    launchd's own database; the wrapper .app and the two log files live
+    outside the data directory. All of it goes, and the result names it.
+    """
+    home, data = _homes(tmp_path)
+    plist = _login_plist(home)
+    bundle = applications_dir / app_bundle.BUNDLE_DIRNAME
+    (bundle / "Contents" / "MacOS").mkdir(parents=True)
+    out_log, err_log = launch_agent.log_paths(home=home)
+    out_log.parent.mkdir(parents=True)
+    out_log.write_text("x")
+    err_log.write_text("y")
+    fake = _FakeLaunchd(loaded=False, disabled=True)
+
+    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+        result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
+
+    assert ["launchctl", "enable", f"gui/{UID}/{launch_agent.LABEL}"] in fake.calls
+    assert result["cleared_override"] is True
+    assert result["removed_plist"] is True
+    assert result["bundle_error"] is None
+    for gone in (plist, bundle, out_log, err_log):
+        assert not gone.exists(), gone
+        assert str(gone) in result["removed"]
+
+
+def test_uninstall_leaves_launchds_override_alone_when_not_disabled(tmp_path):
+    home, data = _homes(tmp_path)
+    fake = _FakeLaunchd(loaded=False, disabled=False)
+    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+        result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
+    assert "enable" not in fake.subcommands
+    assert result["cleared_override"] is False
+    assert result["removed"] == []
+
+
+def test_uninstall_reports_a_bundle_it_could_not_remove(tmp_path, monkeypatch):
+    home, data = _homes(tmp_path)
+    monkeypatch.setattr(app_bundle, "remove", lambda *a, **k: (_ for _ in ()).throw(OSError("busy")))
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
+    assert result["bundle_error"] == "busy"

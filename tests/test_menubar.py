@@ -745,3 +745,61 @@ def test_engine_error_table_is_pruned():
     should_surface_engine_error(ErrorEvent(message="x"), seen, now=ENGINE_ERROR_REPEAT_S)
     assert list(seen) == ["x"]
 
+
+
+# --- sentinel rows: the state, not the remedy ---------------------------------
+
+
+def test_menu_note_keeps_the_state_and_drops_the_remedy():
+    from claude_swap.switcher import USAGE_RELOGIN_REQUIRED
+
+    note = menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    assert "cswap add" in note, "premise: the note carries a remedy"
+    assert menubar.menu_note(note) == "re-login needed"
+
+
+def test_every_sentinel_note_fits_a_menu_row():
+    # A menu is as wide as its widest row; one expired account must not
+    # double it (the 614pt row #171 measured against 314pt for the others).
+    for note in menubar.SENTINEL_NOTES.values():
+        short = menubar.menu_note(note)
+        assert " — " not in short
+        assert len(short) <= menubar.MENU_NOTE_LIMIT
+
+
+def test_menu_note_truncates_an_unknown_long_state_with_an_ellipsis():
+    short = menubar.menu_note("x" * 60)
+    assert short.endswith("…")
+    assert len(short) == menubar.MENU_NOTE_LIMIT
+
+
+def test_menu_note_leaves_a_short_note_alone():
+    assert menubar.menu_note("API key (no quota)") == "API key (no quota)"
+    assert menubar.usage_summary("no credentials") == "no credentials"
+
+
+def test_account_row_shows_the_sentinel_state_not_the_remedy():
+    from claude_swap.switcher import USAGE_RELOGIN_REQUIRED
+
+    label = menubar.format_account_label(
+        2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    )
+    assert label.endswith("re-login needed")
+    assert "cswap add" not in label
+
+
+def test_set_tooltip_reaches_the_native_item_and_tolerates_its_absence():
+    class _NSMenuItem:
+        tip = None
+
+        def setToolTip_(self, text):
+            self.tip = text
+
+    class _Item:
+        def __init__(self):
+            self._menuitem = _NSMenuItem()
+
+    item = _Item()
+    menubar._set_tooltip(item, "re-login needed — the full remedy")
+    assert item._menuitem.tip == "re-login needed — the full remedy"
+    menubar._set_tooltip(object(), "ignored")  # no native item behind it: no error

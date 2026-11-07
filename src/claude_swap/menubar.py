@@ -232,6 +232,32 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
     return rolled
 
 
+MENU_NOTE_LIMIT = 40
+
+
+def menu_note(note: str, limit: int = MENU_NOTE_LIMIT) -> str:
+    """The state half of a sentinel note, sized for a menu row.
+
+    ``SENTINEL_NOTES`` carry a remedy after an em dash ("re-login needed —
+    refresh token dead; log in with Claude Code, then run: cswap add"), which
+    ``cswap list`` has the width for. A menu is as wide as its widest row, so
+    one expired account otherwise doubles the menu and pushes every other
+    row's numbers to the far edge. The row keeps the state; the full note
+    travels as the row's tooltip (see ``rebuild_menu``).
+    """
+    state = note.split(" — ", 1)[0].strip()
+    if len(state) > limit:
+        state = state[: limit - 1].rstrip() + "…"
+    return state
+
+
+def _set_tooltip(item, text: str) -> None:
+    """Attach ``text`` as the row's hover tooltip; NSMenuItem carries one natively."""
+    ns_item = getattr(item, "_menuitem", None)
+    if ns_item is not None and hasattr(ns_item, "setToolTip_"):
+        ns_item.setToolTip_(text)
+
+
 def usage_summary(
     usage: dict | str | None, now: float | None = None, fetched_at: float | None = None
 ) -> str:
@@ -242,7 +268,7 @@ def usage_summary(
     window that's meaningfully ahead of pace (issue #125), never the 5h one.
     """
     if isinstance(usage, str):
-        return usage
+        return menu_note(usage)
     if usage is None:
         return "usage unavailable"
     if now is None:
@@ -851,6 +877,9 @@ def run(switcher) -> int:
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
+                if isinstance(display, str) and display != menu_note(display):
+                    # The row shows the state; the remedy is a hover away.
+                    _set_tooltip(item, display)
                 account_items.append(item)
             if not account_items:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))

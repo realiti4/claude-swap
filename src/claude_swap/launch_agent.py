@@ -567,11 +567,16 @@ def uninstall(
     uid: int | None = None,
     backup_dir: Path | None = None,
 ) -> dict:
-    """Stop the service and delete its plist, wherever it lives.
+    """Stop the service and remove every trace the menu bar left on the Mac.
 
-    Tolerates every partial state — loaded without a plist, a plist that was
-    never bootstrapped, neither — because the point of an uninstall is to
-    arrive at "gone", not to insist on the path taken to get there.
+    That is the plist in either home, launchd's own record of the service
+    (the "Allow in the Background" switch leaves a disabled override that
+    would otherwise outlive the plist), the wrapper ``.app`` the menu bar built
+    for itself, and the two log files. Tolerates every partial state — loaded
+    without a plist, a plist that was never bootstrapped, neither — because
+    the point of an uninstall is to arrive at "gone", not to insist on the
+    path taken to get there. A bundle that cannot be deleted is reported, not
+    fatal: the service itself is already gone by then.
     """
     _require_macos()
     was_loaded = is_loaded(label, uid)
@@ -584,13 +589,40 @@ def uninstall(
                 + (f": {detail}" if detail else "")
             )
 
-    removed = False
+    cleared_override = False
+    if is_disabled(label, uid):
+        cleared_override = _launchctl("enable", service_target(label, uid)).returncode == 0
+
+    removed_paths: list[Path] = []
     for candidate in (plist_path(label, home), session_plist_path(label, backup_dir)):
         if candidate.exists():
             candidate.unlink()
-            removed = True
+            removed_paths.append(candidate)
+    for log in log_paths(label, home):
+        if log.exists():
+            log.unlink()
+            removed_paths.append(log)
 
-    return {"label": label, "was_loaded": was_loaded, "removed_plist": removed}
+    from claude_swap import app_bundle
+
+    if backup_dir is None:
+        from claude_swap.paths import get_backup_root
+
+        backup_dir = get_backup_root()
+    bundle_error: str | None = None
+    try:
+        removed_paths.extend(app_bundle.remove(backup_dir))
+    except OSError as exc:
+        bundle_error = str(exc)
+
+    return {
+        "label": label,
+        "was_loaded": was_loaded,
+        "removed_plist": any(p.suffix == ".plist" for p in removed_paths),
+        "removed": [str(p) for p in removed_paths],
+        "cleared_override": cleared_override,
+        "bundle_error": bundle_error,
+    }
 
 
 def set_start_at_login(
