@@ -6,14 +6,18 @@ Reference for `cswap auto`, and for the menu bar's auto-switch, which runs the s
 
 Set with `--strategy`, or `cswap config set autoswitch.strategy`.
 
-- `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left.
-- `weekly-first` switches at the same lines as `best`, with the same landing rules and hysteresis margin, but among the accounts that qualify it lands on the one whose **weekly window resets soonest** (most quota left breaks ties), so weekly quota that would otherwise expire unused gets spent first. Its at-limit and failover escapes, and the all-over-the-lines case, rank by quota left exactly as `best` does.
-- `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
+- `best` stays put until the active account nears its limit, then moves to the account with the most quota left.
+- `weekly-first` switches at the same lines as `best`, with the same landing rules and hysteresis margin, but among the accounts that qualify it lands on the one whose **weekly window resets soonest** among those with more than a few percent left (most quota left breaks ties), so weekly quota that would otherwise expire unused gets spent first. Its at-limit and failover escapes, and the all-over-the-lines case, rank by quota left exactly as `best` does.
+- `consume-first` (default) proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - `priority-consume-first` follows your own ranking first (see *Account priority tiers* below), then the soonest weekly reset within a tier.
 
 ## Cooldown and hysteresis
 
 A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is already over its switch lines, it moves to the one with the most quota left before a limit (the lowest usage on its fullest window, whatever line that window carries) under `best`, `weekly-first` and `consume-first` alike, once that account has twice the current one's remaining quota or 3 points more than it, whichever is less. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset. `priority-consume-first` does neither: it holds rather than land on an account over its lines (see [Account priority tiers](#account-priority-tiers)).
+
+## API outages
+
+An API outage (a burst of 529 overloaded responses on the active account's requests: 5 or more `/v1/messages` calls over two consecutive polls, at least half of them 529; a 500 or 502 storm does not fire it) moves it off immediately, whether or not it's below the threshold — the cooldown and hysteresis above don't apply, since it's the API that's failing, not the account. The account it left is held out of rotation for 15 minutes so it isn't switched straight back onto while the outage continues (a forced move for another reason, such as the active account hitting its limit, can still fall back onto it when no other candidate is left). Needs the `cswap-pin` request trace armed (off by default) on cswap-pin 0.1.148 or newer; it's a silent no-op on an older pin, or with the trace off.
 
 ## A separate line for the weekly windows
 
@@ -31,7 +35,7 @@ One threshold compared against the busiest window forces the same number on wind
 
 ## Holding an account out of rotation
 
-To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](../README.md#interactive-dashboard-tui), and in the [menu bar](../README.md#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
+To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target — with the caveat that a RUNNING auto-switch leaves a disabled account on its next tick, so an explicit switch onto one sticks only while auto is stopped. They show a `(disabled)` marker in `cswap list`, in the [TUI](../README.md#interactive-dashboard-tui), and in the [menu bar](../README.md#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 
 ## Per-model limits
 

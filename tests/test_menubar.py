@@ -267,6 +267,21 @@ def test_format_account_label_disabled_marker():
     assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_auto_switch_item_shows_a_demoted_engine_as_dry_run():
+    class Engine:
+        demoted_from_live = False
+
+    engine = Engine()
+    assert menubar.auto_switch_item(False, engine) == ("Auto-switch accounts", 0)
+    assert menubar.auto_switch_item(True, None) == ("Auto-switch accounts", 1)
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts", 1)
+    # The flag clears on a later promotion, so the item follows it live.
+    engine.demoted_from_live = True
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts (dry run)", -1)
+    engine.demoted_from_live = False
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts", 1)
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -280,8 +295,8 @@ def test_format_usage_log_full():
 
 
 def test_format_usage_log_without_clock():
-    usage = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 12.0}}
-    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 5h 0% · 7d 12%"
+    usage = {"five_hour": {"pct": 4.0}, "seven_day": {"pct": 12.0}}
+    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 5h 4% · 7d 12%"
 
 
 def test_format_usage_log_partial_window():
@@ -339,12 +354,12 @@ def test_format_title_7d_only():
 
 def test_format_title_both_windows():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42% · 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 5h 42% · 7d 18%"
 
 
 def test_format_title_both_windows_with_name():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 5h 42% · 7d 18%"
 
 
 def test_format_title_icon_only_when_off():
@@ -365,7 +380,7 @@ def test_format_title_scoped_after_windows_multiple_models():
         **_USAGE,
         "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
     }
-    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 5h 42% · 7d 18% · Fable 55% · Opus 7%"
 
 
 def test_format_title_scoped_off_by_default():
@@ -395,14 +410,15 @@ def test_format_title_both_drops_unavailable_windows():
 def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
-    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
+    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 5h 9%"
 
 
 def test_format_title_and_summary_with_a_null_five_hour_window():
     # Ultra accounts have no 5-hour limit; the usage API reports the window as null.
     usage = oauth.build_usage_result({"five_hour": None, "seven_day": {"utilization": 25.0}})
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@x.com", usage, s) == "⇄ 25%"
+    # "both" labels each number here, so a lone 7d figure never reads as the 5h one.
+    assert menubar.format_title("loc@x.com", usage, s) == "⇄ 7d 25%"
     assert menubar.usage_summary(usage) == "7d 25%"
 
 
@@ -489,6 +505,7 @@ class _FakeEntry:
         self.sentinel = sentinel
         self.last_good = last_good
         self.fetched_at = fetched_at
+        self.plan = None
 
 
 class _FakeAcct:
@@ -629,6 +646,58 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
         menubar.run(switcher=None)
 
 
+# --- switch notification -------------------------------------------------------
+
+def test_a_plain_switch_reports_the_propagation_delay():
+    title, body = menubar.switch_notification({"switched": True})
+    assert title == "Account switched"
+    assert "30s" in body
+
+
+def test_a_logged_out_landing_is_not_reported_as_a_working_switch():
+    """An empty slot is a valid destination and leaves the machine LOGGED OUT.
+
+    "Account switched / takes effect within ~30s" tells the user to wait for
+    an account that will never arrive; the recovery step is `/login`.
+    """
+    title, body = menubar.switch_notification({
+        "switched": True,
+        "needsLogin": True,
+        "message": "Switched to Account-2 (b@example.com) — no stored login; "
+                   "run /login",
+    })
+    assert "30s" not in body, (
+        f"a logged-out landing was reported as a switch that propagates: "
+        f"{title!r} {body!r}"
+    )
+    assert "/login" in body, f"the recovery step was dropped: {body!r}"
+
+
+def test_a_deliberate_wait_is_not_titled_an_exhausted_fleet():
+    """The notification is the fourth surface, and it was not counted.
+
+    `AllExhaustedEvent`'s own comment enumerates "the panel, the JSON and the
+    log". This says the same sentence to the same user, and said "All accounts
+    exhausted" for a wait entered BECAUSE every candidate was READ and one
+    still holds quota.
+    """
+    from claude_swap.autoswitch import AllExhaustedEvent
+
+    wait = AllExhaustedEvent(
+        earliest_reset_at="2026-07-05T20:00:00Z", deliberate_wait=True
+    )
+    title, body = menubar.exhausted_notification(wait)
+    assert "exhausted" not in title.lower(), (
+        f"a deliberate wait was announced as an exhausted fleet: {title!r}"
+    )
+    assert body == wait.human(), "the body drifted from the shared renderer"
+
+    real = AllExhaustedEvent(earliest_reset_at=None, deliberate_wait=False)
+    assert menubar.exhausted_notification(real)[0] == "All accounts exhausted", (
+        "a genuinely exhausted fleet lost its own title"
+    )
+
+
 class TestFrameworkBuildWarning:
     """The menu bar draws nothing from a framework build on macOS 26.
 
@@ -755,7 +824,7 @@ def test_menu_note_keeps_the_state_and_drops_the_remedy():
 
     note = menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
     assert "cswap add" in note, "premise: the note carries a remedy"
-    assert menubar.menu_note(note) == "re-login needed"
+    assert menubar.menu_note(note) == "re-login may be needed"
 
 
 def test_every_sentinel_note_fits_a_menu_row():
@@ -784,7 +853,7 @@ def test_account_row_shows_the_sentinel_state_not_the_remedy():
     label = menubar.format_account_label(
         2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
     )
-    assert label.endswith("re-login needed")
+    assert label.endswith("re-login may be needed")
     assert "cswap add" not in label
 
 

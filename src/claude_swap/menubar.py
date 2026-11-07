@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import launch_agent, pace
+from claude_swap import launch_agent, oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.printer import warning
@@ -273,6 +273,7 @@ def usage_summary(
         return "usage unavailable"
     if now is None:
         now = time.time()
+    usage = oauth.display_usage(usage)  # no 5h segment without a running 5h window
     parts: list[str] = []
     rejected = usage.get("rejected")
     if isinstance(rejected, dict):
@@ -330,11 +331,23 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    plan: str | None = None,
 ) -> str:
     """Build one account row's menu label."""
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    plan_note = f"  {plan}" if plan else ""
+    return f"{num}  {label}{marker}{plan_note}  {usage_summary(usage, now, fetched_at)}"
+
+
+def auto_switch_item(enabled: bool, engine) -> tuple[str, int]:
+    """Title and rumps state for the auto-switch item; -1 is the mixed state.
+
+    An engine that lost the live lock only dry-runs, so it is not shown as on.
+    """
+    if enabled and getattr(engine, "demoted_from_live", False):
+        return "Auto-switch accounts (dry run)", -1
+    return "Auto-switch accounts", int(enabled)
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -362,16 +375,20 @@ def format_title(
         segments.append(alias if alias else _local_part(active_email))
     if isinstance(active_usage, dict) and isinstance(active_usage.get("rejected"), dict):
         segments.append("rejected (!)")
+    active_usage = oauth.display_usage(active_usage)  # no running 5h window shows no 5h
+    # Both numbers are labelled: with the 5h window gone the one left would
+    # otherwise be a 7d figure sitting where the 5h one used to be.
+    both = settings.title_pct == "both"
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"{'5h ' if both else ''}{p:.0f}%")
     if settings.title_pct in ("7d", "both"):
         seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"{'7d ' if both else ''}{p:.0f}%")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
@@ -392,6 +409,7 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
     window is available (sentinels, ``None``, or spend-only) so callers can skip
     logging nothing.
     """
+    usage = oauth.display_usage(usage)  # no 5h segment without a running 5h window
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         pct = _window_pct(usage, key)
@@ -476,6 +494,7 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
+    "plans": {},
 }
 
 
@@ -484,17 +503,20 @@ def _adapt_snapshot(snap) -> dict:
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
+    "active_alias": str | None, "plans": {slot: plan label}}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
     """
     accounts = []
+    plans = {}
     active_email = None
     active_usage = None
     active_alias = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
+        if acc.usage.plan:
+            plans[acc.number] = acc.usage.plan
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
@@ -508,7 +530,42 @@ def _adapt_snapshot(snap) -> dict:
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
+        "plans": plans,
     }
+
+
+def switch_notification(payload: dict | None = None) -> tuple[str, str]:
+    """``(title, body)`` for the notification a completed switch posts.
+
+    A ``needsLogin`` landing is a switch onto a slot with no stored login, so
+    the machine is now logged out: the propagation note below would tell the
+    user to wait for an account that never arrives.
+    """
+    if (payload or {}).get("needsLogin"):
+        return (
+            "Logged out",
+            (payload or {}).get("message")
+            or "That slot has no stored login — run /login in Claude Code.",
+        )
+    return (
+        "Account switched",
+        "Switch takes effect within ~30s — restart Claude Code to apply "
+        "immediately.",
+    )
+
+
+def exhausted_notification(event) -> tuple[str, str]:
+    """``(title, body)`` for the notification an ``all-exhausted`` event posts.
+
+    One kind carries two states. A deliberate wait is entered BECAUSE every
+    candidate was READ and one still holds quota, so "All accounts exhausted"
+    is the one thing it is not -- and the notification is a surface
+    `AllExhaustedEvent`'s own enumeration ("the panel, the JSON and the log")
+    does not count.
+    """
+    if getattr(event, "deliberate_wait", False):
+        return "Waiting for a reset", event.human()
+    return "All accounts exhausted", event.human()
 
 
 def _take_worker_snapshot(
@@ -790,15 +847,15 @@ def run(switcher) -> int:
             except Exception:
                 self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
 
-        def _stop_engine(self):
+        def _stop_engine(self, reason):
             if self._engine is not None:
-                self._engine.stop()
+                self._engine.stop(reason)
                 self._engine = None
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
             if self._engine is not None:
-                self._stop_engine()
+                self._stop_engine("restart")
                 self._start_engine()
 
         def _on_engine_event(self, event):
@@ -817,7 +874,7 @@ def run(switcher) -> int:
                 elif ev.kind == "account-quarantined":
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                    rumps.notification("claude-swap", *exhausted_notification(ev))
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
@@ -872,7 +929,8 @@ def run(switcher) -> int:
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                        plan=self.snapshot.get("plans", {}).get(num),
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -980,8 +1038,9 @@ def run(switcher) -> int:
                 interval.add(choice)
             menu.add(interval)
 
-            auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
-            auto_item.state = 1 if self.settings.auto_switch_enabled else 0
+            auto_title, auto_state = auto_switch_item(self.settings.auto_switch_enabled, self._engine)
+            auto_item = rumps.MenuItem(auto_title, callback=self.on_toggle_autoswitch)
+            auto_item.state = auto_state
             menu.add(auto_item)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
@@ -1016,17 +1075,16 @@ def run(switcher) -> int:
                 rumps.alert(title="claude-swap", message=str(e))
                 return False
 
-        def _notify_switched(self):
-            rumps.notification(
-                "claude-swap",
-                "Account switched",
-                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
-            )
+        def _notify_switched(self, payload: dict | None = None):
+            rumps.notification("claude-swap", *switch_notification(payload))
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self._notify_switched()
+                payload: dict = {}
+                if self._guard(lambda: payload.update(
+                    self.switcher.switch_to(str(num), json_output=True) or {}
+                )):
+                    self._notify_switched(payload)
                     self.refresh_async()
             return cb
 
@@ -1123,7 +1181,7 @@ def run(switcher) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
-            self._stop_engine()
+            self._stop_engine("quit")
             rumps.quit_application()
 
         def on_toggle_name(self, _sender):
@@ -1173,7 +1231,7 @@ def run(switcher) -> int:
             if self.settings.auto_switch_enabled:
                 self._start_engine()
             else:
-                self._stop_engine()
+                self._stop_engine("turned off")
             self.rebuild_menu()
 
         def _make_threshold(self, pct):
