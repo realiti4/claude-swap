@@ -842,9 +842,9 @@ class TestInstallIdentity:
         assert "(" not in update_check.describe_identity(identity)
 
     def test_unreadable_metadata_is_not_fatal(self):
-        from claude_swap import update_check
-
         from importlib.metadata import PackageNotFoundError
+
+        from claude_swap import update_check
 
         with patch("importlib.metadata.distribution", side_effect=PackageNotFoundError("claude-swap")):
             assert update_check.install_identity()["source"] is None
