@@ -447,8 +447,12 @@ class AutoScreen(Screen):
         # the admission pass above just ran on, not a fresh read.
         admission_now = now
 
-        def never_a_target(acc) -> tuple:
-            return (997.0, data.reset_tail_key(acc.usage.last_good, admission_now))
+        def key_of(acc) -> tuple:
+            """The engine's own rank when it picked the row, else the tier every
+            other switchable row sorts in (`ordered_accounts` reads the same key)."""
+            if acc.number in ordered_rank:
+                return (0, ordered_rank[acc.number])
+            return data.non_candidate_key(acc, admission_now)
 
         for acc in snap.accounts:
             if acc.number == active_number:
@@ -508,11 +512,7 @@ class AutoScreen(Screen):
                 # `ordered_rank` first: the API-key last resort (data.rank_
                 # switch_candidates) can name THIS row as the engine's actual
                 # next pick, and it must not sort behind every refused row.
-                key = (
-                    (0, ordered_rank[acc.number])
-                    if acc.number in ordered_rank else never_a_target(acc)
-                )
-                ranked.append((key, acc.number))
+                ranked.append((key_of(acc), acc.number))
             elif binding is None:
                 # An extra-usage (pay-as-you-go) account has no 5h/7d window,
                 # so binding_window answers None — but it is not unknown, it has
@@ -543,11 +543,7 @@ class AutoScreen(Screen):
                 # `ordered_rank` already names this row (never derived here),
                 # it IS the engine's pick and must not sort behind a row the
                 # engine refused.
-                key = (
-                    (0, ordered_rank[acc.number])
-                    if acc.number in ordered_rank else never_a_target(acc)
-                )
-                ranked.append((key, acc.number))
+                ranked.append((key_of(acc), acc.number))
             else:
                 # Per-window chips, from the same helper the dashboard uses
                 # (data.chip_label) so one account cannot read two ways. The
@@ -645,27 +641,9 @@ class AutoScreen(Screen):
                         f"  not a candidate ({why})" if why else "  not a candidate",
                         style=palette.muted,
                     )
-                # Position from `ordered_rank` (the engine's own pass, called
-                # once above), never a locally re-derived key -- but a row
-                # the pass never ranked at all still needs a DETERMINISTIC
-                # order among its peers: soonest BINDING-window recovery
-                # first, unknown last (`+inf`, `_binding_recovery_ts`'s
-                # reading -- the window that actually blocks the account,
-                # not always the 7-day one). Only two unranked rows sharing
-                # that same recovery still fall to `sorted(ranked)`'s own
-                # residual tie-break, the account number as a string --
-                # never touching a row the pass DID admit. A disabled row
-                # takes the `never_a_target` tier, never this recovery-
-                # ordered one: the engine will not land here automatically
-                # however soon it recovers.
-                key = (
-                    (0, ordered_rank[acc.number]) if acc.number in ordered_rank
-                    else never_a_target(acc) if acc.disabled
-                    else (1,) + data.waiting_tail_key(
-                        acc.usage.last_good, models, admission_now, settings,
-                        bars.get(acc.number, settings.threshold),
-                    )
-                )
+                # Position from `ordered_rank` (the engine's own pass, called once
+                # above), never a locally re-derived key; a row the pass never
+                # ranked sorts by `key_of`'s tier.
                 if capped:
                     # A veto, not a rank: the engine never lands here.
                     entry.append(
@@ -673,8 +651,7 @@ class AutoScreen(Screen):
                         f"{acc.policy.weekly_cap:g}%",
                         style=palette.sev_warn,
                     )
-                    key = never_a_target(acc)
-                ranked.append((key, acc.number))
+                ranked.append((key_of(acc), acc.number))
             lines[acc.number] = entry
 
         text = Text()

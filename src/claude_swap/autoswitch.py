@@ -706,9 +706,66 @@ def dynamic_expiring(
     )
 
 
-def _expiring_ahead(expiring: list[str], current: str | None) -> list[str]:
-    """The expiring accounts whose window perishes before the active's own."""
+def _expiring_ahead(
+    expiring: list[str], current: str | None, walled: bool
+) -> list[str]:
+    """The expiring accounts a healthy active yields to: those whose window perishes
+    before its own. None while it sits at its wall: its escape prices the landing
+    instead (#403)."""
+    if walled:
+        return []
     return expiring[: expiring.index(current)] if current in expiring else expiring
+
+
+def _rotation_order(
+    warm: Sequence[str],
+    cold: Sequence[str],
+    headroom: Mapping[str, float | None],
+    usage: Mapping[str, dict | str | None],
+    settings: AutoSwitchSettings,
+    now: float,
+) -> list[str]:
+    """The order `dynamic-healthy` rotates its landing in, before any admission. The
+    percent step (T3167, the default) ranks warm and cold in one list by
+    `_perish_then_room_key`; the time-only alternation (``alternation_chunk_pct``
+    0) lists warm before cold."""
+    if settings.alternation_chunk_pct <= 0:
+        return [*warm, *cold]
+    return sorted(
+        (*warm, *cold),
+        key=lambda n: _perish_then_room_key(usage.get(n), headroom.get(n) or 0.0, now),
+    )
+
+
+def _escape_order(
+    candidates: Sequence[str],
+    usage: Mapping[str, dict | str | None],
+    models: Sequence[str],
+    bars: Mapping[str, float],
+    settings: AutoSwitchSettings,
+    last_active_at: dict,
+    now: float,
+) -> list[str]:
+    """The order a walled active leaves by (#403): soonest binding-window recovery,
+    warmth only breaking an exact tie (it never outranks a candidate that comes back
+    sooner, and never keeps the active walled)."""
+    return sorted(
+        candidates,
+        key=lambda n: (
+            _binding_recovery_ts(
+                usage.get(n),
+                models,
+                now,
+                threshold=bars.get(n, settings.threshold),
+                weekly_threshold=settings.weekly_threshold,
+                scale=_ruler(settings),
+            ),
+            0 if _is_warm(n, last_active_at, now, settings.cache_ttl_seconds) else 1,
+        ),
+    )
+
+
+_ROOM_AXIS = "7d reset within 24h, then most room"
 
 
 def dynamic_candidate_order(
@@ -727,17 +784,25 @@ def dynamic_candidate_order(
     trigger: str = "proactive",
     partition: bool = True,
     reasons: dict[str, str] | None = None,
+    raw_active_headroom: float | None = None,
+    models: Sequence[str] = (),
 ) -> tuple[list[str], str]:
-    """The order `dynamic` takes its candidates in, and what it sorted on: the tick's
-    `proactive` arm and the "Next best" panel both build it here, never apart.
+    """The order `dynamic` takes its candidates in, and what it sorted on: the "Next
+    best" panel builds it here from the same pieces the tick's two arms rank by.
 
-    Warm before cold, each tier by `_perish_then_room_key`. On `proactive`, an
-    active at the real wall lifts the peers' own lines when none is left, and the
-    cold tier puts the candidates that clear their plan-scaled landing cost first
+    `proactive`: warm before cold, each tier by `_perish_then_room_key`; an active at
+    the real wall lifts the peers' own lines when none is left, and the cold tier
+    puts the candidates that clear their plan-scaled landing cost first
     (``partition=False`` on the unmodeled retry, whose floor the tick applies
-    itself). The `expiring` accounts go in front: all of them on `proactive`, only
-    those ahead of the active on `dynamic-healthy`. ``reasons`` is the panel's side
-    channel (see `_rank_dynamic_candidates`); the tick passes none.
+    itself). The `expiring` accounts go in front, all of them.
+
+    `dynamic-healthy`: an active whose own model-gated reading (``raw_active_headroom``)
+    is at its wall leaves by `_escape_order`; otherwise the order is `_rotation_order`
+    and the `expiring` accounts ahead of the active (`_expiring_ahead`) go in front.
+    Admission (the landing floor, the step, the dwell) is the tick's, not applied here.
+
+    ``reasons`` is the panel's side channel (see `_rank_dynamic_candidates`); the tick
+    passes none.
     """
     proactive = trigger == "proactive"
     ttl = settings.cache_ttl_seconds
@@ -753,14 +818,30 @@ def dynamic_candidate_order(
         warm, cold = _rank_dynamic_candidates(
             pool, headroom, usage, now, last_active_at, ttl, reasons, entries
         )
-    if proactive and partition:
-        cold.sort(
-            key=lambda n: headroom.get(n, 0.0) < cold_landing_cost(n, usage, entries, settings)
-        )
-    front = expiring if proactive else _expiring_ahead(expiring, current)
-    ordered = warm + cold
+    axis = f"warm, then {_ROOM_AXIS}"
+    if proactive:
+        if partition and cold:
+            cold.sort(
+                key=lambda n: headroom.get(n, 0.0) < cold_landing_cost(n, usage, entries, settings)
+            )
+            axis = (
+                "warm, then cold that clear their landing cost, then other cold, "
+                f"each by {_ROOM_AXIS}"
+            )
+        ordered, front = warm + cold, expiring
+    else:
+        walled = _about_to_wall(raw_active_headroom, _wall_headroom(bars.get(current)))
+        front = _expiring_ahead(expiring, current, walled)
+        if walled:
+            ordered = _escape_order(
+                warm + cold, usage, models, bars, settings, last_active_at, now
+            )
+            axis = "soonest to recover, warm on a tie"
+        else:
+            ordered = _rotation_order(warm, cold, headroom, usage, settings, now)
+            if settings.alternation_chunk_pct > 0:
+                axis = _ROOM_AXIS
     ordered = [n for n in front if n in ordered] + [n for n in ordered if n not in front]
-    axis = "warm, then 7d reset within 24h, then most room"
     return ordered, (f"expiring window, then {axis}" if set(front) & set(ordered) else axis)
 
 
@@ -3015,17 +3096,12 @@ class AutoSwitchEngine:
         # On a healthy active, the expiring accounts ahead of its own window pull the
         # switch. An active walled on its own model-gated axis leaves by the walled
         # escape below (#403), which prices the landing and breaks ties by warmth.
-        ahead: list[str] = []
-        spend_first = False
-        if (
-            trigger == "dynamic-healthy"
-            and expiring
-            and not _about_to_wall(raw_active_headroom, self._active_wall)
-        ):
-            ahead = _expiring_ahead(expiring, current)
-            # The active is itself the soonest expiring window: it spends it, and
-            # only a candidate whose own window perishes sooner may take over.
-            spend_first = not ahead
+        walled = _about_to_wall(raw_active_headroom, self._active_wall)
+        healthy = trigger == "dynamic-healthy"
+        ahead = _expiring_ahead(expiring, current, walled) if healthy else []
+        # The active is itself the soonest expiring window: it spends it, and
+        # only a candidate whose own window perishes sooner may take over.
+        spend_first = healthy and bool(expiring) and not walled and not ahead
 
         dynamic_ordered: list[str] | None = None
         dynamic_any_known = True
@@ -3259,10 +3335,10 @@ class AutoSwitchEngine:
                 if n in cold_set:
                     return h - _cold_cost(n) > SPENT_HEADROOM_PCT
                 return h >= _cold_cost(n)
-            alternation_admissible = [
-                n for n in warm_ordered + cold_ordered
-                if _clears_the_landing_floor(n)
-            ]
+            rotation = _rotation_order(
+                warm_ordered, cold_ordered, floor_headroom, usage, settings, now
+            )
+            alternation_admissible = [n for n in rotation if _clears_the_landing_floor(n)]
             since = last_active_at.get(current)
             rotation_due = since is not None and now - since >= settings.alternation_chunk_seconds
             if settings.alternation_chunk_pct > 0:
@@ -3271,7 +3347,8 @@ class AutoSwitchEngine:
                 alternation_admissible, rotation_due = self._step_alternation(
                     state=state, usage=usage, current=current, since=since, now=now,
                     settings=settings, warm_ordered=warm_ordered,
-                    cold_ordered=cold_ordered, floor_headroom=floor_headroom,
+                    cold_ordered=cold_ordered, ranked=rotation,
+                    floor_headroom=floor_headroom,
                     active_headroom=active_headroom, cold_cost=_cold_cost,
                 )
             partner = next(iter(alternation_admissible), None)
@@ -3329,7 +3406,7 @@ class AutoSwitchEngine:
                 and floor_headroom.get(current, 0.0) < _cold_cost(current)
             )
             walled_escape = None
-            if _about_to_wall(raw_active_headroom, self._active_wall):
+            if walled:
                 if blackout_escape:
                     # ONE list, warm and cold together — never `cold_
                     # ordered` alone (that left a WARM rescue invisible to
@@ -3402,22 +3479,9 @@ class AutoSwitchEngine:
                         if model_gated_partner is None
                         or headroom.get(n, 0.0) >= _cold_cost(n)
                     ]
-                escapees = sorted(
-                    escape_candidates,
-                    # Soonest-reset first; warmth only breaks an exact tie
-                    # (item 4/D) — it never outranks a candidate that comes
-                    # back sooner, and it never keeps the active walled.
-                    key=lambda n: (
-                        _binding_recovery_ts(
-                            usage.get(n),
-                            self._models,
-                            now,
-                            threshold=thresholds[n],
-                            weekly_threshold=settings.weekly_threshold,
-                            scale=_ruler(settings),
-                        ),
-                        0 if _is_warm(n, last_active_at, now, settings.cache_ttl_seconds) else 1,
-                    ),
+                escapees = _escape_order(
+                    escape_candidates, usage, self._models, thresholds, settings,
+                    last_active_at, now,
                 )
                 if escapees:
                     walled_escape = escapees[0]
@@ -5657,6 +5721,7 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         warm_ordered: Sequence[str],
         cold_ordered: Sequence[str],
+        ranked: Sequence[str],
         floor_headroom: dict[str, float | None],
         active_headroom: float,
         cold_cost: Callable[[str], float],
@@ -5666,8 +5731,8 @@ class AutoSwitchEngine:
 
         The step is measured on the active's 5h/7d windows (the replay's
         binding window; a model window gates a landing, it does not time a
-        stay). Warm and cold candidates compete in ONE list by
-        `_perish_then_room_key`; a candidate must keep ``step + SPENT`` points
+        stay). Warm and cold candidates compete in ONE list (``ranked``, from
+        `_rotation_order`); a candidate must keep ``step + SPENT`` points
         after the landing's re-write is charged to it (cold only), the replay's
         ``h >= step + SPENT + landing %``. NOT shipped: the replay's "landing
         under 1% of its larger window" veto, which needs the prefix size the
@@ -5695,7 +5760,6 @@ class AutoSwitchEngine:
         cold = set(cold_ordered)
         dwell = settings.alternation_chunk_seconds
         h = {n: floor_headroom.get(n) or 0.0 for n in (*warm_ordered, *cold_ordered)}
-        ranked = sorted(h, key=lambda n: _perish_then_room_key(usage.get(n), h[n], now))
 
         def room(n: str) -> float:
             return h[n] - (cold_cost(n) if n in cold else 0.0)

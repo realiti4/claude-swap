@@ -17885,9 +17885,13 @@ def test_a_weekly_cap_of_one_hundred_is_no_cap():
     assert expiring_order(["1", "2"], usage, headroom, {}, {"2": 100.0}, {}, lambda n: 0.0, now) == ["2"]
 
 
-def _dco(pool, *, expiring=(), plans=None, trigger="proactive", partition=True, active_headroom=2.0):
+def _dco(
+    pool, *, expiring=(), plans=None, trigger="proactive", partition=True,
+    active_headroom=2.0, raw_active_headroom=60.0, **settings,
+):
     """`dynamic_candidate_order` on three cold peers: 2 resets within a day with 60
-    points of room, 3 holds 90 and resets later, 4 resets within the day with 95."""
+    points of room, 3 holds 90 and resets later, 4 resets within the day with 95.
+    A healthy active reads ``raw_active_headroom`` (60 is clear of its wall)."""
     from types import SimpleNamespace
 
     from claude_swap.autoswitch import dynamic_candidate_order
@@ -17903,28 +17907,53 @@ def _dco(pool, *, expiring=(), plans=None, trigger="proactive", partition=True, 
     headroom = {n: float(100 - u["seven_day"]["pct"]) for n, u in usage.items()}
     entries = {n: SimpleNamespace(plan=p) for n, p in (plans or {}).items()}
     return dynamic_candidate_order(
-        pool, headroom, usage, entries, {}, {}, AutoSwitchSettings(strategy="dynamic"), now,
-        current="1", active_headroom=active_headroom, expiring=expiring,
-        trigger=trigger, partition=partition,
+        pool, headroom, usage, entries, {}, {}, AutoSwitchSettings(strategy="dynamic", **settings),
+        now, current="1", active_headroom=active_headroom, expiring=expiring,
+        trigger=trigger, partition=partition, raw_active_headroom=raw_active_headroom,
     )
 
 
 class TestDynamicCandidateOrder:
-    KEY = "warm, then 7d reset within 24h, then most room"
+    ROOM = "7d reset within 24h, then most room"
+    WARM = f"warm, then {ROOM}"
+    COLD_SPLIT = (
+        "warm, then cold that clear their landing cost, then other cold, "
+        "each by 7d reset within 24h, then most room"
+    )
+    ESCAPE = "soonest to recover, warm on a tie"
 
     def test_a_cold_landing_is_priced_by_the_plan_of_the_account_it_lands_on(self):
         """Cost 20 (Ultra); on Max 5x it is 80, which 2's 60 points do not clear."""
-        assert _dco(["2", "3"]) == (["2", "3"], self.KEY)
-        assert _dco(["2", "3"], plans={"2": "Max 5x"}) == (["3", "2"], self.KEY)
-        assert _dco(["2", "3"], plans={"2": "Max 5x"}, partition=False) == (["2", "3"], self.KEY)
+        assert _dco(["2", "3"]) == (["2", "3"], self.COLD_SPLIT)
+        assert _dco(["2", "3"], plans={"2": "Max 5x"}) == (["3", "2"], self.COLD_SPLIT)
+        assert _dco(["2", "3"], plans={"2": "Max 5x"}, partition=False) == (["2", "3"], self.WARM)
 
     def test_the_expiring_accounts_go_first_and_the_key_says_so(self):
         order = _dco(["2", "3", "4"], expiring=["3", "1", "2"])
-        assert order == (["3", "2", "4"], f"expiring window, then {self.KEY}")
+        assert order == (["3", "2", "4"], f"expiring window, then {self.COLD_SPLIT}")
 
     def test_a_healthy_active_only_yields_to_the_accounts_that_expire_before_it(self):
         peers = ["2", "3", "4"]
         spends_its_own_first = _dco(peers, expiring=["1", "3", "2"], trigger="dynamic-healthy")
-        assert spends_its_own_first == (["2", "4", "3"], self.KEY)
+        assert spends_its_own_first == (["2", "4", "3"], self.ROOM)
         ahead = _dco(peers, expiring=["3", "1", "2"], trigger="dynamic-healthy")
-        assert ahead == (["3", "2", "4"], f"expiring window, then {self.KEY}")
+        assert ahead == (["3", "2", "4"], f"expiring window, then {self.ROOM}")
+
+    def test_the_time_only_alternation_ranks_warm_first_and_the_step_does_not(self):
+        """The percent step (the default) ranks warm and cold in one list; with
+        `alternation_chunk_pct` 0 the time-only arm lists warm before cold."""
+        assert _dco(["3", "2"], trigger="dynamic-healthy")[1] == self.ROOM
+        assert _dco(["3", "2"], trigger="dynamic-healthy", alternation_chunk_pct=0.0)[1] == self.WARM
+
+    def test_an_active_at_its_wall_leaves_by_recovery_and_no_expiring_window_pulls_it(self):
+        """A healthy active whose own model-gated reading is at the wall takes the
+        walled escape's order (`_escape_order`), and the tick's `ahead` stays empty
+        there, so an expiring account is not put in front of it."""
+        order, axis = _dco(
+            ["3", "2", "4"], expiring=["3", "1", "2"], trigger="dynamic-healthy",
+            raw_active_headroom=0.0,
+        )
+        assert axis == self.ESCAPE
+        # 2 and 3 by the reset of their binding 7d window; 4's binding window is the
+        # 5h one, which has no reset to schedule around.
+        assert order == ["2", "3", "4"], order

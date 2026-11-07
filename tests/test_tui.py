@@ -1638,10 +1638,8 @@ class TestWatchScreen:
 def _order_fixture_accounts():
     """Active "3", usable "5" (ranks first only by admission, never by
     sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full). "12"
-    is a genuine candidate the pass refused -- still in the waiting tier,
-    ordered by its own reset -- while "2" (disabled) and "4" (expired) are
-    non-targets the engine will never pick automatically, however soon
-    either resets."""
+    is a genuine candidate the pass refused, "2" (disabled) and "4" (expired)
+    are non-targets; none is ever picked, so all three sort by 7d reset."""
     return [
         make_account(3, active=True, entry=make_entry(95.0, 95.0)),
         make_account(5, entry=make_entry(5.0, 5.0)),
@@ -1659,18 +1657,21 @@ def _order_fixture_accounts():
 
 _ORDER_SETTINGS = AutoSwitchSettings(strategy="best", threshold=90.0)
 
-_WARM_ORDER_SETTINGS = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+# The time-only alternation: the arm where warmth ranks (the percent step lists
+# warm and cold together).
+_WARM_ORDER_SETTINGS = AutoSwitchSettings(
+    strategy="dynamic", threshold=90.0, alternation_chunk_pct=0.0
+)
 
 
 def _warm_fixture_accounts():
     """Active "1" healthy (50/50, `dynamic-healthy`); "2" a warm partner
     (last active 20m ago, cached org context inside the default 1h
     `cache_ttl_seconds`) with a 5-day weekly reset; "3" cold (never
-    active) with the SOONER 1-day reset. `_rank_dynamic_candidates` ranks
+    active) with the SOONER 1-day reset. The time-only alternation lists
     a warm candidate ahead of every cold one regardless of reset time, so
-    every screen must list "2" before "3" -- same fixture the auto view's
-    own `test_a_warm_partner_outranks_a_sooner_cold_reset` uses, reused
-    here to prove the OTHER surfaces agree with it, not just re-derive it.
+    every screen must list "2" before "3": the other surfaces must agree
+    with the auto view, not just re-derive it.
     "3" sits at 5h 85%: a cold landing's cost does not fit what is left, so
     `expiring_order` does not pull it ahead of the warm partner."""
     return [
@@ -1690,6 +1691,15 @@ def _warm_fixture_accounts():
             fetched_at=time.time(), age_s=0.0,
         )),
     ]
+
+
+ROOM_KEY = "7d reset within 24h, then most room"
+WARM_KEY = f"warm, then {ROOM_KEY}"
+COLD_PARTITION_KEY = (
+    "warm, then cold that clear their landing cost, then other cold, "
+    "each by 7d reset within 24h, then most room"
+)
+ESCAPE_KEY = "soonest to recover, warm on a tie"
 
 
 def _autoview_text(snap, active, settings, last_active_at=None):
@@ -1731,22 +1741,16 @@ class TestReadLastActiveAt:
 class TestOrderedAccounts:
     """One order every listing screen renders -- never a re-derived key."""
 
-    def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
-        """Non-targets sort dead last, on BOTH screens: "12" is a real
-        candidate the engine's own pass refused (still waiting on its own
-        reset) and must outrank "2", a disabled slot -- the engine will
-        never pick a disabled account automatically, however soon its
-        window resets, so it belongs with the other non-targets (token-
-        expired "4"), not mixed into the waiting tier by reset time."""
+    def test_matches_the_auto_switch_view_and_sorts_non_candidates_by_7d_reset(self):
+        """The candidate "5" leads, on BOTH screens; "2" (disabled, 7d back in
+        3d), "12" (refused, back in 6d) and "4" (token expired, no reset) follow
+        by that reset, unknown last."""
         snap = AccountsSnapshot(
             accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
         )
         order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, time.time())
-        assert order[0] == "3"  # active pinned first
+        assert order == ["3", "5", "2", "12", "4"], order  # active pinned first
         assert order[1:] == _autoview_order(snap, "3", _ORDER_SETTINGS)
-        for unusable in ("2", "4", "12"):  # disabled / token-expired / 7d-full
-            assert order.index("5") < order.index(unusable)
-        assert order.index("12") < order.index("2")
 
     def test_unmodeled_trigger_keys_stay_in_sync_with_the_auto_view_text(self):
         """Two files key the same trigger names; a name added to one alone
@@ -1755,15 +1759,10 @@ class TestOrderedAccounts:
 
         assert set(autoview._UNMODELED_TEXT) == tui_data._UNMODELED_TRIGGERS
 
-    def test_waiting_tier_orders_by_binding_recovery_not_the_weekly_reset(self):
-        """Two never-ranked candidates: "2"'s BINDING window is its 5-hour
-        one (99%, back in 1h) with a distant, irrelevant 7-day reset (5d);
-        "3"'s binding window is its 7-day one (99%, back in 2d) with a
-        near, irrelevant 5-hour reset. The engine would fail over to
-        whichever recovers first -- "2" -- so the waiting tier must use
-        `_binding_recovery_ts` (the window that actually blocks each
-        account), not a flat 7-day-reset key that reads "3" as sooner
-        because it never looks at which window binds."""
+    def test_refused_rows_order_by_their_7d_reset_not_the_binding_recovery(self):
+        """Two refused peers: "2" binds on its 5h window (back in 1h) with a 7d
+        reset in 5d; "3" binds on its 7d window (back in 2d). Neither is a
+        target, so the row whose 7d resets first leads: "3"."""
         active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
                   "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
         soonest_via_5h = {
@@ -1787,82 +1786,12 @@ class TestOrderedAccounts:
         )
         settings = AutoSwitchSettings(strategy="best", threshold=90.0)
         order = tui_data.ordered_accounts(snap, settings, time.time())
-        assert order == ["1", "2", "3"], order
+        assert order == ["1", "3", "2"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
-    def test_full_accounts_never_outrank_a_waiting_candidate_with_headroom(self):
-        """The owner's report: with no candidate qualifying, "Next best"
-        read a FULL account (every relevant window at or over 100%) ABOVE
-        an account that still has headroom in every window, because the
-        waiting tier's only key was soonest `_binding_recovery_ts` -- so a
-        full "6" (7d 100%, back in 20m) outranked a merely-refused "2" (5h
-        97%, back in 30m), though "2" is usable right now and "6" is not
-        usable until it resets. Headroom-everywhere accounts ("2","4","3")
-        must sort before every full one ("6","7","5"); only inside each
-        half does soonest recovery break the tie. "8" (no stored login)
-        stays last, in its own unswitchable tier. "9" is the CONTROL: a
-        genuinely admitted candidate still ranks first, ahead of both
-        halves of the waiting tier."""
-        active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
-                  "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
-        best_candidate = {"five_hour": {"pct": 5.0, "resets_at": _iso_in(7200)},
-                           "seven_day": {"pct": 5.0, "resets_at": _iso_in(86400)}}
-        headroom_soonest = {  # "2": binds at 97% on 5h, back in 30m
-            "five_hour": {"pct": 97.0, "resets_at": _iso_in(30 * 60)},
-            "seven_day": {"pct": 72.0, "resets_at": _iso_in(86400 * 3)},
-        }
-        headroom_mid = {  # "4": binds at 97% on 7d, back in 5h
-            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
-            "seven_day": {"pct": 97.0, "resets_at": _iso_in(5 * 3600)},
-        }
-        headroom_last = {  # "3": binds at 97% on 7d, back in 10h
-            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
-            "seven_day": {"pct": 97.0, "resets_at": _iso_in(10 * 3600)},
-        }
-        full_soonest = {  # "6": 7d full, back in 20m
-            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
-            "seven_day": {"pct": 100.0, "resets_at": _iso_in(20 * 60)},
-        }
-        full_mid = {  # "7": 7d full, back in 1h
-            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
-            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3600)},
-        }
-        full_last = {  # "5": 7d full, back in 2h
-            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
-            "seven_day": {"pct": 100.0, "resets_at": _iso_in(2 * 3600)},
-        }
-        snap = AccountsSnapshot(
-            accounts=[
-                make_account(1, active=True, entry=UsageEntry(
-                    last_good=active, fetched_at=time.time(), age_s=0.0)),
-                make_account(9, entry=UsageEntry(
-                    last_good=best_candidate, fetched_at=time.time(), age_s=0.0)),
-                make_account(2, entry=UsageEntry(
-                    last_good=headroom_soonest, fetched_at=time.time(), age_s=0.0)),
-                make_account(4, entry=UsageEntry(
-                    last_good=headroom_mid, fetched_at=time.time(), age_s=0.0)),
-                make_account(3, entry=UsageEntry(
-                    last_good=headroom_last, fetched_at=time.time(), age_s=0.0)),
-                make_account(6, entry=UsageEntry(
-                    last_good=full_soonest, fetched_at=time.time(), age_s=0.0)),
-                make_account(7, entry=UsageEntry(
-                    last_good=full_mid, fetched_at=time.time(), age_s=0.0)),
-                make_account(5, entry=UsageEntry(
-                    last_good=full_last, fetched_at=time.time(), age_s=0.0)),
-                make_account(8, switchable=False),
-            ],
-            active_number="1", taken_at=0.0,
-        )
-        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
-        order = tui_data.ordered_accounts(snap, settings, time.time())
-        assert order == ["1", "9", "2", "4", "3", "6", "7", "5", "8"], order
-        assert order[1:] == _autoview_order(snap, "1", settings)
-
-    def test_a_disabled_slot_never_outranks_a_waiting_candidate(self):
-        """CONTROL, isolated from the fixture above: a disabled slot with
-        the SOONEST reset of the fleet must still sort after a genuine
-        waiting candidate -- proving the non-target tier is a separate
-        tier, not just a reset-based tie-break "2" happens to lose."""
+    def test_a_disabled_slot_and_a_refused_row_list_by_7d_reset(self):
+        """A disabled slot (7d back in 10m) and a refused row (7d back in 2d)
+        are both non-targets: the one that resets sooner leads."""
         active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
                   "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
         waiting = {
@@ -1887,7 +1816,7 @@ class TestOrderedAccounts:
         )
         settings = AutoSwitchSettings(strategy="best", threshold=90.0)
         order = tui_data.ordered_accounts(snap, settings, time.time())
-        assert order == ["1", "3", "2"], order
+        assert order == ["1", "2", "3"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
     def test_a_disabled_spend_only_row_sorts_with_the_uniform_spend_tier(self):
@@ -2234,12 +2163,16 @@ class TestPanelOrderIsTheEnginesOrder:
     cap's veto (a capped peer is never listed, a capped active is left at once)."""
 
     @staticmethod
-    def _tick_and_panel(temp_home, fleet, *, tiers=None, caps=None, now=None, **kw):
+    def _tick_and_panel(
+        temp_home, fleet, *, tiers=None, caps=None, now=None, state=None, **kw
+    ):
         """Tick the real engine on ``fleet`` (account 1 active); return the
         account it switched to, the panel's ordered list and its rendered text
         for the same fleet. ``caps`` maps an account to its weekly cap; ``now``
         moves the engine's clock off its fake epoch, for a fleet whose resets
-        are read against the wall clock."""
+        are read against the wall clock. ``state`` is the engine's state file as
+        the tick reads it (``lastActiveAt``, the stay tracker); the panel reads
+        the same ``lastActiveAt``."""
         from claude_swap.autoswitch import TickOutcome
         from tests.test_autoswitch import EngineHarness
 
@@ -2254,6 +2187,11 @@ class TestPanelOrderIsTheEnginesOrder:
             h.switcher.set_account_priority(num, tier)
         for num, cap in caps.items():
             h.switcher.set_account_weekly_cap(num, cap)
+        if state is not None:
+            (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+                json.dumps({"schemaVersion": 1, **state})
+            )
+        last_active_at = (state or {}).get("lastActiveAt")
         assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
         snap = AccountsSnapshot(
             accounts=[
@@ -2273,8 +2211,13 @@ class TestPanelOrderIsTheEnginesOrder:
             taken_at=0.0,
         )
         settings = AutoSwitchSettings(**kw)
-        ordered = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")[0]
-        return str(h.active_number()), ordered, _autoview_text(snap, "1", settings)
+        ordered = tui_data.rank_switch_candidates(
+            snap, settings, time.time(), "1", last_active_at
+        )[0]
+        return (
+            str(h.active_number()), ordered,
+            _autoview_text(snap, "1", settings, last_active_at),
+        )
 
     @pytest.mark.parametrize("active_pct", [50.0, 96.0])
     def test_priority_consume_first_lists_tier_first_then_the_soonest_reset(
@@ -2411,10 +2354,9 @@ class TestPanelOrderIsTheEnginesOrder:
         assert "capped" in row and "not a candidate" not in row, row
 
     def test_a_capped_peer_takes_the_same_place_on_both_screens(self):
-        """#2 is capped and recovers sooner (its 7d window, 1h) than #3,
-        which is refused (95% against the 90 line, back in 2h): the capped
-        row sorts behind the waiting row on `ordered_accounts` as it does in
-        the panel, never among the refused peers by its reset."""
+        """#2 is capped and its 7d window resets in 1h; #3 is refused (95%
+        against the 90 line) and its 7d resets in 3 days. Neither is a target,
+        so both screens list them by that reset, #2 first."""
         settings = AutoSwitchSettings(strategy="best", threshold=90.0)
         capped = UsageEntry(
             last_good={
@@ -2432,7 +2374,7 @@ class TestPanelOrderIsTheEnginesOrder:
             active_number="1", taken_at=0.0,
         )
         order = tui_data.ordered_accounts(snap, settings, time.time())
-        assert order == ["1", "3", "2"], order
+        assert order == ["1", "2", "3"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
     def test_a_capped_api_key_peer_is_not_the_last_resort(self):
@@ -2457,9 +2399,9 @@ class TestPanelOrderIsTheEnginesOrder:
     @pytest.mark.parametrize(
         "five, soon, pick, header",
         [
-            (97.0, True, "2", "expiring window, then warm, then 7d reset within 24h, then most room"),
-            (10.0, True, "2", "expiring window, then warm, then 7d reset within 24h, then most room"),
-            (97.0, False, "3", "warm, then 7d reset within 24h, then most room"),
+            (97.0, True, "2", f"expiring window, then {COLD_PARTITION_KEY}"),
+            (10.0, True, "2", f"expiring window, then {ROOM_KEY}"),
+            (97.0, False, "3", COLD_PARTITION_KEY),
         ],
         ids=["walled-expiring", "healthy-expiring", "walled-nothing-expiring"],
     )
@@ -2491,10 +2433,58 @@ class TestPanelOrderIsTheEnginesOrder:
         assert ordered == [pick, "3" if pick == "2" else "2"], ordered
         assert f"Next best ({header})" in rendered, rendered
 
+    def test_a_healthy_active_lists_the_account_the_tick_rotates_to_first(self, temp_home):
+        """Nothing expires (no 7d reset anywhere) and the active has spent its
+        20-point step. The percent step ranks warm and cold together, most room
+        first: the tick lands on cold 3 (90) over warm 2 (60), and the panel
+        lists 3 first under a key that does not put warm first."""
+        def w(five, seven):
+            return {"five_hour": {"pct": five}, "seven_day": {"pct": seven}}
+
+        now = time.time()
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, {"1": w(20.0, 20.0), "2": w(5.0, 40.0), "3": w(5.0, 10.0)},
+            strategy="dynamic", threshold=90.0, cooldown_seconds=0.0, now=now,
+            state={
+                "lastActiveAt": {"1": now - 700, "2": now - 1200},
+                "alternation": {
+                    "account": "1", "since": now - 700, "anchor": 20.0, "rise": 20.0,
+                    "ran": True,
+                },
+            },
+        )
+        assert engine_pick == "3"
+        assert ordered == ["3", "2"], ordered
+        assert f"Next best ({ROOM_KEY})" in rendered, rendered
+
+    def test_a_walled_active_lists_the_accounts_in_the_order_it_escapes_by(self, temp_home):
+        """Active 1 is walled on Fable (100%) while its 5h/7d read healthy, and
+        every peer is Fable-walled too. The walled escape takes whichever
+        recovers soonest (3, back in 1h) over the roomier 2 (back in 5h), which
+        the step's most-room key would list first; and an expiring window does
+        not pull the list, as it does not pull the tick."""
+        def u(seven, fable_secs):
+            return {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": seven, "resets_at": _iso_in(3 * 86400)},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(fable_secs)}],
+            }
+
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, {"1": u(95.0, 4 * 3600), "2": u(40.0, 5 * 3600), "3": u(70.0, 3600)},
+            strategy="dynamic", threshold=90.0, model="Fable", cooldown_seconds=0.0,
+            now=time.time(),
+        )
+        assert engine_pick == "3"
+        assert ordered == ["3", "2"], ordered
+        assert f"Next best ({ESCAPE_KEY})" in rendered, rendered
+
     def test_rows_that_are_not_candidates_follow_every_candidate_soonest_7d_reset_first(self):
-        """A capped, a disabled, a spend-only and an unreadable row are never a
-        target. They list behind the candidate in the order their 7d windows
-        reset (unknown last), not in the fixed order of what kept them out."""
+        """A capped, a disabled, a spend-only, an unreadable and an at-the-line
+        row are never a target. They list behind the candidate in the order
+        their 7d windows reset (unknown last), not in the fixed order of what
+        kept them out, and `ordered_accounts` lists them the same way; a slot
+        with no stored login trails them all."""
         def w(days):
             return UsageEntry(
                 last_good={
@@ -2516,10 +2506,20 @@ class TestPanelOrderIsTheEnginesOrder:
                 })),
                 make_account(6, entry=make_entry(sentinel="token expired")),
                 make_account(7, entry=w(3), disabled=True),
+                make_account(8, entry=UsageEntry(
+                    last_good={
+                        "five_hour": {"pct": 98.0, "resets_at": _iso_in(3600)},
+                        "seven_day": {"pct": 10.0, "resets_at": _iso_in(4 * 86400)},
+                    },
+                    fetched_at=time.time(), age_s=0.0,
+                )),
+                make_account(9, switchable=False),
             ],
             active_number="1", taken_at=0.0,
         )
-        assert _autoview_order(snap, "1", settings) == ["2", "4", "7", "3", "5", "6"]
+        order = _autoview_order(snap, "1", settings)
+        assert order == ["2", "4", "7", "8", "3", "5", "6", "9"], order
+        assert tui_data.ordered_accounts(snap, settings, time.time())[1:] == order
 
 
 @pytest.mark.asyncio
@@ -2549,7 +2549,9 @@ class TestSharedAccountOrder:
         from claude_swap.tui.widgets import AccountItem, AccountsPanel
 
         (tmp_path / "settings.json").write_text(
-            json.dumps({"schemaVersion": 1, "autoswitch": {"strategy": "dynamic"}})
+            json.dumps({"schemaVersion": 1, "autoswitch": {
+                "strategy": "dynamic", "alternationChunkPct": 0,
+            }})
         )
         (tmp_path / "autoswitch_state.json").write_text(json.dumps({
             "lastActiveAt": {"2": time.time() - 20 * 60},
@@ -4280,48 +4282,33 @@ class TestUnswitchableRowsAreListed:
             f"floor-clearer first: {out!r}"
         )
 
-    def test_a_warm_partner_outranks_a_sooner_cold_reset(self, tmp_path):
-        """`_rank_dynamic_on` used to pass a hardcoded `{}` for
-        `last_active_at`, so `_is_warm` was False for every candidate and
-        the warm tier was always empty (#375's own warm/cold pass never ran
-        here). The engine writes `lastActiveAt` to `<backup_dir>/
-        autoswitch_state.json` on every switch (autoswitch.py's
-        `_mutate_state` call in the switch path) -- this panel must read
-        THAT file, read-only, and rank through it: "2" was active 20m ago
-        (warm, inside the default 1h `cache_ttl_seconds`) with a 5-day
-        weekly reset; "3" has never been active (cold) with the SOONER
-        1-day reset. On reset alone "3" would rank first, but a warm
-        candidate ranks ahead of every cold one regardless of reset time
-        (`_rank_dynamic_candidates`) -- "2" must be first. Also covers the
-        axis legend: the key `dynamic_candidate_order` sorts on, never the
-        recovery axis' "soonest to recover" (that name belongs to the
-        at-limit escape order alone). "3" is at 5h 85%, so a cold landing
-        does not fit and `expiring_order` leaves it behind the warm one.
-        """
+    def test_a_warm_partner_outranks_a_cold_peer_with_more_room(self, tmp_path):
+        """`_rank_dynamic_on` once passed a hardcoded `{}` for `last_active_at`,
+        so no candidate was ever warm. The engine writes `lastActiveAt` to
+        `<backup_dir>/autoswitch_state.json` on every switch; the panel must read
+        that file. With the time-only alternation (`alternation_chunk_pct` 0,
+        the arm where warmth ranks) "2", active 20m ago, goes ahead of "3" (cold,
+        90 points of room against 60): without the file "3" is first. No window
+        carries a 7d reset, so nothing expires and the order is the key's alone."""
         active = {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 50.0}}
-        warm_partner = {
-            "five_hour": {"pct": 40.0},
-            "seven_day": {"pct": 40.0, "resets_at": _iso_in(5 * 86400)},
-        }
-        cold_sooner = {
-            "five_hour": {"pct": 85.0},
-            "seven_day": {"pct": 10.0, "resets_at": _iso_in(1 * 86400)},
-        }
+        warm_partner = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 40.0}}
+        cold_roomier = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 10.0}}
         (tmp_path / "autoswitch_state.json").write_text(json.dumps({
             "lastActiveAt": {"2": time.time() - 20 * 60},
         }))
-        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        settings = AutoSwitchSettings(
+            strategy="dynamic", threshold=90.0, alternation_chunk_pct=0.0
+        )
         out = self._render(self._snap(
             self._acct("1", "active@x.com", switchable=True, last_good=active),
             self._acct("2", "warm@x.com", switchable=True, last_good=warm_partner),
-            self._acct("3", "cold@x.com", switchable=True, last_good=cold_sooner),
+            self._acct("3", "cold@x.com", switchable=True, last_good=cold_roomier),
         ), active="1", settings=settings, backup_dir=tmp_path)
         assert out.index("warm@x.com") < out.index("cold@x.com"), (
-            f"the sooner-reset cold candidate outranked the warm one -- "
+            f"the roomier cold candidate outranked the warm one -- "
             f"lastActiveAt never reached this panel: {out!r}"
         )
-        # The warm partner's own 7d window is the one `expiring_order` walks here.
-        assert "warm, then 7d reset within 24h, then most room)" in out, out
+        assert f"Next best ({WARM_KEY})" in out, out
 
     def test_weekly_first_lists_the_soonest_reset_first_under_its_axis(self):
         """weekly-first's proactive arm ranks through the engine's own pass

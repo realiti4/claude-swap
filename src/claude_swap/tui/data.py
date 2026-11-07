@@ -28,12 +28,10 @@ from claude_swap.autoswitch import (
     STATE_FILENAME,
     ThresholdMap,
     _binding_at,
-    _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
-    _ruler,
     _seven_day_reset_ts,
     _wall_headroom,
     dynamic_candidate_order,
@@ -44,7 +42,6 @@ from claude_swap.autoswitch import (
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.lines import weekly_capped
 from claude_swap.models import AccountsSnapshot
-from claude_swap.poll_policy import binding_pct
 from claude_swap.settings import parse_model_names
 from claude_swap.snapshot_source import SnapshotSource
 from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
@@ -337,17 +334,18 @@ def rank_switch_candidates(
     def _rank_dynamic_on(
         axis: tuple[str, ...], trigger: str, dropped: bool
     ) -> tuple[list[str], str | None]:
-        """`dynamic`'s own healthy/proactive order, built by the function the tick
-        builds it with (`dynamic_candidate_order`), never `rank_candidates_pass`:
-        that pass's landing gate is a hysteresis MARGIN over the active, which a
-        warm candidate with less headroom than a cold one can never clear against
-        an about-to-wall active. `last_active_at` comes from the caller
-        (`read_last_active_at`, the state file the engine writes `lastActiveAt` to
-        on every switch): an unmeasured candidate reads cold, as in the engine.
-        `expiring` is priced on the model-gated headroom, as the tick prices it,
-        also on the unmodeled retry (`dropped`, whose cold floor is a tick-only
-        admission and is not applied here). The healthy arm's alternation dwell
-        and step rules are a tick-only decision, not a display one.
+        """`dynamic`'s own healthy/proactive order, built by `dynamic_candidate_order`
+        from the pieces the tick ranks by, never `rank_candidates_pass`: that pass's
+        landing gate is a hysteresis MARGIN over the active, which a warm candidate
+        with less headroom than a cold one can never clear against an about-to-wall
+        active. `last_active_at` comes from the caller (`read_last_active_at`, the
+        state file the engine writes `lastActiveAt` to on every switch): an unmeasured
+        candidate reads cold, as in the engine. `expiring` is priced on the
+        model-gated headroom, as the tick prices it, also on the unmodeled retry
+        (`dropped`, whose cold floor is a tick-only admission and is not applied
+        here). The active's own never-widened reading picks the healthy arm's walled
+        escape order. Whether a rotation happens now (the step, the dwell, the landing
+        floor) is a tick-only decision: the list is the order it would take them in.
         """
         last = last_active_at or {}
         headroom = _headroom_by_account(usage, axis)
@@ -362,6 +360,7 @@ def rank_switch_candidates(
                 entries, last, settings, now,
             ),
             trigger=trigger, partition=not dropped, reasons=reasons,
+            raw_active_headroom=model_headroom.get(active_number), models=models,
         )
         return ordered, (rank_axis if ordered else None)
 
@@ -442,43 +441,13 @@ def rank_switch_candidates(
     return ordered, rank_axis, trigger, unmodeled
 
 
-def waiting_tail_key(
-    usage: dict | None,
-    models: tuple[str, ...],
-    now: float,
-    settings: "AutoSwitchSettings",
-    line: float,
-) -> tuple:
-    """Sort key for a row the admission pass refused but that still has a
-    usable window: every account with headroom in ALL its windows before
-    every account with ANY window at or over 100% -- a full account is
-    unusable until it resets, however soon that is, so it must never
-    outrank one usable right now. Soonest binding recovery breaks ties
-    inside each half. `ordered_accounts` and the auto view's own
-    `_candidates_text` (autoview.py) both call this, or the two screens
-    can rank this tier two different ways on the same snapshot. ``line`` is
-    the account's own switch threshold (``ThresholdMap[num]``), read on
-    ``_ruler``'s scale as the engine's recovery reads are.
-    """
-    full = 1 if binding_pct(usage, models) >= 100.0 else 0
-    return (
-        full,
-        _binding_recovery_ts(
-            usage,
-            models,
-            now,
-            threshold=line,
-            weekly_threshold=settings.weekly_threshold,
-            scale=_ruler(settings),
-        ),
-    )
-
-
-def reset_tail_key(usage: dict | None, now: float) -> float:
-    """Sort key for a row the engine never lands on (capped, disabled, spend-only,
-    unreadable): its 7d reset, soonest first, an unknown one last."""
-    ts = _seven_day_reset_ts(usage, now)
-    return float("inf") if ts is None else ts
+def non_candidate_key(acc, now: float) -> tuple:
+    """Sort key for a switchable row the engine does not pick (capped, disabled,
+    spend-only, unreadable, or refused at its switch line): soonest 7d reset first,
+    an unknown one last. `ordered_accounts` and the auto view's panel both call it,
+    or the two screens list these rows two ways on one snapshot."""
+    ts = _seven_day_reset_ts(acc.usage.last_good, now)
+    return (1, float("inf") if ts is None else ts)
 
 
 def is_no_plan(acc) -> bool:
@@ -495,9 +464,9 @@ def ordered_accounts(
     last_active_at: dict | None = None,
 ) -> list[str]:
     """Every account number, active first, then the rest as the engine's own
-    pass would rank them: ranked-and-open, usable-but-refused (waiting,
-    soonest binding recovery first), non-target (disabled, sentinel-
-    blocked, spend-only), unswitchable last. THE one order every screen
+    pass would rank them: ranked-and-open, then every other switchable row
+    (`non_candidate_key`: refused, capped, disabled, sentinel-blocked,
+    spend-only), unswitchable last. THE one order every screen
     renders in -- a screen keeping slot order says so at its own call site.
     ``last_active_at`` is the caller's own ``read_last_active_at`` read (one
     file read feeds every screen), so ``dynamic``'s warm/cold pass ranks
@@ -509,8 +478,6 @@ def ordered_accounts(
         snap, settings, now, active_number, last_active_at
     )
     ordered_rank = {num: i for i, num in enumerate(ordered)}
-    models = parse_model_names(settings.model)
-    bars = ThresholdMap(switch_bars(snap), settings.threshold)
 
     def bucket(acc) -> tuple:
         if not acc.switchable:
@@ -519,36 +486,7 @@ def ordered_accounts(
             return (0, ordered_rank[acc.number])
         if is_no_plan(acc):
             return (5,)
-        # A disabled slot is a non-target -- the engine never lands on one
-        # automatically, however soon its own window recovers -- so it
-        # sorts with the other non-targets, never inside the waiting tier
-        # below by reset-time coincidence.
-        if acc.usage.sentinel is not None:
-            return (2,)
-        if binding_pct(acc.usage.last_good, models) is None:
-            # Spend-only: the same bucket whether disabled or not -- a
-            # spend axis carries no window pct to gate `disabled` against,
-            # and the auto view's own key (autoview.py:485-488) reads it
-            # this way too. `disabled` must not pull this row into the
-            # sentinel-like tier above, or the two screens disagree on the
-            # same snapshot.
-            return (3,)
-        if weekly_capped(acc.policy.weekly_cap, acc.usage.last_good):
-            # A veto the engine never lands past, so it drops out of
-            # `ordered_rank` above: behind every waiting row, ahead of the
-            # non-targets, as the auto view's own (997.0,) tier.
-            return (1.5,)
-        if acc.disabled:
-            return (2,)
-        # Soonest BINDING-window recovery first, unknown last -- matches
-        # the auto view's own fallback key for a row its admission pass
-        # refused (autoview.py's `_candidates_text`), or the two screens
-        # can list this same unranked row in two different orders. Not the
-        # 7-day reset alone: the window that actually blocks an account is
-        # whichever is highest, and that is routinely the 5-hour one.
-        return (1,) + waiting_tail_key(
-            acc.usage.last_good, models, now, settings, bars[acc.number]
-        )
+        return non_candidate_key(acc, now)
 
     others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
     numbers = [acc.number for acc in others]
