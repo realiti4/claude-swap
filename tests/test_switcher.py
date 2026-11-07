@@ -7616,7 +7616,8 @@ class TestPurge:
 
     def test_purge_removes_legacy_none_keychain_entry(self, temp_home):
         """Purge should clean account-None-* entries from older buggy runs — from
-        the new security service and best-effort from the legacy keyring."""
+        the new security service and, best-effort, from the service the legacy
+        keyring library used, both through ``security``."""
         switcher = ClaudeAccountSwitcher()
         switcher.platform = Platform.MACOS
         switcher._setup_directories()
@@ -7635,19 +7636,16 @@ class TestPurge:
             },
         })
 
-        mock_keyring = MagicMock()
         with patch("builtins.input", return_value="y"), \
-             patch("claude_swap.switcher.macos_keychain") as mock_kc, \
-             patch.dict(sys.modules, {"keyring": mock_keyring}):
+             patch("claude_swap.switcher.macos_keychain") as mock_kc:
             switcher.purge()
 
-        # New security service: account + legacy account-None both cleaned.
+        # New security service: account + legacy account-None both cleaned, then
+        # the old claude-code service swept the same way (item_exists is truthy
+        # on the mock, so every legacy item counts as present).
         mock_kc.delete_password.assert_has_calls([
             call("claude-swap", "account-1-user@example.com"),
             call("claude-swap", "account-None-user@example.com"),
-        ])
-        # Best-effort legacy keyring cleanup of the old claude-code service.
-        mock_keyring.delete_password.assert_has_calls([
             call("claude-code", "account-1-user@example.com"),
             call("claude-code", "account-None-user@example.com"),
         ])
