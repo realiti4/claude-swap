@@ -2876,6 +2876,32 @@ class TestUnswitchableRowsAreListed:
         assert starts["aaaa@x.com"] == starts["bbbb@x.com"], f"{starts} in {rows!r}"
         assert starts["cccc@x.com"] is None and rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows
 
+    def test_the_threshold_note_starts_in_the_status_column_on_every_row(self):
+        """The `threshold N%` note used to trail whatever the row carried, so
+        it sat at the chips' end on one row and after `5h full` on the next.
+        It is a status piece: one column, with the block kind before it."""
+        from rich.cells import cell_len
+
+        from claude_swap.settings import AutoSwitchSettings
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "noted@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 25.0}, "seven_day": {"pct": 65.0},
+            }),
+            self._acct("3", "much-longer@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 10.0},
+            }),
+        ), active="1", settings=AutoSwitchSettings(threshold=90.0, weekly_threshold=70.0))
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
+        assert rows["noted@x.com"].endswith("threshold 70%"), rows
+        assert rows["much-longer@x.com"].endswith("5h full \u00b7 threshold 90%"), rows
+        starts = {
+            cell_len(line[: line.index("5h full" if "5h full" in line else "threshold")])
+            for line in rows.values()
+        }
+        assert len(starts) == 1, f"the status column moved: {rows!r}"
+
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends
@@ -3008,6 +3034,131 @@ class TestUnswitchableRowsAreListed:
             f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
             f"panel out:\n{rendered}"
         )
+
+
+# Pairwise model of the slot guard below (pict `/o:2 /r:3328`, 9 cases); pict
+# is not a runtime dependency, its output is the table.
+#   USAGE: chip, spend, sentinel      LOGIN: yes, no      WHERE: yes, no
+#   EMAIL: ascii, wide                STALE NOPLAN WALLED BLOCK THRESHOLD
+#   ATLINE NOTCAND DISABLED: on, off
+_SLOT_PAIRWISE = [
+    # usage, login, where, wide email, status keys on
+    ("spend", True, True, True, ("block", "at-line", "disabled")),
+    ("spend", False, False, False,
+     ("stale", "no-plan", "walled", "threshold", "not-candidate")),
+    ("chip", True, True, False, ("stale", "threshold", "at-line")),
+    ("sentinel", True, False, True, ("no-plan", "walled", "block", "not-candidate")),
+    ("chip", False, False, True,
+     ("stale", "block", "threshold", "not-candidate", "disabled")),
+    ("chip", False, True, False, ("no-plan", "walled", "at-line", "disabled")),
+    ("sentinel", False, True, True,
+     ("no-plan", "threshold", "at-line", "not-candidate", "disabled")),
+    ("sentinel", True, False, False, ("stale", "walled", "block", "at-line", "disabled")),
+    ("chip", False, True, False, ("walled",)),
+]
+_SLOT_STATUS_TEXT = {
+    "stale": "stale", "no-plan": "no plan", "walled": "Fable-walled",
+    "block": "Fable-only", "threshold": "threshold 70%",
+    "at-line": "at switch line", "not-candidate": "not a candidate",
+    "disabled": "auto-swap disabled",
+}
+_SLOT_USAGE_TEXT = {
+    "chip": "5h:25% · 7d:10%",
+    "spend": "$$ 26% · $120.00 / $466.00",
+    "sentinel": "keychain unavailable",
+}
+
+
+class TestNextBestRowSlots:
+    """`render_candidate_rows` is the one place a Next best row is padded:
+    every marker is a named slot (number | email | login | usage | status |
+    where), and a slot starts in the SAME display column on every row of the
+    block. Each PR that added a marker used to pad it itself, and the
+    integration build stitched the paddings with sweep edits, so the owner's
+    rows moved every time one landed."""
+
+    def _row(self, number, usage="chip", login=False, where=False, wide=False,
+             on=()):
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        return CandidateRow(
+            number=Text(str(number)),
+            email=Text(f"李{number}@例え.jp" if wide
+                       else f"u{number}@x.com"),
+            usage=Text(_SLOT_USAGE_TEXT.get(usage, usage)),
+            login=Text("login 6d" if login else ""),
+            status={k: Text(_SLOT_STATUS_TEXT[k]) for k in on},
+            where=Text("○ cloud" if where else ""),
+        )
+
+    def _render(self, rows):
+        from claude_swap.tui.autoview import render_candidate_rows
+        from claude_swap.tui.theme import CSWAP_DARK, Palette
+
+        return render_candidate_rows(
+            rows, Palette.from_theme(CSWAP_DARK)
+        ).plain.split("\n")[1:]
+
+    def test_every_slot_starts_in_one_column_on_every_row(self):
+        from rich.cells import cell_len
+
+        from claude_swap.tui.autoview import STATUS_ORDER
+
+        # A new status key must be added to the table above, or this guard
+        # would stop covering it.
+        assert set(_SLOT_STATUS_TEXT) == set(STATUS_ORDER)
+        rows = [self._row(i, *case) for i, case in enumerate(_SLOT_PAIRWISE, 10)]
+        rows += [self._row(i, on=(k,)) for i, k in enumerate(STATUS_ORDER, 30)]
+        rows.append(self._row(40, login=True, where=True, on=tuple(STATUS_ORDER)))
+        rows.append(self._row(41))
+        lines = self._render(rows)
+        assert len(lines) == len(rows)
+        columns: dict[str, set[int]] = {}
+        for row, line in zip(rows, lines):
+            assert line == line.rstrip(), f"trailing pad: {line!r}"
+            # Statuses read in STATUS_ORDER, joined by " \u00b7 ", whatever subset.
+            status = " · ".join(
+                row.status[k].plain for k in STATUS_ORDER if k in row.status
+            )
+            pos = 0
+            for slot, text in (
+                ("number", row.number.plain), ("email", row.email.plain),
+                ("login", row.login.plain), ("usage", row.usage.plain),
+                ("status", status), ("where", row.where.plain),
+            ):
+                if not text:
+                    continue
+                at = line.index(text, pos)
+                columns.setdefault(slot, set()).add(cell_len(line[:at]))
+                pos = at + len(text)
+        assert set(columns) == {"number", "email", "login", "usage", "status", "where"}
+        assert {s: c for s, c in columns.items() if len(c) != 1} == {}, (
+            f"a slot moved between rows: {columns}\n" + "\n".join(lines)
+        )
+
+    def test_an_empty_column_takes_no_space_and_a_trailing_note_sizes_nothing(self):
+        """No login or where anywhere: the usage slot sits two cells after the
+        email, as before. A row whose usage is its last cell (an unswitchable
+        slot's long sentinel note) must not push the status column out."""
+        short = [self._row(1, on=("threshold",)), self._row(2, usage="spend")]
+        assert self._render(short)[0] == (
+            "   1  u1@x.com  5h:25% · 7d:10%  threshold 70%"
+        )
+        long_note = self._row(3, usage="x" * 80)
+        assert self._render(short + [long_note])[0] == self._render(short)[0]
+
+    def test_a_status_key_outside_the_order_is_refused(self):
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        with pytest.raises(ValueError, match="mystery"):
+            CandidateRow(
+                Text("1"), Text("a@x.com"), Text("u"),
+                status={"mystery": Text("m")},
+            )
 
 
 @pytest.mark.asyncio

@@ -15,9 +15,10 @@ snapshot poller runs store-only: the engine is the only fetcher.
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -85,6 +86,73 @@ def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
     if not noted or binding is None or label != binding.label:
         return ""
     return f"threshold {pct_label(binding.line)}%"
+
+
+# Every per-account reason a Next best row is not a plain candidate, in the one
+# order they read. A new marker registers by adding its key here; only "block"
+# and "threshold" have a producer on this branch.
+STATUS_ORDER = (
+    "stale", "no-plan", "walled", "block", "threshold", "at-line",
+    "not-candidate", "disabled",
+)
+
+
+@dataclass
+class CandidateRow:
+    """One Next best row as named slots. A producer fills a slot and never
+    pads it: `render_candidate_rows` owns every column."""
+
+    number: Text
+    email: Text
+    usage: Text  # the chip block, the spend text, or the sentinel note
+    login: Text = field(default_factory=Text)
+    status: dict[str, Text] = field(default_factory=dict)  # keys of STATUS_ORDER
+    where: Text = field(default_factory=Text)  # where-in-use markers, last cell
+
+    def __post_init__(self) -> None:
+        if unknown := self.status.keys() - set(STATUS_ORDER):
+            raise ValueError(f"status key not in STATUS_ORDER: {sorted(unknown)}")
+
+
+def render_candidate_rows(rows: list[CandidateRow], palette: Palette) -> Text:
+    """The block's rows, each led by a newline, every slot starting in one
+    display column on all of them. A slot is as wide as its widest cell among
+    the rows that have something after it, so a row ending in a long sentinel
+    note sizes nothing; a slot empty on every row takes no column at all."""
+    sep = Text(" \u00b7 ", style=palette.muted)
+    grid = [
+        [
+            row.number, row.email, row.login, row.usage,
+            sep.join(row.status[k] for k in STATUS_ORDER if k in row.status),
+            row.where,
+        ]
+        for row in rows
+    ]
+    widths = [2, 0, 0, 0, 0, 0]  # the number is right-aligned, two wide at least
+    used = [False] * len(widths)
+    for cells in grid:
+        last = max(i for i, cell in enumerate(cells) if cell)
+        for i, cell in enumerate(cells):
+            used[i] |= bool(cell)
+            if i < last:
+                widths[i] = max(widths[i], cell.cell_len)
+    out = Text()
+    for cells in grid:
+        line = Text("\n")
+        for i, cell in enumerate(cells):
+            if i and not used[i]:
+                continue
+            cell = cell.copy()
+            pad = max(0, widths[i] - cell.cell_len)
+            if i:
+                cell.pad_right(pad)
+            else:
+                cell.pad_left(pad)
+            line.append("  ")  # the row's indent, then the gutter between slots
+            line.append_text(cell)
+        line.rstrip()
+        out.append_text(line)
+    return out
 
 
 class AutoScreen(Screen):
@@ -442,14 +510,7 @@ class AutoScreen(Screen):
             else:
                 rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
-        lines: dict[str, Text] = {}
-        # Padded to the widest email among the rows THIS block renders, so
-        # every row's chips start in the same column — computed from exactly
-        # the accounts the loop below iterates (all but the active one).
-        email_width = max(
-            (len(acc.email) for acc in snap.accounts if acc.number != active_number),
-            default=0,
-        )
+        rows: dict[str, CandidateRow] = {}
         now = time.time()
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
@@ -479,10 +540,10 @@ class AutoScreen(Screen):
             for label, wpct, resets_at in windows:
                 label_w, pct_w = chip_width.get(label, (0, 0))
                 chip_width[label] = (
-                    max(label_w, len(data.chip_label(
+                    max(label_w, cell_len(data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now)
                     ))),
-                    max(pct_w, len(f"{wpct:.0f}%")),
+                    max(pct_w, cell_len(f"{wpct:.0f}%")),
                 )
         # 5h and 7d lead whatever row came first (sorted is stable, so the
         # rest keep first-seen order).
@@ -498,9 +559,6 @@ class AutoScreen(Screen):
             # showed two accounts here and five in the engine's own log. A row
             # that says why it cannot be picked beats a row that isn't there.
             if not acc.switchable:
-                entry = Text()
-                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -514,8 +572,11 @@ class AutoScreen(Screen):
                     USAGE_API_KEY if acc.kind == "api_key"
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
-                entry.append(f"  {note}", style=palette.sev_warn)
-                lines[acc.number] = entry
+                rows[acc.number] = CandidateRow(
+                    Text(acc.number, style=palette.muted),
+                    Text(acc.email, style=palette.muted),
+                    Text(note, style=palette.sev_warn),
+                )
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
             line = line_of(acc)
@@ -525,12 +586,11 @@ class AutoScreen(Screen):
                 weekly,
                 scale=threshold,
             )
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+            usage = Text()
+            status: dict[str, Text] = {}
             if acc.usage.sentinel is not None:
-                entry.append(
-                    f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
+                usage.append(
+                    data.sentinel_label(acc.usage.sentinel), style=palette.muted
                 )
                 ranked.append(((998.0,), acc.number))
             elif binding is None:
@@ -545,12 +605,12 @@ class AutoScreen(Screen):
                 )
                 if spend is not None:
                     _label, spend_pct, spend_suffix, _full = spend
-                    entry.append("  $$ ", style=palette.muted)
-                    entry.append(f"{spend_pct:.0f}%",
+                    usage.append("$$ ", style=palette.muted)
+                    usage.append(f"{spend_pct:.0f}%",
                                  style=palette.severity(spend_pct))
-                    entry.append(f" · {spend_suffix}", style=palette.muted)
+                    usage.append(f" · {spend_suffix}", style=palette.muted)
                 else:
-                    entry.append("  usage unknown", style=palette.muted)
+                    usage.append("usage unknown", style=palette.muted)
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
                 # into the sort key would change which account the engine
                 # picks, and the ranking axis is not this row's to move.
@@ -567,23 +627,24 @@ class AutoScreen(Screen):
                 for i, (label, (label_w, pct_w)) in enumerate(
                     chip_width.items() if windows else ()
                 ):
-                    sep = "  " if i == 0 else " · " if shown else "   "
+                    sep = "" if i == 0 else " · " if shown else "   "
                     if label not in have:
-                        entry.append(" " * (len(sep) + label_w + pct_w))
+                        usage.append(" " * (len(sep) + label_w + pct_w))
                         continue
                     wpct, resets_at = have[label]
                     label_text = data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now)
                     )
                     pct_text = f"{wpct:.0f}%"
-                    entry.append(sep, style=palette.muted)
+                    usage.append(sep, style=palette.muted)
                     # Label right-aligned so the `:` shares a column (owner,
                     # 2026-09-15); pct right-aligned so the `%` does.
-                    entry.append(
-                        label_text.rjust(label_w) + " " * (pct_w - len(pct_text)),
+                    usage.append(
+                        " " * (label_w - cell_len(label_text)) + label_text
+                        + " " * (pct_w - cell_len(pct_text)),
                         style=palette.muted,
                     )
-                    entry.append(pct_text, style=palette.severity(wpct))
+                    usage.append(pct_text, style=palette.severity(wpct))
                     shown = True
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
@@ -600,15 +661,14 @@ class AutoScreen(Screen):
                         ((label, p) for label, p, _ in windows), line, weekly
                     )
                 if kind == "model":
-                    entry.append(f"  {blocked_model}-only", style=palette.muted)
+                    status["block"] = Text(f"{blocked_model}-only", style=palette.muted)
                 elif kind == "full":
-                    entry.append(f"  {blocked_model} full", style=palette.muted)
-                # The last cell, and only when the binding window's chip was
-                # drawn above.
+                    status["block"] = Text(f"{blocked_model} full", style=palette.muted)
+                # Only when the binding window's chip was drawn above.
                 if binding.label in have:
                     note = _line_note(binding, binding.label, noted(acc))
                     if note:
-                        entry.append(f"  {note}", style=palette.muted)
+                        status["threshold"] = Text(note, style=palette.muted)
                 rank_binding = binding_window(
                     oauth.relevant_windows(acc.usage.last_good, rank_models),
                     line,
@@ -628,10 +688,12 @@ class AutoScreen(Screen):
                     else (-rank_binding.line_headroom,)
                 )
                 ranked.append((key, acc.number))
-            # The chip block's blank cells only exist to line up what follows
-            # them, so whatever ends up trailing the finished row is dropped.
-            entry.rstrip()
-            lines[acc.number] = entry
+            rows[acc.number] = CandidateRow(
+                Text(acc.number, style=palette.foreground),
+                Text(acc.email, style=palette.foreground),
+                usage,
+                status=status,
+            )
 
         text = Text()
         text.append("Next best", style=palette.muted)
@@ -641,6 +703,7 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
-        for _key, number in sorted(ranked):
-            text.append(lines[number])
+        text.append_text(render_candidate_rows(
+            [rows[number] for _key, number in sorted(ranked)], palette
+        ))
         return text
