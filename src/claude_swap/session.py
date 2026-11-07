@@ -77,6 +77,7 @@ from claude_swap.fsutil import (
     link_points_at,
     make_dir_link,
     remove_link,
+    replace_with_retry,
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -161,6 +162,13 @@ MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
 # inline literal — after a rename, old and new launches would serialize on
 # different files.
 MIGRATION_LOCK = ".cswap-history-migration.lock"
+
+# While a profile's own history is merged into ``~/.claude``, the link that
+# will replace it already stands beside it under this suffix
+# (``<item>.cswap-link-staging``), made before anything moves and renamed
+# into place after. One left behind by an interrupted launch is a link and
+# holds nothing; the next launch removes it.
+_STAGED_LINK_SUFFIX = ".cswap-link-staging"
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -761,9 +769,13 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        # Before the fast path below: it never reaches setup_session, and it
-        # has to refuse the same request and handle the same history.
-        share_history = self._resolve_share_history(share_history)
+        # Resolved here for the fast path below, which never reaches
+        # setup_session. setup_session is then handed the request, not the
+        # answer: it resolves it the same way, and only the request says
+        # whether sharing was asked for or defaulted (``_share_history_asked``
+        # — an answer of True would read as asked for).
+        requested_history = share_history
+        share_history = self._resolve_share_history(requested_history)
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
@@ -820,7 +832,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, requested_history
         )
 
         print(
@@ -1403,7 +1415,7 @@ class SessionManager:
             # (Developer Mode or an elevated terminal). Decided before the
             # history merge below, which must never move a profile's history
             # into a tree the profile then cannot be linked to.
-            linkable = self._can_link(name, session_dir)
+            linkable = self._can_link(name, session_dir, source_root)
 
             # Link to the fully resolved target. When ~/.claude/<name> is itself
             # a symlink (a dotfiles setup), linking to the unresolved path makes
@@ -1436,25 +1448,33 @@ class SessionManager:
                 continue
 
             if is_link(dest):
-                if name not in managed:
-                    managed = [*managed, name]  # adopt: only cswap links here
-                if linkable:
-                    try:
-                        if not link_points_at(dest, link_target):
-                            remove_link(dest)
-                            self._make_link(link_target, dest)
-                    except OSError:
-                        continue
+                in_place = link_points_at(dest, link_target)
+                ours = in_place or name in managed or link_points_at(dest, src)
+                if not ours:
+                    # A link cswap never made, leading somewhere else: the
+                    # user's own redirect, left alone like a directory of
+                    # their own — and what it leads to is never touched.
+                    print(
+                        dimmed(
+                            f"Not sharing {name}: the session profile already "
+                            "has its own link."
+                        )
+                    )
+                    continue
+                if in_place:
+                    # Ours, or made by hand to the same place: adopted. Kept
+                    # even where no link could be made now (Windows without
+                    # the privilege): only making one takes the privilege.
                     new_managed.append(name)
                     continue
-                if link_points_at(dest, link_target):
-                    # Made when this process could link (see above): better
-                    # than the copy it would otherwise be replaced with.
-                    new_managed.append(name)
+                # Ours, but not pointing where it should: at the intermediate
+                # symlink of a dotfiles setup, or at a ~/.claude that moved.
+                # Remade below — as a link where one can be made, else as a
+                # copy.
+                try:
+                    remove_link(dest)
+                except OSError:
                     continue
-                # A link to somewhere else that cannot be renewed here
-                # (Windows, no symlink privilege): a copy instead.
-                remove_link(dest)
             elif dest.exists() and name not in managed:
                 # Pre-existing user data in the profile — never touch it.
                 print(
@@ -1468,12 +1488,22 @@ class SessionManager:
             try:
                 if dest.exists():
                     self._remove_managed(dest)
-                if linkable:
-                    self._make_link(link_target, dest)
-                elif src.is_dir():
-                    shutil.copytree(src, dest)
+                if not linkable:
+                    self._copy_item(src, dest)
                 else:
-                    shutil.copy2(src, dest)
+                    try:
+                        self._make_link(link_target, dest)
+                    except OSError as e:
+                        if name in HISTORY_ITEMS:
+                            raise  # history is shared by link or not at all
+                        # The probe said yes and this link still failed (a
+                        # target the volume will not link to, say). The copy
+                        # of old, refreshed on every launch, beats nothing.
+                        self._logger.warning(
+                            f"Could not link {name} into the session ({e}); "
+                            "copying it instead."
+                        )
+                        self._copy_item(src, dest)
             except OSError as e:
                 self._logger.warning(f"Failed to share {name} into session: {e}")
                 continue
@@ -1486,20 +1516,32 @@ class SessionManager:
         self._report_quarantine()
         self._report_sharing_is_the_default()
 
-    def _can_link(self, name: str, session_dir: Path) -> bool:
+    def _can_link(self, name: str, session_dir: Path, source_root: Path) -> bool:
         """Whether ``name`` can be shared into ``session_dir`` by link.
 
         Always off Windows. On Windows a directory takes a junction, which
-        needs no privilege but a volume with reparse points; a file takes a
-        symlink, which needs Developer Mode or an elevated terminal. Both
-        are probed once per process in the profile directory itself, so the
-        answer holds for the link made a moment later in the same place.
+        needs no privilege but a volume with reparse points and a target
+        Windows accepts; a file takes a symlink, which needs Developer Mode
+        or an elevated terminal. Both are probed once per process in the
+        profile directory itself — the junction to ``source_root``, the
+        parent of every target — so the answer holds for the link made a
+        moment later in the same place. A probe is still not the link: the
+        callers keep a copy fallback and a link-before-merge order for the
+        case where the link itself fails.
         """
         if self.switcher.platform != Platform.WINDOWS:
             return True
         if name in _DIR_ITEMS:
-            return can_junction(session_dir)
+            return can_junction(session_dir, source_root)
         return can_symlink(session_dir)
+
+    @staticmethod
+    def _copy_item(src: Path, dest: Path) -> None:
+        """The copy of old: ``dest`` becomes a snapshot of ``src``."""
+        if src.is_dir():
+            shutil.copytree(src, dest)
+        else:
+            shutil.copy2(src, dest)
 
     def _make_link(self, target: Path, dest: Path) -> None:
         """Put the link for ``target`` at ``dest``: a symlink, except that a
@@ -1851,11 +1893,44 @@ class SessionManager:
         The link goes in before the lock is released, so no peer ever finds
         the profile in between — history moved out, nothing linked yet — and
         takes that for a profile with nothing to share.
+
+        And it is made before the merge, under a staging name beside the
+        history — the real kind, to the real target, in the real directory —
+        and only renamed into place once the merge is done. A probe that
+        said yes is not the link itself: a link that cannot be made is found
+        out while the profile's history is still exactly where it was.
         """
         if not dest.exists() or is_link(dest):
             return True  # a peer finished this item; the generic loop links
         if not profile_is_quiescent(session_dir):
             self._report_deferral(session_dir, dest)
+            return False
+        if not self._seed_history_source(src, dest):
+            print(
+                dimmed(
+                    f"Not sharing {dest.name}: {src} could not be created "
+                    "(see log)."
+                )
+            )
+            return False
+        # The same target the generic loop links to (see its note on a
+        # ~/.claude entry that is itself a symlink).
+        link_target = src.resolve() if src.is_symlink() else src
+        staged = dest.with_name(dest.name + _STAGED_LINK_SUFFIX)
+        try:
+            if is_link(staged):
+                remove_link(staged)  # left by an interrupted launch
+            elif staged.exists():
+                raise OSError(f"{staged} exists and is not a link")
+            self._make_link(link_target, staged)
+        except OSError as e:
+            self._logger.warning(f"Could not link {dest.name} into the session: {e}")
+            print(
+                dimmed(
+                    f"Not sharing {dest.name}: it could not be linked here "
+                    "(see log) — the account keeps its own."
+                )
+            )
             return False
         try:
             self._merge_history_into_source(src, dest)
@@ -1864,6 +1939,7 @@ class SessionManager:
             # file is "nothing readable to merge", and losing a launch to a
             # stray byte in ~/.claude/history.jsonl would strand every
             # account that has not migrated yet.
+            self._discard_staged_link(staged)
             self._logger.warning(f"Could not merge {dest.name} into {src}: {e}")
             print(
                 dimmed(
@@ -1873,12 +1949,11 @@ class SessionManager:
             )
             return False
         try:
-            if not self._seed_history_source(src, dest):
-                raise OSError(f"no {src} to link to")
-            # The same target the generic loop links to (see its note on a
-            # ~/.claude entry that is itself a symlink).
-            self._make_link(src.resolve() if src.is_symlink() else src, dest)
+            # The merge has emptied and removed ``dest``; the link slides
+            # into its place by rename, which moves the link, not its target.
+            replace_with_retry(staged, dest)
         except OSError as e:
+            self._discard_staged_link(staged)
             self._logger.warning(f"Failed to share {dest.name} into session: {e}")
             print(
                 dimmed(
@@ -1895,6 +1970,13 @@ class SessionManager:
             )
         )
         return True
+
+    def _discard_staged_link(self, staged: Path) -> None:
+        """Best effort: a staging link that will not be used must not linger."""
+        try:
+            remove_link(staged)
+        except OSError as e:
+            self._logger.warning(f"Could not remove {staged}: {e}")
 
     def _report_deferral(
         self, session_dir: Path, dest: Path, lock_busy: bool = False

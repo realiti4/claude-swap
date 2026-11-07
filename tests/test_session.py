@@ -900,15 +900,39 @@ class TestSharingPosix:
         assert (session_dir / "private.txt").read_text() == "keep me"
         assert not (session_dir / SHARE_MANIFEST).exists()
 
-    def test_repoints_stale_link(self, share_setup, temp_home):
+    def test_repoints_a_managed_link_gone_stale(self, share_setup, temp_home):
+        """Recorded in the manifest, so cswap's own: a ~/.claude that moved,
+        say. Pointed back at the source."""
         source, session_dir, mgr = share_setup
         elsewhere = temp_home / "elsewhere.json"
         elsewhere.write_text("{}")
         (session_dir / "settings.json").symlink_to(elsewhere)
+        (session_dir / SHARE_MANIFEST).write_text(
+            json.dumps({"items": ["settings.json"], "mode": "symlink"})
+        )
 
         mgr._sync_sharing(session_dir, share=True)
 
         assert (session_dir / "settings.json").readlink() == source / "settings.json"
+
+    def test_a_link_of_the_users_own_is_left_alone(
+        self, share_setup, temp_home, capsys
+    ):
+        """Not in the manifest and leading somewhere else: a redirect the
+        user set up, kept like a directory of their own (and its target is
+        never touched)."""
+        source, session_dir, mgr = share_setup
+        elsewhere = temp_home / "elsewhere.json"
+        elsewhere.write_text('{"mine": true}')
+        (session_dir / "settings.json").symlink_to(elsewhere)
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "settings.json").readlink() == elsewhere
+        assert elsewhere.read_text() == '{"mine": true}'
+        assert "Not sharing settings.json" in capsys.readouterr().out
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "settings.json" not in manifest["items"]
 
     def test_links_to_resolved_target_when_source_is_symlink(
         self, share_setup, temp_home
@@ -1014,13 +1038,13 @@ class TestSharingWindowsMode:
         refused one (FAT, a network share), holds a copy; the next launch
         that can link does, and a launch that cannot copies as before."""
         source, session_dir, mgr = windows_mgr
-        monkeypatch.setattr(session_mod, "can_junction", lambda _dir: False)
+        monkeypatch.setattr(session_mod, "can_junction", lambda *_a: False)
         mgr._sync_sharing(session_dir, share=True)
         assert (session_dir / "skills").is_dir()
         assert not is_link(session_dir / "skills")
         assert (session_dir / "skills" / "a.md").read_text() == "skill"
 
-        monkeypatch.setattr(session_mod, "can_junction", lambda _dir: True)
+        monkeypatch.setattr(session_mod, "can_junction", lambda *_a: True)
         mgr._sync_sharing(session_dir, share=True)
 
         assert is_link(session_dir / "skills")
@@ -1036,9 +1060,12 @@ class TestSharingWindowsMode:
         assert "skills" in manifest["items"]
         assert is_link(session_dir / "skills")
 
-    def test_a_hand_made_link_elsewhere_is_repointed(self, windows_mgr, tmp_path):
-        """As a stale symlink is on POSIX (``test_repoints_stale_link``): a
-        link is cswap's to point, and what it pointed at is not touched."""
+    def test_a_hand_made_link_elsewhere_is_left_alone(
+        self, windows_mgr, tmp_path, capsys
+    ):
+        """Not in the manifest and leading somewhere else: the user's own
+        redirect (#292 names people who junctioned by hand before cswap
+        could). Kept, like a directory of their own."""
         source, session_dir, mgr = windows_mgr
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
@@ -1047,8 +1074,52 @@ class TestSharingWindowsMode:
 
         mgr._sync_sharing(session_dir, share=True)
 
+        assert link_points_at(session_dir / "skills", elsewhere)
+        assert (elsewhere / "mine.md").read_text() == "mine"
+        assert "Not sharing skills: the session profile already has its own link" in (
+            capsys.readouterr().out
+        )
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "skills" not in manifest["items"]
+
+    def test_a_managed_link_gone_stale_is_repointed(self, windows_mgr, tmp_path):
+        source, session_dir, mgr = windows_mgr
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "mine.md").write_text("mine")
+        make_dir_link(elsewhere, session_dir / "skills")
+        (session_dir / SHARE_MANIFEST).write_text(
+            json.dumps({"items": ["skills"], "mode": "copy"})
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
         assert link_points_at(session_dir / "skills", source / "skills")
         assert (elsewhere / "mine.md").read_text() == "mine"
+
+    def test_a_directory_link_that_fails_falls_back_to_a_copy(
+        self, windows_mgr, monkeypatch
+    ):
+        """The probe said yes and the link itself still failed (a target the
+        volume will not link to, say): the copy of old rather than nothing,
+        and the managed copy that was there is not lost either."""
+        source, session_dir, mgr = windows_mgr
+        monkeypatch.setattr(session_mod, "can_junction", lambda *_a: False)
+        mgr._sync_sharing(session_dir, share=True)  # a managed copy, as before
+
+        monkeypatch.setattr(session_mod, "can_junction", lambda *_a: True)
+
+        def refuse(target, link):
+            raise OSError(1, "The request is not supported")
+
+        monkeypatch.setattr(session_mod, "make_dir_link", refuse)
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "skills").is_dir()
+        assert not is_link(session_dir / "skills")
+        assert (session_dir / "skills" / "a.md").read_text() == "skill"
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "skills" in manifest["items"]
 
     def test_a_real_directory_in_the_profile_is_left_alone(self, windows_mgr, capsys):
         source, session_dir, mgr = windows_mgr
@@ -3333,6 +3404,48 @@ class TestShareHistoryWindows:
 
         assert any("history.jsonl stays per-account" in m for m in warned)
 
+    @pytest.fixture
+    def launch(self, win_history, capture_exec, auth_status_tracks_seed, refresh_rotates):
+        """``cswap run 2`` up to the exec, through bootstrap and the sync."""
+        source, session_dir, mgr = win_history
+        # The seed went in under the macOS backend the fixtures pin; the
+        # bootstrap reads through the Windows one, so persist it there too.
+        mgr.switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, CREDS)
+        mgr.switcher._write_account_config(ACCOUNT_NUM, ACCOUNT_EMAIL, CONFIG)
+
+        def run(**kwargs) -> None:
+            with pytest.raises(_ExecCalled):
+                mgr.run("2", [], **kwargs)
+
+        return run
+
+    def test_a_launch_that_asked_for_nothing_gets_the_dimmed_note(
+        self, win_history, launch, monkeypatch, capsys
+    ):
+        """Through ``run`` and ``setup_session`` both, where the request is
+        resolved twice: the default must still read as a default."""
+        warned: list[str] = []
+        monkeypatch.setattr(
+            session_mod, "warning", lambda msg, **_k: warned.append(msg)
+        )
+
+        launch()
+
+        assert "history.jsonl stays per-account" in capsys.readouterr().out
+        assert not any("stays per-account" in m for m in warned)
+
+    def test_a_launch_that_asked_with_the_flag_gets_a_warning(
+        self, win_history, launch, monkeypatch
+    ):
+        warned: list[str] = []
+        monkeypatch.setattr(
+            session_mod, "warning", lambda msg, **_k: warned.append(msg)
+        )
+
+        launch(share_history=True)
+
+        assert any("history.jsonl stays per-account" in m for m in warned)
+
     def test_the_accounts_own_history_file_is_kept_not_merged(self, win_history):
         """The merge moves a profile's history into ~/.claude for the link
         that follows. With no link possible for history.jsonl, merging it
@@ -3410,7 +3523,7 @@ class TestShareHistoryWindows:
         """A profile on a volume without reparse points: nothing is linked,
         so nothing is merged, and the launch says why."""
         source, session_dir, mgr = win_history
-        monkeypatch.setattr(session_mod, "can_junction", lambda _dir: False)
+        monkeypatch.setattr(session_mod, "can_junction", lambda *_a: False)
         own = session_dir / "projects" / "-home-user-app"
         own.mkdir(parents=True)
         (own / "bbb.jsonl").write_text("profile-b\n")
@@ -3435,6 +3548,43 @@ class TestShareHistoryWindows:
         monkeypatch.setattr(mgr.switcher, "resolve_account", past_the_resolver)
         with pytest.raises(RuntimeError, match="the launch goes on"):
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+
+    def test_a_directory_link_that_cannot_be_made_leaves_transcripts_where_they_were(
+        self, win_history, monkeypatch, capsys
+    ):
+        """The probe said yes, the junction itself failed: nothing has moved,
+        and the shared tree is untouched."""
+        source, session_dir, mgr = win_history
+        own = session_dir / "projects" / "-home-user-app"
+        own.mkdir(parents=True)
+        (own / "bbb.jsonl").write_text("profile-b\n")
+
+        def refuse(target, link):
+            raise OSError(1, "The request is not supported")
+
+        monkeypatch.setattr(session_mod, "make_dir_link", refuse)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (own / "bbb.jsonl").read_text() == "profile-b\n"
+        assert not is_link(session_dir / "projects")
+        assert not (source / "projects" / "-home-user-app" / "bbb.jsonl").exists()
+        assert not list(session_dir.glob("projects.*"))
+        assert "projects: it could not be linked here" in capsys.readouterr().out
+
+    def test_a_staging_link_left_by_an_interrupted_launch_is_cleared(
+        self, win_history
+    ):
+        source, session_dir, mgr = win_history
+        own = session_dir / "projects" / "-home-user-app"
+        own.mkdir(parents=True)
+        (own / "bbb.jsonl").write_text("profile-b\n")
+        make_dir_link(source, session_dir / "projects.cswap-link-staging")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert is_link(session_dir / "projects")
+        assert (source / "projects" / "-home-user-app" / "bbb.jsonl").read_text() == "profile-b\n"
+        assert not list(session_dir.glob("projects.*"))
 
 
 class TestShareHistoryWindowsSymlinks:
@@ -3510,18 +3660,19 @@ class TestShareHistoryWindowsSymlinks:
 
         assert removed == []
 
-    def test_a_link_that_fails_after_the_merge_is_retried_next_launch(
+    def test_a_link_that_cannot_be_made_leaves_the_history_where_it_was(
         self, win_history, monkeypatch, capsys
     ):
-        """The probe said yes and the link still failed. The merged history
-        is in ~/.claude, the launch says so, and the next launch links it:
-        nothing is lost, one session runs on the shared history unlinked."""
+        """The probe said yes and the link itself still failed. Because the
+        link is made before the merge, the account's prompt history has not
+        moved: it is still the profile's own, ~/.claude is unchanged, and
+        the launch that can link merges it."""
         source, session_dir, mgr = win_history
         (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
         real_symlink_to = Path.symlink_to
 
         def refuse_history(self, target, *args, **kwargs):
-            if self.name == "history.jsonl":
+            if self.name.startswith("history.jsonl"):
                 e = OSError(22, "A required privilege is not held by the client")
                 e.winerror = 1314
                 raise e
@@ -3530,15 +3681,17 @@ class TestShareHistoryWindowsSymlinks:
         monkeypatch.setattr(Path, "symlink_to", refuse_history)
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
-        assert '{"p": "profile"}' in (source / "history.jsonl").read_text()
-        assert not (session_dir / "history.jsonl").exists()
-        assert "linking it back failed" in capsys.readouterr().out
+        assert (session_dir / "history.jsonl").read_text() == '{"p": "profile"}\n'
+        assert (source / "history.jsonl").read_text() == '{"p": "main"}\n'
+        assert not list(session_dir.glob("history.jsonl.*"))  # no staging left
+        assert "could not be linked here" in capsys.readouterr().out
         manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
         assert "history.jsonl" not in manifest["items"]
 
         monkeypatch.setattr(Path, "symlink_to", real_symlink_to)
         mgr._sync_sharing(session_dir, share=True, share_history=True)
         assert (session_dir / "history.jsonl").is_symlink()
+        assert '{"p": "profile"}' in (source / "history.jsonl").read_text()
 
 
 class TestHistoryMergeNeverLooksThroughLinks:
@@ -3661,11 +3814,14 @@ class TestShareHistoryDecision:
         assert manager._resolve_share_history(True) is True
         assert capsys.readouterr().out == ""
 
-    def test_windows_hands_setup_session_the_decision(
-        self, manager, capture_exec, monkeypatch, capsys
+    @pytest.mark.parametrize("requested", [None, True, False])
+    def test_run_hands_setup_session_the_request_not_the_answer(
+        self, manager, capture_exec, monkeypatch, capsys, requested
     ):
-        """``run`` decides once and hands ``setup_session`` the decision
-        rather than the question."""
+        """``setup_session`` resolves the same request the same way; handed
+        the answer instead, a defaulted True would read as asked for, and
+        the note for an unlinkable history item would come out as a
+        warning on a launch that asked for nothing."""
         manager.switcher.platform = Platform.WINDOWS
         handed_over = []
 
@@ -3675,9 +3831,9 @@ class TestShareHistoryDecision:
 
         monkeypatch.setattr(manager, "setup_session", setup_session)
         with pytest.raises(SessionError, match="stop here"):
-            manager.run("2", [])
+            manager.run("2", [], share_history=requested)
 
-        assert handed_over == [True]
+        assert handed_over == [requested]
         assert capsys.readouterr().out == ""
 
     def test_the_flag_is_remembered_as_asked_for(self, manager):

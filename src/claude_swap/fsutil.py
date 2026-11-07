@@ -387,17 +387,23 @@ def can_symlink(directory: os.PathLike | str) -> bool:
     )
 
 
-def can_junction(directory: os.PathLike | str) -> bool:
-    """Whether a directory link can be made in ``directory``.
+def can_junction(
+    directory: os.PathLike | str, target: os.PathLike | str | None = None
+) -> bool:
+    """Whether a directory link from ``directory`` to ``target`` can be made.
 
     Always true off Windows (a symlink). A junction needs no privilege but
     does need a volume with reparse points -- NTFS or ReFS; FAT and network
-    shares refuse -- so one is made to ``directory`` itself and removed,
-    once per directory per process.
+    shares refuse -- and a target Windows accepts, so one is made from
+    ``directory`` to ``target`` (``directory`` itself when none is given)
+    and removed, once per directory and target per process. Pass the parent
+    of the real targets, so the probe fails where the real link would.
     """
     if sys.platform != "win32":
         return True
-    target = os.path.abspath(directory)
+    to = os.path.abspath(target if target is not None else directory)
     return _probe_link(
-        directory, "junction", lambda probe: make_dir_link(target, probe)
+        directory,
+        f"junction:{os.path.normcase(to)}",
+        lambda probe: make_dir_link(to, probe),
     )

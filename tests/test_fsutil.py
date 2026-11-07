@@ -766,10 +766,23 @@ class TestLinkProbes:
 
     def test_answers_are_kept_per_kind(self, tmp_path, monkeypatch):
         monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        here = os.path.normcase(str(tmp_path))
         monkeypatch.setattr(
-            fsutil, "_LINK_PROBES", {(os.path.normcase(str(tmp_path)), "junction"): False}
+            fsutil, "_LINK_PROBES", {(here, f"junction:{here}"): False}
         )
         if not _host_can_symlink(tmp_path):
             pytest.skip("this host cannot create symlinks")
         assert can_junction(tmp_path) is False  # the cached answer
         assert can_symlink(tmp_path) is True  # probed on its own
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_junction_probe_is_per_target(self, tmp_path):
+        """The probe links to the target's parent, where the real link will
+        point, so a target Windows refuses is found out before anything moves."""
+        target = tmp_path / "claude-home"
+        target.mkdir()
+        assert can_junction(tmp_path, target) is True
+        assert list(tmp_path.iterdir()) == [target]
+        assert len(fsutil._LINK_PROBES) == 1
+        assert can_junction(tmp_path) is True  # a second key, its own probe
+        assert len(fsutil._LINK_PROBES) == 2
