@@ -138,7 +138,9 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(
+            req, timeout=timeout, context=oauth._pin_aware_ssl_context()
+        ) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — display-only; never let it surface
         _logger.debug("Plan fetch failed: %r", e)

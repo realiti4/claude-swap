@@ -522,7 +522,13 @@ def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     Claude records the logged-in account in the profile's ``.claude.json``
     ``oauthAccount`` and rewrites it on every (re-)login, so this reflects the
     profile's *current* identity — which an in-session ``/login`` can re-point
-    at a different account than the slot the profile was created for. Returns
+    at a different account than the slot the profile was created for.
+
+    THE PROFILE'S FILE, NOT THE GLOBAL ONE, and under a pin that distinction
+    decides the answer. A pin splices the pinned identity into the GLOBAL
+    ``~/.claude.json`` only, so this still reports who the profile is logged
+    in as. Read the global file here instead and every profile would report
+    the pin. Returns
     ``(email, organization_uuid)`` with ``""`` for a missing org, or ``None``
     when no identity is readable (missing dir/file/field).
     """
@@ -795,10 +801,11 @@ class SessionManager:
         # another session's terminal) the *default* login is still what a
         # session for this account would copy, so it is read from the
         # default profile rather than from the preset directory.
-        if config_dir_preset:
-            current = self._default_login_identity()
-        else:
-            current = self.switcher._get_current_account()
+        # THE LOGIN, NOT THE IDENTITY FILE. Under a pin that file names the
+        # pinned account, so asking for the pinned account while another one
+        # serves took this fast path and exec'd claude with the SERVING
+        # account's environment.
+        current = self._default_live_login()
         if current is not None and current == (email, org_uuid):
             if require_session:
                 raise SessionError(
@@ -819,10 +826,11 @@ class SessionManager:
                 session_dir_for(self.switcher.backup_dir, account_num, email),
                 share_history,
             )
-            env = dict(os.environ)
-            # Run on the default login, not on the preset profile.
-            env.pop("CLAUDE_CONFIG_DIR", None)
-            self._exec(claude_bin, claude_args, env=env)
+            # Run on the default login, not on the preset profile. Out of
+            # os.environ too, not just the child's copy: `_exec` never returns,
+            # and the pin wiring it runs follows os.environ.
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self._exec(claude_bin, claude_args, env=dict(os.environ))
         if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
@@ -901,17 +909,23 @@ class SessionManager:
             return requested
         return load_run_settings(self.switcher.backup_dir).share_history
 
-    @staticmethod
-    def _default_login_identity() -> tuple[str, str] | None:
-        """``(email, org_uuid)`` of the default profile's login, if any.
+    def _default_live_login(self) -> tuple[str, str] | None:
+        """``(email, org_uuid)`` of the default profile's live login, under a pin too.
 
-        Ignores ``CLAUDE_CONFIG_DIR``, like ``_read_mcp_source``.
+        `_live_login_identity` un-splices, but every live input it reads
+        follows ``CLAUDE_CONFIG_DIR``, so it is asked with that variable out
+        of the way. None when it cannot say: a session is built, as for an
+        unreadable default config. ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` wins for
+        the store and stays; under a pin the recorded slot can answer instead.
         """
-        config = SessionManager._load_json_object(get_default_global_config_path())
-        oauth = config.get("oauthAccount") if config else None
-        if not isinstance(oauth, dict) or not oauth.get("emailAddress"):
+        preset = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        try:
+            return self.switcher._live_login_identity()
+        except Exception:  # noqa: BLE001 -- a launch must not die on this read
             return None
-        return oauth["emailAddress"], oauth.get("organizationUuid", "") or ""
+        finally:
+            if preset is not None:
+                os.environ["CLAUDE_CONFIG_DIR"] = preset
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -936,7 +950,18 @@ class SessionManager:
         already released — an exec'd claude must never inherit a held flock).
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
+
+        Every launch path funnels through here, so this is also where the
+        cloud pin routes the child through its proxy. Without the extra
+        installed — or with no pin set — the environment comes back unchanged;
+        an optional feature must never be able to block a launch.
         """
+        try:
+            from claude_swap import pin as _pin
+
+            env = _pin.wire_launch_env(self.switcher, env)
+        except Exception:  # noqa: BLE001 — an optional feature cannot block a launch
+            pass
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:

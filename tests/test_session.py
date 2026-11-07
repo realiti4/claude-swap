@@ -20,6 +20,7 @@ from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import session as session_mod
+from claude_swap import settings as settings_mod
 from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -212,7 +213,9 @@ def refresh_rotates(monkeypatch):
     def fake_gate(self, account_num: str, email: str, snapshot: str):
         from claude_swap import oauth as oauth_mod
         calls.append(snapshot)
-        self._write_account_credentials(account_num, email, ROTATED_CREDS)
+        self._write_account_credentials(
+            account_num, email, ROTATED_CREDS, attributed=True
+        )
         return oauth_mod.RefreshOutcome(ROTATED_CREDS, None)
 
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -459,7 +462,9 @@ class TestBootstrap:
         token_creds = json.dumps(
             {"claudeAiOauth": {"accessToken": "sk-ant-oat01-x", "expiresAt": 0}}
         )
-        seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds)
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds, attributed=True
+        )
         refresh_calls = []
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
@@ -1585,9 +1590,9 @@ class TestRun:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
         # The default login is a different account: no fast path.
         monkeypatch.setattr(
-            session_mod.SessionManager,
-            "_default_login_identity",
-            staticmethod(lambda: ("other@example.com", "")),
+            manager.switcher,
+            "_get_current_account",
+            lambda: ("other@example.com", ""),
         )
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
@@ -1605,9 +1610,9 @@ class TestRun:
         # login's refresh token and log out every claude running on it.
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
         monkeypatch.setattr(
-            session_mod.SessionManager,
-            "_default_login_identity",
-            staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
         )
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
@@ -1620,12 +1625,95 @@ class TestRun:
     ):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
         monkeypatch.setattr(
-            session_mod.SessionManager,
-            "_default_login_identity",
-            staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
         )
         with pytest.raises(SessionError, match="active default"):
             manager.run("2", [], require_session=True)
+
+    def test_preset_config_dir_reads_the_login_under_a_pin(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        temp_home,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        capsys,
+    ):
+        # Under a pin the default profile's oauthAccount names the PINNED
+        # account (2) while the recorded active slot (1) is the one serving.
+        sw = manager.switcher
+        sw._write_json(
+            settings_mod.settings_path(sw.backup_dir),
+            {
+                "remoteControl": {
+                    "pinnedEmail": ACCOUNT_EMAIL,
+                    "pinnedOrganizationUuid": ORG_UUID,
+                }
+            },
+        )
+        (temp_home / ".claude.json").write_text(CONFIG)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+
+        with pytest.raises(_ExecCalled) as serving:
+            manager.run("1", [])
+        assert "CLAUDE_CONFIG_DIR" not in serving.value.env
+        assert "already the active default login" in capsys.readouterr().out
+
+        # The fast path leaves for good, taking the preset with it.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        with pytest.raises(_ExecCalled) as pinned:
+            manager.run("2", [])
+        session_dir = session_dir_for(sw.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        assert pinned.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+        assert "/somewhere/else" in capsys.readouterr().out
+
+    def test_preset_config_dir_is_gone_from_the_pin_wiring_on_the_fast_path(
+        self, manager, capture_exec, monkeypatch, temp_home
+    ):
+        # `_exec` wires the pin into `get_global_config_path()`, which follows
+        # os.environ, while the child boots on the default profile.
+        wired = []
+
+        def fake_exec(self, claude_bin, claude_args, env):
+            wired.append(get_global_config_path())
+            raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
+
+        monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert wired == [temp_home / ".claude.json"]
+
+    def test_unreadable_login_builds_a_session_and_keeps_the_preset(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        def unreadable():
+            raise OSError("config unreadable")
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        monkeypatch.setattr(manager.switcher, "_live_login_identity", unreadable)
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+        assert os.environ["CLAUDE_CONFIG_DIR"] == "/somewhere/else"
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
@@ -1906,7 +1994,7 @@ class TestGuards:
         block_real_keychain.set_password(service, account, "stale")
 
         seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS, attributed=True
         )
 
         assert not (session_dir / ".credentials.json").exists()
@@ -2050,7 +2138,7 @@ class TestGuards:
         try:
             with caplog.at_level(logging.WARNING, logger="claude-swap"):
                 seeded_switcher._write_account_credentials(
-                    ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+                    ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS, attributed=True
                 )
         finally:
             if not marker_lands:
@@ -2085,9 +2173,14 @@ class TestGuards:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         # Unexpired, so the read-only request is made; an expired copy under
-        # a live session is not requested at all.
+        # a live session is not requested at all. attributed=True: this is
+        # test setup standing in for the slot's own prior rotation, exactly
+        # like every other ROTATED_CREDS seed in this file — the fork's
+        # write-attribution guard (absent upstream, where this line
+        # originated) refuses an unattested cross-lineage overwrite of a
+        # populated slot otherwise.
         seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS, attributed=True,
         )
         make_live(session_dir)
         seen: dict[str, bool] = {}
@@ -4190,6 +4283,58 @@ class TestShareHistoryIsTheDefault:
         # exists to leave alone.
         assert (session_dir / ".credentials.json").read_bytes() == credentials
 
+    def test_preset_config_dir_fast_path_merges_the_requested_profile(
+        self, launch, manager, monkeypatch, temp_home
+    ):
+        """Inside another session's terminal CLAUDE_CONFIG_DIR is preset. The
+        merge is still the requested account's profile into ``~/.claude``, and
+        the preset is out of os.environ when claude is exec'd."""
+        session_dir = launch(share_history=False)
+        self._give_own_history(session_dir)
+        _active_default_login(monkeypatch, manager)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(temp_home / "elsewhere"))
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        shared = temp_home / ".claude"
+        assert self._is_linked(session_dir, shared)
+        assert (
+            shared / "projects" / "-home-user-app" / "bbb.jsonl"
+        ).read_text() == "profile-b\n"
+        assert "CLAUDE_CONFIG_DIR" not in os.environ
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert not (temp_home / "elsewhere").exists()
+
+    def test_serving_account_under_a_pin_gets_its_history_merged(
+        self, manager, capture_exec, temp_home
+    ):
+        """Under a pin the default profile's oauthAccount names the PINNED
+        account (2) while account 1 serves: the fast path is taken on the live
+        login, and it is the serving account's history that is merged."""
+        sw = manager.switcher
+        sw._write_json(
+            settings_mod.settings_path(sw.backup_dir),
+            {
+                "remoteControl": {
+                    "pinnedEmail": ACCOUNT_EMAIL,
+                    "pinnedOrganizationUuid": ORG_UUID,
+                }
+            },
+        )
+        (temp_home / ".claude.json").write_text(CONFIG)
+        serving = session_dir_for(sw.backup_dir, "1", "account1@example.com")
+        pinned = session_dir_for(sw.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        self._give_own_history(serving)
+        self._give_own_history(pinned)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("1", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert self._is_linked(serving, temp_home / ".claude")
+        assert not (pinned / "projects").is_symlink()
+
     def test_fast_path_merge_touches_history_and_nothing_else(
         self, launch, manager, monkeypatch, temp_home
     ):
@@ -5043,7 +5188,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         # The gate rotates the backup, exactly as the real one does.
         def fake_gate(self, num, email, snapshot):
-            self._write_account_credentials(num, email, ROTATED_CREDS)
+            self._write_account_credentials(
+                num, email, ROTATED_CREDS, attributed=True,
+            )
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
         monkeypatch.setattr(
@@ -5095,7 +5242,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
 
         def fake_gate(self, num, email, snapshot):
-            self._write_account_credentials(num, email, ROTATED_CREDS)
+            self._write_account_credentials(
+                num, email, ROTATED_CREDS, attributed=True,
+            )
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
         monkeypatch.setattr(
