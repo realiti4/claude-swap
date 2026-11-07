@@ -1537,6 +1537,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ("switch", "NUM|EMAIL", args.switch_to),
         ("export", "PATH", args.export),
         ("import", "PATH", args.import_),
+        ("import-usage", "PATH", args.import_usage),
     ):
         if value is not None and not value:
             parser.error(f"'{subcommand}' requires a non-empty {metavar}")

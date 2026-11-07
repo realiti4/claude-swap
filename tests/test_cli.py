@@ -1859,12 +1859,14 @@ class TestEmptyValueArguments:
             ["switch", ""],
             ["export", ""],
             ["import", ""],
+            ["import-usage", ""],
             ["--remove-account", ""],
             ["--disable-account", ""],
             ["--enable-account", ""],
             ["--switch-to", ""],
             ["--export", ""],
             ["--import", ""],
+            ["--import-usage", ""],
         ],
     )
     def test_empty_value_is_rejected(self, argv, capsys):
