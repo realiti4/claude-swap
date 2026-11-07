@@ -277,3 +277,32 @@ def test_bundle_built_from_the_real_interpreter_starts_and_imports(tmp_path: Pat
     assert proc.returncode == 0, proc.stderr
     assert Path(proc.stdout.strip()) == apps / app_bundle.BUNDLE_DIRNAME / "Contents"
     assert app_bundle.interpreter_error(python) is None
+
+
+# --- remove -------------------------------------------------------------------
+
+
+def test_remove_deletes_the_bundle_from_both_homes(tmp_path):
+    apps, backup = tmp_path / "apps", tmp_path / "data"
+    for home in (apps, backup):
+        (home / app_bundle.BUNDLE_DIRNAME / "Contents" / "MacOS").mkdir(parents=True)
+
+    removed = app_bundle.remove(backup, applications=apps)
+
+    assert sorted(removed) == sorted(
+        [apps / app_bundle.BUNDLE_DIRNAME, backup / app_bundle.BUNDLE_DIRNAME]
+    )
+    assert not (apps / app_bundle.BUNDLE_DIRNAME).exists()
+    assert not (backup / app_bundle.BUNDLE_DIRNAME).exists()
+
+
+def test_remove_is_quiet_when_there_is_no_bundle(tmp_path):
+    assert app_bundle.remove(tmp_path / "data", applications=tmp_path / "apps") == []
+
+
+def test_remove_reads_the_applications_dir_at_call_time(tmp_path, monkeypatch):
+    # So a test (or a future setting) can point it away from /Applications.
+    apps = tmp_path / "apps"
+    (apps / app_bundle.BUNDLE_DIRNAME).mkdir(parents=True)
+    monkeypatch.setattr(app_bundle, "APPLICATIONS_DIR", apps)
+    assert app_bundle.remove(tmp_path / "data") == [apps / app_bundle.BUNDLE_DIRNAME]
