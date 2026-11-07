@@ -36,6 +36,7 @@ class _Host:
     def __init__(self, credentials_dir: Path):
         self.platform = Platform.MACOS
         self.credentials_dir = credentials_dir
+        self.sequence_file = credentials_dir.parent / "sequence.json"
         self._logger = logging.getLogger("test")
 
 

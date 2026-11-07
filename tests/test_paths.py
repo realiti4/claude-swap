@@ -20,6 +20,7 @@ from claude_swap.paths import (
     get_backup_root,
     get_claude_config_home,
     get_credentials_path,
+    get_default_global_config_path,
     get_global_config_path,
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
@@ -80,6 +81,38 @@ class TestGetGlobalConfigPath:
         legacy = custom / ".config.json"
         legacy.write_text("{}")
         assert get_global_config_path() == legacy
+
+
+@pytest.mark.parametrize(
+    "resolver", [get_global_config_path, get_default_global_config_path]
+)
+@pytest.mark.parametrize(
+    "legacy_kind, global_present, expect_legacy",
+    [
+        ("absent", False, False),
+        ("empty", True, False),
+        ("empty", False, True),
+        ("empty_readonly", False, False),
+        ("nonempty", True, True),
+        ("directory", False, False),
+    ],
+)
+def test_legacy_config_rule_matches_claude_code_2_1_299(
+    isolated_home: Path, resolver, legacy_kind, global_present, expect_legacy
+):
+    """An empty .config.json only wins while it is writable and .claude.json is absent."""
+    legacy = isolated_home / ".claude" / ".config.json"
+    legacy.parent.mkdir()
+    if legacy_kind == "directory":
+        legacy.mkdir()
+    elif legacy_kind != "absent":
+        legacy.write_text("{}" if legacy_kind == "nonempty" else "")
+        if legacy_kind == "empty_readonly":
+            legacy.chmod(0o444)
+    global_cfg = isolated_home / ".claude.json"
+    if global_present:
+        global_cfg.write_text("{}")
+    assert resolver() == (legacy if expect_legacy else global_cfg)
 
 
 class TestGetCredentialsPath:
