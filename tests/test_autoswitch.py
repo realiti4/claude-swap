@@ -17735,6 +17735,9 @@ _ENG = {"lastSwitchAt": 5, "lastSwitchTo": "2", "leftTrigger": "failover"}
         ({**_ENG, "lastManualSwitchAt": 6, "lastManualSwitchTo": 3}, ("3", "manual")),
         ({**_ENG, "lastManualSwitchAt": 4, "lastManualSwitchTo": "3"}, ("2", "failover")),
         ({**_ENG, "lastManualSwitchAt": "x", "lastManualSwitchTo": "3"}, ("2", "failover")),
+        ({**_ENG, "lastLimitSwitchAt": 6, "lastLimitSwitchTo": 3}, ("3", "at-limit")),
+        ({**_ENG, "lastLimitSwitchAt": 4, "lastLimitSwitchTo": "3"}, ("2", "failover")),
+        ({**_ENG, "lastLimitSwitchAt": "x", "lastLimitSwitchTo": "3"}, ("2", "failover")),
         ({"lastSwitchAt": 5, "lastSwitchTo": "2"}, None),  # no trigger recorded
         ({**_ENG, "lastSwitchAt": "x"}, None),
     ],
@@ -17821,6 +17824,32 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
         assert last_engine_switch(h.switcher.backup_dir) == ("2", "expiring-window")
         assert h.engine._read_state()["leftTrigger"] == "alternation"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected", "stamped"),
+        [
+            ({"current_at_limit": True}, ("3", "at-limit"), True),
+            ({}, ("2", "expiring-window"), False),
+            ({"current_at_limit": True, "manual_source": "cli"}, ("3", "manual"), False),
+        ],
+    )
+    def test_the_pins_wall_switch_is_read_as_the_newest_switch(
+        self, temp_home, kwargs, expected, stamped
+    ):
+        """A `switch()` with no `manual_source` records nothing, so after the pin's
+        429 wall move 2 -> 3 the engine's older `expiring-window` on 2 still read
+        as the newest switch. Only the at-limit landing stamps its own entry."""
+        h = _xw_harness(temp_home)
+        backup = h.switcher.backup_dir
+        assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
+        assert last_engine_switch(backup) == ("2", "expiring-window")
+        h.clock.advance(60.0)
+        usage = self._fleet(h, **{"2": _xw(h, 100.0, 87.0, 2 * _H)})
+        with patch.object(h.switcher, "_usage_by_account", return_value=usage):
+            h.switcher.switch(strategy="best", json_output=True, **kwargs)
+        assert h.active_number() == 3
+        assert last_engine_switch(backup) == expected
+        assert ("lastLimitSwitchTo" in h.engine._read_state()) is stamped
 
     def test_it_is_the_sooner_expiring_window_and_the_active_then_holds_it(
         self, temp_home

@@ -7338,7 +7338,9 @@ class ClaudeAccountSwitcher:
                   fallback silently steering the pick is impossible.
             manual_source: A hand caller's name (``"tui"``, ``"cli"``,
                   ``"menubar"``): a real switch is then recorded for the engine
-                  (:meth:`_record_manual_switch`). ``None`` records nothing.
+                  (:meth:`_record_manual_switch`). ``None`` records nothing,
+                  except a ``current_at_limit`` landing, which stamps
+                  ``lastLimitSwitchAt`` for the pin.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -7485,6 +7487,10 @@ class ClaudeAccountSwitcher:
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
                 self._record_manual_switch(manual_source, op["from"], op["to"])
+                if current_at_limit and not manual_source:
+                    from claude_swap.autoswitch import record_limit_switch
+
+                    record_limit_switch(self, op["to"])
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
