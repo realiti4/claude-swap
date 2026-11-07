@@ -3429,6 +3429,13 @@ class AutoSwitchEngine:
             plan.add(current)
         if self._idle_hold_since is None:
             pick = due_candidate(candidates, pre, now)
+            if pick is None:
+                disabled = [
+                    n
+                    for n in self.switcher.disabled_account_numbers()
+                    if n != current and n not in quarantined
+                ]
+                pick = due_candidate(disabled, pre, now)
             if pick is not None:
                 plan.add(pick)
         # A STOPPED ENGINE ISSUES NO FETCHES, and an entry gate is not enough:
