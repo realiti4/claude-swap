@@ -14,6 +14,7 @@ import pytest
 from claude_swap import __version__
 from claude_swap import cli
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
@@ -766,7 +767,12 @@ class TestCLICommands:
 class TestRunCommand:
     """`cswap run` pre-dispatch: parsing, forwarding, and dispatch."""
 
-    def _dispatch(self, argv: list[str]):
+    @pytest.fixture(autouse=True)
+    def _backup_dir(self, tmp_path):
+        """An empty backup root: nothing here may depend on settings.json."""
+        self.backup_dir = tmp_path
+
+    def _dispatch(self, argv: list[str], **switcher_attrs):
         """Run cli.main() with a fake SessionManager; returns recorded calls."""
         calls = []
 
@@ -779,7 +785,7 @@ class TestRunCommand:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 calls.append((
@@ -788,23 +794,28 @@ class TestRunCommand:
                 ))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=self.backup_dir,
+                                          **switcher_attrs)), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", *argv]):
             cli.main()
         return calls
 
+    # share_history is forwarded as typed: None for "neither flag", which
+    # SessionManager.run resolves against run.shareHistory (tested there).
+
     def test_run_dispatches_with_defaults(self):
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], True, None, False) in calls
 
     def test_run_by_email(self):
         calls = self._dispatch(["run", "user@example.com"])
-        assert ("run", "user@example.com", [], True, False, False) in calls
+        assert ("run", "user@example.com", [], True, None, False) in calls
 
     def test_no_share_flag(self):
         calls = self._dispatch(["run", "2", "--no-share"])
-        assert ("run", "2", [], False, False, False) in calls
+        assert ("run", "2", [], False, None, False) in calls
 
     def test_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--share-history"])
@@ -814,18 +825,26 @@ class TestRunCommand:
         calls = self._dispatch(["run", "2", "--no-share-history"])
         assert ("run", "2", [], True, False, False) in calls
 
+    @pytest.mark.parametrize("stored", ["true", "false"])
+    def test_share_history_setting_is_not_resolved_here(self, stored):
+        """One reader for run.shareHistory, and it is not the CLI: a second
+        one here is how a launcher ends up with its own idea of the default."""
+        set_setting(self.backup_dir, "run.shareHistory", stored)
+        calls = self._dispatch(["run", "2"])
+        assert ("run", "2", [], True, None, False) in calls
+
     def test_require_session_flag(self):
         calls = self._dispatch(["run", "2", "--require-session"])
-        assert ("run", "2", [], True, False, True) in calls
+        assert ("run", "2", [], True, None, True) in calls
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
-        assert ("run", "2", ["--resume", "--model", "x"], True, False, False) in calls
+        assert ("run", "2", ["--resume", "--model", "x"], True, None, False) in calls
 
     def test_tail_may_contain_run_flags(self):
         """Args after `--` are NOT parsed by cswap, even if they look like ours."""
         calls = self._dispatch(["run", "2", "--", "--no-share"])
-        assert ("run", "2", ["--no-share"], True, False, False) in calls
+        assert ("run", "2", ["--no-share"], True, None, False) in calls
 
     def test_run_unknown_flag_errors(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
@@ -841,6 +860,9 @@ class TestRunCommand:
         out = capsys.readouterr().out
         assert "--no-share" in out
         assert "this terminal only" in out
+        # Sharing history is the default, so the help leads with the way out.
+        assert "--share-history, --no-share-history" in out
+        assert "This is the default" in out
 
     def test_main_help_mentions_run(self):
         result = subprocess.run(
@@ -870,7 +892,7 @@ class TestRunCommand:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 from claude_swap.exceptions import SessionError
@@ -878,7 +900,8 @@ class TestRunCommand:
                 raise SessionError("boom")
 
         with patch("claude_swap.session.SessionManager", FailingSessionManager), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=self.backup_dir)), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "2"]):
             with pytest.raises(SystemExit) as excinfo:
@@ -966,7 +989,7 @@ class TestSubcommandAliases:
             show_token_status=False, json_output=True,
         )
 
-    def test_run_subcommand_still_dispatches(self):
+    def test_run_subcommand_still_dispatches(self, tmp_path):
         """`cswap run 2` keeps reaching the session pre-dispatch (not translated)."""
         calls = []
 
@@ -979,13 +1002,14 @@ class TestSubcommandAliases:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 calls.append((identifier, claude_args, share))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=tmp_path)), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "2"]):
             cli.main()
@@ -1616,7 +1640,7 @@ class TestRunAutoResolve:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 calls.append(("run", identifier, claude_args, share, share_history))
@@ -1663,7 +1687,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, None) in calls
 
     def test_mapped_subdir_inherits(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1687,7 +1711,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, None) in calls
 
     def test_unmapped_dir_falls_back_to_default(self, tmp_path, monkeypatch, capsys):
         backup = tmp_path / "backup"
@@ -1736,7 +1760,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "3"]):
             cli.main()
-        assert ("run", "3", [], True, False) in calls
+        assert ("run", "3", [], True, None) in calls
 
     def test_no_account_forwards_tail(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1759,7 +1783,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "--", "--resume"]):
             cli.main()
-        assert ("run", "2", ["--resume"], True, False) in calls
+        assert ("run", "2", ["--resume"], True, None) in calls
 
     def test_no_account_forwards_share_history(self, tmp_path, monkeypatch):
         """--share-history survives the mapped-account resolution path."""

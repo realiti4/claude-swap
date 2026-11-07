@@ -238,6 +238,15 @@ def usage_summary(
     if now is None:
         now = time.time()
     parts: list[str] = []
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe leads the row: the account is at its
+        # limit until the refusal ends, however low the windows below read.
+        seg = "rejected (!)"
+        countdown = _live_countdown(rejected, now)
+        if countdown:
+            seg += f" ({countdown})"
+        parts.append(seg)
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         pace_result = None
@@ -315,6 +324,8 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
+    if isinstance(active_usage, dict) and isinstance(active_usage.get("rejected"), dict):
+        segments.append("rejected (!)")
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
@@ -440,6 +451,20 @@ def _adapt_snapshot(snap) -> dict:
         "active_usage": active_usage,
         "active_alias": active_alias,
     }
+
+
+def _take_worker_snapshot(
+    snapshot_source, *, full: bool, has_engine: bool
+) -> tuple[dict, bool]:
+    """Take and adapt one display snapshot; returns ``(snap, store_only)``.
+
+    Routine ticks read store-only while the hosted auto-switch engine is
+    running; an explicit Refresh now (``full=True``) still runs a store-governed
+    on-demand pass.
+    """
+    store_only = has_engine and not full
+    raw = snapshot_source.take(full=full, store_only=store_only)
+    return _adapt_snapshot(raw), store_only
 
 
 # macOS 26 stopped drawing status items for processes launched through an
@@ -610,21 +635,26 @@ def run(switcher) -> int:
         def _worker(self, full):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. While the engine
-            # runs it already paces all fetching, so the display reads store-only.
+            # runs it already paces all fetching, so routine display ticks read
+            # store-only; an explicit Refresh now (full=True) still runs a
+            # store-governed pass.
             try:
                 try:
-                    raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
+                    snap, store_only = _take_worker_snapshot(
+                        self._snapshot_source,
+                        full=full,
+                        has_engine=self._engine is not None,
                     )
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
                     return
-                snap = _adapt_snapshot(raw)
                 self._log_usage(snap)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
                 self._dirty = True  # picked up by on_sync_tick on the main thread
+                if store_only:
+                    self._snapshot_source.refresh_plans()
             finally:
                 self._refreshing = False
 
