@@ -1245,6 +1245,8 @@ class TestSetupTokenHeaderProbe:
         assert outcome.usage is None
         assert outcome.error == "setup-token"
         assert calls == []
+        # The kind renders through ERROR_NOTES, which names the remedy.
+        assert "usage.headerProbe" in oauth.ERROR_NOTES["setup-token"]
 
     def test_exhausted_account_reads_headers_off_the_429(self):
         values = dict(_UNIFIED_HEADERS)
