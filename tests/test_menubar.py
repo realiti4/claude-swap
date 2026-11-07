@@ -825,7 +825,7 @@ def test_account_row_shows_the_sentinel_state_not_the_remedy():
     label = menubar.format_account_label(
         2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
     )
-    assert label.endswith("re-login needed")
+    assert label.endswith("re-login needed · login ?")
     assert "cswap add" not in label
 
 
