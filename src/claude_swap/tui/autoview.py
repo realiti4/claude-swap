@@ -79,7 +79,7 @@ _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 
 def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
-    """The "threshold 97%" note that ends the row, once a weekly line or the
+    """The "threshold 97%" status piece, once a weekly line or the
     account's own threshold makes the lines differ: the chip's raw pct stays,
     and the threshold it is judged against is named only where it is not the one
     number in the header. Empty unless `label` is the BINDING window's."""
@@ -92,7 +92,7 @@ def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
 # order they read. A new marker registers by adding its key here; only "block"
 # and "threshold" have a producer on this branch.
 STATUS_ORDER = (
-    "stale", "no-plan", "walled", "block", "threshold", "at-line",
+    "stale", "no-plan", "walled", "block", "capped", "threshold", "at-line",
     "not-candidate", "disabled",
 )
 
@@ -108,33 +108,41 @@ class CandidateRow:
     login: Text = field(default_factory=Text)
     status: dict[str, Text] = field(default_factory=dict)  # keys of STATUS_ORDER
     where: Text = field(default_factory=Text)  # where-in-use markers, last cell
+    note: bool = False  # usage is free text (a sentinel note): it sizes no column
 
     def __post_init__(self) -> None:
         if unknown := self.status.keys() - set(STATUS_ORDER):
             raise ValueError(f"status key not in STATUS_ORDER: {sorted(unknown)}")
+        # A marker never pads itself; usage is exempt, its chip blanks pad on purpose.
+        for cell in (self.login, self.where, *self.status.values()):
+            if cell.plain != cell.plain.strip():
+                raise ValueError(
+                    f"marker has leading or trailing whitespace: {cell.plain!r}"
+                )
 
 
 def render_candidate_rows(rows: list[CandidateRow], palette: Palette) -> Text:
     """The block's rows, each led by a newline, every slot starting in one
-    display column on all of them. A slot is as wide as its widest cell among
-    the rows that have something after it, so a row ending in a long sentinel
-    note sizes nothing; a slot empty on every row takes no column at all."""
+    display column on all of them. A slot is as wide as its widest cell over
+    every row that fills it; a free-text usage note sizes nothing, and a slot
+    empty on every row takes no column at all."""
     sep = Text(" \u00b7 ", style=palette.muted)
-    grid = [
-        [
-            row.number, row.email, row.login, row.usage,
-            sep.join(row.status[k] for k in STATUS_ORDER if k in row.status),
-            row.where,
-        ]
-        for row in rows
-    ]
+    grid = []
+    for row in rows:
+        status = Text()
+        for key in STATUS_ORDER:
+            if key in row.status:
+                if status:
+                    status.append_text(sep)
+                status.append_text(row.status[key])
+        grid.append([row.number, row.email, row.login, row.usage, status, row.where])
+    usage = 3
     widths = [2, 0, 0, 0, 0, 0]  # the number is right-aligned, two wide at least
     used = [False] * len(widths)
-    for cells in grid:
-        last = max(i for i, cell in enumerate(cells) if cell)
+    for row, cells in zip(rows, grid):
         for i, cell in enumerate(cells):
             used[i] |= bool(cell)
-            if i < last:
+            if not (i == usage and row.note):
                 widths[i] = max(widths[i], cell.cell_len)
     out = Text()
     for cells in grid:
@@ -143,6 +151,7 @@ def render_candidate_rows(rows: list[CandidateRow], palette: Palette) -> Text:
             if i and not used[i]:
                 continue
             cell = cell.copy()
+            # A note wider than usage overflows on its own row; the next slot follows it.
             pad = max(0, widths[i] - cell.cell_len)
             if i:
                 cell.pad_right(pad)
@@ -576,6 +585,7 @@ class AutoScreen(Screen):
                     Text(acc.number, style=palette.muted),
                     Text(acc.email, style=palette.muted),
                     Text(note, style=palette.sev_warn),
+                    note=True,
                 )
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
@@ -588,7 +598,9 @@ class AutoScreen(Screen):
             )
             usage = Text()
             status: dict[str, Text] = {}
+            free_text = False
             if acc.usage.sentinel is not None:
+                free_text = True
                 usage.append(
                     data.sentinel_label(acc.usage.sentinel), style=palette.muted
                 )
@@ -610,6 +622,7 @@ class AutoScreen(Screen):
                                  style=palette.severity(spend_pct))
                     usage.append(f" · {spend_suffix}", style=palette.muted)
                 else:
+                    free_text = True
                     usage.append("usage unknown", style=palette.muted)
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
                 # into the sort key would change which account the engine
@@ -693,6 +706,7 @@ class AutoScreen(Screen):
                 Text(acc.email, style=palette.foreground),
                 usage,
                 status=status,
+                note=free_text,
             )
 
         text = Text()
