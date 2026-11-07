@@ -501,12 +501,12 @@ def _two_account_stores(temp_home: Path, sample_sequence_data: dict):
 def _install_patches(switcher, creds_store, configs_store, live_state):
     patches = [
         patch.object(switcher, "_read_account_credentials",
-                     side_effect=lambda n, e: creds_store.get((str(n), e), "")),
+                     side_effect=lambda n, e, **_kw: creds_store.get((str(n), e), "")),
         # The strict reader must answer from the same double: a caller that
         # asks absent-vs-unreadable would otherwise bypass it entirely and
         # read the real (empty) store.
         patch.object(switcher, "_read_account_credentials_ex",
-                     side_effect=lambda n, e: (creds_store.get((str(n), e), ""), False)),
+                     side_effect=lambda n, e, **_kw: (creds_store.get((str(n), e), ""), False)),
         patch.object(switcher, "_write_account_credentials",
                      side_effect=lambda n, e, c: creds_store.__setitem__((str(n), e), c)),
         patch.object(switcher, "_read_account_config",
@@ -752,3 +752,110 @@ class TestAccountRowDisabled:
     def test_disabled_absent_by_default(self):
         row = account_row(1, "a@example.com", "", "", False, None)
         assert "disabled" not in row
+
+
+class TestUsageFromJson:
+    """``list --json`` usage read back into the internal dict (import-usage)."""
+
+    INTERNAL = {
+        "five_hour": {"pct": 12.0, "resets_at": "2099-01-01T05:00:00+00:00"},
+        "seven_day": {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
+        "spend": {"used": 5.0, "limit": 50.0, "pct": 10.0, "currency": "USD",
+                  "resets_at": "2099-02-01T00:00:00+00:00"},
+        "scoped": [{"name": "Fable", "pct": 30.0,
+                    "resets_at": "2099-01-07T00:00:00+00:00"}],
+    }
+
+    def test_round_trips_what_the_api_measured(self):
+        import time
+
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        back = usage_from_json(usage_to_json(self.INTERNAL, fetched_at=time.time()))
+        # Pace fields are dropped; countdown/clock are rebuilt from resets_at,
+        # the way a fresh fetch writes them.
+        windows = (back["five_hour"], back["seven_day"], back["spend"], back["scoped"][0])
+        for window in windows:
+            assert window.pop("countdown") and window.pop("clock")
+        assert back == self.INTERNAL
+
+    def test_header_probe_reading_keeps_its_source_and_rejection(self):
+        """An imported setup-token reading must still read as partial or
+        refused on the other machine, not as a healthy endpoint reading."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            "five_hour": {"pct": 5.0},
+            "rejected": {"retry_after_s": 60.0,
+                         "resets_at": "2099-01-01T05:00:00+00:00"},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        exported = usage_to_json(internal)
+        assert exported["source"] == "headers"
+        assert exported["rejected"] == {
+            "retryAfterS": 60.0, "resetsAt": "2099-01-01T05:00:00+00:00",
+        }
+        back = usage_from_json(exported)
+        back["five_hour"].pop("countdown", None)
+        back["five_hour"].pop("clock", None)
+        assert back == internal
+        assert oauth.account_headroom(back) == 0.0
+        partial = usage_from_json({"fiveHour": {"pct": 5}, "source": "headers"})
+        assert oauth.account_headroom(partial) is None
+
+    def test_a_window_without_a_reset_keeps_its_pct(self):
+        from claude_swap.json_output import usage_from_json
+
+        assert usage_from_json({"fiveHour": {"pct": 3}}) == {"five_hour": {"pct": 3.0}}
+
+    @pytest.mark.parametrize("window, key, other", [
+        ("five_hour", "fiveHour", "seven_day"), ("seven_day", "sevenDay", "five_hour"),
+    ])
+    @pytest.mark.parametrize("resets_at", [None, "2099-01-01T05:00:00+00:00"])
+    def test_a_window_without_a_figure_round_trips(self, window, key, other, resets_at):
+        # ``list --json`` emits ``"pct": null`` for a window reported without a
+        # utilization figure; ``cswap import-usage`` must read that document back.
+        import time
+
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            window: {"pct": None},
+            other: {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
+        }
+        if resets_at:
+            internal[window]["resets_at"] = resets_at
+        exported = usage_to_json(internal, fetched_at=time.time())
+        assert exported[key]["pct"] is None
+        back = usage_from_json(exported)
+        for entry in back.values():
+            entry.pop("countdown", None)
+            entry.pop("clock", None)
+        assert back == internal
+
+    @pytest.mark.parametrize("usage", [
+        None,
+        {},
+        {"fiveHour": {"pct": "12"}},
+        {"fiveHour": {"pct": -1}},
+        {"fiveHour": {"pct": float("nan")}},
+        {"fiveHour": {"pct": True}},
+        {"fiveHour": {}},
+        {"fiveHour": {"pct": None, "resetsAt": "next tuesday"}},
+        {"spend": {"pct": None, "used": 1, "limit": 2, "currency": "USD"}},
+        {"scoped": [{"name": "Fable", "pct": None}]},
+        # a header probe never reports a window without a figure
+        {"fiveHour": {"pct": None}, "sevenDay": {"pct": 5}, "source": "headers"},
+        {"sevenDay": {"pct": 1, "resetsAt": "next tuesday"}},
+        {"spend": {"pct": 1, "used": 1, "currency": "USD"}},
+        {"scoped": [{"pct": 1}]},
+        {"scoped": {"name": "Fable", "pct": 1}},
+        {"source": "headers"},
+        {"rejected": "yes"},
+        {"rejected": {"retryAfterS": "30"}},
+    ])
+    def test_malformed_usage_is_refused(self, usage):
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError):
+            usage_from_json(usage)

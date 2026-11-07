@@ -68,6 +68,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from claude_swap import oauth
+from claude_swap.lines import window_line
 
 # Freshness floor shared by every collector: an entry younger than this is
 # served from the store without any fetch, so the maximum sustained rate on
@@ -78,13 +79,16 @@ SERVE_TTL_S = 180.0
 # below.
 MIN_INTERVAL_S = 180.0
 
-# Urgent mode: the ACTIVE account, within ESCALATION_MARGIN_PCT of the
-# switch threshold, with movement observed this poll (i.e. actually burning
-# toward the limit). Bounded by construction: either the threshold is crossed
-# (the engine switches away) or the movement stops (the next poll decays back
-# to MIN_INTERVAL_S) — worst case margin/movement-delta ≈ 15 polls per
-# episode, inside the measured ~28-30 request rolling-hour window; overshoot
-# on top of steady traffic is absorbed by the post-429 floor below.
+# Urgent mode: the ACTIVE account, with some window that ROSE this poll to
+# within ESCALATION_MARGIN_PCT of its own switch line (i.e. actually burning
+# toward a limit — a window dropping into the band just gained room). Judged
+# per window rather than on the binding max: a 5h window closing on its line
+# under a flat, higher weekly window is exactly the burn a max-only rule is
+# blind to. Bounded by construction: either the line is crossed (the engine
+# switches away) or the rise stops (the next poll decays back to
+# MIN_INTERVAL_S) — worst case margin/movement-delta ≈ 15 polls per episode,
+# inside the measured ~28-30 request rolling-hour window; overshoot on top of
+# steady traffic is absorbed by the post-429 floor below.
 URGENT_INTERVAL_S = 60.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
@@ -102,9 +106,10 @@ CANDIDATE_MAX_INTERVAL_S = 600.0
 # forward.
 EXHAUSTED_INTERVAL_S = 600.0
 
-# A window whose binding pct moved at least this much between polls is being
-# consumed somewhere (this machine, another PC, session mode) → tighten; an
-# unmoved one backs off toward its ceiling.
+# An account whose binding (max) pct moved at least this much between polls
+# is being consumed somewhere (this machine, another PC, session mode) →
+# tighten; an unmoved one backs off toward its ceiling. Urgent mode reads the
+# same delta per window, rising only.
 MOVEMENT_DELTA_PCT = 1.0
 
 # ±fraction applied to each scheduled interval so independent processes
@@ -137,9 +142,10 @@ RECENT_429_WINDOW_S = 3600.0
 POST_429_BACKOFF_MULT = 1.5
 POST_429_MAX_INTERVAL_S = 1800.0
 
-# The engine escalates to a full candidate refresh when the active account is
-# within this margin of the threshold (decision policy, but the urgent-mode
-# cadence keys on the same band, so it lives with the cadence numbers).
+# The engine escalates to a full candidate refresh when any of the active
+# account's windows is within this margin of its own switch line (decision
+# policy, but the urgent-mode cadence keys on the same band, so it lives with
+# the cadence numbers).
 ESCALATION_MARGIN_PCT = 15.0
 
 # Never schedule a poll later than a known window reset (+ slack): stored
@@ -202,14 +208,17 @@ def plan_after_fetch(
     models: tuple[str, ...],
     recent_429: bool,
     now: float,
+    weekly_threshold: float | None = None,
     rng: Callable[[], float] = random.random,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
     Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since the previous
     poll) halves the interval, floored at ``MIN_INTERVAL_S`` — or drops to
-    ``URGENT_INTERVAL_S`` when the active account is moving inside the
-    escalation band. No movement backs off ×1.5 toward the account's ceiling;
+    ``URGENT_INTERVAL_S`` when one of the active account's windows rose by
+    that much into the escalation band under its own line (``threshold`` for
+    the 5h window, ``weekly_threshold`` when set for the weekly ones). No
+    movement backs off ×1.5 toward the account's ceiling;
     unknown utilization uses the default. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
@@ -235,13 +244,19 @@ def plan_after_fetch(
         # through 90s/135s polls that the budget never intended.
         moving = False
         interval = min(ceiling, max(MIN_INTERVAL_S, base * 1.5))
-    if (
-        is_active
-        and moving
-        and not recent_429
-        and new_pct is not None
-        and new_pct >= threshold - ESCALATION_MARGIN_PCT
-    ):
+    # Per window, by label, rising only: the window that matters for a switch
+    # may not be the max (5h climbing under a flat higher 7d), and a window
+    # that just dropped into the band is a rollover, not a burn.
+    prev_pcts = {
+        label: pct for label, pct, _ in oauth.relevant_windows(prev_usage, models)
+    }
+    rising_in_band = any(
+        label in prev_pcts
+        and pct - prev_pcts[label] >= MOVEMENT_DELTA_PCT
+        and pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
+        for label, pct, _ in oauth.relevant_windows(new_usage, models)
+    )
+    if is_active and rising_in_band and not recent_429:
         interval = URGENT_INTERVAL_S
     if recent_429:
         # AIMD additive-increase: grow the interval multiplicatively from the
