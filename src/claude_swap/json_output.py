@@ -152,14 +152,24 @@ def _is_number(value: object) -> bool:
     )
 
 
-def _window_from_json(window: object, label: str) -> dict:
-    """One JSON window back to the internal shape, fetch-time strings rebuilt."""
+def _window_from_json(window: object, label: str, nullable: bool = False) -> dict:
+    """One JSON window back to the internal shape, fetch-time strings rebuilt.
+
+    ``nullable`` admits ``"pct": null``, which :func:`usage_to_json` emits for
+    a 5h/7d window the API reported without a utilization figure.
+    """
     if not isinstance(window, dict):
         raise ValueError(f"{label} must be an object")
     pct = window.get("pct")
-    if not _is_number(pct) or pct < 0:
-        raise ValueError(f"{label}.pct must be a non-negative number")
-    out: dict = {"pct": float(pct)}
+    if nullable and "pct" in window and pct is None:
+        pct_value = None
+    elif _is_number(pct) and pct >= 0:
+        pct_value = float(pct)
+    else:
+        raise ValueError(
+            f"{label}.pct must be a non-negative number{' or null' if nullable else ''}"
+        )
+    out: dict = {"pct": pct_value}
     resets_at = window.get("resetsAt")
     if resets_at is not None:
         if not isinstance(resets_at, str):
@@ -179,17 +189,23 @@ def usage_from_json(usage: object) -> dict:
     ``resetsAt``, the spend amounts and the scoped model names. Everything
     derived at serialization (countdown, clock, pace fields) is dropped, and
     the fetch-time strings are rebuilt from ``resets_at``, which gives the
-    shape :func:`oauth.build_usage_result` stores. Raises ``ValueError`` on
-    anything malformed, so an importer can refuse a document before writing
-    any of it.
+    shape :func:`oauth.build_usage_result` stores. A 5h/7d window's ``pct``
+    may be ``null`` (reported without a figure), except in a ``source:
+    headers`` document, which the probe never produces that way. Raises
+    ``ValueError`` on anything malformed, so an importer can refuse a
+    document before writing any of it.
     """
     if not isinstance(usage, dict):
         raise ValueError("usage must be an object")
     out: dict = {}
     if "fiveHour" in usage:
-        out["five_hour"] = _window_from_json(usage["fiveHour"], "fiveHour")
+        out["five_hour"] = _window_from_json(
+            usage["fiveHour"], "fiveHour", nullable=True
+        )
     if "sevenDay" in usage:
-        out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
+        out["seven_day"] = _window_from_json(
+            usage["sevenDay"], "sevenDay", nullable=True
+        )
     if "spend" in usage:
         spend = usage["spend"]
         out_spend = _window_from_json(spend, "spend")
@@ -227,6 +243,11 @@ def usage_from_json(usage: object) -> dict:
     if not out:
         raise ValueError("usage carries no windows")
     if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        # The header probe never reports a window without a figure, and one
+        # would pass the completeness check while contributing no window.
+        for key, label in (("five_hour", "fiveHour"), ("seven_day", "sevenDay")):
+            if key in out and out[key]["pct"] is None:
+                raise ValueError(f"{label}.pct cannot be null in a headers reading")
         out["source"] = oauth.USAGE_SOURCE_HEADERS
     return out
 
@@ -341,6 +362,9 @@ def subscription_plan_fields(record: dict) -> dict:
     for key in ("organizationType", "billingType", "subscriptionStatus"):
         if key in plan:
             fields[key] = plan[key]
+    name = plan.get("planDisplayName")
+    if isinstance(name, str) and name:
+        fields["planDisplayName"] = name
     fields["expired"] = subscription.is_expired(plan)
     fields["fetchedAt"] = _timestamp(record["fetchedAt"])
     return fields

@@ -623,6 +623,106 @@ class TestCLI:
         assert exc.value.code == 2
         assert "can only be used with 'menubar'" in capsys.readouterr().err
 
+    def _menubar_settings(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("claude_swap.paths.get_backup_root", lambda: tmp_path)
+        return tmp_path / "menubar_settings.json"
+
+    def test_install_service_auto_switch_turns_the_toggle_on_before_install(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # install() restarts a running service and the menu bar reads the
+        # toggle once at launch, so the write has to land first.
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        seen = self._service_harness(
+            monkeypatch, ["cswap", "menubar", "--install-service", "--auto-switch"]
+        )
+        at_install = {}
+
+        def fake_install():
+            at_install["enabled"] = json.loads(path.read_text())["auto_switch_enabled"]
+            seen["called"] = "install"
+            return {"label": "com.cswap.menubar", "plist": "/tmp/p.plist", "stderr_log": "/tmp/e.log"}
+
+        monkeypatch.setattr("claude_swap.launch_agent.install", fake_install)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert at_install == {"enabled": True}
+        assert "auto-switch: on" in capsys.readouterr().out
+
+    def test_install_service_says_when_auto_switch_is_off(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # The toggle defaults to off and lives only in the menu: a service
+        # installed from a terminal otherwise runs as a display for weeks.
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert "auto-switch: off" in captured.err
+        assert "--auto-switch" in captured.err
+        assert not path.exists()  # reporting never writes the setting
+
+    def test_service_status_reports_auto_switch(self, monkeypatch, tmp_path, capsys):
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        path.write_text(json.dumps({"auto_switch_enabled": True}))
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        assert "auto-switch: on" in capsys.readouterr().out
+
+    def test_auto_switch_flag_requires_install_service(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["cswap", "menubar", "--auto-switch"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 2
+        assert "--auto-switch/--no-auto-switch can only be used with" in capsys.readouterr().err
+
+    def test_install_service_no_auto_switch_turns_the_toggle_off(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        path.write_text(json.dumps({"auto_switch_enabled": True, "title_pct": "5h"}))
+        self._service_harness(
+            monkeypatch, ["cswap", "menubar", "--install-service", "--no-auto-switch"]
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        saved = json.loads(path.read_text())
+        assert saved["auto_switch_enabled"] is False
+        assert saved["title_pct"] == "5h"  # other settings survive
+        assert "auto-switch: off" in capsys.readouterr().err
+
+    def test_install_service_failure_restores_the_toggle(self, monkeypatch, tmp_path):
+        # A failed install must not leave auto-switch changed with no
+        # service running behind it.
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        self._service_harness(
+            monkeypatch, ["cswap", "menubar", "--install-service", "--auto-switch"]
+        )
+
+        def failing_install():
+            raise RuntimeError("bootstrap failed")
+
+        monkeypatch.setattr("claude_swap.launch_agent.install", failing_install)
+
+        with pytest.raises(BaseException):
+            cli.main()
+
+        assert json.loads(path.read_text())["auto_switch_enabled"] is False
+
     def test_plain_menubar_does_not_touch_the_service(self, monkeypatch):
         seen = self._service_harness(monkeypatch, ["cswap", "menubar"])
 
@@ -754,7 +854,7 @@ class TestRunCommand:
 
     @pytest.fixture(autouse=True)
     def _backup_dir(self, tmp_path):
-        """An empty backup root, so run.shareHistory reads its default."""
+        """An empty backup root: nothing here may depend on settings.json."""
         self.backup_dir = tmp_path
 
     def _dispatch(self, argv: list[str], **switcher_attrs):
@@ -770,7 +870,7 @@ class TestRunCommand:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 calls.append((
@@ -787,17 +887,20 @@ class TestRunCommand:
             cli.main()
         return calls
 
+    # share_history is forwarded as typed: None for "neither flag", which
+    # SessionManager.run resolves against run.shareHistory (tested there).
+
     def test_run_dispatches_with_defaults(self):
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], True, None, False) in calls
 
     def test_run_by_email(self):
         calls = self._dispatch(["run", "user@example.com"])
-        assert ("run", "user@example.com", [], True, False, False) in calls
+        assert ("run", "user@example.com", [], True, None, False) in calls
 
     def test_no_share_flag(self):
         calls = self._dispatch(["run", "2", "--no-share"])
-        assert ("run", "2", [], False, False, False) in calls
+        assert ("run", "2", [], False, None, False) in calls
 
     def test_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--share-history"])
@@ -807,45 +910,26 @@ class TestRunCommand:
         calls = self._dispatch(["run", "2", "--no-share-history"])
         assert ("run", "2", [], True, False, False) in calls
 
-    def test_share_history_setting_is_the_default(self):
-        set_setting(self.backup_dir, "run.shareHistory", "true")
+    @pytest.mark.parametrize("stored", ["true", "false"])
+    def test_share_history_setting_is_not_resolved_here(self, stored):
+        """One reader for run.shareHistory, and it is not the CLI: a second
+        one here is how a launcher ends up with its own idea of the default."""
+        set_setting(self.backup_dir, "run.shareHistory", stored)
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, True, False) in calls
-
-    def _windows_dispatch(self, argv):
-        from claude_swap.models import Platform
-
-        set_setting(self.backup_dir, "run.shareHistory", "true")
-        return self._dispatch(argv, platform=Platform.WINDOWS)
-
-    def test_share_history_setting_warns_and_falls_back_on_windows(self, capsys):
-        calls = self._windows_dispatch(["run", "2"])
-        assert ("run", "2", [], True, False, False) in calls
-        assert "run.shareHistory is not supported on Windows" in capsys.readouterr().out
-
-    def test_explicit_share_history_still_forwarded_on_windows(self, capsys):
-        # SessionManager.run raises for it; the CLI must not swallow it.
-        calls = self._windows_dispatch(["run", "2", "--share-history"])
-        assert ("run", "2", [], True, True, False) in calls
-        assert "not supported on Windows" not in capsys.readouterr().out
-
-    def test_no_share_history_flag_overrides_setting(self):
-        set_setting(self.backup_dir, "run.shareHistory", "true")
-        calls = self._dispatch(["run", "2", "--no-share-history"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], True, None, False) in calls
 
     def test_require_session_flag(self):
         calls = self._dispatch(["run", "2", "--require-session"])
-        assert ("run", "2", [], True, False, True) in calls
+        assert ("run", "2", [], True, None, True) in calls
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
-        assert ("run", "2", ["--resume", "--model", "x"], True, False, False) in calls
+        assert ("run", "2", ["--resume", "--model", "x"], True, None, False) in calls
 
     def test_tail_may_contain_run_flags(self):
         """Args after `--` are NOT parsed by cswap, even if they look like ours."""
         calls = self._dispatch(["run", "2", "--", "--no-share"])
-        assert ("run", "2", ["--no-share"], True, False, False) in calls
+        assert ("run", "2", ["--no-share"], True, None, False) in calls
 
     def test_run_unknown_flag_errors(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
@@ -861,6 +945,9 @@ class TestRunCommand:
         out = capsys.readouterr().out
         assert "--no-share" in out
         assert "this terminal only" in out
+        # Sharing history is the default, so the help leads with the way out.
+        assert "--share-history, --no-share-history" in out
+        assert "This is the default" in out
 
     def test_main_help_mentions_run(self):
         result = subprocess.run(
@@ -890,7 +977,7 @@ class TestRunCommand:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 from claude_swap.exceptions import SessionError
@@ -1000,7 +1087,7 @@ class TestSubcommandAliases:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 calls.append((identifier, claude_args, share))
@@ -1638,7 +1725,7 @@ class TestRunAutoResolve:
                 identifier,
                 claude_args,
                 share=True,
-                share_history=False,
+                share_history=None,
                 require_session=False,
             ):
                 calls.append(("run", identifier, claude_args, share, share_history))
@@ -1685,7 +1772,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, None) in calls
 
     def test_mapped_subdir_inherits(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1709,7 +1796,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, None) in calls
 
     def test_unmapped_dir_falls_back_to_default(self, tmp_path, monkeypatch, capsys):
         backup = tmp_path / "backup"
@@ -1758,7 +1845,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "3"]):
             cli.main()
-        assert ("run", "3", [], True, False) in calls
+        assert ("run", "3", [], True, None) in calls
 
     def test_no_account_forwards_tail(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1781,7 +1868,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "--", "--resume"]):
             cli.main()
-        assert ("run", "2", ["--resume"], True, False) in calls
+        assert ("run", "2", ["--resume"], True, None) in calls
 
     def test_no_account_forwards_share_history(self, tmp_path, monkeypatch):
         """--share-history survives the mapped-account resolution path."""
@@ -1806,58 +1893,6 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run", "--share-history"]):
             cli.main()
         assert ("run", "2", [], True, True) in calls
-
-    def _mapped_run(self, tmp_path, monkeypatch, argv, platform):
-        from claude_swap.mappings import MappingStore
-
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        backup = tmp_path / "backup"
-        backup.mkdir()
-        MappingStore(backup).set(repo, "work@co.com", "")
-        set_setting(backup, "run.shareHistory", "true")
-        seq = {
-            "accounts": {"2": {"email": "work@co.com", "organizationUuid": "",
-                                "organizationName": ""}},
-            "sequence": [2],
-        }
-        sw = self._fake_switcher(backup, seq)
-        sw.platform = platform
-        calls = []
-        monkeypatch.chdir(repo)
-        with patch("claude_swap.session.SessionManager", self._fake_manager(calls)), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=sw), \
-             patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(sys, "argv", ["claude-swap", *argv]):
-            cli.main()
-        return calls
-
-    def test_mapped_dir_setting_warns_and_falls_back_on_windows(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        from claude_swap.models import Platform
-
-        calls = self._mapped_run(tmp_path, monkeypatch, ["run"], Platform.WINDOWS)
-        assert ("run", "2", [], True, False) in calls
-        assert "run.shareHistory is not supported on Windows" in capsys.readouterr().out
-
-    def test_unmapped_run_is_silent_on_windows(self, tmp_path, monkeypatch, capsys):
-        from claude_swap.models import Platform
-
-        backup = tmp_path / "backup"
-        backup.mkdir()
-        set_setting(backup, "run.shareHistory", "true")
-        sw = self._fake_switcher(backup, {"accounts": {}, "sequence": []})
-        sw.platform = Platform.WINDOWS
-        calls = []
-        monkeypatch.chdir(tmp_path)
-        with patch("claude_swap.session.SessionManager", self._fake_manager(calls)), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=sw), \
-             patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(sys, "argv", ["claude-swap", "run"]):
-            cli.main()
-        assert calls == [("exec_default", [])]
-        assert "Windows" not in capsys.readouterr().out
 
 
 class TestDisableEnableDispatch:
@@ -1893,6 +1928,72 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestEmptyValueArguments:
+    """A required value that arrives empty is a usage error, not a no-op.
+
+    ``cswap export "$DEST"`` with an unset DEST used to match no branch of the
+    dispatch chain and return from main() normally: exit 0, nothing printed,
+    no file written, and no way for the calling script to notice.
+    """
+
+    def _run(self, argv, capsys):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            code = 0
+            try:
+                cli.main()
+            except SystemExit as exc:
+                code = exc.code or 0
+        return code, capsys.readouterr(), switcher_cls
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["remove", ""],
+            ["disable", ""],
+            ["enable", ""],
+            ["switch", ""],
+            ["export", ""],
+            ["import", ""],
+            ["import-usage", ""],
+            ["--remove-account", ""],
+            ["--disable-account", ""],
+            ["--enable-account", ""],
+            ["--switch-to", ""],
+            ["--export", ""],
+            ["--import", ""],
+            ["--import-usage", ""],
+        ],
+    )
+    def test_empty_value_is_rejected(self, argv, capsys):
+        code, captured, switcher_cls = self._run(argv, capsys)
+        assert code == 2, f"{argv} exited {code} having printed {captured.out!r}"
+        assert "requires a non-empty" in captured.err
+        switcher_cls.assert_not_called()
+
+    def test_empty_value_is_blamed_before_its_modifiers(self, capsys):
+        """The empty PATH is the error, not the --account that accompanied it."""
+        _, captured, _ = self._run(["export", "", "--account", "1"], capsys)
+        assert "'export' requires a non-empty PATH" in captured.err
+
+    def test_add_token_still_accepts_an_empty_value(self, capsys):
+        """``--add-token`` uses const="" to mean "prompt me", so it is exempt."""
+        code, captured, switcher_cls = self._run(["--add-token"], capsys)
+        assert code == 0, captured.err
+        switcher_cls.return_value.add_account_from_token.assert_called_once_with(
+            token="", email=None, slot=None
+        )
+
+    def test_a_whitespace_only_path_is_still_a_path(self, capsys):
+        """A filename of spaces is legal on POSIX; only an empty value is rejected."""
+        with patch("claude_swap.transfer.export_accounts") as export_accounts:
+            code, captured, _ = self._run(["export", " "], capsys)
+        assert code == 0, captured.err
+        assert export_accounts.call_args.args[1] == " "
 
 
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):

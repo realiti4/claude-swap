@@ -106,9 +106,9 @@ from claude_swap.usage_store import (
     with_sentinel,
 )
 
-# Service name under which the legacy ``keyring`` backend stored per-account
+# Service name under which the legacy ``keyring`` library stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
-# and for the Windows Credential Manager migration).
+# and purge's sweep of items it left behind).
 KEYRING_SERVICE = "claude-code"
 
 # SECURITY_SERVICE and CLAUDE_CODE_KEYCHAIN_SERVICE now live in credentials.py
@@ -122,6 +122,17 @@ SETUP_TOKEN_SCOPES = oauth.SETUP_TOKEN_SCOPES
 # accounts never burst the shared usage endpoint from one IP in the same
 # instant (request hygiene; see issue #85).
 _FETCH_STAGGER_S = 0.25
+
+# Slack allowed between two slots' reset instants before the lockstep
+# heuristic stops calling them the same window. The two slots are read by two
+# separate usage requests (see _FETCH_STAGGER_S), and the endpoint serialises
+# one shared boundary with sub-second jitter across them — issue #161 saw the
+# same 5h reset come back as ...:00.129393 and ...:00.340384, so an exact
+# comparison never fires. A few seconds covers the stagger and the latency
+# spread of a whole collect pass; it cannot merge two real accounts, whose
+# windows open when their own first request lands and would have to coincide
+# on the 5h *and* the 7d boundary to within that same slack.
+_LOCKSTEP_RESET_TOLERANCE_S = 5.0
 
 # Show a "· Xm ago" age note on displayed usage older than this. Inside the
 # serve TTL the data is current by design (that is the polling cadence), so
@@ -157,12 +168,14 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
         if w:
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
             marker = _pace_marker(w, fetched_at) if label == "7d" else ""
+            # ``pct`` None (utilization unavailable) renders as ``?``, never 0%.
+            pct = f"{w['pct']:>3.0f}%" if isinstance(w.get("pct"), (int, float)) else "   ?"
             cell = oauth.fresh_reset_strings(w)
             if cell:
                 countdown, clock = cell
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
+                rows.append((label, f"{pct}   resets {clock:<12}  in {countdown}{marker}"))
             else:
-                rows.append((label, f"{w['pct']:>3.0f}%{marker}"))
+                rows.append((label, f"{pct}{marker}"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
@@ -286,7 +299,7 @@ def last_seen_note(entry: UsageEntry) -> str | None:
 
 
 def _plan_marker(record: dict | None, now: float) -> str:
-    """`` · Max 20x`` after a slot's header; a lapsed subscription is a
+    """`` · Ultra`` after a slot's header; a lapsed subscription is a
     highlighted ``Free``. No words: a bare "expired" beside an account reads
     as the OAuth token, which this tool also calls expired, the row is long
     already, and ``--json`` carries ``expired``/``subscriptionStatus``.
@@ -376,26 +389,6 @@ def _same_directory(left: Path, right: Path) -> bool:
         return left.resolve() == right.resolve()
     except OSError:  # unreadable mount / permission — compare as written
         return left == right
-
-
-def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
-    """Best-effort purge of legacy ``KEYRING_SERVICE`` entries via ``keyring``.
-
-    Used only during ``purge()`` to mop up entries a never-completed
-    keyring → file/security migration left behind. Never raises: keyring being
-    unavailable or an entry being absent just means nothing to clean up.
-    """
-    try:
-        import keyring  # noqa: PLC0415 - legacy cleanup only
-
-        for username in usernames:
-            try:
-                keyring.delete_password(KEYRING_SERVICE, username)
-                removed_items.append(f"Legacy keyring credential: {username}")
-            except Exception:
-                pass  # Doesn't exist / other error — ignore
-    except Exception:
-        pass  # keyring unavailable — nothing to clean up
 
 
 
@@ -1236,6 +1229,14 @@ class ClaudeAccountSwitcher:
         self._ensure_no_live_session(num_a, email_a, "--swap-accounts")
         self._ensure_no_live_session(num_b, email_b, "--swap-accounts")
 
+        # A profile that rotated past its backup advances the backup first:
+        # the backup is what moves, and the profile's Keychain item is deleted
+        # with the old slot key (see _adopt_before_relocation).
+        org_a = record_a.get("organizationUuid", "") or ""
+        org_b = record_b.get("organizationUuid", "") or ""
+        self._adopt_before_relocation(num_a, email_a, org_a, "--swap-accounts")
+        self._adopt_before_relocation(num_b, email_b, org_b, "--swap-accounts")
+
         # Read both slots' backup material up front so a read failure aborts
         # before anything has been moved. Missing material reads as "" (an
         # api-key or never-backed-up slot) and stays missing after the swap
@@ -1687,6 +1688,12 @@ class ClaudeAccountSwitcher:
         # pull state out from under a running process.
         self._ensure_no_live_session(num_src, email, "--move-account")
 
+        # Same as swap: the backup is what moves, and the profile's Keychain
+        # item is deleted with the old slot key, so a profile that rotated
+        # past its backup advances the backup first.
+        org_uuid = record.get("organizationUuid", "") or ""
+        self._adopt_before_relocation(num_src, email, org_uuid, "--move-account")
+
         # Read backup material up front so a read failure aborts before any
         # move. Missing material reads as "" (api-key or never-backed-up
         # slot) — but the plain reader answers that same "" for a backup
@@ -2088,6 +2095,30 @@ class ClaudeAccountSwitcher:
         """Whether a slot is flagged out of rotation in already-loaded data."""
         record = data.get("accounts", {}).get(str(account_num))
         return bool(record and record.get("disabled"))
+
+    #: The fields a user puts on a managed slot, as opposed to the identity
+    #: and provenance fields (email, uuid, org, added, kind) that a re-login
+    #: rewrites from the new credential. ``add_account`` and
+    #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
+    #: carry exactly these across; a new per-account setting belongs here.
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+
+    @classmethod
+    def _carried_settings(cls, record: dict | None) -> dict:
+        """The user-set fields of ``record``, to reattach to a rebuilt one.
+
+        Absent keys stay absent: every writer (``set_alias``,
+        ``set_account_disabled``, ``set_account_threshold``,
+        ``set_account_priority``) pops a cleared setting rather than storing a
+        default, and a copy must not reintroduce one.
+        """
+        if not record:
+            return {}
+        return {
+            key: record[key]
+            for key in cls.USER_ACCOUNT_SETTINGS
+            if record.get(key) is not None
+        }
 
     @staticmethod
     def _policy_from_data(data: dict, account_num: str) -> AccountPolicy:
@@ -3278,29 +3309,75 @@ class ClaudeAccountSwitcher:
           Checked after the generation test, so a profile provably on the
           backup's generation still answers False with its identity gone.
         """
+        with FileLock(self.lock_file):
+            return self._adopt_session_credential_locked(account_num, email, org_uuid)
+
+    def _adopt_session_credential_locked(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> bool | None:
+        """Body of :meth:`_adopt_session_credential`; the caller holds
+        ``self.lock_file``.
+
+        Split out so swap and move, which hold the lock across their whole
+        resolve-validate-mutate span (FileLock is non-reentrant), can adopt a
+        slot's rotated session credential before relocating its backup.
+        """
         from claude_swap.session import profile_is_quiescent, read_session_identity
 
         session_dir = self._session_dir(account_num, email)
-        with FileLock(self.lock_file):
-            if not profile_is_quiescent(session_dir):
-                return None
-            profile = self._session_profile_ahead(account_num, email, org_uuid)
-            if profile is None:
-                return False
-            if read_session_identity(session_dir) is None:
-                return None
-            self._store._write_account_credentials(account_num, email, profile)
+        if not profile_is_quiescent(session_dir):
+            return None
+        profile = self._session_profile_ahead(account_num, email, org_uuid)
+        if profile is None:
+            return False
+        if read_session_identity(session_dir) is None:
+            return None
+        self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
             "into its backup"
         )
         return True
 
+    def _adopt_before_relocation(
+        self, account_num: str, email: str, org_uuid: str, action: str
+    ) -> None:
+        """Advance a slot's backup to its session profile's generation before
+        swap or move relocates that backup. The caller holds ``self.lock_file``
+        and has passed ``_ensure_no_live_session`` for the slot.
+
+        Swap and move carry the BACKUP to the new slot key. The profile's
+        hashed Keychain item cannot follow (its service name hashes the old
+        path) and is deleted with the old key. After a session that refreshed,
+        that item holds the family's newest generation and the backup a
+        consumed one, so relocating without adopting seeds the destination
+        profile from a grant whose first refresh gets invalid_grant -- and the
+        fresh generation is gone with the old item. Same contract as the switch
+        guard: adopt when the profile is ahead and nothing runs against it;
+        refuse only when adoption is undecidable while the profile is provably
+        ahead, since proceeding would carry the consumed generation silently.
+        """
+        adopted = self._adopt_session_credential_locked(account_num, email, org_uuid)
+        if adopted is None and self._session_profile_ahead(
+            account_num, email, org_uuid
+        ):
+            raise SessionError(
+                f"Account-{account_num} ({email}) has a session profile whose "
+                "credential has rotated past the stored backup, and it could "
+                "not be adopted into the backup: the profile's identity file "
+                "(.claude.json) could not be read, or a Claude instance started "
+                "against it just now. Relocating the backup would carry a "
+                "consumed generation and lose the fresh one. Re-login inside "
+                f"the profile ('cswap run {account_num}', then /login) so its "
+                f"identity is rewritten, then retry {action}."
+            )
+
     def _delete_session_profile(self, account_num: str, email: str) -> None:
         """Remove an account's session profile dir and its keychain entry.
 
-        Keychain first: the hashed service name is derived from the dir path
-        and can't be recomputed once the dir is gone.
+        Keychain first, and unconditionally: the hashed service name is
+        derived from the dir PATH, which this call always has, so the entry
+        is deletable whether or not the dir is still there.
 
         The stale marker is a SIBLING of the dir, so ``rmtree`` does not take
         it: clear it explicitly, or the next profile created for this same
@@ -3312,8 +3389,16 @@ class ClaudeAccountSwitcher:
         )
 
         session_dir = self._session_dir(account_num, email)
+        # NOT under an `exists()` guard. swap and move relocate the profile
+        # with `os.replace` and only then prune the old slot key, so by the
+        # time this runs the old dir is exactly what no longer exists -- and
+        # the keychain entry does not follow a relocated dir, because its
+        # service name hashes the path. Guarding the delete on the dir left
+        # that entry, holding the account's rotated tokens, at a name no
+        # command names again: `purge` builds its list from the profile dirs
+        # that still exist, so it never reaches it either.
+        delete_macos_keychain_entry(session_dir)
         if session_dir.exists():
-            delete_macos_keychain_entry(session_dir)
             shutil.rmtree(session_dir, ignore_errors=True)
         # NOT under that `if`. The marker lives OUTSIDE the dir, so it
         # outlives it: `purge` removes profile dirs (`iterdir()` + `is_dir()`)
@@ -3653,10 +3738,22 @@ class ClaudeAccountSwitcher:
             )
             return creds
 
+        oauth_data = oauth.extract_oauth_data(creds)
+        if oauth_data is not None and not (
+            oauth_data.get("accessToken") or oauth_data.get("refreshToken")
+        ):
+            # Claude Code empties both tokens in place after ``invalid_grant``.
+            # That is provably unusable, not unverifiable: registering it
+            # would overwrite a working backup (same shape as the switch
+            # path's ``"wiped"`` classification).
+            raise ConfigError(
+                f"The stored credential for {email} has no access or refresh "
+                f"token (Claude Code clears both after a rejected refresh). "
+                f"Nothing was changed. Log in as {email} again, then re-run."
+            )
         token = oauth.extract_access_token(creds)
         if not token:
             return unverified("no access token to resolve")
-        oauth_data = oauth.extract_oauth_data(creds)
         if oauth_data and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             # Unresolvable, exactly like an offline profile fetch. NOT a
             # refresh: consuming a grant retires its predecessor server-side,
@@ -3922,7 +4019,11 @@ class ClaudeAccountSwitcher:
             slot: Specify the slot number to store the account in.
                   When None, auto-assigns the next available number.
                   When specified, prompts for confirmation if the slot
-                  is already occupied by a different account.
+                  is already occupied by a different account. Re-adding
+                  the account that already holds the slot (or moving it
+                  there from another) refreshes the login and keeps the
+                  settings the user put on it: alias, disabled flag,
+                  threshold and priority.
             assume_yes: Skip that overwrite prompt (callers with their own
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
@@ -4063,18 +4164,24 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        # Capture any alias to carry forward before destructive cleanup below
-        # deletes the old record (same account moving slots, or refreshing in place).
-        existing_alias = None
+        # Capture the settings the user put on the slot before the destructive
+        # cleanup below deletes the old record (same account moving slots, or
+        # refreshing in place). The alias, the disabled flag and the per-account
+        # threshold and priority belong to the account, not to the login being
+        # refreshed, so losing them here would silently return a parked account
+        # to automatic rotation or drop it back onto the global policy. Only a
+        # record belonging to the SAME account is read: a displaced occupant's
+        # lineage ends with it, and the newcomer must not inherit its state.
+        carried: dict = {}
         if slot is not None:
             prior = data.get("accounts", {}).get(account_num) or {}
             if (
                 prior.get("email") == current_email
                 and prior.get("organizationUuid", "") == current_org_uuid
             ):
-                existing_alias = prior.get("alias")
+                carried = self._carried_settings(prior)
             if migrate_from:
-                existing_alias = data["accounts"][migrate_from].get("alias") or existing_alias
+                carried.update(self._carried_settings(data["accounts"][migrate_from]))
 
         if alias is not None:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -4103,8 +4210,19 @@ class ClaudeAccountSwitcher:
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
 
-        # Get account UUID and org fields
-        config_data = self._read_json(config_path)
+        # Get account UUID and org fields. Read strictly, because the ownership
+        # probe's network round-trip sits between the identity read this add was
+        # verified against and this one: a `.claude.json` caught mid-rewrite came
+        # back as None and the `.get` below died with a raw AttributeError, which
+        # `cli.py`'s `except ClaudeSwitchError` does not catch -- so `--json`
+        # emitted no envelope at all. Falling back to `{}` is not the answer
+        # either; it would blank the uuid and org fields of a slot whose live
+        # config carries real ones. `strict` speaks for a file that is THERE but
+        # unreadable, so None now means only that it was deleted in that same
+        # window, which is the refusal the read above already makes.
+        config_data = self._read_json(config_path, strict=True)
+        if config_data is None:
+            raise ConfigError("Claude config file not found")
         oauth_data = config_data.get("oauthAccount", {})
         account_uuid = oauth_data.get("accountUuid", "") or ""
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
@@ -4148,9 +4266,9 @@ class ClaudeAccountSwitcher:
             "organizationName": organization_name,
             "added": get_timestamp(),
         }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
+        if alias is not None:
+            carried["alias"] = alias  # an explicit --alias wins over the carried one
+        data["accounts"][account_num].update(carried)
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
@@ -4188,7 +4306,10 @@ class ClaudeAccountSwitcher:
                    defaults to ``setup-token-{slot}@token.local`` (or
                    ``api-key-{slot}@token.local`` for API keys) since these tokens
                    carry no real email metadata.
-            slot:  Slot number to use; auto-assigned when ``None``.
+            slot:  Slot number to use; auto-assigned when ``None``. Re-adding
+                   to the slot the same account already holds refreshes the
+                   token and keeps its alias, disabled flag, threshold and
+                   priority.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
         """
@@ -4321,6 +4442,21 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
+        # Same carry-forward as ``add_account``, and for the same reason: a
+        # slot-pinned token account is refreshed by re-running this with --slot,
+        # which rebuilds the record wholesale, and the user's settings on it
+        # belong to the account rather than to the token being replaced.
+        carried: dict = {}
+        if slot is not None:
+            prior = data.get("accounts", {}).get(account_num) or {}
+            if (
+                prior.get("email") == email
+                and prior.get("organizationUuid", "") == ""
+            ):
+                carried = self._carried_settings(prior)
+            if migrate_from:
+                carried.update(self._carried_settings(data["accounts"][migrate_from]))
+
         if displace_slot:
             d_num, d_email, d_org = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -4358,6 +4494,7 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
+        record.update(carried)
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -5904,13 +6041,14 @@ class ClaudeAccountSwitcher:
         fingerprints and untouched sequence.json identities, so
         ``_duplicate_account_warnings`` cannot see them. But both tokens
         report the same account's usage: identical 5h *and* 7d percentages
-        with identical reset timestamps — the exact signal the issue's
+        with reset instants that agree to within
+        ``_LOCKSTEP_RESET_TOLERANCE_S`` — the exact signal the issue's
         reporter had to reverse-engineer by hand, automated here from data
         ``list``/watch already fetched.
 
         Heuristic, not proof: it goes quiet once the older generation dies
         and stops producing comparable usage, and only rows where both
-        windows carry a non-null ``resets_at`` are compared (two idle
+        windows carry a parseable ``resets_at`` are compared (two idle
         accounts at 0% with nothing scheduled are indistinguishable, never
         flagged; API-key slots have sentinel usage and never reach the
         comparison). Known benign false-positive source until PR #119 lands:
@@ -5918,7 +6056,7 @@ class ClaudeAccountSwitcher:
         report that account's usage — same lockstep signature, different
         cause.
         """
-        seen: dict[tuple, str] = {}
+        rows: list[tuple[str, object, float, object, float]] = []
         out: list[str] = []
         for num, _email, _org_name, _org_uuid, _is_active, _creds, _alias in accounts_info:
             snum = str(num)
@@ -5930,22 +6068,32 @@ class ClaudeAccountSwitcher:
             d7 = usage.get("seven_day")
             if not isinstance(h5, dict) or not isinstance(d7, dict):
                 continue
-            key = (
-                h5.get("pct"), h5.get("resets_at"),
-                d7.get("pct"), d7.get("resets_at"),
-            )
-            if key[1] is None or key[3] is None or key[0] is None or key[2] is None:
+            h5_pct, d7_pct = h5.get("pct"), d7.get("pct")
+            h5_ts = poll_policy.parse_reset_ts(h5.get("resets_at"))
+            d7_ts = poll_policy.parse_reset_ts(d7.get("resets_at"))
+            if h5_pct is None or d7_pct is None or h5_ts is None or d7_ts is None:
                 continue
-            other = seen.get(key)
-            if other:
-                out.append(
-                    f"Account-{other} and Account-{snum} report identical "
-                    "usage and reset times — they may be the same account "
-                    "(issue #117). If it persists, log in with the missing "
-                    "account and re-add it: cswap add --slot N"
-                )
-            else:
-                seen[key] = snum
+            rows.append((snum, h5_pct, h5_ts, d7_pct, d7_ts))
+        # A tolerance is not an equality, so there is no key to hash on; the
+        # comparison is pairwise over the managed slots, of which there are
+        # single digits. The break keeps a slot to a single warning when
+        # several earlier slots match it, as the keyed lookup it replaces did.
+        for i, (snum, h5_pct, h5_ts, d7_pct, d7_ts) in enumerate(rows):
+            for other, o_h5_pct, o_h5_ts, o_d7_pct, o_d7_ts in rows[:i]:
+                if (
+                    h5_pct == o_h5_pct
+                    and d7_pct == o_d7_pct
+                    and abs(h5_ts - o_h5_ts) <= _LOCKSTEP_RESET_TOLERANCE_S
+                    and abs(d7_ts - o_d7_ts) <= _LOCKSTEP_RESET_TOLERANCE_S
+                ):
+                    out.append(
+                        f"Account-{other} and Account-{snum} report identical "
+                        "usage and matching reset times — they may be the "
+                        "same account (issue #117). If it persists, log in "
+                        "with the missing account and re-add it: "
+                        "cswap add --slot N"
+                    )
+                    break
         return out
 
     def _build_list_payload(
@@ -7799,17 +7947,38 @@ class ClaudeAccountSwitcher:
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
 
+    def _quarantined_history_files(self) -> int:
+        """How many collided transcripts are parked under the backup dir.
+
+        Only counted for purge's confirm prompt, so a full walk is fine: the
+        tree holds one file per collision a migration hit, not a profile's
+        worth of transcripts.
+        """
+        from claude_swap.session import QUARANTINE_DIRNAME
+
+        root = self.backup_dir / QUARANTINE_DIRNAME
+        if not root.is_dir():
+            return 0
+        try:
+            return sum(1 for p in root.rglob("*") if p.is_file())
+        except OSError:
+            return 0
+
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
 
         This removes:
         - All stored account credentials (``.enc`` files on Linux/WSL/Windows; on
           macOS both the Keychain items via ``security`` and any fallback ``.enc``
-          files), plus a best-effort sweep of any pre-migration keyring / Windows
-          Credential Manager entries left behind
+          files, plus a best-effort sweep of items the legacy ``keyring`` library
+          left behind)
         - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
+
+        One file is left on purpose: ``session.MIGRATION_LOCK`` in ``~/.claude``,
+        an empty lock file. Deleting a lock another launch may be holding lets
+        a third one take a fresh copy of it at the same time.
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
@@ -7863,6 +8032,32 @@ class ClaudeAccountSwitcher:
             print("  - All stored account credential files")
         if session_dirs:
             print("  - All session profiles and their Keychain entries")
+        # The quarantine tree sits inside the backup dir, so rmtree below takes
+        # it with everything else. Every file in it is the losing half of a
+        # transcript collision that history migration deliberately refused to
+        # delete — nothing anywhere else holds a copy, so this bullet gets its
+        # own count and its own warning colour.
+        from claude_swap.session import QUARANTINE_DIRNAME
+
+        quarantined = self._quarantined_history_files()
+        if quarantined:
+            warning(
+                f"  - {quarantined} quarantined conversation transcript(s) in "
+                f"{self.backup_dir / QUARANTINE_DIRNAME}"
+            )
+            print(
+                dimmed(
+                    "    These are the ONLY remaining copy of the losing half "
+                    "of each collided"
+                )
+            )
+            print(
+                dimmed(
+                    "    session — history migration parked them here rather "
+                    "than deleting them."
+                )
+            )
+            print(dimmed("    Copy them somewhere else first if you want them."))
         print()
         print(dimmed("Note: This does NOT affect your current Claude Code login."))
         print()
@@ -7904,12 +8099,25 @@ class ClaudeAccountSwitcher:
                         except Exception:
                             pass  # Ignore errors during purge
 
-                # Best-effort sweep of any pre-migration keyring / Credential
-                # Manager entries left behind by an incomplete keyring → files
-                # (Windows) or keyring → security (macOS) migration. Linux/WSL
-                # never used a keyring backend.
-                if self.platform in (Platform.MACOS, Platform.WINDOWS):
-                    _sweep_legacy_keyring(usernames, removed_items)
+                # Items the legacy ``keyring`` library stored (service
+                # ``claude-code``) that the keyring → security migration left
+                # behind: its keyring-less fallback in 0.23–0.30 copied without
+                # deleting, a delete can fail, and an ambiguous account-None is
+                # never attributed. Best-effort through ``security`` (deleting
+                # another app's item never prompts). Checked attribute-only first
+                # so the summary lists only items that were there. Windows
+                # Credential Manager entries from before 0.11 are out of reach
+                # without the keyring library; Linux/WSL never used one.
+                if self.platform == Platform.MACOS:
+                    for username in usernames:
+                        try:
+                            if macos_keychain.item_exists(KEYRING_SERVICE, username):
+                                macos_keychain.delete_password(KEYRING_SERVICE, username)
+                                removed_items.append(
+                                    f"Legacy keyring credential: {username}"
+                                )
+                        except Exception:
+                            pass  # Ignore errors during purge
 
         # Session-profile keychain entries must go BEFORE the backup dir:
         # the hashed service names are derived from the dir paths and can't
