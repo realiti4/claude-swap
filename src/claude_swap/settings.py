@@ -213,7 +213,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
-            help="cswap run shares one chat history across accounts; not on Windows yet",
+            help="cswap run shares one chat history across accounts",
         ),
         SettingSpec(
             "updates", "check", "check", "bool",

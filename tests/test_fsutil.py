@@ -9,11 +9,19 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import fsutil
 from claude_swap.fsutil import (
     atomic_write_bytes,
     atomic_write_text,
+    can_junction,
+    can_symlink,
+    is_link,
+    link_points_at,
+    make_dir_link,
+    make_file_link,
     publish_target,
     read_text_with_retry,
+    remove_link,
     replace_with_retry,
 )
 
@@ -564,3 +572,217 @@ class TestAtomicWriteTempName:
 
         assert target.read_text(encoding="utf-8") == "new"
         assert [p.name for p in tmp_path.iterdir()] == [target.name]
+
+
+# ---------------------------------------------------------------------------
+# links: symlinks and Windows junctions behind one vocabulary
+# ---------------------------------------------------------------------------
+
+
+def _host_can_symlink(where: Path) -> bool:
+    probe = where / ".symlink-probe"
+    try:
+        probe.symlink_to(where / "nonexistent")
+    except OSError:
+        return False
+    probe.unlink()
+    return True
+
+
+class TestIsLink:
+    def test_plain_entries_and_missing_paths_are_not_links(self, tmp_path):
+        (tmp_path / "d").mkdir()
+        (tmp_path / "f").write_text("x")
+        assert not is_link(tmp_path / "d")
+        assert not is_link(tmp_path / "f")
+        assert not is_link(tmp_path / "missing")
+
+    def test_a_directory_link_is_a_link_even_when_dangling(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        make_dir_link(target, link)
+        assert is_link(link)
+        target.rmdir()
+        assert is_link(link)  # dangling: exists() is False, is_link is not
+
+    def test_a_file_symlink_is_a_link(self, tmp_path):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        (tmp_path / "f").write_text("x")
+        make_file_link(tmp_path / "f", tmp_path / "l")
+        assert is_link(tmp_path / "l")
+        assert (tmp_path / "l").read_text() == "x"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_make_dir_link_is_a_junction_on_windows(self, tmp_path):
+        """The one directory link an ordinary Windows user may create: not a
+        symlink to the stdlib, but a link to cswap."""
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("precious")
+        link = tmp_path / "link"
+        make_dir_link(target, link)
+        assert link.is_junction()
+        assert not link.is_symlink()
+        assert is_link(link)
+        assert (link / "keep.txt").read_text() == "precious"
+        (link / "written.txt").write_text("through the junction")
+        assert (target / "written.txt").read_text() == "through the junction"
+
+
+class TestLinkPointsAt:
+    def test_a_directory_link_points_at_its_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        make_dir_link(target, tmp_path / "link")
+        assert link_points_at(tmp_path / "link", target)
+        assert not link_points_at(tmp_path / "link", tmp_path)
+
+    def test_not_a_link_points_nowhere(self, tmp_path):
+        (tmp_path / "f").write_text("x")
+        assert not link_points_at(tmp_path / "f", tmp_path / "f")
+        assert not link_points_at(tmp_path / "missing", tmp_path)
+
+    def test_the_stored_path_counts_not_where_it_leads(self, tmp_path):
+        """A link to an intermediate link is a different link than one to the
+        resolved target (the dotfiles case in session._sync_items)."""
+        real = tmp_path / "real"
+        real.mkdir()
+        hop = tmp_path / "hop"
+        make_dir_link(real, hop)
+        make_dir_link(hop, tmp_path / "link")
+        assert link_points_at(tmp_path / "link", hop)
+        assert not link_points_at(tmp_path / "link", real)
+
+    def test_ignores_the_windows_extended_length_prefix(self, monkeypatch):
+        prefix = "\\\\?\\"
+        monkeypatch.setattr(
+            fsutil.os, "readlink", lambda _p: prefix + "C:\\Users\\me\\.claude\\projects"
+        )
+        assert link_points_at(Path("link"), Path("C:\\Users\\me\\.claude\\projects"))
+
+    def test_unc_prefix_maps_back_to_the_share_path(self, monkeypatch):
+        monkeypatch.setattr(
+            fsutil.os, "readlink", lambda _p: "\\\\?\\UNC\\server\\share\\projects"
+        )
+        assert link_points_at(Path("link"), Path("\\\\server\\share\\projects"))
+
+    def test_other_target_does_not_match(self, monkeypatch):
+        monkeypatch.setattr(fsutil.os, "readlink", lambda _p: "/elsewhere")
+        assert not link_points_at(Path("link"), Path("/target"))
+
+
+class TestRemoveLink:
+    def test_removes_a_directory_link_and_keeps_its_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("precious")
+        link = tmp_path / "link"
+        make_dir_link(target, link)
+
+        remove_link(link)
+
+        assert not link.exists() and not is_link(link)
+        assert (target / "keep.txt").read_text() == "precious"
+
+    def test_removes_a_file_link_and_keeps_its_target(self, tmp_path):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        (tmp_path / "f").write_text("x")
+        make_file_link(tmp_path / "f", tmp_path / "l")
+
+        remove_link(tmp_path / "l")
+
+        assert not (tmp_path / "l").exists()
+        assert (tmp_path / "f").read_text() == "x"
+
+
+class TestLinkProbes:
+    @pytest.fixture(autouse=True)
+    def fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(fsutil, "_LINK_PROBES", {})
+
+    def test_off_windows_both_are_true_without_probing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "linux")
+        calls = []
+        monkeypatch.setattr(fsutil.os, "symlink", lambda *a, **k: calls.append(a))
+        assert can_symlink(tmp_path) is True
+        assert can_junction(tmp_path) is True
+        assert calls == []
+
+    def test_a_refused_symlink_reads_as_unavailable_and_leaves_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+
+        def refuse(*_a, **_k):
+            e = OSError(22, "A required privilege is not held by the client")
+            e.winerror = 1314
+            raise e
+
+        monkeypatch.setattr(fsutil.os, "symlink", refuse)
+        assert can_symlink(tmp_path) is False
+        assert list(tmp_path.iterdir()) == []
+
+    def test_symlink_probe_runs_once_per_directory(self, tmp_path, monkeypatch):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        calls = []
+        real = os.symlink
+
+        def counting(*a, **k):
+            calls.append(a)
+            return real(*a, **k)
+
+        monkeypatch.setattr(fsutil.os, "symlink", counting)
+        other = tmp_path / "other"
+        other.mkdir()
+
+        assert can_symlink(tmp_path) is True
+        assert can_symlink(tmp_path) is True
+        assert can_symlink(other) is True
+
+        assert len(calls) == 2  # one per directory, not per call
+        assert list(tmp_path.iterdir()) == [other]
+        assert list(other.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_junction_probe_is_true_on_ntfs_and_leaves_nothing(self, tmp_path):
+        assert can_junction(tmp_path) is True
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_a_refused_junction_reads_as_unavailable(self, tmp_path, monkeypatch):
+        import _winapi
+
+        def refuse(*_a):
+            raise OSError(1, "The request is not supported")
+
+        monkeypatch.setattr(_winapi, "CreateJunction", refuse)
+        assert can_junction(tmp_path) is False
+        assert list(tmp_path.iterdir()) == []
+
+    def test_answers_are_kept_per_kind(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        here = os.path.normcase(str(tmp_path))
+        monkeypatch.setattr(
+            fsutil, "_LINK_PROBES", {(here, f"junction:{here}"): False}
+        )
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        assert can_junction(tmp_path) is False  # the cached answer
+        assert can_symlink(tmp_path) is True  # probed on its own
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_junction_probe_is_per_target(self, tmp_path):
+        """The probe links to the target's parent, where the real link will
+        point, so a target Windows refuses is found out before anything moves."""
+        target = tmp_path / "claude-home"
+        target.mkdir()
+        assert can_junction(tmp_path, target) is True
+        assert list(tmp_path.iterdir()) == [target]
+        assert len(fsutil._LINK_PROBES) == 1
+        assert can_junction(tmp_path) is True  # a second key, its own probe
+        assert len(fsutil._LINK_PROBES) == 2
