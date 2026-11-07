@@ -1670,7 +1670,9 @@ def _warm_fixture_accounts():
     a warm candidate ahead of every cold one regardless of reset time, so
     every screen must list "2" before "3" -- same fixture the auto view's
     own `test_a_warm_partner_outranks_a_sooner_cold_reset` uses, reused
-    here to prove the OTHER surfaces agree with it, not just re-derive it."""
+    here to prove the OTHER surfaces agree with it, not just re-derive it.
+    "3" sits at 5h 85%: a cold landing's cost does not fit what is left, so
+    `expiring_order` does not pull it ahead of the warm partner."""
     return [
         make_account(1, active=True, entry=make_entry(50.0, 50.0)),
         make_account(2, entry=UsageEntry(
@@ -1682,7 +1684,7 @@ def _warm_fixture_accounts():
         )),
         make_account(3, entry=UsageEntry(
             last_good={
-                "five_hour": {"pct": 10.0},
+                "five_hour": {"pct": 85.0},
                 "seven_day": {"pct": 10.0, "resets_at": _iso_in(1 * 86400)},
             },
             fetched_at=time.time(), age_s=0.0,
@@ -2232,15 +2234,19 @@ class TestPanelOrderIsTheEnginesOrder:
     cap's veto (a capped peer is never listed, a capped active is left at once)."""
 
     @staticmethod
-    def _tick_and_panel(temp_home, fleet, *, tiers=None, caps=None, **kw):
+    def _tick_and_panel(temp_home, fleet, *, tiers=None, caps=None, now=None, **kw):
         """Tick the real engine on ``fleet`` (account 1 active); return the
         account it switched to, the panel's ordered list and its rendered text
-        for the same fleet. ``caps`` maps an account to its weekly cap."""
+        for the same fleet. ``caps`` maps an account to its weekly cap; ``now``
+        moves the engine's clock off its fake epoch, for a fleet whose resets
+        are read against the wall clock."""
         from claude_swap.autoswitch import TickOutcome
         from tests.test_autoswitch import EngineHarness
 
         tiers, caps = tiers or {}, caps or {}
         h = EngineHarness(temp_home, **kw)
+        if now is not None:
+            h.clock.now = now
         for num in fleet:
             h.seed(int(num), f"user{num}@example.com")
         h.make_live("user1@example.com", 1)
@@ -2447,6 +2453,73 @@ class TestPanelOrderIsTheEnginesOrder:
         )
         ordered, *_ = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
         assert ordered == [], ordered
+
+    @pytest.mark.parametrize(
+        "five, soon, pick, header",
+        [
+            (97.0, True, "2", "expiring window, then warm, then 7d reset within 24h, then most room"),
+            (10.0, True, "2", "expiring window, then warm, then 7d reset within 24h, then most room"),
+            (97.0, False, "3", "warm, then 7d reset within 24h, then most room"),
+        ],
+        ids=["walled-expiring", "healthy-expiring", "walled-nothing-expiring"],
+    )
+    def test_dynamic_lists_the_account_the_tick_lands_on_first_and_names_its_key(
+        self, temp_home, five, soon, pick, header
+    ):
+        """Account 2 (7d 40%, a reset 30 h out) is spent at the fleet's rate
+        before it resets, so `expiring_order` pulls it ahead of 3 (98 points of
+        room), which the perish-then-room key alone ranks first. The tick lands
+        on 2, and the panel's order and header are the tick's, never
+        "(soonest reset)"."""
+        def w(five_pct, seven_pct, secs):
+            return {
+                "five_hour": {"pct": five_pct},
+                "seven_day": {"pct": seven_pct, "resets_at": _iso_in(secs)},
+            }
+
+        fleet = {
+            "1": w(five, 10.0, 6 * 86400),
+            "2": w(10.0, 40.0, 30 * 3600 if soon else 6 * 86400),
+            "3": w(10.0, 2.0, 6 * 86400),
+            "4": w(100.0, 1.0, 6 * 86400),
+        }
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, fleet, strategy="dynamic", threshold=90.0, cooldown_seconds=0.0,
+            now=time.time(),
+        )
+        assert engine_pick == pick
+        assert ordered == [pick, "3" if pick == "2" else "2"], ordered
+        assert f"Next best ({header})" in rendered, rendered
+
+    def test_rows_that_are_not_candidates_follow_every_candidate_soonest_7d_reset_first(self):
+        """A capped, a disabled, a spend-only and an unreadable row are never a
+        target. They list behind the candidate in the order their 7d windows
+        reset (unknown last), not in the fixed order of what kept them out."""
+        def w(days):
+            return UsageEntry(
+                last_good={
+                    "five_hour": {"pct": 5.0},
+                    "seven_day": {"pct": 52.0, "resets_at": _iso_in(days * 86400)},
+                },
+                fetched_at=time.time(), age_s=0.0,
+            )
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(20.0, 10.0)),
+                make_account(2, entry=make_entry(10.0, 10.0)),
+                make_account(3, entry=w(5), policy=AccountPolicy(weekly_cap=50.0)),
+                make_account(4, entry=w(2), disabled=True),
+                make_account(5, entry=make_entry(None, None, spend={
+                    "used": 1.0, "limit": 5.0, "pct": 20.0, "currency": "USD",
+                })),
+                make_account(6, entry=make_entry(sentinel="token expired")),
+                make_account(7, entry=w(3), disabled=True),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        assert _autoview_order(snap, "1", settings) == ["2", "4", "7", "3", "5", "6"]
 
 
 @pytest.mark.asyncio
@@ -4220,9 +4293,10 @@ class TestUnswitchableRowsAreListed:
         1-day reset. On reset alone "3" would rank first, but a warm
         candidate ranks ahead of every cold one regardless of reset time
         (`_rank_dynamic_candidates`) -- "2" must be first. Also covers the
-        axis legend: the engine's own name for this ranking is "soonest
-        reset", never the recovery axis' "soonest to recover" (that name
-        belongs to the at-limit escape order alone).
+        axis legend: the key `dynamic_candidate_order` sorts on, never the
+        recovery axis' "soonest to recover" (that name belongs to the
+        at-limit escape order alone). "3" is at 5h 85%, so a cold landing
+        does not fit and `expiring_order` leaves it behind the warm one.
         """
         active = {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 50.0}}
         warm_partner = {
@@ -4230,7 +4304,7 @@ class TestUnswitchableRowsAreListed:
             "seven_day": {"pct": 40.0, "resets_at": _iso_in(5 * 86400)},
         }
         cold_sooner = {
-            "five_hour": {"pct": 10.0},
+            "five_hour": {"pct": 85.0},
             "seven_day": {"pct": 10.0, "resets_at": _iso_in(1 * 86400)},
         }
         (tmp_path / "autoswitch_state.json").write_text(json.dumps({
@@ -4246,7 +4320,8 @@ class TestUnswitchableRowsAreListed:
             f"the sooner-reset cold candidate outranked the warm one -- "
             f"lastActiveAt never reached this panel: {out!r}"
         )
-        assert "Next best (soonest reset)" in out, out
+        # The warm partner's own 7d window is the one `expiring_order` walks here.
+        assert "warm, then 7d reset within 24h, then most room)" in out, out
 
     def test_weekly_first_lists_the_soonest_reset_first_under_its_axis(self):
         """weekly-first's proactive arm ranks through the engine's own pass

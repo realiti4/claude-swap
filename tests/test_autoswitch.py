@@ -17883,3 +17883,48 @@ def test_a_weekly_cap_of_one_hundred_is_no_cap():
     headroom = {"1": 0.0, "2": 40.0}
     # The room is 7d's 37 points (a cap of 100 is none, as models.py reads it), not 100 - 100.
     assert expiring_order(["1", "2"], usage, headroom, {}, {"2": 100.0}, {}, lambda n: 0.0, now) == ["2"]
+
+
+def _dco(pool, *, expiring=(), plans=None, trigger="proactive", partition=True, active_headroom=2.0):
+    """`dynamic_candidate_order` on three cold peers: 2 resets within a day with 60
+    points of room, 3 holds 90 and resets later, 4 resets within the day with 95."""
+    from types import SimpleNamespace
+
+    from claude_swap.autoswitch import dynamic_candidate_order
+
+    now = 1_000_000.0
+    usage = {
+        n: {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 100.0 - room, "resets_at": _iso_at(now + left)},
+        }
+        for n, room, left in (("2", 60.0, 10 * _H), ("3", 90.0, 4 * _D), ("4", 95.0, 20 * _H))
+    }
+    headroom = {n: float(100 - u["seven_day"]["pct"]) for n, u in usage.items()}
+    entries = {n: SimpleNamespace(plan=p) for n, p in (plans or {}).items()}
+    return dynamic_candidate_order(
+        pool, headroom, usage, entries, {}, {}, AutoSwitchSettings(strategy="dynamic"), now,
+        current="1", active_headroom=active_headroom, expiring=expiring,
+        trigger=trigger, partition=partition,
+    )
+
+
+class TestDynamicCandidateOrder:
+    KEY = "warm, then 7d reset within 24h, then most room"
+
+    def test_a_cold_landing_is_priced_by_the_plan_of_the_account_it_lands_on(self):
+        """Cost 20 (Ultra); on Max 5x it is 80, which 2's 60 points do not clear."""
+        assert _dco(["2", "3"]) == (["2", "3"], self.KEY)
+        assert _dco(["2", "3"], plans={"2": "Max 5x"}) == (["3", "2"], self.KEY)
+        assert _dco(["2", "3"], plans={"2": "Max 5x"}, partition=False) == (["2", "3"], self.KEY)
+
+    def test_the_expiring_accounts_go_first_and_the_key_says_so(self):
+        order = _dco(["2", "3", "4"], expiring=["3", "1", "2"])
+        assert order == (["3", "2", "4"], f"expiring window, then {self.KEY}")
+
+    def test_a_healthy_active_only_yields_to_the_accounts_that_expire_before_it(self):
+        peers = ["2", "3", "4"]
+        spends_its_own_first = _dco(peers, expiring=["1", "3", "2"], trigger="dynamic-healthy")
+        assert spends_its_own_first == (["2", "4", "3"], self.KEY)
+        ahead = _dco(peers, expiring=["3", "1", "2"], trigger="dynamic-healthy")
+        assert ahead == (["3", "2", "4"], f"expiring window, then {self.KEY}")

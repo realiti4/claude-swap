@@ -665,6 +665,105 @@ def _rank_dynamic_candidates(
     return [num for _, num in warm], [num for _, num in cold]
 
 
+def cold_landing_cost(
+    n: str, usage: Mapping[str, dict | str | None], entries: Mapping[str, UsageEntry],
+    settings: AutoSwitchSettings,
+) -> float:
+    """What a cold landing on ``n`` eats on its binding window (`_cold_landing_cost_pct`
+    at its plan): the figure the tick, `dynamic_candidate_order` and the panel price by."""
+    return _cold_landing_cost_pct(
+        usage.get(n), settings.cold_switch_cost_pct, getattr(entries.get(n), "plan", None)
+    )
+
+
+def dynamic_expiring(
+    current: str | None,
+    oauth_candidates: Sequence[str],
+    usage: Mapping[str, dict | str | None],
+    headroom: Mapping[str, float | None],
+    bars: Mapping[str, float],
+    policies: Mapping[str, AccountPolicy],
+    entries: Mapping[str, UsageEntry],
+    last_active_at: dict,
+    settings: AutoSwitchSettings,
+    now: float,
+) -> list[str]:
+    """`expiring_order` on the inputs the tick reads: the tick and the "Next best"
+    panel both call it, so one fleet is priced one way."""
+    def landing_cost(n: str) -> float:
+        """A cold landing's cost in 5h points, scaled by plan."""
+        if n == current or _is_warm(n, last_active_at, now, settings.cache_ttl_seconds):
+            return 0.0
+        return _cold_landing_cost_pct(
+            None, settings.cold_switch_cost_pct, getattr(entries.get(n), "plan", None)
+        )
+
+    return expiring_order(
+        [current, *oauth_candidates], usage, headroom, bars,
+        {n: p.weekly_cap for n, p in policies.items()},
+        {n: getattr(e, "plan", None) for n, e in entries.items()},
+        landing_cost, now,
+    )
+
+
+def _expiring_ahead(expiring: list[str], current: str | None) -> list[str]:
+    """The expiring accounts whose window perishes before the active's own."""
+    return expiring[: expiring.index(current)] if current in expiring else expiring
+
+
+def dynamic_candidate_order(
+    pool: Sequence[str],
+    headroom: dict[str, float | None],
+    usage: dict[str, dict | str | None],
+    entries: Mapping[str, UsageEntry],
+    bars: dict[str, float],
+    last_active_at: dict,
+    settings: AutoSwitchSettings,
+    now: float,
+    *,
+    current: str | None,
+    active_headroom: float | None,
+    expiring: list[str],
+    trigger: str = "proactive",
+    partition: bool = True,
+    reasons: dict[str, str] | None = None,
+) -> tuple[list[str], str]:
+    """The order `dynamic` takes its candidates in, and what it sorted on: the tick's
+    `proactive` arm and the "Next best" panel both build it here, never apart.
+
+    Warm before cold, each tier by `_perish_then_room_key`. On `proactive`, an
+    active at the real wall lifts the peers' own lines when none is left, and the
+    cold tier puts the candidates that clear their plan-scaled landing cost first
+    (``partition=False`` on the unmodeled retry, whose floor the tick applies
+    itself). The `expiring` accounts go in front: all of them on `proactive`, only
+    those ahead of the active on `dynamic-healthy`. ``reasons`` is the panel's side
+    channel (see `_rank_dynamic_candidates`); the tick passes none.
+    """
+    proactive = trigger == "proactive"
+    ttl = settings.cache_ttl_seconds
+    warm, cold = _rank_dynamic_candidates(
+        pool, headroom, usage, now, last_active_at, ttl, reasons, entries, bars
+    )
+    if proactive and not warm and not cold and _about_to_wall(active_headroom):
+        # Only an active at the REAL wall lifts the peers' own lines (see `_bars`
+        # in the tick): one merely past its own line stays, or two such accounts
+        # would trade places every tick.
+        if reasons is not None:
+            reasons.clear()
+        warm, cold = _rank_dynamic_candidates(
+            pool, headroom, usage, now, last_active_at, ttl, reasons, entries
+        )
+    if proactive and partition:
+        cold.sort(
+            key=lambda n: headroom.get(n, 0.0) < cold_landing_cost(n, usage, entries, settings)
+        )
+    front = expiring if proactive else _expiring_ahead(expiring, current)
+    ordered = warm + cold
+    ordered = [n for n in front if n in ordered] + [n for n in ordered if n not in front]
+    axis = "warm, then 7d reset within 24h, then most room"
+    return ordered, (f"expiring window, then {axis}" if set(front) & set(ordered) else axis)
+
+
 def _blackout_retry_admission_bar(
     floor_headroom: dict[str, float | None],
     current: str,
@@ -2875,12 +2974,9 @@ class AutoSwitchEngine:
         # (the same figure), per account: 5h points where a 5h window exists,
         # 7d points where not, scaled by the account's plan.
         def _cold_cost(n: str) -> float:
-            return _cold_landing_cost_pct(
-                usage.get(n), settings.cold_switch_cost_pct,
-                getattr(entries.get(n), "plan", None),
-            )
+            return cold_landing_cost(n, usage, entries, settings)
 
-        def _dynamic_rank(cands, hroom, at_now, active_h):
+        def _dynamic_rank(cands, hroom, at_now, active_h, partition=True):
             recovered = self._left_account_recovered(
                 state, usage, hroom, active_h, settings, at_now, current,
                 thresholds=thresholds,
@@ -2891,26 +2987,18 @@ class AutoSwitchEngine:
             )
 
             def rank(pool):
-                warm, cold = _rank_dynamic_candidates(
-                    pool, hroom, usage, at_now, last_active_at,
-                    settings.cache_ttl_seconds, bars=self._bars,
-                )
-                if not warm and not cold and _about_to_wall(active_h):
-                    # Only an active at the REAL wall lifts the peers' own
-                    # lines (see `_bars` above): one merely past its own line
-                    # stays, or two such accounts would trade places every tick.
-                    warm, cold = _rank_dynamic_candidates(
-                        pool, hroom, usage, at_now, last_active_at,
-                        settings.cache_ttl_seconds,
-                    )
-                return warm, cold
+                return dynamic_candidate_order(
+                    pool, hroom, usage, entries, self._bars, last_active_at,
+                    settings, at_now, current=current, active_headroom=active_h,
+                    expiring=expiring, partition=partition,
+                )[0]
 
-            warm, cold = rank([n for n in cands if n != no_return])
+            ordered = rank([n for n in cands if n != no_return])
             bar_active = no_return is not None
-            if no_return is not None and not warm and not cold and recovered:
-                warm, cold = rank(cands)
+            if no_return is not None and not ordered and recovered:
+                ordered = rank(cands)
                 bar_active = False
-            return warm, cold, bar_active
+            return ordered, bar_active
 
         # T3310: an account whose 7d window expires with room left pulls the
         # switch (`expiring_order`); its logged trigger is `expiring-window`,
@@ -2919,20 +3007,9 @@ class AutoSwitchEngine:
         logged_trigger: str | None = None
         if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
             now = self.clock()
-
-            def _landing_cost(n: str) -> float:
-                """A cold landing's cost in 5h points, scaled by plan."""
-                if n == current or _is_warm(n, last_active_at, now, settings.cache_ttl_seconds):
-                    return 0.0
-                return _cold_landing_cost_pct(
-                    None, settings.cold_switch_cost_pct, getattr(entries.get(n), "plan", None)
-                )
-
-            expiring = expiring_order(
-                [current, *oauth_candidates], usage, headroom, self._bars,
-                {n: p.weekly_cap for n, p in policies.items()},
-                {n: getattr(e, "plan", None) for n, e in entries.items()},
-                _landing_cost, now,
+            expiring = dynamic_expiring(
+                current, oauth_candidates, usage, headroom, self._bars, policies,
+                entries, last_active_at, settings, now,
             )
 
         # On a healthy active, the expiring accounts ahead of its own window pull the
@@ -2945,7 +3022,7 @@ class AutoSwitchEngine:
             and expiring
             and not _about_to_wall(raw_active_headroom, self._active_wall)
         ):
-            ahead = expiring[: expiring.index(current)] if current in expiring else expiring
+            ahead = _expiring_ahead(expiring, current)
             # The active is itself the soonest expiring window: it spends it, and
             # only a candidate whose own window perishes sooner may take over.
             spend_first = not ahead
@@ -2954,14 +3031,13 @@ class AutoSwitchEngine:
         dynamic_any_known = True
         if settings.strategy == "dynamic" and trigger == "proactive":
             now = self.clock()
-            warm_ordered, cold_ordered, bar_active = _dynamic_rank(
+            dynamic_ordered, bar_active = _dynamic_rank(
                 oauth_candidates, headroom, now, active_headroom,
             )
             floor_headroom = headroom
             model_window_dropped = False
             if (
-                not warm_ordered
-                and not cold_ordered
+                not dynamic_ordered
                 and self._models
                 and _model_window_binds_everywhere(
                     usage, self._models, settings.threshold,
@@ -2977,8 +3053,9 @@ class AutoSwitchEngine:
                 # active included) makes dropping the model set the right
                 # call — retry once on the unmodeled (5h/7d only) axis.
                 unmodeled = _headroom_by_account(usage, ())
-                warm_ordered, cold_ordered, bar_active = _dynamic_rank(
+                dynamic_ordered, bar_active = _dynamic_rank(
                     oauth_candidates, unmodeled, now, unmodeled.get(current),
+                    partition=False,
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
@@ -2999,14 +3076,19 @@ class AutoSwitchEngine:
             # candidate that merely resets sooner then outranked a
             # floor-clearing one, landing on the worse account. A STABLE
             # PARTITION keeps `cold_ordered`'s own order within each half
-            # but always tries every floor-clearing candidate first.
+            # but always tries every floor-clearing candidate first
+            # (`dynamic_candidate_order`).
             if model_window_dropped:
                 cold_floor = _blackout_retry_admission_bar(floor_headroom, current)
-                cold_clears_floor = [
-                    n for n in cold_ordered
-                    if floor_headroom.get(n, 0.0) > cold_floor
+                cold_ordered = [
+                    n for n in dynamic_ordered
+                    if not _is_warm(n, last_active_at, now, settings.cache_ttl_seconds)
                 ]
-                if not warm_ordered and not cold_clears_floor and cold_ordered:
+                dynamic_ordered = [
+                    n for n in dynamic_ordered
+                    if n not in cold_ordered or floor_headroom.get(n, 0.0) > cold_floor
+                ]
+                if cold_ordered and not dynamic_ordered:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-floor",
@@ -3017,15 +3099,6 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-            else:
-                cold_clears_floor = sorted(
-                    cold_ordered,
-                    key=lambda n: floor_headroom.get(n, 0.0) < _cold_cost(n),
-                )
-            dynamic_ordered = warm_ordered + cold_clears_floor
-            dynamic_ordered = [n for n in expiring if n in dynamic_ordered] + [
-                n for n in dynamic_ordered if n not in expiring
-            ]
             if not dynamic_ordered and bar_active:
                 # The no-return bar (item 2) is holding this, not a
                 # genuinely viable-free fleet -- a deliberate hold pending

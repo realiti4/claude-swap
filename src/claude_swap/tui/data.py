@@ -27,16 +27,17 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     STATE_FILENAME,
     ThresholdMap,
-    _about_to_wall,
     _binding_at,
     _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
-    _rank_dynamic_candidates,
     _ruler,
+    _seven_day_reset_ts,
     _wall_headroom,
+    dynamic_candidate_order,
+    dynamic_expiring,
     rank_candidates_pass,
     rank_priority_candidates,
 )
@@ -334,77 +335,44 @@ def rank_switch_candidates(
         return "at-limit" if active_headroom <= 0 else "proactive"
 
     def _rank_dynamic_on(
-        axis: tuple[str, ...], trigger: str
+        axis: tuple[str, ...], trigger: str, dropped: bool
     ) -> tuple[list[str], str | None]:
-        """`dynamic`'s own healthy/proactive ranking -- `_rank_dynamic_
-        candidates` (warm/cold tiered, soonest weekly reset), never
-        `rank_candidates_pass`: that pass's landing gate is a hysteresis
-        MARGIN over the active, which a warm candidate with less headroom
-        than a cold one can never clear against an about-to-wall active
-        (autoswitch.py's own comment at the `_dynamic_rank` call site).
-        `last_active_at` comes from the caller (`read_last_active_at`, the
-        SAME state file the engine itself writes `lastActiveAt` to on every
-        switch, read-only, never `{}` by construction) -- an unmeasured
-        candidate still reads cold, never warm (`_is_warm`'s own contract),
-        the file just being unreadable or stale here is no different from
-        the engine's own read. `settings.cold_switch_cost_pct` only
-        reorders cold candidates (floor-clearing first, never dropped) on
-        the `proactive` trigger -- the tick's own `_tick_inner` applies
-        that same partition ONLY there (`dynamic_ordered = warm_ordered +
-        cold_clears_floor`, reached only when `trigger == "proactive"`);
-        on `dynamic-healthy` the tick never applies it (the alternation
-        arm's own admissible-partner filter is a SEPARATE, tick-only
-        question), so this display stays on `_rank_dynamic_candidates`'
-        own order there -- soonest weekly reset, warm before cold, a
-        headroom candidate with hours to reset ranked ahead of one with
-        more headroom but a reset days out (the owner's 2026-09-19 case).
-        Only this ranking and the at-limit recovery order below
-        (`rank_candidates_pass`) are emulated here -- the healthy arm's own
-        alternation dwell/giveback rules (`alternation_chunk_seconds`,
-        `ALTERNATION_MAX_GIVEBACK_PCT`) are a tick-only decision, not a
-        display one, and are deliberately not built here.
+        """`dynamic`'s own healthy/proactive order, built by the function the tick
+        builds it with (`dynamic_candidate_order`), never `rank_candidates_pass`:
+        that pass's landing gate is a hysteresis MARGIN over the active, which a
+        warm candidate with less headroom than a cold one can never clear against
+        an about-to-wall active. `last_active_at` comes from the caller
+        (`read_last_active_at`, the state file the engine writes `lastActiveAt` to
+        on every switch): an unmeasured candidate reads cold, as in the engine.
+        `expiring` is priced on the model-gated headroom, as the tick prices it,
+        also on the unmodeled retry (`dropped`, whose cold floor is a tick-only
+        admission and is not applied here). The healthy arm's alternation dwell
+        and step rules are a tick-only decision, not a display one.
         """
+        last = last_active_at or {}
         headroom = _headroom_by_account(usage, axis)
-        warm, cold = _rank_dynamic_candidates(
-            oauth_candidates, headroom, usage, now, last_active_at or {},
-            settings.cache_ttl_seconds, reasons, entries, bars,
+        ordered, rank_axis = dynamic_candidate_order(
+            oauth_candidates, headroom, usage, entries, bars, last, settings, now,
+            current=active_number,
+            # The active reads as the engine passes it: widened on the model axis,
+            # its own unmodeled headroom on the retry.
+            active_headroom=active_headroom if axis else headroom.get(active_number),
+            expiring=dynamic_expiring(
+                active_number, oauth_candidates, usage, model_headroom, bars, policies,
+                entries, last, settings, now,
+            ),
+            trigger=trigger, partition=not dropped, reasons=reasons,
         )
-        # Only an active at the REAL wall lifts the peers' own lines, on the
-        # `proactive` arm alone (`_dynamic_rank`); the healthy arm never does.
-        # The active reads as the engine passes it: widened on the model axis,
-        # its own unmodeled headroom on the retry.
-        if (
-            trigger == "proactive"
-            and not warm
-            and not cold
-            and _about_to_wall(
-                active_headroom if axis else headroom.get(active_number)
-            )
-        ):
-            reasons.clear()
-            warm, cold = _rank_dynamic_candidates(
-                oauth_candidates, headroom, usage, now, last_active_at or {},
-                settings.cache_ttl_seconds, reasons, entries,
-            )
-        if trigger == "proactive":
-            cold_floor = settings.cold_switch_cost_pct
-            cold_clears = [n for n in cold if headroom[n] >= cold_floor]
-            cold_rest = [n for n in cold if n not in cold_clears]
-            ordered = warm + cold_clears + cold_rest
-        else:
-            ordered = warm + cold
-        # "soonest reset" -- the axis `_rank_dynamic_candidates` actually
-        # sorts by (autoswitch.py's own name for it, ~3775); "soonest to
-        # recover" is the DIFFERENT binding-recovery axis `rank_candidates_
-        # pass` uses for the at-limit escape order, below.
-        return ordered, ("soonest reset" if ordered else None)
+        return ordered, (rank_axis if ordered else None)
 
-    def _rank_on(axis: tuple[str, ...], trigger: str) -> tuple[list[str], str | None]:
+    def _rank_on(
+        axis: tuple[str, ...], trigger: str, dropped: bool = False
+    ) -> tuple[list[str], str | None]:
         reasons.clear()  # a retried pass replaces the one before it
         if trigger in _UNMODELED_TRIGGERS:
             return [], None
         if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
-            return _rank_dynamic_on(axis, trigger)
+            return _rank_dynamic_on(axis, trigger, dropped)
         headroom = _headroom_by_account(usage, axis)
         if settings.strategy == "priority-consume-first" and trigger != "weekly-capped":
             # The engine ranks every trigger through its priority pass alone,
@@ -463,7 +431,7 @@ def rank_switch_candidates(
             usage, models, settings.threshold, settings.weekly_threshold, bars
         )
     ):
-        ordered, rank_axis = _rank_on((), trigger)
+        ordered, rank_axis = _rank_on((), trigger, dropped=True)
     if (
         not ordered
         and api_key_candidates
@@ -504,6 +472,13 @@ def waiting_tail_key(
             scale=_ruler(settings),
         ),
     )
+
+
+def reset_tail_key(usage: dict | None, now: float) -> float:
+    """Sort key for a row the engine never lands on (capped, disabled, spend-only,
+    unreadable): its 7d reset, soonest first, an unknown one last."""
+    ts = _seven_day_reset_ts(usage, now)
+    return float("inf") if ts is None else ts
 
 
 def is_no_plan(acc) -> bool:

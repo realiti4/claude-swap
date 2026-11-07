@@ -446,6 +446,10 @@ class AutoScreen(Screen):
         # window chips) -- the fallback key must agree with the SAME `now`
         # the admission pass above just ran on, not a fresh read.
         admission_now = now
+
+        def never_a_target(acc) -> tuple:
+            return (997.0, data.reset_tail_key(acc.usage.last_good, admission_now))
+
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -506,7 +510,7 @@ class AutoScreen(Screen):
                 # next pick, and it must not sort behind every refused row.
                 key = (
                     (0, ordered_rank[acc.number])
-                    if acc.number in ordered_rank else (998.0,)
+                    if acc.number in ordered_rank else never_a_target(acc)
                 )
                 ranked.append((key, acc.number))
             elif binding is None:
@@ -541,7 +545,7 @@ class AutoScreen(Screen):
                 # engine refused.
                 key = (
                     (0, ordered_rank[acc.number])
-                    if acc.number in ordered_rank else (999.0,)
+                    if acc.number in ordered_rank else never_a_target(acc)
                 )
                 ranked.append((key, acc.number))
             else:
@@ -651,12 +655,12 @@ class AutoScreen(Screen):
                 # that same recovery still fall to `sorted(ranked)`'s own
                 # residual tie-break, the account number as a string --
                 # never touching a row the pass DID admit. A disabled row
-                # shares the sentinel branch's fixed tier (998.0) above,
-                # never this reset-ordered one: the engine will not land
-                # here automatically however soon it recovers.
+                # takes the `never_a_target` tier, never this recovery-
+                # ordered one: the engine will not land here automatically
+                # however soon it recovers.
                 key = (
                     (0, ordered_rank[acc.number]) if acc.number in ordered_rank
-                    else (998.0,) if acc.disabled
+                    else never_a_target(acc) if acc.disabled
                     else (1,) + data.waiting_tail_key(
                         acc.usage.last_good, models, admission_now, settings,
                         bars.get(acc.number, settings.threshold),
@@ -669,7 +673,7 @@ class AutoScreen(Screen):
                         f"{acc.policy.weekly_cap:g}%",
                         style=palette.sev_warn,
                     )
-                    key = (997.0,)
+                    key = never_a_target(acc)
                 ranked.append((key, acc.number))
             lines[acc.number] = entry
 
