@@ -7414,6 +7414,73 @@ class TestAddAccountFromToken:
         assert "1" not in data["accounts"]
         assert 7 in data["sequence"]
 
+    def test_slot_refresh_preserves_alias_and_disabled(self, temp_home):
+        """Re-running `add-token --slot N` when that slot's token expires is a
+        refresh of the same account, so the alias and the park the user set on
+        the slot must outlive the old token."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", slot=3)
+
+        switcher.set_alias("3", "ci")
+        switcher.set_account_disabled("3", True)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v2", slot=3)
+
+        record = switcher._get_sequence_data()["accounts"]["3"]
+        assert record.get("alias") == "ci"
+        assert record.get("disabled") is True
+
+    def test_slot_migration_preserves_alias_and_disabled(self, temp_home):
+        """Moving a token account to another slot with --slot carries its
+        alias and its disabled flag along with it."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", slot=3)
+
+        email = switcher._get_sequence_data()["accounts"]["3"]["email"]
+        switcher.set_alias("3", "ci")
+        switcher.set_account_disabled("3", True)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"), \
+             patch.object(switcher, "_delete_account_files"):
+            switcher.add_account_from_token("token-v1", email, slot=6)
+
+        data = switcher._get_sequence_data()
+        assert "3" not in data["accounts"]
+        assert data["accounts"]["6"].get("alias") == "ci"
+        assert data["accounts"]["6"].get("disabled") is True
+
+    def test_displacing_a_different_account_does_not_inherit_its_state(
+        self, temp_home,
+    ):
+        """Overwriting an occupied slot ends that slot's lineage; the new
+        account must not pick up the displaced one's alias or park."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", "old@example.com", slot=4)
+
+        switcher.set_alias("4", "ci")
+        switcher.set_account_disabled("4", True)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"), \
+             patch.object(switcher, "_delete_account_files"):
+            switcher.add_account_from_token(
+                "token-v2", "new@example.com", slot=4, assume_yes=True,
+            )
+
+        record = switcher._get_sequence_data()["accounts"]["4"]
+        assert record["email"] == "new@example.com"
+        assert "alias" not in record
+        assert "disabled" not in record
+
     def test_update_in_place_same_email(self, temp_home, capsys):
         """Calling add_account_from_token again for the same email refreshes in place."""
         switcher = self._make_switcher(temp_home)
@@ -10868,6 +10935,15 @@ class TestMacosKeychainFallback:
         s._backup_enc_path("1", "a@example.com").write_text(bad)
         assert s._read_account_credentials("1", "a@example.com") == "FROM-KC"
 
+    def test_backup_non_utf8_enc_falls_back_to_keychain(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """A garbled .enc is garbled whatever its bytes decode to."""
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "FROM-KC")
+        s._backup_enc_path("1", "a@example.com").write_bytes(b"\xff\xfegarbled")
+        assert s._read_account_credentials("1", "a@example.com") == "FROM-KC"
+
     def test_backup_delete_removes_both_backends(
         self, temp_home: Path, block_real_keychain
     ):
@@ -12266,11 +12342,45 @@ class TestLockstepUsageDetection:
         assert "Account-1 and Account-2" in warnings[0]
         assert "may be the same account" in warnings[0]
 
+    def test_subsecond_reset_jitter_still_flagged(
+        self, temp_home, sample_sequence_data,
+    ):
+        """Issue #161: the two slots are fetched a fraction of a second
+        apart, so the API hands back the same window boundary with a
+        different sub-second component. The timestamps below are the pair
+        the reporter observed."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entries = {
+            "1": self._entry(
+                25.0, "2026-07-25T09:00:00.129393+00:00",
+                60.0, "2026-07-28T00:00:00.101000+00:00",
+            ),
+            "2": self._entry(
+                25.0, "2026-07-25T09:00:00.340384+00:00",
+                60.0, "2026-07-28T00:00:00.902000+00:00",
+            ),
+        }
+        warnings = switcher._lockstep_usage_warnings(self._info(), entries)
+        assert len(warnings) == 1
+        assert "Account-1 and Account-2" in warnings[0]
+
     def test_differing_resets_not_flagged(self, temp_home, sample_sequence_data):
         switcher = self._switcher(temp_home, sample_sequence_data)
         entries = {
             "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
             "2": self._entry(25.0, "2026-07-10T13:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+        }
+        assert switcher._lockstep_usage_warnings(self._info(), entries) == []
+
+    def test_resets_a_minute_apart_not_flagged(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The tolerance absorbs fetch skew, nothing more: two accounts whose
+        5h windows opened a minute apart are still two accounts."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entries = {
+            "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+            "2": self._entry(25.0, "2026-07-10T12:01:00Z", 60.0, "2026-07-14T00:00:00Z"),
         }
         assert switcher._lockstep_usage_warnings(self._info(), entries) == []
 
@@ -14604,6 +14714,52 @@ class TestDisableEnableAccount:
 
         assert s.is_account_disabled("2") is False
 
+    def test_slot_refresh_keeps_account_parked(self, temp_home):
+        """`cswap add --slot N` on the account already in slot N is the
+        documented way to recover a dead login; it refreshes the credential
+        rather than re-registering the account, so the park must survive it.
+        Bare `cswap add` (refresh in place) already keeps the flag."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        self._make_live(temp_home, "b@example.com", 2)
+
+        s.add_account(slot=2)
+
+        assert s.is_account_disabled("2") is True
+        assert s.switchable_account_numbers() == ["1"]
+
+    def test_slot_migration_keeps_account_parked(self, temp_home):
+        """Moving a parked account to another slot carries the flag along,
+        the same way it carries the alias."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        self._make_live(temp_home, "b@example.com", 2)
+
+        s.add_account(slot=5)
+
+        assert "2" not in s._get_sequence_data()["accounts"]
+        assert s.is_account_disabled("5") is True
+
+    def test_displacing_a_parked_account_does_not_inherit_its_flag(
+        self, temp_home,
+    ):
+        """Overwriting slot N with a different account ends that slot's
+        lineage, so the newcomer starts in rotation."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        self._make_live(temp_home, "a@example.com", 1)
+
+        s.add_account(slot=2, assume_yes=True)
+
+        assert s._get_sequence_data()["accounts"]["2"]["email"] == "a@example.com"
+        assert s.is_account_disabled("2") is False
+
     # -- warnings ----------------------------------------------------------
 
     def test_disable_active_account_warns_but_sets_flag(self, temp_home, capsys):
@@ -14939,6 +15095,23 @@ class TestBackupReadTriState:
             "1", "test@example.com"
         )
         assert value == "CREDS"
+        assert unreadable is False
+
+    def test_non_utf8_enc_is_corrupt_not_a_crash(self, temp_home: Path):
+        # The .enc is the only backend here, so undecodable bytes have to reach
+        # the same content-level verdict as bad base64 rather than raising out
+        # of a reader every caller expects to answer with a value.
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._store._write_account_credentials("1", "test@example.com", "CREDS")
+        s._store._backup_enc_path("1", "test@example.com").write_bytes(
+            b"\xff\xfegarbled"
+        )
+        value, unreadable = s._store._read_account_credentials_ex(
+            "1", "test@example.com"
+        )
+        assert value == ""
         assert unreadable is False
 
 
@@ -20320,6 +20493,25 @@ class TestStashReaderUnreadableVsAbsent:
             "`refresh_input = current or snapshot` hides it from every "
             "POST-side assertion"
         )
+
+    def test_undecodable_entry_bytes_are_corrupt_not_a_crash(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Bytes that are not UTF-8 at all are the same corrupt entry as bad
+        base64, and must reach the same terminal verdict instead of raising
+        out of the reader on the caller's behalf."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        entry_path = s._store._stash_entry_path(self._stash_successor(s))
+        entry_path.write_bytes(b"\xff\xfegarbled")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._post_rejects_spent) as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert post.called
+        assert out.error == "invalid_grant"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
     def test_row_d_absent_entry_bytes_terminate_instead_of_deferring(
         self, temp_home: Path, sample_sequence_data: dict,
