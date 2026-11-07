@@ -23,7 +23,7 @@ import pytest
 
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.exceptions import ConfigError, ValidationError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError, ValidationError
 
 CREDS = json.dumps({"claudeAiOauth": {
     "accessToken": "sk-ant-oat01-THEIRS", "refreshToken": "rt-theirs",
@@ -1346,3 +1346,32 @@ def test_extract_oauth_data_is_none_for_json_that_is_not_an_object():
     from claude_swap import oauth
     assert oauth.extract_oauth_data("[]") is None
     assert oauth.extract_oauth_data('"x"') is None
+def test_a_config_torn_mid_rewrite_in_that_window_is_refused_not_a_crash(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The same window, with the config unreadable rather than changed.
+
+    The second read is not guaranteed to produce a config at all: Claude Code
+    rewrites `.claude.json` constantly, and the ownership probe's network
+    round-trip makes the gap between the two reads seconds wide. `_read_json`
+    answers None for a file caught mid-rewrite, and the `.get` on the next
+    line then died with a raw AttributeError -- which `cli.py` does not catch,
+    so `cswap --json add` printed a traceback and no envelope at all, leaving
+    a scripted or menu-bar caller with unparseable output.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    cfg = s._get_claude_config_path()
+
+    def tears_during_lookup(token):
+        # Claude Code is part-way through replacing the file.
+        cfg.write_text('{"oauthAccount": {"emailAddr', encoding="utf-8")
+        return {"uuid": "u-ax", "email": "ax@example.com",
+                "organizationUuid": ""}
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               side_effect=tears_during_lookup):
+        with pytest.raises(ClaudeSwitchError):
+            s.add_account(slot=7, assume_yes=True)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
