@@ -40,6 +40,7 @@ from claude_swap.autoswitch import (
     last_engine_switch,
     pct_label,
     proactive_switch_bar_pct,
+    record_limit_switch,
 )
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -17736,6 +17737,8 @@ _ENG = {"lastSwitchAt": 5, "lastSwitchTo": "2", "leftTrigger": "failover"}
         ({**_ENG, "lastManualSwitchAt": 4, "lastManualSwitchTo": "3"}, ("2", "failover")),
         ({**_ENG, "lastManualSwitchAt": "x", "lastManualSwitchTo": "3"}, ("2", "failover")),
         ({**_ENG, "lastLimitSwitchAt": 6, "lastLimitSwitchTo": 3}, ("3", "at-limit")),
+        ({**_ENG, "lastLimitSwitchAt": 6, "lastLimitSwitchTo": 3, "lastLimitSwitchTrigger": "refused"}, ("3", "refused")),
+        ({**_ENG, "lastLimitSwitchAt": 6, "lastLimitSwitchTo": 3, "lastLimitSwitchTrigger": 7}, ("2", "failover")),
         ({**_ENG, "lastLimitSwitchAt": 4, "lastLimitSwitchTo": "3"}, ("2", "failover")),
         ({**_ENG, "lastLimitSwitchAt": "x", "lastLimitSwitchTo": "3"}, ("2", "failover")),
         ({"lastSwitchAt": 5, "lastSwitchTo": "2"}, None),  # no trigger recorded
@@ -17850,6 +17853,19 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert h.active_number() == 3
         assert last_engine_switch(backup) == expected
         assert ("lastLimitSwitchTo" in h.engine._read_state()) is stamped
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [({}, ("3", "at-limit")), ({"trigger": "refused"}, ("3", "refused"))],
+    )
+    def test_a_limit_record_carries_its_trigger(self, temp_home, kwargs, expected):
+        """The pin's refusal switch lands on the same line as the wall switch and
+        names itself; a record with no trigger is the wall's `at-limit`."""
+        h = _xw_harness(temp_home)
+        assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
+        h.clock.advance(60.0)
+        record_limit_switch(h.switcher, {"number": 3}, **kwargs)
+        assert last_engine_switch(h.switcher.backup_dir) == expected
 
     def test_it_is_the_sooner_expiring_window_and_the_active_then_holds_it(
         self, temp_home

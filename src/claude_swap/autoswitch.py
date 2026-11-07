@@ -763,17 +763,18 @@ def _read_state_file(path: Path) -> dict:
 def last_engine_switch(backup_dir: Path) -> tuple[str, str] | None:
     """The newest switch on record as (target slot, trigger): the engine's
     (``lastSwitchTrigger``, else ``leftTrigger``), a hand's (``manual``) or the
-    pin's wall switch (``at-limit``).
+    pin's wall switch (``lastLimitSwitchTrigger``, else ``at-limit``).
     cswap-pin's session-affinity keep reads it and yields its keep to
     ``expiring-window`` and ``manual``. A missing or malformed field drops that
     entry; ``None`` when neither is left. No lock: the writers are atomic."""
     state = _read_state_file(backup_dir / STATE_FILENAME)
     engine_trigger = state.get("lastSwitchTrigger") or state.get("leftTrigger")
+    limit_trigger = state.get("lastLimitSwitchTrigger") or "at-limit"
     entries = []
     for at, to, trigger in (
         ("lastManualSwitchAt", "lastManualSwitchTo", "manual"),
         ("lastSwitchAt", "lastSwitchTo", engine_trigger),
-        ("lastLimitSwitchAt", "lastLimitSwitchTo", "at-limit"),
+        ("lastLimitSwitchAt", "lastLimitSwitchTo", limit_trigger),
     ):
         when, slot = state.get(at), state.get(to)
         if (
@@ -1620,11 +1621,14 @@ def record_manual_switch(
         _logger.warning("could not record the manual switch", exc_info=True)
 
 
-def record_limit_switch(switcher: ClaudeAccountSwitcher, to_ref: dict | None) -> None:
+def record_limit_switch(
+    switcher: ClaudeAccountSwitcher, to_ref: dict | None, trigger: str = "at-limit"
+) -> None:
     """The pin's 429 wall switch leaves its trace (T3344): it calls ``switch()``
     with no ``manual_source``, so without this ``last_engine_switch`` keeps
-    answering with the engine's older switch. Only ``lastLimitSwitchAt`` and
-    ``lastLimitSwitchTo``, the engine's and the hand's records untouched. Nothing
+    answering with the engine's older switch. Only ``lastLimitSwitchAt``,
+    ``lastLimitSwitchTo`` and ``lastLimitSwitchTrigger`` (the pin's own trigger,
+    e.g. ``refused``), the engine's and the hand's records untouched. Nothing
     escapes it: a record must never fail the switch it follows."""
     try:
         if to_ref and to_ref.get("number") is not None:
@@ -1635,6 +1639,7 @@ def record_limit_switch(switcher: ClaudeAccountSwitcher, to_ref: dict | None) ->
                 state["schemaVersion"] = STATE_SCHEMA_VERSION
                 state["lastLimitSwitchAt"] = switcher._usage_store.clock()
                 state["lastLimitSwitchTo"] = str(to_ref["number"])
+                state["lastLimitSwitchTrigger"] = trigger
                 atomic_write_json(path, state)
     except Exception:  # noqa: BLE001 -- a record must never fail the switch
         _logger.warning("could not record the at-limit switch", exc_info=True)
