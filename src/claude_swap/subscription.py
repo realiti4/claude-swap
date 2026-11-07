@@ -81,8 +81,15 @@ _TIER_LABELS = {
 
 # A seat on a Team organization is not a personal subscription, whatever rate
 # tier the seat carries, so the organization type wins where it is known.
+#
+# ``claude_pro`` is the same story with a different label: a paying Pro
+# subscription reports the *default* rate-limit bucket (``default_claude_ai``),
+# which is also what a lapsed account falls back to, so the tier alone would
+# print "Free" for a subscriber who is paying. The organization type is the
+# field that still names the plan.
 _ORG_TYPE_LABELS = {
     "claude_team": "Team",
+    "claude_pro": "Pro",
 }
 
 _KEPT_FIELDS = (
