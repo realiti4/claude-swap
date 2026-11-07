@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.cells import cell_len
 
 from claude_swap import oauth
 from claude_swap.json_output import USAGE_NO_CREDENTIALS
@@ -77,6 +78,19 @@ class TestFormatLoginExpiry:
         ]
         widths = {len(s) for s in shapes}
         assert widths == {6}
+
+    def test_short_form_is_three_columns_for_every_shape(self):
+        now = 1_000_000.0
+        cases = {
+            (None, False): "?  ",
+            (now - 1, False): "now",
+            (now + 999_999, True): "now",
+            (now + 23 * 86400 + 4 * 3600, False): "23d",
+            (now + 5 * 3600 + 7 * 60, False): "5h ",
+            (now + 45 * 60, False): "0h ",
+        }
+        for (expires_at, quarantined), want in cases.items():
+            assert oauth.format_login_expiry(expires_at, quarantined, now, short=True) == want
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +222,64 @@ class TestDashboardMiniRowAlignment:
             offsets = {line.index("login") for line in lines}
             assert len(offsets) == 1
 
+    @pytest.mark.asyncio
+    async def test_80x24_dashboard_with_seven_accounts_keeps_usage_and_menu(
+        self, tmp_path, monkeypatch
+    ):
+        # Seven accounts at 80x24: the 14-column login token pushed the minis
+        # past the panel's 74 columns, the rows wrapped and the menu was
+        # scrolled out of view. The token now steps down (full, short, none)
+        # rather than wrap, and usage figures are never cut.
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import AccountsPanel, MenuItem
+
+        expires = time.time() + 23 * 86400 + 4 * 3600
+        accounts = [
+            _replace_login(
+                make_account(
+                    n,
+                    active=n == 1,
+                    email=f"developer{n}@example.com",
+                    alias="work" if n in (1, 2) else "",
+                ),
+                expires,
+            )
+            for n in range(1, 8)
+        ]
+        # The plan marker fills the active header: it has no room for the
+        # token, and that must not take the minis' token with it.
+        accounts[0] = dataclasses.replace(
+            accounts[0], subscription_plan=TestPlanMarkerAndLoginTogether.PLAN
+        )
+
+        async def dashboard():
+            app = make_app(FakeSwitcher(accounts, tmp_path))
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                panel = app.screen.query_one(AccountsPanel)
+                menu = app.screen.query_one("#menu", ListView)
+                shown = [
+                    item for item in menu.query(MenuItem)
+                    if menu.region.contains_region(item.region)
+                ]
+                return panel.render().plain.splitlines(), panel.size, len(shown)
+
+        lines, size, shown = await dashboard()
+        assert all(cell_len(line) <= size.width for line in lines)
+        assert size.height == len(lines)  # nothing wrapped
+        minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
+        assert len(minis) == 6 and "login" not in lines[0]
+        assert all("5h 25%" in line and "7d 10%" in line for line in minis)
+        # The middle form: "login 23d" fits at 74 columns, the full one does not.
+        assert all("login 23d  " in line and "23d04h" not in line for line in minis)
+
+        # The same dashboard with no login token at all, as the menu was.
+        monkeypatch.setattr(widgets, "LOGIN_FORMS", (None,))
+        bare_lines, _size, bare_shown = await dashboard()
+        assert len(lines) == len(bare_lines)  # the card's login row is gone too
+        assert shown == bare_shown > 0
+
 
 class TestPlanMarkerAndLoginTogether:
     """A slot carrying both a subscription plan and a login expiry shows both."""
@@ -224,8 +296,8 @@ class TestPlanMarkerAndLoginTogether:
         acc = self._account()
         card = widgets.account_card_text(acc, 100).plain
         mini = widgets.mini_account_text(acc, time.time()).plain
-        assert "· Max 20x" in card.splitlines()[0]
-        assert any(line.lstrip().startswith("login") for line in card.splitlines()[1:])
+        header = card.splitlines()[0]
+        assert "· Max 20x" in header and "login 5h" in header
         assert "login" in mini and "· Max 20x" in mini
 
     def test_cli_header_and_login_row(
@@ -289,3 +361,46 @@ async def test_next_best_login_column_alignment(tmp_path, fake_engine):
         assert len(lines) == 3
         offsets = {line.index("login") for line in lines}
         assert len(offsets) == 1
+
+
+@pytest.mark.asyncio
+async def test_next_best_rows_never_wrap_on_a_narrow_screen(tmp_path, fake_engine):
+    """A 44-column email pushes the full `login 23d04h` token past the 76-column
+    row; the token steps down to its short form so the usage figure stays on
+    the line."""
+    expires = time.time() + 23 * 86400 + 4 * 3600
+    accounts = [make_account(1, active=True, email="active@example.com")] + [
+        _replace_login(make_account(n, email=f"{'x' * 31}{n}@example.com"), expires)
+        for n in (2, 3)
+    ]
+    app = make_app(FakeSwitcher(accounts, tmp_path))
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+        from textual.widgets import Static
+
+        candidates = app.screen.query_one("#candidates", Static)
+        rows = [line for line in candidates.render().plain.splitlines() if "login" in line]
+        assert len(rows) == 2
+        assert all(cell_len(row) <= candidates.size.width for row in rows)
+        assert all("used" in row and "login 23d" in row and "23d04h" not in row for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_switch_screen_card_header_keeps_login_within_the_width(tmp_path):
+    from claude_swap.tui.widgets import AccountCard
+
+    acc = _replace_login(
+        make_account(1, active=True, email="dev-account-1@a.io", alias="work"),
+        time.time() + 23 * 86400 + 4 * 3600,
+    )
+    app = make_app(FakeSwitcher([acc, make_account(2)], tmp_path))
+    async with app.run_test(size=(70, 24)) as pilot:
+        await settle(pilot)
+        await pilot.press("s")
+        await pilot.pause()
+        card = app.screen.query(AccountCard).first()
+        header = card.render().plain.splitlines()[0]
+        assert cell_len(header) <= card.size.width
+        assert "login 23d" in header

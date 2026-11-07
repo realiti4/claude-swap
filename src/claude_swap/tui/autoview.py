@@ -30,14 +30,13 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     pct_label,
 )
-from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.lines import binding_window
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel
+from claude_swap.tui.widgets import AccountsPanel, fit_login, login_segment
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -328,7 +327,7 @@ class AutoScreen(Screen):
         # starts at the same offset regardless of which email is longest.
         email_width = max((len(acc.email) for acc in candidates), default=0)
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
-        lines: dict[str, Text] = {}
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, up to the login, after it)
         for acc in candidates:
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
@@ -339,14 +338,9 @@ class AutoScreen(Screen):
                 weekly,
                 scale=threshold,
             )
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
-            quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
-            login_value = oauth.format_login_expiry(
-                acc.login_expires_at, quarantined
-            )
-            entry.append(f"  login {login_value}", style=palette.muted)
+            head, entry = Text(), Text()
+            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            head.append(f"{acc.email:<{email_width}}", style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -368,13 +362,22 @@ class AutoScreen(Screen):
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
                 ranked.append((-binding.line_headroom, acc.number))
-            lines[acc.number] = entry
+            lines[acc.number] = (acc, head, entry)
 
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
-            text.append(lines[number])
+        order = [lines[number] for _pct, number in sorted(ranked)]
+        # The box has no width before its first layout; its CSS padding is 2 a side.
+        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
+        for row in fit_login(
+            lambda login: [
+                Text.assemble(head, Text(login_segment(acc, login), style=palette.muted), tail)
+                for acc, head, tail in order
+            ],
+            budget,
+        ):
+            text.append(row)
         return text

@@ -141,7 +141,10 @@ _LOGIN_VALUE_WIDTH = 6
 
 
 def format_login_expiry(
-    expires_at: float | None, quarantined: bool, now: float | None = None
+    expires_at: float | None,
+    quarantined: bool,
+    now: float | None = None,
+    short: bool = False,
 ) -> str:
     """Fixed-width countdown to a stored login's refresh-token expiry.
 
@@ -151,23 +154,27 @@ def format_login_expiry(
     refresh-token lineage — the same fact either signals), ``"?"`` when the
     stamp is missing or unreadable. Right-padded to the widest shape
     (``_LOGIN_VALUE_WIDTH``) so a column of these lines up.
+
+    ``short`` is the three-column form for rows too narrow for the full one:
+    ``"23d"``, ``"5h"``, ``"now"`` (login needed), ``"?"``.
     """
+    needed = "now" if short else "needed"
     if quarantined:
-        text = "needed"
+        text = needed
     elif expires_at is None:
         text = "?"
     else:
         now = now if now is not None else datetime.now(timezone.utc).timestamp()
         remaining = expires_at - now
         if remaining <= 0:
-            text = "needed"
+            text = needed
         elif remaining >= 86400:
             days, rem = divmod(int(remaining), 86400)
-            text = f"{days}d{rem // 3600:02d}h"
+            text = f"{days}d" if short else f"{days}d{rem // 3600:02d}h"
         else:
             rem = int(remaining)
-            text = f"{rem // 3600}h{(rem % 3600) // 60:02d}m"
-    return text.ljust(_LOGIN_VALUE_WIDTH)
+            text = f"{rem // 3600}h" if short else f"{rem // 3600}h{(rem % 3600) // 60:02d}m"
+    return text.ljust(3 if short else _LOGIN_VALUE_WIDTH)
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:

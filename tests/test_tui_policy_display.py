@@ -40,11 +40,11 @@ from tests.test_tui import (
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
 # instead (see ``test_the_card_bar_rows_are_untouched``).  The ``login ?``
-# segment and the card's login row come from the login-expiry column, which
-# every account view now carries.
-GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
+# segment comes from the login-expiry column, which every account view now
+# carries: it ends the card header and follows the name in a mini row.
+GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active   login ?"
 GOLDEN_MINI = " 2  dev (user2@example.com)  login ?       [personal]   5h 25% · 7d 10%"
-GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
+GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)   login ?"
 GOLDEN_MINI_DISABLED = " 3  user3@example.com  login ?       [personal]  (disabled)   5h 25% · 7d 10%"
 
 NOW = 1000.0
@@ -143,10 +143,9 @@ class TestUnpolicedAccountsRenderExactlyAsBefore:
         # labels, and no policy token anywhere below the header.
         acc = make_account(2, active=True, alias="dev")
         lines = card(acc).splitlines()
-        assert len(lines) == 4
+        assert len(lines) == 3
         assert lines[1].startswith("    5h ")
         assert lines[2].startswith("    7d ")
-        assert lines[3].startswith("    login ")
         for token in ("th ",):
             assert token not in "\n".join(lines[1:])
 

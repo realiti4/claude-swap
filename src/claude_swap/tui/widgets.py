@@ -9,8 +9,9 @@ auto-switch trigger line), and stale-measurement dimming.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
@@ -180,15 +181,32 @@ def usage_rows(
 _LOGIN_LABEL = "login"
 
 
-def _append_login_line(
-    text: Text, acc: AccountSnapshot, label_width: int, now: float, palette: Palette
-) -> None:
-    """One "login <countdown>" row, label-padded like the card's other rows."""
+# Login-countdown forms, fullest first: "login 23d04h", "login 23d", nothing.
+LOGIN_FORMS = ("full", "short", None)
+
+
+def login_segment(
+    acc: AccountSnapshot, form: str | None, now: float | None = None, gap: str = "  "
+) -> str:
+    """The ``login <countdown>`` text of a row, led by ``gap`` ("" when ``form`` is None)."""
+    if form is None:
+        return ""
     quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
-    value = oauth.format_login_expiry(acc.login_expires_at, quarantined, now)
-    text.append("\n    ")
-    text.append(f"{_LOGIN_LABEL:<{label_width}} ", style=palette.muted)
-    text.append(value, style=palette.muted)
+    value = oauth.format_login_expiry(
+        acc.login_expires_at, quarantined, now, short=form == "short"
+    )
+    return f"{gap}{_LOGIN_LABEL} {value}"
+
+
+def fit_login(build: Callable[[str | None], list[Text]], budget: int) -> list[Text]:
+    """``build(form)`` for the fullest login form in which every row's first
+    line fits ``budget`` columns; usage figures are never cut, so with no
+    fitting form the login goes."""
+    for form in LOGIN_FORMS:
+        rows = build(form)
+        if all(cell_len(row.plain.strip("\n").partition("\n")[0]) <= budget for row in rows):
+            break
+    return rows
 
 
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
@@ -236,11 +254,13 @@ def account_card_text(
     weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    login: str | None = "full",
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
     5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
-    per-model rows, which reset weekly."""
+    per-model rows, which reset weekly. ``login`` is the form of the login
+    countdown that ends the header (see ``LOGIN_FORMS``)."""
     now = now if now is not None else time.time()
 
     text = Text()
@@ -261,6 +281,7 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
+    text.append(login_segment(acc, login, now, "   ").rstrip(), style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
@@ -276,7 +297,6 @@ def account_card_text(
             if last_seen is not None:
                 text.append("\n    ")
                 text.append(f"└ {last_seen}", style=palette.muted)
-        _append_login_line(text, acc, len(_LOGIN_LABEL), now, palette)
         return text
 
     rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
@@ -289,13 +309,10 @@ def account_card_text(
             # identically.
             note = ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)
             text.append(f" · {note}", style=palette.muted)
-        _append_login_line(text, acc, len(_LOGIN_LABEL), now, palette)
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
-    label_width = max(
-        [len(label) for label, _pct, _suffix, _full in rows] + [len(_LOGIN_LABEL)]
-    )
+    label_width = max(len(label) for label, _pct, _suffix, _full in rows)
     bar_width = max(12, min(30, width - 42 - label_width))
     for label, pct, suffix, suffix_full in rows:
         # everything on a row except the suffix: indent, label, bar, " NNN%"
@@ -322,8 +339,15 @@ def account_card_text(
                 palette=palette,
             )
         )
-    _append_login_line(text, acc, label_width, now, palette)
     return text
+
+
+def fitted_card_text(acc: AccountSnapshot, width: int, budget: int, **kwargs) -> Text:
+    """``account_card_text`` with the login form its header has room for in ``budget`` columns."""
+    (card,) = fit_login(
+        lambda login: [account_card_text(acc, width, login=login, **kwargs)], budget
+    )
+    return card
 
 
 def mini_row_display_name(acc: AccountSnapshot) -> str:
@@ -334,7 +358,12 @@ def mini_row_display_name(acc: AccountSnapshot) -> str:
 
 
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, email_width: int = 0, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    email_width: int = 0,
+    palette: Palette = Palette.DARK,
+    login: str | None = "full",
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -351,9 +380,7 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(" " * max(0, email_width - len(mini_row_display_name(acc))))
-    quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
-    login_value = oauth.format_login_expiry(acc.login_expires_at, quarantined, now)
-    text.append(f"  {_LOGIN_LABEL} {login_value}", style=palette.muted)
+    text.append(login_segment(acc, login, now), style=palette.muted)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
@@ -441,7 +468,8 @@ class AccountsPanel(Static):
                 style=palette.muted,
             )
         now = time.time()
-        width = (self.size.width or 80) - 2
+        panel_width = self.size.width or 80
+        width = panel_width - 2
         # Widest displayed name (alias included) among the mini rows, so
         # their login columns start at the same offset regardless of which
         # account's name is longest.
@@ -449,20 +477,32 @@ class AccountsPanel(Static):
             (len(mini_row_display_name(acc)) for acc in snap.accounts if not acc.is_active),
             default=0,
         )
+        # One login form for all the minis so their columns line up; the
+        # card's header also carries the plan and age, so it fits its own.
+        inactive = [acc for acc in snap.accounts if not acc.is_active and self._show_minis]
+        minis = iter(
+            fit_login(
+                lambda login: [
+                    mini_account_text(
+                        acc, now, email_width=email_width, palette=palette, login=login
+                    )
+                    for acc in inactive
+                ],
+                panel_width,
+            )
+        )
         blocks: list[Text] = []
         for acc in snap.accounts:
             if acc.is_active:
                 blocks.append(
-                    account_card_text(
-                        acc, width, threshold=app.threshold_pct,
+                    fitted_card_text(
+                        acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette,
                     )
                 )
             elif self._show_minis:
-                blocks.append(
-                    mini_account_text(acc, now, email_width=email_width, palette=palette)
-                )
+                blocks.append(next(minis))
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
@@ -490,8 +530,9 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        return account_card_text(
-            self._acc, self.size.width or 80, threshold=self._threshold,
+        width = self.size.width or 80
+        return fitted_card_text(
+            self._acc, width, width, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
         )
 
