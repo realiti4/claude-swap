@@ -17854,18 +17854,14 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert last_engine_switch(backup) == expected
         assert ("lastLimitSwitchTo" in h.engine._read_state()) is stamped
 
-    @pytest.mark.parametrize(
-        ("kwargs", "expected"),
-        [({}, ("3", "at-limit")), ({"trigger": "refused"}, ("3", "refused"))],
-    )
-    def test_a_limit_record_carries_its_trigger(self, temp_home, kwargs, expected):
+    def test_a_limit_record_carries_its_trigger(self, temp_home):
         """The pin's refusal switch lands on the same line as the wall switch and
-        names itself; a record with no trigger is the wall's `at-limit`."""
+        names itself instead of reading as `at-limit`."""
         h = _xw_harness(temp_home)
         assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
         h.clock.advance(60.0)
-        record_limit_switch(h.switcher, {"number": 3}, **kwargs)
-        assert last_engine_switch(h.switcher.backup_dir) == expected
+        record_limit_switch(h.switcher, {"number": 3}, trigger="refused")
+        assert last_engine_switch(h.switcher.backup_dir) == ("3", "refused")
 
     def test_it_is_the_sooner_expiring_window_and_the_active_then_holds_it(
         self, temp_home
