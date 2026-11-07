@@ -85,7 +85,7 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account whose weekly window resets soonest (the default strategy; `--strategy best` picks the most quota left instead) — before you hit the limit, and safe to run while Claude Code is working:
 
 ```bash
 cswap auto                     # foreground loop, polls every 60s
@@ -104,22 +104,23 @@ cswap auto --dry-run           # log what it would do, never switch
 
 | Strategy | Switches | Lands on |
 |---|---|---|
-| `best` (default) | when the active account reaches its threshold | the account with the most quota left |
+| `best` | when the active account reaches its threshold | the account with the most quota left |
 | `weekly-first` | same as `best` | the account whose weekly window resets soonest |
-| `consume-first` | at the threshold, and earlier whenever an account that resets sooner has room | the account whose weekly window resets soonest |
+| `consume-first` (default) | at the threshold, and earlier whenever an account that resets sooner has room | the account whose weekly window resets soonest |
+| `dynamic` | like `consume-first`, and re-checks each tick whether a `--model` window is really what's binding | the soonest weekly reset, never an account with no room on the window in force |
 | `priority-consume-first` | whenever a higher-tier account is usable | your highest tier (`cswap priority`), then the soonest weekly reset |
 
 The weekly ones exist because weekly quota left unused at its reset is lost.
 
 **Per-account controls**
 
-- `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target.
+- `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target, though a running auto-switch leaves it on its next tick.
 - `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
 - `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
 
 **Good to know**
 
-- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling.
+- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling. `dynamic` holds too, unless the active account is at its limit.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping between accounts near the threshold.
 - `--weekly-threshold 97` gives the 7-day and per-model windows their own line, so the weekly budget can run higher than the 5-hour window. `--threshold`, and any per-account threshold, then governs the 5-hour window only.
 - `--model Fable` folds that model's weekly limit into the decision, for when you hit a per-model limit before the account-wide ones. Names are the per-model rows in `cswap list` (e.g. `Fable: 100%`), matched case-insensitively.
@@ -159,7 +160,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 - **Chat history.** Shared by default: every account reads and writes the history in `~/.claude`. History an account kept on its own before is merged in on its next launch, and nothing already saved is lost (a file that differs on both sides is kept aside in `history-conflicts/` in the backup directory). `cswap config set run.shareHistory false` gives each account its own history; `--no-share-history` does it for one launch. On Windows, conversations are shared through a directory junction, which needs no special rights; the prompt-history file (`history.jsonl`) is shared only when Windows lets cswap create a symlink (Developer Mode, or an elevated terminal) and otherwise stays per-account.
 - **MCP servers.** User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` stops sharing your `~/.claude` setup (settings, skills, etc.) and removes the mirrored MCP config (profiles that never mirrored are left alone). Chat history is separate: it stays shared unless you also pass `--no-share-history`.
-- **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead.
+- **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead, and also refuses when no account is named and the directory maps to no usable account (the other way `cswap run` reaches the default login).
 - **Tokens.** A session refreshes its own copy of the account's token; once it exits, the credential it rotated is captured back into the account's stored backup before a switch, swap, move, or usage check uses it. While the session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail) — exit the session first, or pick another account.
 - **Usage.** While a session runs, its account's usage is read with the session's own credential, which cswap never refreshes. A read the server refuses shows as token expired, and isn't retried, until the session renews the credential on its next call.
 
@@ -187,6 +188,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
+
+`cswap tui --auto` opens the auto-switch view **live**, for a TUI meant to keep running unattended — after a reboot, a deploy, or a tmux respawn it resumes switching instead of waiting in dry-run for a keypress. Only the flag does this: a bare `cswap tui` lands on the dashboard, and reaching the auto view from the menu watches without switching, so opening a view never starts moving accounts on its own. One live engine runs per machine — a second TUI still shows its dashboard but stays in dry-run and says so, since two engines decide independently and undo each other's switches.
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
@@ -230,6 +233,7 @@ cswap unclaimed                 # List stashed credential entries (slot + why th
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
+cswap tui --auto                # Dashboard, opened on the auto-switch view, LIVE
 cswap upgrade                   # Upgrade claude-swap to the latest version
 cswap purge                     # Remove all claude-swap data
 ```
