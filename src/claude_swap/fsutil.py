@@ -247,3 +247,163 @@ def atomic_write_text(
     atomic_write_bytes(
         path, text.encode("utf-8"), mode=mode, follow_symlinks=follow_symlinks
     )
+
+
+# ---------------------------------------------------------------------------
+# Links
+# ---------------------------------------------------------------------------
+#
+# A link, here, is a directory entry that leads somewhere else and holds no
+# data of its own: a symlink on any platform, or a directory junction on
+# Windows. Junctions matter because they are the one directory link an
+# ordinary Windows user can create (a symlink needs Developer Mode or an
+# elevated token), and because the stdlib does not count them as links:
+# ``Path.is_symlink()`` is False for one, ``is_dir()`` follows it, and
+# ``rglob`` and ``os.walk`` descend into it as into a plain directory. Code
+# that must tell a cswap-made link from real user data goes through
+# ``is_link``, never ``is_symlink``.
+
+# Windows stores a link target with the extended-length prefix in front:
+# ``\\?\C:\...``, or ``\\?\UNC\server\share\...`` for a network path.
+_EXTENDED_PREFIX = "\\\\?\\"
+_EXTENDED_UNC_PREFIX = _EXTENDED_PREFIX + "UNC\\"
+
+
+def is_link(path: os.PathLike | str) -> bool:
+    """Whether ``path`` is a symlink or a Windows junction, dangling or not."""
+    target = Path(path)
+    try:
+        return target.is_symlink() or target.is_junction()
+    except OSError:
+        return False
+
+
+def _without_extended_prefix(path: str) -> str:
+    """Drop the extended-length prefix Windows puts on a stored link target."""
+    if path.startswith(_EXTENDED_UNC_PREFIX):
+        return "\\\\" + path[len(_EXTENDED_UNC_PREFIX):]
+    if path.startswith(_EXTENDED_PREFIX):
+        return path[len(_EXTENDED_PREFIX):]
+    return path
+
+
+def link_points_at(link: os.PathLike | str, target: os.PathLike | str) -> bool:
+    """Whether the link at ``link`` stores ``target`` as its destination.
+
+    Compares the stored path, not where it leads: a link to an intermediate
+    symlink is a different (and worse) link than one to the resolved file
+    even though both end at the same place -- see the note on dotfiles
+    setups in ``session.SessionManager._sync_items``. Windows hands a stored
+    path back with its extended-length prefix, which is stripped first.
+    False for anything that is not a link.
+    """
+    try:
+        stored = os.readlink(link)
+    except OSError:
+        return False
+    return Path(_without_extended_prefix(os.fspath(stored))) == Path(target)
+
+
+def remove_link(link: os.PathLike | str) -> None:
+    """Remove a symlink or junction itself, never what it leads to.
+
+    ``os.unlink`` takes a file symlink anywhere, a directory symlink on
+    POSIX, and on Windows a directory symlink and a junction alike (CPython
+    removes a directory reparse point with ``RemoveDirectoryW``). ``rmdir``
+    is the fallback for a build that answers EISDIR or EPERM instead.
+    """
+    try:
+        os.unlink(link)
+    except (IsADirectoryError, PermissionError):
+        os.rmdir(link)
+
+
+def make_dir_link(target: os.PathLike | str, link: os.PathLike | str) -> None:
+    """Put a directory link at ``link`` leading to ``target``.
+
+    A symlink on POSIX. On Windows a junction: it needs no privilege, stores
+    an absolute path, and Claude Code reads and writes through it exactly as
+    through a symlink (issue #292). ``target`` must be absolute and on a
+    local volume; a filesystem without reparse points (FAT, a network
+    share) refuses with OSError -- ``can_junction`` says so in advance.
+    """
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module; private but stable since 3.5
+
+        _winapi.CreateJunction(os.fspath(target), os.fspath(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def make_file_link(target: os.PathLike | str, link: os.PathLike | str) -> None:
+    """Put a symlink at ``link`` leading to the file ``target``.
+
+    The one link cswap makes that needs a privilege on Windows: Developer
+    Mode, or an elevated token. ``can_symlink`` says so in advance.
+    """
+    os.symlink(target, link)
+
+
+# ``(directory, kind) -> bool``: each probe runs once per process. Module-level
+# so a test can reset it.
+_LINK_PROBES: dict[tuple[str, str], bool] = {}
+
+
+def _probe_link(directory: os.PathLike | str, kind: str, make) -> bool:
+    key = (os.path.normcase(os.path.abspath(directory)), kind)
+    if key not in _LINK_PROBES:
+        probe = Path(directory) / f".cswap-link-probe-{os.getpid()}"
+        try:
+            try:
+                os.unlink(probe)  # left by a probe that was interrupted
+            except OSError:
+                pass
+            make(probe)
+            os.unlink(probe)
+            _LINK_PROBES[key] = True
+        except OSError:
+            try:
+                os.unlink(probe)
+            except OSError:
+                pass
+            _LINK_PROBES[key] = False
+    return _LINK_PROBES[key]
+
+
+def can_symlink(directory: os.PathLike | str) -> bool:
+    """Whether this process may create a file symlink in ``directory``.
+
+    Always true off Windows, where trying is the check. On Windows only a
+    process with Developer Mode on or an elevated token may, so one dangling
+    probe link is made and removed, once per directory per process (the
+    answer cannot change within one). Probed in the directory the real link
+    goes in, so a filesystem or permission difference cannot say yes here
+    and no there.
+    """
+    if sys.platform != "win32":
+        return True
+    return _probe_link(
+        directory, "symlink", lambda probe: os.symlink("cswap-link-probe", probe)
+    )
+
+
+def can_junction(
+    directory: os.PathLike | str, target: os.PathLike | str | None = None
+) -> bool:
+    """Whether a directory link from ``directory`` to ``target`` can be made.
+
+    Always true off Windows (a symlink). A junction needs no privilege but
+    does need a volume with reparse points -- NTFS or ReFS; FAT and network
+    shares refuse -- and a target Windows accepts, so one is made from
+    ``directory`` to ``target`` (``directory`` itself when none is given)
+    and removed, once per directory and target per process. Pass the parent
+    of the real targets, so the probe fails where the real link would.
+    """
+    if sys.platform != "win32":
+        return True
+    to = os.path.abspath(target if target is not None else directory)
+    return _probe_link(
+        directory,
+        f"junction:{os.path.normcase(to)}",
+        lambda probe: make_dir_link(to, probe),
+    )
