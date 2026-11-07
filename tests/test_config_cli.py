@@ -50,6 +50,7 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "ui.showOrgTag",
             "run.shareHistory",
             "updates.check",
             "usage.headerProbe",
