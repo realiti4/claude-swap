@@ -165,12 +165,91 @@ def test_an_unreadable_window_from_the_header_probe_is_classified(monkeypatch):
     assert outcome.error == "bad-response"
 
 
-def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
-    monkeypatch, tmp_path,
+def test_a_probe_without_a_5h_header_reads_as_weekly_only(monkeypatch):
+    # An Ultra account has no 5h limit, so its probe carries no 5h header.
+    data = oauth.parse_unified_ratelimit_headers({
+        "anthropic-ratelimit-unified-status": "allowed",
+        "anthropic-ratelimit-unified-7d-utilization": "0.88",
+        "anthropic-ratelimit-unified-7d-reset": "1791154800",
+        "anthropic-ratelimit-unified-representative-claim": "seven_day",
+    })
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    outcome = oauth._usage_from_probe("token", "for account 2")
+    assert outcome.error is None
+    assert "five_hour" not in outcome.usage
+    assert oauth.account_headroom(outcome.usage) == 12.0
+
+
+@pytest.mark.parametrize("window", ["5h", "7d"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param("nan", id="nan"),
+        pytest.param("inf", id="infinity"),
+        pytest.param("-0.1", id="negative"),
+        pytest.param("", id="empty-string"),
+        pytest.param("high", id="string"),
+    ],
+)
+def test_an_unusable_header_utilization_fails_the_reading(monkeypatch, window, bad):
+    # Dropping it would read a 5h account as one with no 5h window.
+    data = oauth.parse_unified_ratelimit_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "0.2",
+        "anthropic-ratelimit-unified-7d-utilization": "0.4",
+        f"anthropic-ratelimit-unified-{window}-utilization": bad,
+    })
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    outcome = oauth._usage_from_probe("token", "for account 2")
+    assert outcome.usage is None
+    assert outcome.error == "bad-response"
+
+
+@pytest.mark.parametrize("header, value", [
+    pytest.param("reset", "1791154800", id="reset-only"),
+    pytest.param("status", "allowed", id="status-allowed-only"),
+    pytest.param("status", "rejected", id="status-rejected-only"),
+])
+def test_a_5h_header_without_a_utilization_fails_the_reading(
+    monkeypatch, header, value,
 ):
-    # A 429 rejection outranks its unreadable utilization header: the refusal
-    # and its Retry-After are kept, so a healthy cached reading cannot leave the
-    # refused account eligible for a switch.
+    # A 5h window that is present but has no figure is not "no 5h window".
+    data = oauth.parse_unified_ratelimit_headers({
+        "anthropic-ratelimit-unified-7d-utilization": "0.4",
+        f"anthropic-ratelimit-unified-5h-{header}": value,
+    })
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    outcome = oauth._usage_from_probe("token", "for account 2")
+    assert outcome.usage is None
+    assert outcome.error == "bad-response"
+
+
+def test_a_fable_bucket_header_is_not_a_7d_window_header(monkeypatch):
+    data = oauth.parse_unified_ratelimit_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "0.2",
+        "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
+    })
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    outcome = oauth._usage_from_probe("token", "for account 2")
+    assert outcome.error is None
+    assert "seven_day" not in outcome.usage
+
+
+@pytest.mark.parametrize("five_hour", [
+    pytest.param({"utilization": "1e308"}, id="overflow"),
+    pytest.param({"utilization": "nan"}, id="nan"),
+    pytest.param({"utilization": "inf"}, id="infinity"),
+    pytest.param({"utilization": "-0.1"}, id="negative"),
+    pytest.param({"utilization": ""}, id="empty-string"),
+    pytest.param({"utilization": "high"}, id="string"),
+    pytest.param({"status": "rejected"}, id="status-without-a-figure"),
+])
+def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
+    monkeypatch, tmp_path, five_hour,
+):
+    # A 429 rejection outranks its unreadable 5h window, whether the figure
+    # overflows, fails to parse or is missing beside a 5h status header: the
+    # refusal and its Retry-After are kept, so a healthy cached reading cannot
+    # leave the refused account eligible for a switch.
     import email.message
     import time
 
@@ -188,7 +267,7 @@ def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
     headers = email.message.Message()
     for key, value in {
         "anthropic-ratelimit-unified-status": "rejected",
-        "anthropic-ratelimit-unified-5h-utilization": "1e308",
+        **{f"anthropic-ratelimit-unified-5h-{k}": v for k, v in five_hour.items()},
         "anthropic-ratelimit-unified-7d-utilization": "0.6",
         "anthropic-ratelimit-unified-reset": str(int(now + 1800)),
         "Retry-After": "600",
