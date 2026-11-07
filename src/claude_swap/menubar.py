@@ -27,6 +27,7 @@ import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar
 
 from claude_swap import launch_agent, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
@@ -234,6 +235,80 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
 
 MENU_NOTE_LIMIT = 40
 
+# A refresh older than this many intervals is called stale in the health row.
+STALE_REFRESH_INTERVALS = 3
+
+
+@dataclass(frozen=True)
+class EngineStoppedEvent:
+    """Queued by the menu bar's engine thread when its ``run_loop`` ends.
+
+    Carries the engine object, not just a flag: a restart starts the
+    replacement before the old thread has finished, so the old thread's exit
+    must be matched against the engine the app hosts *now* before anything is
+    cleared (see :func:`engine_exit_applies`). ``error`` is the exception that
+    ended the loop, or None when it returned on its own.
+    """
+
+    kind: ClassVar[str] = "engine-stopped"
+    engine: object
+    error: str | None = None
+
+    def human(self) -> str:
+        return self.error or "the engine loop ended on its own"
+
+
+def engine_exit_applies(current, stopped) -> bool:
+    """Whether a stopped engine is the one the menu bar currently hosts.
+
+    False for a predecessor that finished after a restart, and for an engine
+    the app already let go of through its own stop.
+    """
+    return current is not None and current is stopped
+
+
+def _age_text(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "just now"
+    minutes, hours, days = seconds // 60, seconds // 3600, seconds // 86400
+    if hours < 1:
+        return f"{minutes}m ago"
+    if days < 1:
+        return f"{hours}h {minutes % 60}m ago"
+    return f"{days}d {hours % 24}h ago"
+
+
+def health_label(
+    *,
+    auto_enabled: bool,
+    engine_running: bool,
+    snapshot_age: float | None,
+    refresh_interval: int,
+) -> tuple[str, bool]:
+    """The menu's first row: ``(label, attention)``.
+
+    Four states hide behind "the icon is there": auto-switch off in settings,
+    enabled with the engine running, enabled with no engine (it failed to
+    start or its thread died), and usage that stopped refreshing. The row
+    names the first three and dates the fourth; ``attention`` is True for the
+    state that needs a click, so the caller can wire a restart to the row and
+    flag the title.
+    """
+    if not auto_enabled:
+        status, attention = "Auto-switch off", False
+    elif engine_running:
+        status, attention = "Auto-switch running", False
+    else:
+        status, attention = "⚠ Auto-switch stopped, click to restart", True
+    if snapshot_age is None:
+        usage = "usage not refreshed yet"
+    elif snapshot_age > STALE_REFRESH_INTERVALS * refresh_interval:
+        usage = f"usage stale, last {_age_text(snapshot_age)}"
+    else:
+        usage = f"usage {_age_text(snapshot_age)}"
+    return f"{status} · {usage}", attention
+
 
 def menu_note(note: str, limit: int = MENU_NOTE_LIMIT) -> str:
     """The state half of a sentinel note, sized for a menu row.
@@ -351,10 +426,17 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    *,
+    attention: bool = False,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    ``attention`` prefixes a warning sign: auto-switch is enabled but not
+    running, which the closed menu would otherwise never show.
+    """
+    icon = f"⚠ {ICON}" if attention else ICON
     if active_email is None:
-        return ICON
+        return icon
     if now is None:
         now = time.time()
     segments: list[str] = []
@@ -380,8 +462,8 @@ def format_title(
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
     if not segments:
-        return ICON
-    return f"{ICON} " + " · ".join(segments)
+        return icon
+    return f"{icon} " + " · ".join(segments)
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -669,6 +751,9 @@ def run(switcher) -> int:
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
             # background thread while enabled.
             self._engine = None
+            # Why the engine is not running although auto-switch is enabled:
+            # a failed start or a thread that died. Shown in the health row.
+            self._engine_failure: str | None = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
             self._engine_errors_surfaced: dict[str, float] = {}
@@ -780,20 +865,30 @@ def run(switcher) -> int:
             except Exception as e:  # never let a bad start crash the menu bar
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
                 rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
+                self._engine_failure = str(e)
+                self._dirty = True  # the health row picks it up on the next tick
                 return
             self._engine = engine
+            self._engine_failure = None
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
 
         def _run_engine(self, engine):
+            # Engine thread. Whatever ends the loop, tell the main thread which
+            # engine ended; it decides whether that is still the hosted one.
+            error = None
             try:
                 engine.run_loop()
-            except Exception:
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
                 self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
+            finally:
+                self._on_engine_event(EngineStoppedEvent(engine, error))
 
         def _stop_engine(self):
             if self._engine is not None:
                 self._engine.stop()
                 self._engine = None
+            self._engine_failure = None
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
@@ -832,6 +927,26 @@ def run(switcher) -> int:
                     ):
                         self.switcher._logger.warning("auto-switch %s", ev.human())
                         rumps.notification("claude-swap", "Auto-switch error", ev.human())
+                elif ev.kind == "engine-stopped":
+                    # The thread behind the hosted engine ended without us
+                    # stopping it. Before this the reference stayed set: the
+                    # display kept reading store-only for an engine that no
+                    # longer fetched, and the menu kept looking enabled.
+                    if engine_exit_applies(self._engine, ev.engine):
+                        self._engine = None
+                        self._engine_failure = ev.human()
+                        self.switcher._logger.warning(
+                            "auto-switch stopped (%s); the menu bar keeps showing "
+                            "usage but will not switch until it is restarted",
+                            self._engine_failure,
+                        )
+                        rumps.notification(
+                            "claude-swap",
+                            "Auto-switch stopped",
+                            f"{self._engine_failure}. Open the menu to restart it.",
+                        )
+                        self.rebuild_menu()
+                        self.refresh_async()  # display fetching resumes on its own
 
         def _threshold(self) -> int:
             """Current auto-switch threshold from core settings (for the menu)."""
@@ -842,11 +957,18 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
+            health, attention = health_label(
+                auto_enabled=self.settings.auto_switch_enabled,
+                engine_running=self._engine is not None,
+                snapshot_age=(time.time() - self._snapshot_at) if self._snapshot_at else None,
+                refresh_interval=self.settings.refresh_interval,
+            )
             self.title = format_title(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                attention=attention,
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -884,7 +1006,15 @@ def run(switcher) -> int:
             if not account_items:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))
 
+            health_item = rumps.MenuItem(
+                health, callback=self.on_restart_engine if attention else None
+            )
+            if attention and self._engine_failure:
+                _set_tooltip(health_item, self._engine_failure)
+
             self.menu = [
+                health_item,
+                None,
                 *account_items,
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._switch(None)),
@@ -1174,6 +1304,12 @@ def run(switcher) -> int:
                 self._start_engine()
             else:
                 self._stop_engine()
+            self.rebuild_menu()
+
+        def on_restart_engine(self, _sender):
+            # The health row's click while auto-switch is enabled but not running.
+            self._engine_failure = None
+            self._start_engine()
             self.rebuild_menu()
 
         def _make_threshold(self, pct):

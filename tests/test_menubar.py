@@ -803,3 +803,74 @@ def test_set_tooltip_reaches_the_native_item_and_tolerates_its_absence():
     menubar._set_tooltip(item, "re-login needed — the full remedy")
     assert item._menuitem.tip == "re-login needed — the full remedy"
     menubar._set_tooltip(object(), "ignored")  # no native item behind it: no error
+
+
+# --- health row: auto-switch state + refresh age -------------------------------
+
+
+def test_health_label_off():
+    label, attention = menubar.health_label(
+        auto_enabled=False, engine_running=False, snapshot_age=90, refresh_interval=60
+    )
+    assert label == "Auto-switch off · usage 1m ago"
+    assert attention is False
+
+
+def test_health_label_running():
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=True, snapshot_age=30, refresh_interval=60
+    )
+    assert label == "Auto-switch running · usage just now"
+    assert attention is False
+
+
+def test_health_label_enabled_but_not_running_needs_attention():
+    # The state that used to look healthy: the toggle on, no engine behind it.
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=False, snapshot_age=30, refresh_interval=60
+    )
+    assert label.startswith("⚠ Auto-switch stopped, click to restart")
+    assert attention is True
+
+
+def test_health_label_dates_a_stale_refresh_and_a_missing_one():
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, snapshot_age=241, refresh_interval=60
+    )
+    assert "usage stale, last 4m ago" in label  # past 3 intervals
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, snapshot_age=None, refresh_interval=60
+    )
+    assert label.endswith("usage not refreshed yet")
+
+
+@pytest.mark.parametrize(
+    "seconds, text",
+    [(5, "just now"), (120, "2m ago"), (3900, "1h 5m ago"), (90000, "1d 1h ago")],
+)
+def test_age_text(seconds, text):
+    assert menubar._age_text(seconds) == text
+
+
+def test_engine_exit_applies_only_to_the_hosted_engine():
+    old, new = object(), object()
+    assert menubar.engine_exit_applies(old, old) is True
+    # Restart race: the predecessor's thread finishes after the replacement
+    # started; its exit must not clear the replacement.
+    assert menubar.engine_exit_applies(new, old) is False
+    # Already let go through the app's own stop.
+    assert menubar.engine_exit_applies(None, old) is False
+
+
+def test_engine_stopped_event_names_the_error_or_the_plain_end():
+    engine = object()
+    assert menubar.EngineStoppedEvent(engine, "RuntimeError: boom").human() == "RuntimeError: boom"
+    assert menubar.EngineStoppedEvent(engine).human() == "the engine loop ended on its own"
+    assert menubar.EngineStoppedEvent.kind == "engine-stopped"
+
+
+def test_format_title_attention_prefix():
+    settings = menubar.MenuBarSettings()
+    assert menubar.format_title(None, None, settings, attention=True) == "⚠ ⇄"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, settings, attention=True).startswith("⚠ ⇄ ")
+    assert not menubar.format_title("loc@papaya.asia", _USAGE, settings).startswith("⚠")
