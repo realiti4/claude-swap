@@ -1679,6 +1679,45 @@ class TestListAccountsUsage:
         assert "login lapses" in account2
         assert "cswap add" in account2
 
+    def test_list_skips_the_lapse_note_when_the_login_is_already_dead(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A slot already shown as "re-login needed" carries the same remedy;
+        a lapse note under it would say it twice."""
+        import time as _time
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        far_ms = int((_time.time() + 30 * 86400) * 1000)
+        for lapse_ms in (
+            int((_time.time() + 2 * 86400) * 1000),
+            int((_time.time() - 86400) * 1000),
+        ):
+            active_creds = json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-active", "refreshTokenExpiresAt": far_ms,
+            }})
+            backup_creds = json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-backup", "refreshTokenExpiresAt": lapse_ms,
+            }})
+
+            switcher = ClaudeAccountSwitcher()
+            switcher._setup_directories()
+            switcher._write_json(switcher.sequence_file, sample_sequence_data)
+            entries = {
+                "1": UsageEntry(),
+                "2": UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED),
+            }
+
+            with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+                 patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+                 patch.object(switcher, "_collect_usage_entries", return_value=entries):
+                switcher.list_accounts()
+
+            account2 = capsys.readouterr().out.split("  2: ", 1)[1]
+            assert "re-login needed" in account2
+            assert "login lapse" not in account2
+            assert account2.count("cswap add") == 1
+
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):

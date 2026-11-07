@@ -6145,9 +6145,11 @@ class ClaudeAccountSwitcher:
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
-            lapse_note = oauth.login_expiry_note(creds)
-            if lapse_note is not None:
-                print(f"     {yellowed(lapse_note)}")
+            # A dead login already reads "re-login needed" with the same remedy.
+            if entries[str(num)].sentinel != USAGE_RELOGIN_REQUIRED:
+                lapse_note = oauth.login_expiry_note(creds)
+                if lapse_note is not None:
+                    print(f"     {yellowed(lapse_note)}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):
