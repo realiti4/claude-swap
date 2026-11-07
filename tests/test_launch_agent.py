@@ -9,6 +9,7 @@ or writes outside the temp directory.
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import stat
@@ -964,8 +965,7 @@ def test_a_first_install_has_no_profile_to_compare_against(tmp_path, monkeypatch
 def _stamp(data, pid, version="0.0.0", source=None):
     path = launch_agent.worker_stamp_path(data)
     path.write_text(
-        '{"pid": %d, "started_at": 1.0, "version": "%s", "source": %s}'
-        % (pid, version, "null" if source is None else '"%s"' % source)
+        json.dumps({"pid": pid, "started_at": 1.0, "version": version, "source": source})
     )
     return path
 
@@ -973,7 +973,7 @@ def _stamp(data, pid, version="0.0.0", source=None):
 def test_write_worker_stamp_records_this_process_and_build(tmp_path):
     from claude_swap.update_check import install_identity
 
-    home, data = _homes(tmp_path)
+    _home, data = _homes(tmp_path)
     launch_agent.write_worker_stamp(data)
     stamp = launch_agent.read_worker_stamp(data)
     assert stamp["pid"] == os.getpid()
@@ -982,7 +982,7 @@ def test_write_worker_stamp_records_this_process_and_build(tmp_path):
 
 
 def test_worker_build_is_stale_only_for_the_running_pids_own_older_stamp(tmp_path, monkeypatch):
-    home, data = _homes(tmp_path)
+    _home, data = _homes(tmp_path)
     _stamp(data, pid=4242, version="0.0.0")
     monkeypatch.setattr(
         "claude_swap.update_check.install_identity",
@@ -996,7 +996,7 @@ def test_worker_build_is_stale_only_for_the_running_pids_own_older_stamp(tmp_pat
 
 def test_worker_build_compares_the_commit_too(tmp_path, monkeypatch):
     # A git install keeps its version string across commits.
-    home, data = _homes(tmp_path)
+    _home, data = _homes(tmp_path)
     _stamp(data, pid=4242, version="1.0.0b1", source="aaaaaaa")
     monkeypatch.setattr(
         "claude_swap.update_check.install_identity",

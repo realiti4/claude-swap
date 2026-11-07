@@ -345,7 +345,7 @@ def install_identity() -> dict:
     differ only here — anyone installed from a branch, for instance — so a
     "did the build change?" question compares both.
     """
-    import importlib.metadata as metadata
+    from importlib import metadata
 
     from claude_swap import __version__
 
@@ -354,8 +354,8 @@ def install_identity() -> dict:
         raw = metadata.distribution("claude-swap").read_text("direct_url.json")
         if raw:
             source = (json.loads(raw).get("vcs_info") or {}).get("commit_id") or None
-    except Exception:
-        source = None
+    except (OSError, ImportError, ValueError, AttributeError, TypeError):
+        source = None  # no metadata, or not the shape pip/uv write: not a git install
     return {"version": __version__, "source": source}
 
 
@@ -409,13 +409,15 @@ def _restart_menubar_if_rebuilt(before: dict) -> None:
     if after is None or after == before:
         return
     from claude_swap import launch_agent
+    from claude_swap.exceptions import ClaudeSwitchError
 
     try:
         pid = launch_agent.service_pid()
         if pid is None:
             return
         launch_agent.kickstart(restart=True)
-    except Exception as exc:  # the upgrade itself succeeded; only the restart did not
+    except (ClaudeSwitchError, OSError) as exc:
+        # The upgrade itself succeeded; only the restart did not.
         warning(f"Menu bar not restarted onto the new build: {exc}")
         return
     print(f"Menu bar restarted onto {describe_identity(after)} (was pid {pid}).")

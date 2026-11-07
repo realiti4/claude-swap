@@ -844,15 +844,19 @@ class TestInstallIdentity:
     def test_unreadable_metadata_is_not_fatal(self):
         from claude_swap import update_check
 
-        with patch("importlib.metadata.distribution", side_effect=RuntimeError("no dist")):
+        from importlib.metadata import PackageNotFoundError
+
+        with patch("importlib.metadata.distribution", side_effect=PackageNotFoundError("claude-swap")):
             assert update_check.install_identity()["source"] is None
         assert update_check.describe_identity(None) == "unknown"
 
 
+_OLD_BUILD = {"version": "0.27.2", "source": None}
+_NEW_BUILD = {"version": "0.28.0", "source": None}
+
+
 @patch("claude_swap.update_check.sys.platform", "darwin")
 class TestUpgradeRestartsARunningMenuBar:
-    OLD = {"version": "0.27.2", "source": None}
-    NEW = {"version": "0.28.0", "source": None}
 
     def _launchd(self, monkeypatch, pid):
         calls = []
@@ -866,8 +870,8 @@ class TestUpgradeRestartsARunningMenuBar:
         from claude_swap import update_check
 
         calls = self._launchd(monkeypatch, 4242)
-        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: self.NEW)
-        update_check._restart_menubar_if_rebuilt(self.OLD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
         assert calls == [{"restart": True}]
         assert "Menu bar restarted onto 0.28.0 (was pid 4242)" in capsys.readouterr().out
 
@@ -876,18 +880,18 @@ class TestUpgradeRestartsARunningMenuBar:
         from claude_swap import update_check
 
         calls = self._launchd(monkeypatch, None)
-        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: self.NEW)
-        update_check._restart_menubar_if_rebuilt(self.OLD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
         assert calls == []
 
     def test_does_nothing_when_the_build_did_not_change_or_is_unknown(self, monkeypatch):
         from claude_swap import update_check
 
         calls = self._launchd(monkeypatch, 4242)
-        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: self.OLD)
-        update_check._restart_menubar_if_rebuilt(self.OLD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _OLD_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
         monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: None)
-        update_check._restart_menubar_if_rebuilt(self.OLD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
         assert calls == []
 
     def test_a_same_version_git_install_still_counts_as_changed(self, monkeypatch):
@@ -912,8 +916,8 @@ class TestUpgradeRestartsARunningMenuBar:
             raise ClaudeSwitchError("launchctl kickstart failed (exit 3)")
 
         monkeypatch.setattr("claude_swap.launch_agent.kickstart", boom)
-        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: self.NEW)
-        update_check._restart_menubar_if_rebuilt(self.OLD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
         captured = capsys.readouterr()
         assert "not restarted" in captured.out + captured.err
 
@@ -924,8 +928,8 @@ class TestUpgradeRestartsARunningMenuBar:
 
         mock_run.return_value = MagicMock(returncode=0)
         calls = self._launchd(monkeypatch, 4242)
-        monkeypatch.setattr(update_check, "install_identity", lambda: self.OLD)
-        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: self.NEW)
+        monkeypatch.setattr(update_check, "install_identity", lambda: _OLD_BUILD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
         with patch("claude_swap.update_check._installed_version_on_disk", return_value="0.28.0"):
             assert run_self_upgrade("0.27.2") == 0
         assert calls == [{"restart": True}]
