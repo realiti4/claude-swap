@@ -174,8 +174,9 @@ Examples:
             "already accumulated is merged into ~/.claude first. "
             "--no-share-history keeps this account's history separate for "
             "this launch, `cswap config set run.shareHistory false` for "
-            "every launch. Not supported on Windows, where each account "
-            "keeps its own history."
+            "every launch. On Windows, projects/ is shared either way and "
+            "history.jsonl only when symlinks are allowed (Developer Mode, "
+            "or an elevated terminal)."
         ),
     )
     parser.add_argument(
@@ -1103,6 +1104,49 @@ def _use_native_tls() -> None:
         pass
 
 
+def _menubar_settings_path():
+    from claude_swap.paths import get_backup_root
+
+    return get_backup_root() / "menubar_settings.json"
+
+
+def _set_menubar_auto_switch(enabled: bool) -> bool:
+    """Set the menu bar's auto-switch toggle and return its previous value."""
+    from claude_swap.menubar import MenuBarSettings
+
+    path = _menubar_settings_path()
+    settings = MenuBarSettings.load(path)
+    previous = settings.auto_switch_enabled
+    settings.auto_switch_enabled = enabled
+    settings.save(path)
+    return previous
+
+
+def _print_menubar_auto_switch(*, suggest_flag: bool) -> None:
+    """Say whether the menu bar will switch accounts or only show usage.
+
+    The toggle defaults to off and lives only in the menu, so a service
+    installed from a terminal can run for weeks as a display while its owner
+    believes it is switching (it only shows when an account hits its limit).
+    """
+    from claude_swap.menubar import MenuBarSettings
+
+    if MenuBarSettings.load(_menubar_settings_path()).auto_switch_enabled:
+        print("  auto-switch: on")
+        return
+    hint = (
+        "turn it on from the menu, or re-run with --auto-switch"
+        if suggest_flag
+        else "turn it on from the menu, or run "
+        "`cswap menubar --install-service --auto-switch`"
+    )
+    warning(
+        f"  auto-switch: off -- the menu bar shows usage but will not switch "
+        f"accounts; {hint}",
+        file=sys.stderr,
+    )
+
+
 def _menubar_service(args) -> int:
     """Handle ``menubar --install-service|--uninstall-service|--service-status``.
 
@@ -1120,10 +1164,22 @@ def _menubar_service(args) -> int:
         from claude_swap.menubar import framework_build_warning
 
         unsupported = framework_build_warning()
-        result = launch_agent.install()
+        # Before install(): it restarts a running service, and the menu bar
+        # reads its toggle once at launch.
+        previous = None
+        if args.auto_switch is not None:
+            previous = _set_menubar_auto_switch(args.auto_switch)
+        try:
+            result = launch_agent.install()
+        except BaseException:
+            # Don't leave the toggle changed with no service behind it.
+            if previous is not None and previous != args.auto_switch:
+                _set_menubar_auto_switch(previous)
+            raise
         print(f"Menu bar service installed ({result['label']}).")
         print(f"  plist: {result['plist']}")
         print(f"  logs:  {result['stderr_log']}")
+        _print_menubar_auto_switch(suggest_flag=True)
         print(
             dimmed(
                 "It starts at login from now on. Re-run this after a cswap "
@@ -1156,6 +1212,7 @@ def _menubar_service(args) -> int:
     pid = f" (pid {result['pid']})" if result["pid"] else ""
     print(f"Menu bar service: {state}{pid}")
     print(f"  plist: {result['plist']}")
+    _print_menubar_auto_switch(suggest_flag=False)
     if not result["installed"]:
         print(dimmed("launchd still has it loaded, but the plist is gone."))
     return 0
@@ -1387,6 +1444,24 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--auto-switch",
+        dest="auto_switch",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "With 'menubar --install-service': turn the menu bar's "
+            "auto-switch on (it defaults to off)"
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-switch",
+        dest="auto_switch",
+        action="store_const",
+        const=False,
+        help="With 'menubar --install-service': turn the menu bar's auto-switch off",
+    )
+    parser.add_argument(
         "--uninstall-service",
         action="store_true",
         help="With 'menubar': stop the LaunchAgent and remove its plist (macOS)",
@@ -1523,6 +1598,25 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
 
+    # An empty value satisfies the guard above (the option *is* set) but matches
+    # no truthiness-tested branch of the dispatch chain below, so cswap would
+    # fall out of it and exit 0 having done nothing: `cswap export "$DEST"` with
+    # an unset DEST must not look like a completed backup. Rejected here, ahead
+    # of the modifier guards, so the error names the empty value instead of
+    # blaming an --account/--force/--full that was used correctly. --add-token is
+    # exempt: its const="" means "prompt me for the token".
+    for subcommand, metavar, value in (
+        ("remove", "NUM|EMAIL", args.remove_account),
+        ("disable", "NUM|EMAIL", args.disable_account),
+        ("enable", "NUM|EMAIL", args.enable_account),
+        ("switch", "NUM|EMAIL", args.switch_to),
+        ("export", "PATH", args.export),
+        ("import", "PATH", args.import_),
+        ("import-usage", "PATH", args.import_usage),
+    ):
+        if value is not None and not value:
+            parser.error(f"'{subcommand}' requires a non-empty {metavar}")
+
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
@@ -1575,6 +1669,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         parser.error(
             "--install-service, --uninstall-service and --service-status "
             "can only be used with 'menubar'"
+        )
+
+    if args.auto_switch is not None and not args.install_service:
+        parser.error(
+            "--auto-switch/--no-auto-switch can only be used with "
+            "'menubar --install-service'"
         )
 
     # Self-upgrade runs before switcher init so we don't touch config/keychain

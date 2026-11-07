@@ -623,6 +623,106 @@ class TestCLI:
         assert exc.value.code == 2
         assert "can only be used with 'menubar'" in capsys.readouterr().err
 
+    def _menubar_settings(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("claude_swap.paths.get_backup_root", lambda: tmp_path)
+        return tmp_path / "menubar_settings.json"
+
+    def test_install_service_auto_switch_turns_the_toggle_on_before_install(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # install() restarts a running service and the menu bar reads the
+        # toggle once at launch, so the write has to land first.
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        seen = self._service_harness(
+            monkeypatch, ["cswap", "menubar", "--install-service", "--auto-switch"]
+        )
+        at_install = {}
+
+        def fake_install():
+            at_install["enabled"] = json.loads(path.read_text())["auto_switch_enabled"]
+            seen["called"] = "install"
+            return {"label": "com.cswap.menubar", "plist": "/tmp/p.plist", "stderr_log": "/tmp/e.log"}
+
+        monkeypatch.setattr("claude_swap.launch_agent.install", fake_install)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert at_install == {"enabled": True}
+        assert "auto-switch: on" in capsys.readouterr().out
+
+    def test_install_service_says_when_auto_switch_is_off(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # The toggle defaults to off and lives only in the menu: a service
+        # installed from a terminal otherwise runs as a display for weeks.
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert "auto-switch: off" in captured.err
+        assert "--auto-switch" in captured.err
+        assert not path.exists()  # reporting never writes the setting
+
+    def test_service_status_reports_auto_switch(self, monkeypatch, tmp_path, capsys):
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        path.write_text(json.dumps({"auto_switch_enabled": True}))
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        assert "auto-switch: on" in capsys.readouterr().out
+
+    def test_auto_switch_flag_requires_install_service(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["cswap", "menubar", "--auto-switch"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 2
+        assert "--auto-switch/--no-auto-switch can only be used with" in capsys.readouterr().err
+
+    def test_install_service_no_auto_switch_turns_the_toggle_off(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        path.write_text(json.dumps({"auto_switch_enabled": True, "title_pct": "5h"}))
+        self._service_harness(
+            monkeypatch, ["cswap", "menubar", "--install-service", "--no-auto-switch"]
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        saved = json.loads(path.read_text())
+        assert saved["auto_switch_enabled"] is False
+        assert saved["title_pct"] == "5h"  # other settings survive
+        assert "auto-switch: off" in capsys.readouterr().err
+
+    def test_install_service_failure_restores_the_toggle(self, monkeypatch, tmp_path):
+        # A failed install must not leave auto-switch changed with no
+        # service running behind it.
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        self._service_harness(
+            monkeypatch, ["cswap", "menubar", "--install-service", "--auto-switch"]
+        )
+
+        def failing_install():
+            raise RuntimeError("bootstrap failed")
+
+        monkeypatch.setattr("claude_swap.launch_agent.install", failing_install)
+
+        with pytest.raises(BaseException):
+            cli.main()
+
+        assert json.loads(path.read_text())["auto_switch_enabled"] is False
+
     def test_plain_menubar_does_not_touch_the_service(self, monkeypatch):
         seen = self._service_harness(monkeypatch, ["cswap", "menubar"])
 
@@ -1828,6 +1928,72 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestEmptyValueArguments:
+    """A required value that arrives empty is a usage error, not a no-op.
+
+    ``cswap export "$DEST"`` with an unset DEST used to match no branch of the
+    dispatch chain and return from main() normally: exit 0, nothing printed,
+    no file written, and no way for the calling script to notice.
+    """
+
+    def _run(self, argv, capsys):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            code = 0
+            try:
+                cli.main()
+            except SystemExit as exc:
+                code = exc.code or 0
+        return code, capsys.readouterr(), switcher_cls
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["remove", ""],
+            ["disable", ""],
+            ["enable", ""],
+            ["switch", ""],
+            ["export", ""],
+            ["import", ""],
+            ["import-usage", ""],
+            ["--remove-account", ""],
+            ["--disable-account", ""],
+            ["--enable-account", ""],
+            ["--switch-to", ""],
+            ["--export", ""],
+            ["--import", ""],
+            ["--import-usage", ""],
+        ],
+    )
+    def test_empty_value_is_rejected(self, argv, capsys):
+        code, captured, switcher_cls = self._run(argv, capsys)
+        assert code == 2, f"{argv} exited {code} having printed {captured.out!r}"
+        assert "requires a non-empty" in captured.err
+        switcher_cls.assert_not_called()
+
+    def test_empty_value_is_blamed_before_its_modifiers(self, capsys):
+        """The empty PATH is the error, not the --account that accompanied it."""
+        _, captured, _ = self._run(["export", "", "--account", "1"], capsys)
+        assert "'export' requires a non-empty PATH" in captured.err
+
+    def test_add_token_still_accepts_an_empty_value(self, capsys):
+        """``--add-token`` uses const="" to mean "prompt me", so it is exempt."""
+        code, captured, switcher_cls = self._run(["--add-token"], capsys)
+        assert code == 0, captured.err
+        switcher_cls.return_value.add_account_from_token.assert_called_once_with(
+            token="", email=None, slot=None
+        )
+
+    def test_a_whitespace_only_path_is_still_a_path(self, capsys):
+        """A filename of spaces is legal on POSIX; only an empty value is rejected."""
+        with patch("claude_swap.transfer.export_accounts") as export_accounts:
+            code, captured, _ = self._run(["export", " "], capsys)
+        assert code == 0, captured.err
+        assert export_accounts.call_args.args[1] == " "
 
 
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):

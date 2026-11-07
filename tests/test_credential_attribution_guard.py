@@ -424,7 +424,7 @@ EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
     ("switcher.py", "persist_backup_credentials"): 1,
     ("switcher.py", "_consume_backup_grant_locked"): 2,
     ("switcher.py", "_adopt_stashed_successor"): 1,
-    ("switcher.py", "_adopt_session_credential"): 1,
+    ("switcher.py", "_adopt_session_credential_locked"): 1,
     ("switcher.py", "add_account"): 2,
     ("switcher.py", "add_account_from_token"): 2,
     ("switcher.py", "_fetch_active_usage"): 2,
