@@ -1567,7 +1567,13 @@ class CredentialStore:
             enc_present = True
         if enc_present:
             try:
-                encoded = enc_file.read_text(encoding="utf-8").strip()
+                # BYTES, not text: `read_text` decodes inside the read and
+                # `UnicodeDecodeError` is a `ValueError`, so a .enc of garbled
+                # bytes escaped this arm AND the corrupt-content arm below, and
+                # raised out of a reader whose contract is `""`. Garbled bytes
+                # are what that second arm exists for, and `b64decode` rejects
+                # them there. Same split as `_read_stash_manifest_ex`.
+                encoded = enc_file.read_bytes().strip()
             except OSError as e:
                 # The .enc EXISTS but could not be read (permissions, a
                 # mid-unmount, ...) — a real read failure, not "no backup".
