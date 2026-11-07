@@ -73,7 +73,7 @@ cswap switch user@example.com
 cswap switch dev                # or by alias, once set with `cswap alias 2 dev`
 ```
 
-Not sure which one? `cswap list` is the dashboard — every account's 5-hour and 7-day usage and reset times at a glance:
+Not sure which one? `cswap list` is the dashboard — every account's plan, 5-hour and 7-day usage and reset times at a glance:
 
 ```bash
 cswap list
@@ -137,9 +137,9 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 
 Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
 
-The exact rules (margins, landing, polling cadence, tier handling) are in [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md).
-
 </details>
+
+The exact rules (margins, landing, polling cadence, tier handling) are in [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md).
 
 ### Run multiple accounts at the same time (session mode)
 
@@ -255,6 +255,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died until you [re-add them](#refresh-expired-tokens)
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
+- The plan shown after each slot (`· Ultra`, `· Pro`, `· Team`) comes from your account profile and refreshes every six hours, independently of usage; a subscription that has lapsed shows as a highlighted `Free`.
 
 ## Data locations
 
@@ -413,6 +414,13 @@ cswap add-token --email user@example.com     # optional label override
 </details>
 
 **Note:** Third-party providers configured through `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` are not managed or switched; those exported variables stay in effect after a switch, so unset them to use the swapped account.
+
+## Documentation
+
+- [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
+- [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
+
+`cswap --help` and `cswap <command> --help` document every flag.
 
 ## Uninstall
 
