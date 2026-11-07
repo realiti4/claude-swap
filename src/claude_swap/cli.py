@@ -174,8 +174,9 @@ Examples:
             "already accumulated is merged into ~/.claude first. "
             "--no-share-history keeps this account's history separate for "
             "this launch, `cswap config set run.shareHistory false` for "
-            "every launch. Not supported on Windows, where each account "
-            "keeps its own history."
+            "every launch. On Windows, projects/ is shared either way and "
+            "history.jsonl only when symlinks are allowed (Developer Mode, "
+            "or an elevated terminal)."
         ),
     )
     parser.add_argument(
