@@ -289,7 +289,7 @@ cswap menubar --install-service     # register the login start again and restart
 cswap menubar --uninstall-service   # stop it and remove the LaunchAgent
 ```
 
-The plist lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` while Start at login is on and in the data directory while it is off; logs go to `~/Library/Logs/com.cswap.menubar.{log,err}`. After `cswap upgrade` the running process keeps the old build until it restarts: `cswap menubar --install-service`, or `launchctl kickstart -k gui/$(id -u)/com.cswap.menubar`. If you switched it off under System Settings → General → Login Items & Extensions → Allow in the Background, `cswap menubar` says so instead of starting it.
+The plist lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` while Start at login is on and in the data directory while it is off; logs go to `~/Library/Logs/com.cswap.menubar.{log,err}`. After `cswap upgrade` the running process keeps the old build until it restarts: `cswap menubar --install-service`, or `launchctl kickstart -k gui/$(id -u)/com.cswap.menubar`. If you switched it off under System Settings → General → Login Items & Extensions → Allow in the Background, `cswap menubar` still starts it when you ask, but says that macOS will not start it at login until you turn that back on.
 
 </details>
 

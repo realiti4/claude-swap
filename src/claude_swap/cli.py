@@ -1245,6 +1245,14 @@ def _menubar_start(args) -> int:
         print(f"Menu bar started{pid}.")
         if not result["start_at_login"]:
             print(dimmed("  Start at login is off, so this lasts until you log out."))
+    if result["switched_off"]:
+        # macOS allowed this start; the switch only governs the start at login.
+        warning(
+            f"  Switched off under {launch_agent.SYSTEM_SETTINGS_HINT}: it runs "
+            "now because you asked, but macOS will not start it at login until "
+            "you turn that back on.",
+            file=sys.stderr,
+        )
     _print_menubar_auto_switch(suggest_flag=True)
     if unsupported:
         # Said here too, not only at launch: the service survives reboots and
@@ -1335,10 +1343,10 @@ def _menubar_service(args) -> int:
     plist = result["plist"] if result["start_at_login"] else result["session_plist"]
     print(f"  plist: {plist or result['plist']}")
     _print_menubar_auto_switch(suggest_flag=False)
-    if result["disabled"]:
+    if result["switched_off"]:
         warning(
-            f"  turned off in {launch_agent.SYSTEM_SETTINGS_HINT}; "
-            "cswap menubar cannot start it until it is turned on there",
+            f"  switched off under {launch_agent.SYSTEM_SETTINGS_HINT}; "
+            "macOS will not start it at login until you turn that back on",
             file=sys.stderr,
         )
     if not result["configured"]:

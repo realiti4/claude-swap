@@ -486,13 +486,18 @@ class _FakeLaunchd:
     when asked to. Records every argv so tests can assert the sequence.
     """
 
-    def __init__(self, *, loaded=False, pid=None, disabled=False):
-        self.loaded, self.pid, self.disabled = loaded, pid, disabled
+    def __init__(self, *, loaded=False, pid=None, switched_off=False, launchd_disabled=False):
+        self.loaded, self.pid = loaded, pid
+        self.switched_off = switched_off  # the System Settings switch (BTM)
+        self.launchd_disabled = launchd_disabled  # launchd's own override list
         self.calls: list[list[str]] = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
         sub = argv[1]
+        if argv[0] == "sfltool":
+            disposition = "disallowed" if self.switched_off else "allowed"
+            return _completed(0, stdout=_btm_dump(disposition))
         if sub == "print":
             if not self.loaded:
                 return _completed(1)
@@ -501,7 +506,7 @@ class _FakeLaunchd:
                 lines.append(f"\tpid = {self.pid}")
             return _completed(0, stdout="\n".join(lines) + "\n")
         if sub == "print-disabled":
-            flag = "disabled" if self.disabled else "enabled"
+            flag = "disabled" if self.launchd_disabled else "enabled"
             listing = f'\tdisabled services = {{\n\t\t"{launch_agent.LABEL}" => {flag}\n\t}}\n'
             return _completed(0, stdout=listing)
         if sub == "bootstrap":
@@ -515,6 +520,27 @@ class _FakeLaunchd:
     @property
     def subcommands(self):
         return [c[1] for c in self.calls]
+
+
+def _btm_dump(disposition: str, label: str = launch_agent.LABEL) -> str:
+    """Two records in `sfltool dumpbtm`'s shape; ours carries ``disposition``."""
+    return (
+        " #1:\n"
+        "                 Name: Docker\n"
+        "                 Type: legacy daemon (0x10010)\n"
+        "          Disposition: [enabled, allowed, notified] (0xb)\n"
+        "           Identifier: 16.com.docker.socket\n"
+        "                  URL: /Library/LaunchDaemons/com.docker.socket.plist\n"
+        "\n"
+        " #2:\n"
+        "                 Name: cswap\n"
+        "       Developer Name: (null)\n"
+        "                 Type: legacy agent (0x10008)\n"
+        f"          Disposition: [enabled, {disposition}, notified] (0x9)\n"
+        f"           Identifier: 8.{label}\n"
+        f"                  URL: /Users/501/Library/LaunchAgents/{label}.plist\n"
+        "    Parent Identifier: Unknown Developer\n"
+    )
 
 
 def _homes(tmp_path):
@@ -574,6 +600,9 @@ def test_ensure_leaves_a_running_service_alone(tmp_path):
     assert result["action"] == "already-running"
     assert result["pid"] == 4242
     assert not {"bootstrap", "bootout", "kickstart"} & set(fake.subcommands)
+    # The ~2 s System Settings read is skipped when nothing is about to start.
+    assert "dumpbtm" not in fake.subcommands
+    assert result["switched_off"] is False
 
 
 def test_ensure_kickstarts_a_quit_service(tmp_path):
@@ -667,16 +696,29 @@ def test_ensure_prefers_the_login_plist_when_both_exist(tmp_path):
     assert not session.exists()
 
 
-def test_ensure_refuses_a_service_disabled_in_system_settings(tmp_path):
+def test_ensure_starts_a_switched_off_service_and_reports_the_switch(tmp_path):
+    """macOS reserves the Login Items switch for the start at login.
+
+    A manual start still goes through (verified on macOS 27: the job ran on
+    after the switch was off), so refusing would be stricter than the OS.
+    The caller is told instead.
+    """
     home, data = _homes(tmp_path)
-    fake = _FakeLaunchd(disabled=True)
+    fake = _FakeLaunchd(switched_off=True)
 
-    with pytest.raises(ClaudeSwitchError) as exc:
-        _ensure(fake, home, data)
+    result = _ensure(fake, home, data)
 
-    assert "System Settings" in str(exc.value)
-    assert "bootstrap" not in fake.subcommands
-    assert not launch_agent.plist_path(home=home).exists()
+    assert result["action"] == "first-setup"
+    assert result["switched_off"] is True
+    assert "bootstrap" in fake.subcommands
+    assert "dumpbtm" in fake.subcommands
+
+
+def test_ensure_reports_launchds_own_disable_the_same_way(tmp_path):
+    home, data = _homes(tmp_path)
+    fake = _FakeLaunchd(launchd_disabled=True)
+    result = _ensure(fake, home, data)
+    assert result["switched_off"] is True
 
 
 def test_ensure_refuses_off_macos(tmp_path):
@@ -688,11 +730,30 @@ def test_ensure_refuses_off_macos(tmp_path):
 # --- is_disabled / the job's pid -------------------------------------------
 
 
+@pytest.mark.parametrize("disposition, expected", [("disallowed", True), ("allowed", False)])
+def test_btm_record_disallowed_reads_our_items_disposition(disposition, expected):
+    assert launch_agent._btm_record_disallowed(_btm_dump(disposition), launch_agent.LABEL) is expected
+
+
+def test_btm_record_disallowed_ignores_other_items_and_a_missing_record():
+    dump = _btm_dump("disallowed", label="com.other.agent")
+    assert launch_agent._btm_record_disallowed(dump, launch_agent.LABEL) is False
+    assert launch_agent._btm_record_disallowed("", launch_agent.LABEL) is False
+
+
+def test_btm_disallowed_is_false_when_the_dump_cannot_be_read():
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.return_value = _completed(1, stderr="Must be run as root")
+        assert launch_agent._btm_disallowed() is False
+    with patch.object(launch_agent.subprocess, "run", side_effect=FileNotFoundError):
+        assert launch_agent._btm_disallowed() is False
+
+
 @pytest.mark.parametrize(
     "value, disabled",
     [("disabled", True), ("true", True), ("enabled", False), ("false", False)],
 )
-def test_is_disabled_reads_both_launchctl_spellings(value, disabled):
+def test_launchd_disabled_reads_both_launchctl_spellings(value, disabled):
     listing = (
         "\tdisabled services = {\n"
         f'\t\t"{launch_agent.LABEL}" => {value}\n'
@@ -701,13 +762,13 @@ def test_is_disabled_reads_both_launchctl_spellings(value, disabled):
     )
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print-disabled": _completed(0, stdout=listing)})
-        assert launch_agent.is_disabled(uid=UID) is disabled
+        assert launch_agent._launchd_disabled(uid=UID) is disabled
 
 
-def test_is_disabled_is_false_when_the_list_cannot_be_read():
+def test_launchd_disabled_is_false_when_the_list_cannot_be_read():
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print-disabled": _completed(1, stderr="nope")})
-        assert launch_agent.is_disabled(uid=UID) is False
+        assert launch_agent._launchd_disabled(uid=UID) is False
 
 
 def test_running_as_service_matches_the_jobs_pid_to_this_process():
@@ -796,13 +857,13 @@ def test_install_removes_a_session_plist_so_login_wins(tmp_path):
 def test_status_reports_start_at_login_and_the_system_settings_switch(tmp_path):
     home, data = _homes(tmp_path)
     session = _session_plist(home, data)
-    fake = _FakeLaunchd(loaded=True, pid=4242, disabled=True)
+    fake = _FakeLaunchd(loaded=True, pid=4242, switched_off=True)
     with patch.object(launch_agent.subprocess, "run", side_effect=fake):
         result = launch_agent.status(home=home, uid=UID, backup_dir=data)
     assert result["start_at_login"] is False
     assert result["configured"] is True
     assert result["session_plist"] == str(session)
-    assert result["disabled"] is True
+    assert result["switched_off"] is True
     assert result["pid"] == 4242
 
 
@@ -823,7 +884,7 @@ def test_uninstall_removes_the_bundle_the_logs_and_launchds_override(
     out_log.parent.mkdir(parents=True)
     out_log.write_text("x")
     err_log.write_text("y")
-    fake = _FakeLaunchd(loaded=False, disabled=True)
+    fake = _FakeLaunchd(loaded=False, launchd_disabled=True)
 
     with patch.object(launch_agent.subprocess, "run", side_effect=fake):
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
@@ -839,7 +900,7 @@ def test_uninstall_removes_the_bundle_the_logs_and_launchds_override(
 
 def test_uninstall_leaves_launchds_override_alone_when_not_disabled(tmp_path):
     home, data = _homes(tmp_path)
-    fake = _FakeLaunchd(loaded=False, disabled=False)
+    fake = _FakeLaunchd(loaded=False)
     with patch.object(launch_agent.subprocess, "run", side_effect=fake):
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
     assert "enable" not in fake.subcommands

@@ -67,11 +67,17 @@ LABEL = "com.cswap.menubar"
 # plist uses it; so does a developer who wants the app attached to a terminal.
 WORKER_FLAG = "--foreground"
 
-# Where the user switches a LaunchAgent off ("Allow in the Background"). launchd
-# then refuses to bootstrap it, so the message has to point here, not at a retry.
+# Where the user switches a LaunchAgent off. The switch governs the start at
+# login only: macOS still lets the user's own `launchctl bootstrap` through, so
+# a start is allowed to proceed, but it has to say that this is where the
+# login start was turned off.
 SYSTEM_SETTINGS_HINT = (
     "System Settings → General → Login Items & Extensions → Allow in the Background"
 )
+
+# `sfltool dumpbtm` lists every background item with its disposition; it is
+# the only non-root view of the System Settings switch and takes ~2 s.
+_BTM_DUMP_TIMEOUT_SECONDS = 15.0
 
 # launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which covers
 # `security` (Keychain reads) but not a Homebrew or ~/.local/bin `claude`. The
@@ -289,16 +295,12 @@ def is_loaded(label: str = LABEL, uid: int | None = None) -> bool:
     return _launchctl("print", service_target(label, uid)).returncode == 0
 
 
-def is_disabled(label: str = LABEL, uid: int | None = None) -> bool:
-    """Whether the user switched the service off in System Settings.
+def _launchd_disabled(label: str = LABEL, uid: int | None = None) -> bool:
+    """Whether launchd's own override list disables the service.
 
-    ``launchctl print-disabled gui/<uid>`` lists the services the user has
-    disabled — the "Allow in the Background" switch writes exactly this. launchd
-    refuses to bootstrap a disabled service, so :func:`ensure` asks first and
-    names the switch instead of relaying launchd's bare error. Older launchctl
-    spelled the value ``true``; current ones say ``disabled``. A list that
-    cannot be read counts as "not disabled": refusing on a read failure would
-    block the common case to guard against a rare one.
+    ``launchctl print-disabled gui/<uid>`` is what ``launchctl disable`` writes.
+    Older launchctl spelled the value ``true``; current ones say ``disabled``.
+    A list that cannot be read counts as "not disabled".
     """
     printed = _launchctl("print-disabled", domain_target(uid))
     if printed.returncode != 0:
@@ -310,6 +312,64 @@ def is_disabled(label: str = LABEL, uid: int | None = None) -> bool:
             value = stripped.split("=>", 1)[1].strip().rstrip(";").lower()
             return value in ("disabled", "true")
     return False
+
+
+def _btm_record_disallowed(dump: str, label: str) -> bool:
+    """Whether ``sfltool dumpbtm`` output lists ``label`` as switched off.
+
+    Records are blocks headed `` #N:``; each has a ``Disposition: [..]`` line
+    before its ``Identifier:`` line, which BTM spells as ``<type>.<label>``
+    (``8.com.cswap.menubar`` for a user agent). ``disallowed`` in the
+    disposition is the "Allow in the Background" switch in the off position;
+    an item the user left alone reads ``allowed``.
+    """
+    matches = disallowed = False
+    for raw in dump.splitlines():
+        line = raw.strip()
+        if line.startswith("#") and line.endswith(":"):
+            if matches and disallowed:
+                return True
+            matches = disallowed = False
+        elif line.startswith("Identifier:"):
+            identifier = line.split(":", 1)[1].strip()
+            matches = identifier == label or identifier.endswith("." + label)
+        elif line.startswith("Disposition:") and "[" in line:
+            flags = line.split("[", 1)[1].split("]", 1)[0]
+            disallowed = "disallowed" in [flag.strip() for flag in flags.split(",")]
+    return matches and disallowed
+
+
+def _btm_disallowed(label: str = LABEL) -> bool:
+    """Whether the user switched the item off under Login Items & Extensions.
+
+    That switch is recorded by backgroundtaskmanagementd, not in launchd's
+    disabled list, and it governs the start at login only: a manual
+    ``launchctl bootstrap`` from the user's own session still goes through
+    (verified on macOS 27). A dump that cannot be read — older releases want
+    root for it — counts as "not switched off".
+    """
+    try:
+        proc = subprocess.run(
+            ["sfltool", "dumpbtm"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_BTM_DUMP_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    return _btm_record_disallowed(proc.stdout, label)
+
+
+def switched_off_in_system_settings(label: str = LABEL, uid: int | None = None) -> bool:
+    """Whether the user turned the service off, in either place macOS offers.
+
+    Slow (about two seconds, see :func:`_btm_disallowed`), so callers ask only
+    when the answer changes what they say: before a start, and for status.
+    """
+    return _launchd_disabled(label, uid) or _btm_disallowed(label)
 
 
 def _job_state(
@@ -368,7 +428,9 @@ def status(
     ``installed`` and ``start_at_login`` both mean "the plist is in
     ``~/Library/LaunchAgents``"; the first name predates the second and is kept
     for callers that read it. ``session_plist`` is set while Start at login is
-    off, and ``configured`` is true when either plist exists.
+    off, ``configured`` is true when either plist exists, and ``switched_off``
+    reports the System Settings switch (a slow read, see
+    :func:`switched_off_in_system_settings`).
     """
     _require_macos()
     loaded, state, pid = _job_state(label, uid)
@@ -384,7 +446,7 @@ def status(
         "state": state,
         "pid": pid,
         "plist": str(login),
-        "disabled": is_disabled(label, uid),
+        "switched_off": switched_off_in_system_settings(label, uid),
     }
 
 
@@ -454,21 +516,20 @@ def ensure(
     and the job reloaded, keeping the environment the installing shell
     forwarded — this shell may lack the proxy variables that one had. ``restart``
     restarts a running job even when nothing changed, for a setting the menu bar
-    only reads at launch. Returns the action taken (``first-setup``, ``started``,
-    ``restarted`` or ``already-running``) with the paths and the pid.
+    only reads at launch.
+
+    A service the user switched off under Login Items & Extensions is still
+    started: macOS itself allows the manual start and reserves that switch for
+    the start at login, so refusing would be stricter than the OS. The result's
+    ``switched_off`` lets the caller say that it will not come back at login.
+    Returns the action taken (``first-setup``, ``started``, ``restarted`` or
+    ``already-running``) with the paths and the pid.
     """
     _require_macos()
     program = program or resolve_program()
     login_plist = plist_path(label, home)
     session_plist = session_plist_path(label, backup_dir)
     out_log, err_log = log_paths(label, home)
-
-    if is_disabled(label, uid):
-        raise ClaudeSwitchError(
-            f"The menu bar service is turned off in {SYSTEM_SETTINGS_HINT}. "
-            f"Turn it on there (or run: launchctl enable {service_target(label, uid)}), "
-            "then run cswap menubar again."
-        )
 
     first_setup = not login_plist.exists() and not session_plist.exists()
     if first_setup or login_plist.exists():
@@ -497,9 +558,13 @@ def ensure(
         repaired = True
 
     loaded, _state, pid = _job_state(label, uid)
+    switched_off = False
     if pid is not None and not repaired and not restart:
         action = "already-running"
     else:
+        # Asked only when something is about to start: the read takes ~2 s and
+        # a running service has nothing new to say about the login start.
+        switched_off = switched_off_in_system_settings(label, uid)
         action = "restarted" if pid is not None else ("first-setup" if first_setup else "started")
         if repaired or not loaded:
             _reload(target, label, uid)
@@ -516,6 +581,7 @@ def ensure(
         "stdout_log": str(out_log),
         "stderr_log": str(err_log),
         "pid": pid,
+        "switched_off": switched_off,
     }
 
 
@@ -590,7 +656,7 @@ def uninstall(
             )
 
     cleared_override = False
-    if is_disabled(label, uid):
+    if _launchd_disabled(label, uid):
         cleared_override = _launchctl("enable", service_target(label, uid)).returncode == 0
 
     removed_paths: list[Path] = []

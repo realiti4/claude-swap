@@ -555,7 +555,7 @@ class TestCLI:
                     "state": "running",
                     "pid": 4242,
                     "plist": "/tmp/p.plist",
-                    "disabled": False,
+                    "switched_off": False,
                 },
             ),
         )
@@ -575,6 +575,7 @@ class TestCLI:
                     "stdout_log": "/tmp/o.log",
                     "stderr_log": "/tmp/e.log",
                     "pid": 4242,
+                    "switched_off": False,
                 },
             ),
         )
@@ -782,6 +783,7 @@ class TestCLI:
             "stdout_log": "/tmp/o.log",
             "stderr_log": "/tmp/e.log",
             "pid": 4242,
+            "switched_off": False,
         }
         payload.update(overrides)
         return payload
@@ -841,6 +843,36 @@ class TestCLI:
         out = capsys.readouterr().out
         assert "Menu bar started (pid 4242)" in out
         assert "Start at login is off" in out
+
+    def test_plain_menubar_says_when_the_login_items_switch_is_off(self, monkeypatch, capsys):
+        # macOS lets the manual start through; the switch governs the login start.
+        self._service_harness(monkeypatch, ["cswap", "menubar"])
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.ensure",
+            lambda **k: self._ensure_payload(action="started", switched_off=True),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        captured = capsys.readouterr()
+        assert "Menu bar started (pid 4242)" in captured.out
+        assert "will not start it at login" in captured.err
+
+    def test_service_status_says_when_the_login_items_switch_is_off(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+        status = {
+            "label": "com.cswap.menubar", "installed": True, "start_at_login": True,
+            "session_plist": None, "configured": True, "loaded": True,
+            "state": "running", "pid": 4242, "plist": "/tmp/p.plist", "switched_off": True,
+        }
+        monkeypatch.setattr("claude_swap.launch_agent.status", lambda *a, **k: status)
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        assert "will not start it at login" in capsys.readouterr().err
 
     def test_foreground_runs_the_app_when_no_service_is_running(self, monkeypatch):
         seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--foreground"])
