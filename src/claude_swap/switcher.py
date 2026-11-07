@@ -6133,7 +6133,7 @@ class ClaudeAccountSwitcher:
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
+        for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
@@ -6145,6 +6145,11 @@ class ClaudeAccountSwitcher:
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
+            # A dead login already reads "re-login needed" with the same remedy.
+            if entries[str(num)].sentinel != USAGE_RELOGIN_REQUIRED:
+                lapse_note = oauth.login_expiry_note(creds)
+                if lapse_note is not None:
+                    print(f"     {yellowed(lapse_note)}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):
