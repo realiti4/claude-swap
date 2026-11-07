@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -874,6 +875,83 @@ class TestFetchUsageForAccount:
         assert captured.out == ""
 
 
+class TestNativeTlsFallbackIsAudible:
+    """A silent fallback to stdlib ssl is a silent NARROWING OF TRUST.
+
+    ``_use_native_tls`` swallows every exception so the CLI is never blocked
+    over a trust nicety. That part is right. What is wrong is that it leaves no
+    trace, and the two paths do not trust the same roots.
+
+    Measured on macOS, comparing the OS keychains against what stdlib
+    actually loads:
+
+        OS-store unique roots           173   (system 154, admin 4, login 15)
+        stdlib-loaded roots             128
+        trusted by OS, NOT by stdlib     67   <-- lost, with no message
+
+    Four of those live in /Library/Keychains/System.keychain, which is where an
+    administrator puts a corporate MITM CA. So the fallback can take away the
+    exact root the machine was configured with, and the user is then told to
+    "trust the CA in the OS store" by a remedy note pointing at a store that is
+    no longer being read.
+    """
+
+    def test_a_failed_injection_says_so(self, caplog):
+        import logging
+        import builtins
+        from claude_swap import cli
+
+        real_import = builtins.__import__
+
+        def refuse(name, *a, **k):
+            if name == "truststore":
+                raise ImportError("simulated: truststore unavailable")
+            return real_import(name, *a, **k)
+
+        builtins.__import__ = refuse
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+        finally:
+            builtins.__import__ = real_import
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "truststore" in joined.lower() or "native" in joined.lower(), (
+            f"the fallback left no trace; records={[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_a_successful_injection_stays_quiet(self, caplog):
+        """The control: the normal path must not warn, or the warning is noise
+        every run and stops being read.
+
+        It also puts ssl back. ``inject_into_ssl`` is process-global with no
+        automatic undo, so without the ``finally`` every later
+        ``ssl.create_default_context()`` on this worker returns a
+        ``truststore`` context, a different class with a different API.
+        """
+        import logging
+        import ssl
+        from claude_swap import cli
+
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+            assert not [r for r in caplog.records
+                        if r.name == "claude-swap"
+                        and r.levelno == logging.WARNING]
+        finally:
+            try:
+                import truststore
+
+                truststore.extract_from_ssl()
+            except Exception:  # noqa: BLE001 -- nothing to undo is fine
+                pass
+
+        assert type(ssl.create_default_context()).__module__ == "ssl", (
+            "this test left truststore injected into ssl"
+        )
+
+
 class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 
@@ -930,6 +1008,89 @@ class TestClassifyUsageError:
         assert oauth._classify_usage_error(
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
+
+    def test_tls_cert_failure_is_not_flattened_to_network(self):
+        """A MITM proxy with an untrusted CA must not read as a transport error.
+
+        Measured on one host: every usage poll went through a
+        TLS-terminating proxy whose CA urllib does not trust, so each one raised
+
+            URLError(SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED]
+            certificate verify failed: unable to get local issuer certificate"))
+
+        and was recorded as ``network``. One account sat dead for ten days and
+        "network" is the only word anyone could see; the real cause reaches
+        DEBUG alone, which nothing enables. "Cannot reach the host" and "reached
+        the host and refused its certificate" need opposite fixes, so they may
+        not share a token.
+        """
+        e = urllib.error.URLError(
+            ssl.SSLCertVerificationError(
+                1,
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "unable to get local issuer certificate (_ssl.c:1000)",
+            )
+        )
+        assert oauth._classify_usage_error(e)[0] == "tls-cert"
+
+    def test_a_non_cert_ssl_failure_is_not_a_cert_failure(self):
+        """Pins the PREDICATE, not just the outcome.
+
+        ``ssl.SSLCertVerificationError`` is the narrow choice on purpose, and
+        the obvious loosening -- ``ssl.SSLError`` -- passes every other test in
+        this file. A non-cert TLS failure is a different condition with a
+        different repair: speaking https to a plaintext port raises
+        ``SSLError("record layer failure")``, and calling that ``tls-cert``
+        sends the operator to fix a CA bundle for a wrong-port problem.
+        """
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ssl.SSLEOFError("handshake failed"))
+        )[0] == "network"
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ssl.SSLError("record layer failure"))
+        )[0] == "network"
+
+    def test_tls_cert_carries_a_remedy_note(self):
+        """A kind with no ERROR_NOTES entry renders as the bare identifier.
+
+        The whole point of splitting this out of ``network`` is that the two
+        need different repairs, and that only reaches the operator through the
+        note. Without one the display trades one uninformative word for
+        another. ``test_every_deterministic_kind_has_a_note`` states the same
+        principle but iterates ``_DETERMINISTIC_REFRESH_ERRORS``, which is a
+        refresh-error list -- a usage-fetch kind is outside its loop, so it
+        cannot cover this.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert "tls-cert" in ERROR_NOTES
+        note = ERROR_NOTES["tls-cert"]
+        assert "SSL_CERT_FILE" in note
+
+    def test_a_hostname_mismatch_is_tls_cert_and_its_note_says_so(self):
+        """``SSLCertVerificationError`` is not only an untrusted chain.
+
+        A certificate issued for another host (a captive portal, a proxy that
+        does not re-sign per host) raises the same class with OpenSSL
+        verify_code 62. One kind covers "the certificate check refused this
+        connection", so the note has to name that cause too, or it prescribes
+        a CA fix for a problem no CA fixes.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        err = ssl.SSLCertVerificationError(
+            1,
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "Hostname mismatch, certificate is not valid for 'api.example.com'. "
+            "(_ssl.c:1000)",
+        )
+        err.verify_code = 62
+        err.verify_message = (
+            "Hostname mismatch, certificate is not valid for 'api.example.com'"
+        )
+        e = urllib.error.URLError(err)
+        assert oauth._classify_usage_error(e)[0] == "tls-cert"
+        assert "different host" in ERROR_NOTES["tls-cert"]
 
     def test_bad_response(self):
         try:
