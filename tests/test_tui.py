@@ -121,8 +121,12 @@ class FakeSwitcher:
         )
         self.calls: list[tuple] = []
         self.fetch_sets: list[set[str] | None] = []
+        self.plan_refreshes = 0
 
     # -- surface the TUI consumes ------------------------------------------
+
+    def refresh_subscription_plans(self) -> None:
+        self.plan_refreshes += 1
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         self.fetch_sets.append(fetch)
@@ -190,9 +194,9 @@ class FakeSwitcher:
         print(f"Added Account {slot or 9}")
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self, threshold: float, weekly_threshold: float | None, models: tuple[str, ...]
     ) -> None:
-        self._poll_inputs_override = (threshold, models)
+        self._poll_inputs_override = (threshold, weekly_threshold, models)
 
     def clear_poll_policy_inputs(self) -> None:
         self._poll_inputs_override = None
@@ -551,6 +555,34 @@ class TestUsageRows:
         assert usage_rows(None, time.time()) == []
         assert usage_rows({}, time.time()) == []
 
+    def test_window_without_a_figure_is_a_row_drawn_as_unknown(self):
+        # ``utilization: null`` keeps its row with no pct; the card draws it as
+        # "usage unknown".
+        from claude_swap.tui.widgets import account_card_text, mini_account_text, usage_rows
+
+        entry = make_entry(pct5=47.0, pct7=12.0)
+        entry.last_good["five_hour"]["pct"] = None
+        now = time.time()
+        rows = usage_rows(entry.last_good, now)
+        assert [(label, pct) for label, pct, *_ in rows] == [("5h", None), ("7d", 12.0)]
+        assert rows[0][2].startswith("resets ")
+        card = account_card_text(make_account(1, entry=entry), 80, now=now).plain
+        assert "5h" in card and "usage unknown" in card and " 0%" not in card
+        mini = mini_account_text(make_account(2, entry=entry), now).plain
+        assert "5h ? · 7d 12%" in mini
+
+    @pytest.mark.parametrize("key", ["five_hour", "seven_day"])
+    @pytest.mark.parametrize("width", [60, 70, 80])
+    def test_unknown_row_stays_within_the_card_width(self, key, width):
+        # "usage unknown" is wider than " NNN%": the row must budget for it
+        # when deciding whether the clock-extended reset suffix fits.
+        from claude_swap.tui.widgets import account_card_text
+
+        entry = make_entry(pct5=47.0, pct7=12.0)
+        entry.last_good[key]["pct"] = None
+        card = account_card_text(make_account(1, entry=entry), width, now=time.time()).plain
+        assert all(len(line) <= width for line in card.splitlines()), card
+
     def test_seven_day_ahead_of_pace_marker(self):
         # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
         from claude_swap.tui.widgets import usage_rows
@@ -585,6 +617,20 @@ class TestUsageRows:
         row = usage_rows(last_good, now, now)[0]
         assert "(!)" in row[2]
         assert "ahead of pace" not in row[2]
+
+    def test_rejected_probe_shows_a_maxed_row(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 30.0},
+            "rejected": {"retry_after_s": 3600.0, "resets_at": _iso_in(3600)},
+            "source": "headers",
+        }
+        label, pct, suffix, _full = usage_rows(last_good, now, now)[-1]
+        assert (label, pct) == ("probe", 100.0)
+        assert suffix.startswith("rejected (!)") and "resets" in suffix
 
     def test_no_pace_marker_without_fetched_at(self):
         from claude_swap.tui.widgets import usage_rows
@@ -626,6 +672,22 @@ class TestUsageRows:
 
 
 class TestMiniAccountText:
+    def test_rejected_probe_is_flagged(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 20.0},
+                "seven_day": {"pct": 30.0},
+                "rejected": {"retry_after_s": None, "resets_at": None},
+            },
+            fetched_at=now,
+            age_s=0.0,
+        )
+        text = mini_account_text(make_account(1, entry=entry), now).plain
+        assert text.endswith("5h 20% · 7d 30% · rejected (!)")
+
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
@@ -1254,6 +1316,16 @@ class TestWatchScreen:
             await settle(pilot)
             assert fake.fetch_sets == [set()]
 
+    async def test_auto_mode_refreshes_plans_outside_the_snapshot(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert fake.plan_refreshes == 0
+            app.set_store_only(True)
+            await settle(pilot)
+            assert fake.plan_refreshes >= 1
+
     async def test_watch_title_shows_snapshot_age_and_long_refresh(self, tmp_path):
         app = make_app(self._fake(tmp_path))
         async with app.run_test(size=(100, 40)) as pilot:
@@ -1495,6 +1567,104 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_rank_by_policy_headroom_under_a_weekly_line(
+        self, tmp_path, fake_engine
+    ):
+        """The 'Next best' list is the engine's own ordering: under a weekly
+        line a 7d 93% account outranks a 5h 95% one (18.5 vs 5 policy points;
+        raw pct would put it last), each row names the window that binds and
+        the line it is judged against, and the summary shows the line."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 93.0)),
+                make_account(3, entry=make_entry(95.0, 47.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+            assert "7d  93% used (line 97%)" in plain
+            assert "5h  95% used (line 85%)" in plain
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "threshold 85%" in summary and "weekly 97%" in summary
+            assert app.weekly_threshold_pct == 97.0
+
+    async def test_candidates_follow_a_session_threshold_adjust(
+        self, tmp_path, fake_engine
+    ):
+        """The list ranks by the lines in force: a session adjust must re-rank
+        it and move the 5h rows' line label at once, not at the next snapshot.
+        At 85/97 the 7d 93% row (18.5 policy points) outranks the 5h 83% row
+        (17); at 88/97 it falls to 15.6 and the order flips."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(83.0, 10.0)),
+                make_account(3, entry=make_entry(5.0, 93.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            assert "5h  83% used (line 85%)" in plain
+            await pilot.press("t", "right", "right", "right")
+            await pilot.pause()
+            assert app.screen._settings.threshold == 88.0
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index("user3@example.com")
+            assert "5h  83% used (line 88%)" in plain
+            assert "7d  93% used (line 97%)" in plain
+
+    async def test_candidates_show_no_line_without_a_weekly_one(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(42.0, 10.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "5h  42% used" in plain
+            assert "(line" not in plain
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "weekly" not in summary
+            assert app.weekly_threshold_pct is None
+
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
     ):
@@ -1710,3 +1880,26 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+class TestWeeklyTick:
+    def test_the_weekly_rows_tick_at_the_weekly_line(self):
+        from claude_swap.tui.widgets import _BAR_TICK, account_card_text
+
+        acc = make_account(
+            1, active=True, entry=make_entry(50.0, 50.0, scoped=[("Fable", 50.0)])
+        )
+
+        def ticks(**lines):
+            plain = account_card_text(acc, 100, **lines).plain
+            rows = {
+                ln.split()[0]: ln
+                for ln in plain.splitlines()
+                if ln.strip().startswith(("5h", "7d", "Fable"))
+            }
+            return {label: ln.index(_BAR_TICK) for label, ln in rows.items()}
+
+        with_weekly = ticks(threshold=85.0, weekly_threshold=97.0)
+        assert with_weekly["7d"] > with_weekly["5h"]
+        assert with_weekly["Fable"] == with_weekly["7d"]
+        without = ticks(threshold=85.0)
+        assert without["5h"] == without["7d"] == without["Fable"] == with_weekly["5h"]

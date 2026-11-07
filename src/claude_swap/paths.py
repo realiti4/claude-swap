@@ -4,8 +4,10 @@ Mirrors claude-code's own resolution so cswap reads and writes the same files
 claude-code does. Key rules (from claude-code source):
 
 - Config home: ``CLAUDE_CONFIG_DIR`` if set, else ``~/.claude``.
-- Global config: ``<config_home>/.config.json`` if it exists (legacy),
-  otherwise ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``. Note the asymmetry:
+- Global config: ``<config_home>/.config.json`` (legacy) if it is a regular
+  file that is non-empty, or empty and writable with no ``.claude.json`` (the
+  rule of claude-code 2.1.299), otherwise
+  ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``. Note the asymmetry:
   ``.claude.json`` sits at homedir by default, not inside ``.claude/``.
 - Credentials: ``<config_home>/.credentials.json``.
 
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from pathlib import Path
 
 from claude_swap.exceptions import MigrationError
@@ -39,18 +42,31 @@ def get_claude_config_home() -> Path:
     return Path.home() / ".claude"
 
 
+def _pick_global_config(legacy: Path, global_cfg: Path) -> Path:
+    """Claude Code 2.1.299's choice between ``.config.json`` and ``.claude.json``."""
+    try:
+        st = legacy.stat()  # follows symlinks; an error makes the global file win
+    except OSError:
+        return global_cfg
+    if stat.S_ISREG(st.st_mode) and (
+        st.st_size > 0 or (st.st_mode & 0o222 and not os.path.exists(global_cfg))
+    ):
+        return legacy
+    return global_cfg
+
+
 def get_global_config_path() -> Path:
     """Return the path to the global Claude config file.
 
-    Returns the legacy ``<config_home>/.config.json`` if it exists, else
+    Returns the legacy ``<config_home>/.config.json`` if Claude Code would use
+    it (see :func:`_pick_global_config`), else
     ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``.
     """
-    legacy = get_claude_config_home() / ".config.json"
-    if legacy.exists():
-        return legacy
     env = os.environ.get("CLAUDE_CONFIG_DIR")
     base = Path(env) if env else Path.home()
-    return base / ".claude.json"
+    return _pick_global_config(
+        get_claude_config_home() / ".config.json", base / ".claude.json"
+    )
 
 
 def get_default_claude_config_home() -> Path:
@@ -71,10 +87,9 @@ def get_default_global_config_path() -> Path:
     (session sharing) must not source from another session when invoked from
     inside one.
     """
-    legacy = get_default_claude_config_home() / ".config.json"
-    if legacy.exists():
-        return legacy
-    return Path.home() / ".claude.json"
+    return _pick_global_config(
+        get_default_claude_config_home() / ".config.json", Path.home() / ".claude.json"
+    )
 
 
 def get_credentials_path() -> Path:

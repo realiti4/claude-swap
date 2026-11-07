@@ -48,9 +48,11 @@ def ensure_notification_identity(
 ) -> Path | None:
     """Ensure rumps can resolve a bundle identifier for notifications.
 
-    Command-line Python tools have no app bundle, so rumps looks for an
-    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
-    environment; repair the tiny plist on every launch when needed.
+    Fallback for runs outside the wrapper bundle (``claude_swap.app_bundle``),
+    whose Info.plist already carries the identifier: a bare command-line
+    interpreter has no app bundle, so rumps looks for an ``Info.plist`` beside
+    it. uv/pipx reinstalls can recreate that environment; repair the tiny
+    plist on every launch when needed.
     """
     if platform != "darwin":
         return None
@@ -236,6 +238,15 @@ def usage_summary(
     if now is None:
         now = time.time()
     parts: list[str] = []
+    rejected = usage.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe leads the row: the account is at its
+        # limit until the refusal ends, however low the windows below read.
+        seg = "rejected (!)"
+        countdown = _live_countdown(rejected, now)
+        if countdown:
+            seg += f" ({countdown})"
+        parts.append(seg)
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         pace_result = None
@@ -313,6 +324,8 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
+    if isinstance(active_usage, dict) and isinstance(active_usage.get("rejected"), dict):
+        segments.append("rejected (!)")
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
@@ -440,6 +453,20 @@ def _adapt_snapshot(snap) -> dict:
     }
 
 
+def _take_worker_snapshot(
+    snapshot_source, *, full: bool, has_engine: bool
+) -> tuple[dict, bool]:
+    """Take and adapt one display snapshot; returns ``(snap, store_only)``.
+
+    Routine ticks read store-only while the hosted auto-switch engine is
+    running; an explicit Refresh now (``full=True``) still runs a store-governed
+    on-demand pass.
+    """
+    store_only = has_engine and not full
+    raw = snapshot_source.take(full=full, store_only=store_only)
+    return _adapt_snapshot(raw), store_only
+
+
 # macOS 26 stopped drawing status items for processes launched through an
 # exec trampoline, and a CPython *framework* build is exactly that: its
 # ``bin/python3.x`` is a stub that posix_spawns into ``Python.app``
@@ -518,14 +545,6 @@ def framework_build_warning(
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    ensure_notification_identity()
-    _warn = framework_build_warning()
-    if _warn:
-        # stderr, not stdout: launchd sends stdout to the .log file where it
-        # would sit in a block buffer for the life of the process, and the
-        # install output points the user at the .err file anyway. stderr stays
-        # line-buffered even when redirected, so it lands immediately.
-        warning(_warn, file=sys.stderr)
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
@@ -538,6 +557,23 @@ def run(switcher) -> int:
             "Menu bar mode requires 'rumps'. "
             "Install with: pip install 'claude-swap[menubar]'"
         ) from e
+
+    from claude_swap import app_bundle
+
+    # Hop into the wrapper .app before anything AppKit-side is set up, so the
+    # status item's owner has a bundle identifier that menu bar managers can
+    # key on. Returns only when staying in this interpreter (already bundled,
+    # opted out, framework build, or the bundle could not be built).
+    app_bundle.maybe_reexec(switcher.backup_dir)
+    if not app_bundle.in_bundle():
+        ensure_notification_identity()
+    _warn = framework_build_warning()
+    if _warn:
+        # stderr, not stdout: launchd sends stdout to the .log file where it
+        # would sit in a block buffer for the life of the process, and the
+        # install output points the user at the .err file anyway. stderr stays
+        # line-buffered even when redirected, so it lands immediately.
+        warning(_warn, file=sys.stderr)
 
     # rumps never sets an activation policy, so under a framework Python the
     # process launches as a regular app and parks a "Python" icon in the Dock
@@ -599,21 +635,26 @@ def run(switcher) -> int:
         def _worker(self, full):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. While the engine
-            # runs it already paces all fetching, so the display reads store-only.
+            # runs it already paces all fetching, so routine display ticks read
+            # store-only; an explicit Refresh now (full=True) still runs a
+            # store-governed pass.
             try:
                 try:
-                    raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
+                    snap, store_only = _take_worker_snapshot(
+                        self._snapshot_source,
+                        full=full,
+                        has_engine=self._engine is not None,
                     )
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
                     return
-                snap = _adapt_snapshot(raw)
                 self._log_usage(snap)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
                 self._dirty = True  # picked up by on_sync_tick on the main thread
+                if store_only:
+                    self._snapshot_source.refresh_plans()
             finally:
                 self._refreshing = False
 
