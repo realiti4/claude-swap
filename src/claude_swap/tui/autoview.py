@@ -127,6 +127,8 @@ class CandidateRow:
                 raise ValueError(
                     f"marker has leading or trailing whitespace: {cell.plain!r}"
                 )
+        if orphan := self.short.keys() - self.status.keys():
+            raise ValueError(f"short form without a status entry: {sorted(orphan)}")
 
 
 def _cut(cell: Text, width: int) -> Text:
@@ -191,7 +193,7 @@ def render_candidate_rows(
                 if i and not used[i]:
                     continue
                 if room is not None and i == len(cells) - 1:
-                    if (left := room - line.cell_len - 2) < 1:
+                    if (left := room - line.cell_len - 2) < 2:
                         continue
                     cell = _cut(cell, left)
                 else:
@@ -211,7 +213,11 @@ def render_candidate_rows(
     limit = 10**9 if width is None else width
 
     def over(block: list[Text]) -> int:
-        return max((line.cell_len for line in block), default=0) - limit
+        # A free-text note row is left out: it never fits and is never cut.
+        return max(
+            (line.cell_len for row, line in zip(rows, block) if not row.note),
+            default=0,
+        ) - limit
 
     widest = max((row.email.cell_len for row in rows), default=0)
     for short in (False, True):
@@ -728,13 +734,14 @@ class AutoScreen(Screen):
                     shown = True
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
-                # a model-only block (the engine's fallback ranks around it),
-                # and the two must read the same way here as in the decision
-                # log — same helper, `classify_candidate_block`. Always on
-                # `models`, the full pinned set: this label explains why the
-                # row is not simply "open" on the criteria the user actually
-                # configured, independent of whether `rank_models` below has
-                # dropped to the retry's axis for ORDERING purposes.
+                # a model-only block (the engine's fallback ranks around it).
+                # The decision log classifies with the same helper,
+                # `classify_candidate_block`, but words it its own way; the
+                # panel words it plainly. Always on `models`, the full pinned
+                # set: this label explains why the row is not simply "open" on
+                # the criteria the user actually configured, independent of
+                # whether `rank_models` below has dropped to the retry's axis
+                # for ORDERING purposes.
                 kind, blocked_model = "open", None
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(

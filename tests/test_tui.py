@@ -2116,6 +2116,8 @@ class TestAutoScreen:
                 make_account(2, entry=make_entry(5.0, 93.0),
                              email="a.very.long.address.indeed@example-company.com"),
                 make_account(3, entry=make_entry(95.0, 47.0)),
+                # Its sentinel row is wider than the panel and sizes nothing.
+                make_account(4, switchable=False),
             ],
             tmp_path,
         )
@@ -3319,6 +3321,37 @@ class TestNextBestRowSlots:
         # form keeps its long one).
         _lines, slot = self._fit(69, self._SHORT_NOTES)
         assert slot == 69 - 25 - 23
+
+    def test_a_sentinel_row_wider_than_the_panel_does_not_move_the_chip_rows(self):
+        """A free-text note never fits and is never cut, so it is left out of
+        the fit: the chip rows keep the form they would have without it."""
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        chip_rows = self._note_rows()
+        sentinel = CandidateRow(
+            Text("6"), chip_rows[0].email, Text("x" * 150), note=True
+        )
+        for width in (200, 80, 70, 69, 50):
+            assert self._render(chip_rows + [sentinel], width)[:-1] == (
+                self._render(chip_rows, width)
+            ), width
+
+    def test_a_note_with_one_column_of_room_is_dropped_not_cut_to_a_lone_ellipsis(self):
+        lines = self._render(self._note_rows(), 38)  # the note column would start at 37
+        assert all(line.endswith("5h:25% · 7d:10%") for line in lines), lines
+
+    def test_a_short_key_without_a_long_entry_is_refused(self):
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        with pytest.raises(ValueError, match="threshold"):
+            CandidateRow(
+                Text("1"), Text("a@x.com"), Text("u"),
+                short={"threshold": Text("lim 97%")},
+            )
 
     def test_the_note_is_cut_last_and_the_usage_slot_never(self):
         notes = dict(self._SHORT_NOTES, **{"own+off": "lim 70% · au…"})
