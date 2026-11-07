@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 
 import pytest
 
@@ -34,16 +35,17 @@ from tests.test_tui import (
     settle,
 )
 
-# Goldens captured from the unmodified engine at
+# Goldens captured from the unmodified engine (the mini row's window chips and
+# their ``:`` separator are the fork's; see ``mini``) at
 # 4f6c6ac6f303bd910d51bf5bf2fb36d553f4f37f60a50e438291d4feb5cadfbe, rendered
 # through the same ``make_account`` fixture used below.  Only the header row and
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
 # instead (see ``test_the_card_bar_rows_are_untouched``).
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h 25% · 7d 10%"
+GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h:25% · 7d:10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h 25% · 7d 10%"
+GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h:25% · 7d:10%"
 
 NOW = 1000.0
 
@@ -63,7 +65,10 @@ def card(acc) -> str:
 
 
 def mini(acc) -> str:
-    return mini_account_text(acc, NOW).plain
+    # The fork's mini row draws each window as a chip with its reset countdown,
+    # measured against ``NOW`` and so against the wall clock: drop the countdown
+    # so the goldens stay a statement about the policy token alone.
+    return re.sub(r"\(⟳[^)]*\)", "", mini_account_text(acc, NOW).plain)
 
 
 class TestThresholdBadge:
@@ -105,6 +110,34 @@ class TestThresholdBadge:
         assert "60%" in header
         row = mini(acc)
         assert "60%" in row
+
+
+class TestWeeklyCapBadge:
+    """`cap N%` names the cap; `CAPPED` appears once a weekly window reaches it."""
+
+    @pytest.mark.parametrize(
+        ("cap", "pct7", "shown"),
+        [
+            (90.0, 85.0, "cap 90%"),
+            (90.0, 92.0, "cap 90% CAPPED"),
+            (100.0, 99.0, "cap 100%"),
+        ],
+    )
+    def test_the_badge_follows_the_window(self, cap, pct7, shown):
+        acc = with_policy(
+            make_account(2, active=True, alias="dev", entry=make_entry(pct7=pct7)),
+            weekly_cap=cap,
+        )
+        for text in (card(acc).splitlines()[0], mini(acc)):
+            assert shown in text
+            assert ("CAPPED" in text) is shown.endswith("CAPPED")
+
+    def test_a_busy_five_hour_window_never_marks_it(self):
+        acc = with_policy(
+            make_account(2, alias="dev", entry=make_entry(pct5=99.0, pct7=10.0)),
+            weekly_cap=50.0,
+        )
+        assert "CAPPED" not in mini(acc)
 
 
 class TestUnpolicedAccountsRenderExactlyAsBefore:
@@ -166,7 +199,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
     def _fleet(self, tmp_path):
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
-            "autoswitch": {"threshold": 90},
+            "autoswitch": {"threshold": 90, "strategy": "best"},
         }))
         return FakeSwitcher(
             [
@@ -196,8 +229,28 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
             assert "(line" not in self._row(plain, "user3@example.com")
+
+    async def test_a_capped_candidate_is_marked_and_ranked_last(
+        self, tmp_path, fake_engine
+    ):
+        """Account 2 has the most room (48 points against 45) but is past its
+        weekly cap: the engine never lands there, so the panel names the cap
+        and lists it last."""
+        fleet = self._fleet(tmp_path)
+        fleet._accounts[1] = with_policy(
+            make_account(2, entry=make_entry(10.0, 52.0)), weekly_cap=50.0
+        )
+        app = make_app(fleet)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            assert "capped 7d 52% >= 50%" in self._row(plain, "user2@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
         self, tmp_path, fake_engine
@@ -217,4 +270,47 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
+
+    async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
+        self, tmp_path, fake_engine
+    ):
+        """Under dynamic the panel ranks on 5h/7d alone once no candidate is
+        open on the model axis, as the engine's retry does. Candidates 2 and 3
+        sit under the dynamic bar (97) but over their own 80 line on Fable, so
+        neither is open and the ranking drops the model: 2's real 5h (20%)
+        beats 3's (60%). Judged on the bar, both read open, the model gate
+        stays, and 3 (Fable 84) ranks first."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(
+                        2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 85.0)])
+                    ),
+                    threshold=80.0,
+                ),
+                with_policy(
+                    make_account(
+                        3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 84.0)])
+                    ),
+                    threshold=80.0,
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+

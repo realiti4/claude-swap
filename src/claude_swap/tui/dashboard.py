@@ -79,6 +79,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            ("Weekly cap…", "cap-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -116,6 +117,28 @@ class DashboardScreen(Screen):
             entries.append(
                 (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
             )
+        entries.append(_BACK)
+        return entries
+
+    def _cap_entries(self) -> MenuEntries:
+        """One row per account with the weekly cap auto-switch holds it to."""
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            own = acc.policy.weekly_cap
+            state = "none" if own is None else f"{own:g}%"
+            entries.append((f"{acc.number}  {name}   {state}", f"cap:{acc.number}"))
+        entries.append(_BACK)
+        return entries
+
+    @staticmethod
+    def _cap_value_entries(number: str) -> MenuEntries:
+        """100 is "use to exhaustion": never capped."""
+        entries: MenuEntries = [("no cap (strategy's threshold)", f"set-cap:{number}:default")]
+        entries += [
+            (f"{pct}%", f"set-cap:{number}:{pct}") for pct in (80, 85, 90, 95, 98, 100)
+        ]
         entries.append(_BACK)
         return entries
 
@@ -191,6 +214,16 @@ class DashboardScreen(Screen):
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
+            await self._pop_menu()
+        elif action_id == "cap-menu":
+            await self._push_menu("weekly cap", self._cap_entries())
+        elif action_id.startswith("cap:"):
+            number = action_id.split(":", 1)[1]
+            await self._push_menu(f"account {number}", self._cap_value_entries(number))
+        elif action_id.startswith("set-cap:"):
+            _, number, value = action_id.split(":")
+            app.do_set_account_weekly_cap(number, None if value == "default" else float(value))
+            await self._pop_menu()
             await self._pop_menu()
         else:
             actions[action_id]()

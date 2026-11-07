@@ -452,9 +452,10 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         s.set_account_disabled(num, True)
         s.set_account_threshold(num, 85.0)
         s.set_account_priority(num, 2)
+        s.set_account_weekly_cap(num, 90)
 
     def test_every_setter_written_key_is_carried(self, temp_home: Path):
-        """Whatever the four setters put on a record is exactly what a rebuild
+        """Whatever the setters put on a record is exactly what a rebuild
         keeps, so a new per-account setting cannot be added to one side only."""
         s = self._fleet(temp_home, count=1)
         before = dict(self._record(s, "1"))
@@ -475,7 +476,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         assert record["threshold"] == pytest.approx(85.0)
         assert record["priority"] == 2
         assert record["alias"] == "work" and record["disabled"] is True
-        assert s.account_policies()["2"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["2"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
 
     def test_slot_migration_keeps_threshold_and_priority(self, temp_home: Path):
         s = self._fleet(temp_home, count=2)
@@ -485,7 +486,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         s.add_account(slot=5)
 
         assert "2" not in (s._get_sequence_data() or {})["accounts"]
-        assert s.account_policies()["5"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["5"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
         assert self._record(s, "5")["alias"] == "work"
 
     def test_explicit_alias_still_wins_over_the_carried_one(self, temp_home: Path):
@@ -520,7 +521,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
 
         s.add_account_from_token("token-v2", slot=3)
 
-        assert s.account_policies()["3"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["3"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
         record = self._record(s, "3")
         assert record["alias"] == "work" and record["disabled"] is True
 
@@ -533,7 +534,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         s.add_account_from_token("token-v1", email, slot=6)
 
         assert "3" not in (s._get_sequence_data() or {})["accounts"]
-        assert s.account_policies()["6"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["6"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
 
     def test_token_displacement_does_not_inherit_policy(self, temp_home: Path):
         s = self._setup(temp_home)
@@ -610,3 +611,73 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         payload = self._payload(self._fleet(temp_home))
         for row in payload["accounts"]:
             assert "threshold" not in row
+
+
+def _entry(pct7: float):
+    from claude_swap.usage_store import UsageEntry
+
+    return UsageEntry(
+        last_good={"five_hour": {"pct": 1.0}, "seven_day": {"pct": pct7}},
+        fetched_at=0.0, age_s=0.0,
+    )
+
+
+class TestWeeklyCapStore(PolicyStoreBase):
+    """`weeklyCap` lives in the same record, so a whole-file copy carries it."""
+
+    def test_a_policy_round_trips_through_the_stored_record(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        s.set_account_threshold("1", 85.0)
+        s.set_account_weekly_cap("1", 90)
+        assert self._record(s, "1")["weeklyCap"] == 90.0
+        # What the roster sync does: copy sequence.json whole, read it back.
+        copy = json.loads(json.dumps(s._get_sequence_data()))
+        assert s._policy_from_data(copy, "1") == AccountPolicy(
+            threshold=85.0, weekly_cap=90.0
+        )
+
+    def test_clearing_pops_the_key_and_a_bad_value_leaves_the_store_untouched(
+        self, temp_home: Path
+    ):
+        s = self._fleet(temp_home)
+        s.set_account_weekly_cap("1", 90)
+        before = s.sequence_file.read_bytes()
+        for bad in (49, 100.5, "x", True):
+            with pytest.raises(ValueError, match="weekly cap must be between 50 and 100"):
+                s.set_account_weekly_cap("1", bad)
+        assert s.sequence_file.read_bytes() == before
+        s.set_account_weekly_cap("1", None)
+        assert "weeklyCap" not in self._record(s, "1")
+
+    def test_an_unreadable_cap_reads_as_no_cap(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        data = s._get_sequence_data() or {}
+        data["accounts"]["1"]["weeklyCap"] = "garbage"
+        assert s._policy_from_data(data, "1").weekly_cap is None
+
+    def test_best_never_picks_a_capped_account(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        usage = {"1": _entry(50).last_good, "2": _entry(80).last_good, "3": _entry(70).last_good}
+        assert s._select_best_switchable("1", usage=usage)[0] is None  # 1 is best
+        usage["1"] = _entry(95).last_good
+        assert s._select_best_switchable("1", usage=usage)[0] == "3"
+        s.set_account_weekly_cap("3", 70)
+        assert s._select_best_switchable("1", usage=usage)[0] == "2"
+        s.set_account_weekly_cap("2", 80)
+        assert s._select_best_switchable("1", usage=usage) == (None, "capped")
+
+    def test_a_manual_switch_to_a_capped_account_warns_and_proceeds(
+        self, temp_home: Path, capsys
+    ):
+        from unittest.mock import patch
+
+        s = self._fleet(temp_home)
+        s.set_account_weekly_cap("2", 90)
+        op = {"from": {"number": 1, "email": "a"}, "to": {"number": 2, "email": "b"}}
+        with patch.object(s, "usage_entries_by_account", return_value={"2": _entry(92)}), \
+             patch.object(s, "_perform_switch", return_value=op) as perform:
+            s.switch_to("2", manual_source="cli")
+            s.switch_to("2")  # the engine's own call: no warning
+        perform.assert_called()
+        err = capsys.readouterr().err
+        assert err.count("past its weekly cap (7d 92% >= 90%)") == 1

@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth
+from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     HORIZON_HEADROOM_RATIO,
     SPENT_HEADROOM_PCT,
@@ -34,11 +34,17 @@ from claude_swap.autoswitch import (
     TickOutcome,
     _binding_recovery_ts,
     _every_account_above_threshold,
+    _headroom_by_account,
+    _model_window_binds_everywhere,
     _parse_reset_ts,
     pct_label,
 )
+from claude_swap.lines import binding_window, weekly_capped
 from claude_swap.settings import AutoSwitchSettings
+from claude_swap.usage_store import FetchRecord, UsageEntry
 
+# The module, not its Test class: a class imported by name is collected here too.
+import tests.test_autoswitch as test_autoswitch
 from tests.test_autoswitch import (
     _R_LATEST,
     _R_SOON,
@@ -56,6 +62,8 @@ GLOBAL = AutoSwitchSettings().threshold  # 90.0
 
 def _fleet(temp_home, **settings_kwargs) -> EngineHarness:
     """Three seeded OAuth accounts, account 1 live and active."""
+    # The suite reasons in `best` terms; the fork defaults to consume-first.
+    settings_kwargs.setdefault("strategy", "best")
     h = EngineHarness(temp_home, **settings_kwargs)
     h.seed(1, "a@example.com")
     h.seed(2, "b@example.com")
@@ -544,8 +552,8 @@ class TestRankCandidatesStaysPure:
             if monkey is not None:
                 setattr(h.switcher, name, _boom)
 
-        ordered_a, _, _ = h.engine._rank_candidates(**kwargs)
-        ordered_b, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_a, _, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_b, _, _, _ = h.engine._rank_candidates(**kwargs)
         assert ordered_a == ordered_b
 
     def test_two_calls_on_different_snapshots_use_the_passed_map(self, temp_home):
@@ -553,7 +561,7 @@ class TestRankCandidatesStaysPure:
         h = _fleet(temp_home)
         thresholds = ThresholdMap({"2": 45.0, "3": 95.0}, GLOBAL)
         phase1 = self._kwargs(h, thresholds)
-        ordered1, _, _ = h.engine._rank_candidates(**phase1)
+        ordered1, _, _, _ = h.engine._rank_candidates(**phase1)
         # 2 is at 50 utilization, over its own 45 line -> not a landing spot.
         assert "2" not in ordered1
         assert ordered1 == ["3"]
@@ -561,7 +569,7 @@ class TestRankCandidatesStaysPure:
         phase2 = dict(phase1)
         phase2["usage"] = {"1": _usage(99.0), "2": _usage(20.0), "3": _usage(60.0)}
         phase2["headroom"] = {"1": 1.0, "2": 80.0, "3": 40.0}
-        ordered2, _, _ = h.engine._rank_candidates(**phase2)
+        ordered2, _, _, _ = h.engine._rank_candidates(**phase2)
         # Same map, fresher snapshot: 2 is now at 20, under its own line.
         assert ordered2[0] == "2"
 
@@ -1238,6 +1246,169 @@ class TestRecoveryUsesTheRankingsScale:
         assert recovery == _parse_reset_ts(_R_SOON)
 
 
+class TestTheWalledEscapeSortsOnTheRankingsScale:
+    """The dynamic-healthy walled escape orders its candidates by
+    `_binding_recovery_ts`, which must read each one's own line and the
+    ruler the ranking scores on, like every other recovery site.
+
+    Global 90, weekly 95, dynamic (ruler 97). Account 2 carries a 98 line and
+    sits at 5h 93% (resets in an hour) and 7d 96% (resets in 5 days). On the
+    global line both windows are over, and the 5h one binds (headroom 7 < 8);
+    on its own line only the 7d one is. Account 3 is blocked on its 7d too and
+    comes back in 2 days, so the order is 2 then 3 on the wrong reading and
+    3 then 2 on the right one. Every account is blocked, which is what makes
+    the active's Fable wall read `dynamic-healthy` and reach the escape.
+    """
+
+    def test_an_escapee_with_its_own_line_is_sorted_on_the_window_that_binds_it(
+        self, temp_home
+    ):
+        u = test_autoswitch.TestBoundedWalledEscapeUnderDynamicHealthy._u
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, weekly_threshold=95.0,
+            strategy="dynamic",
+        )
+        for num in (1, 2, 3):
+            h.seed(num, f"a{num}@example.invalid")
+        h.make_live("a1@example.invalid", 1)
+        h.switcher.set_account_threshold("2", 98.0)
+        h.engine = h._make_engine()
+        fleet = {
+            "1": u(18, 20, 100, days_out=4),                      # Fable-walled
+            "2": u(93, 96, 0, days_out=5, five_h_resets=3600),
+            "3": u(10, 96, 0, days_out=2),
+        }
+        windows = list(oauth.relevant_windows(fleet["2"], ("Fable",)))
+        peer = _parse_reset_ts(fleet["3"]["seven_day"]["resets_at"])
+        wrong = binding_window(windows, 90.0, 95.0)
+        right = binding_window(windows, 98.0, 95.0, scale=97.0)
+        assert _parse_reset_ts(wrong.resets_at) < peer < _parse_reset_ts(right.resets_at)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 3
+
+
+class TestTheModelWindowPredicateReadsEachAccountsOwnLine:
+    """`_model_window_binds_everywhere` decides whether the model window is a
+    fleet-wide wall (and so whether dynamic may drop it). It must judge an
+    account against the line the ranking lands it on, not the global one: with
+    per-account lines it was wrong both ways. Global 90, model "Fable"; the
+    5h/7d windows are open throughout, so only the Fable window can block.
+    """
+
+    @staticmethod
+    def _fable(pct, five_hour=10.0):
+        return {
+            "five_hour": {"pct": five_hour},
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": pct}],
+        }
+
+    def _binds(self, usage, overrides=None):
+        return _model_window_binds_everywhere(
+            usage, ("Fable",), GLOBAL, lines=ThresholdMap(overrides or {}, GLOBAL)
+        )
+
+    def test_a_lower_own_line_blocks_what_the_global_line_lets_through(self):
+        usage = {"1": self._fable(95.0), "2": self._fable(85.0)}
+        assert self._binds(usage) is False         # 2 is open at 90
+        assert self._binds(usage, {"2": 80.0}) is True   # 85 >= its own 80
+
+    def test_a_higher_own_line_opens_what_the_global_line_blocks(self):
+        usage = {"1": self._fable(95.0), "2": self._fable(92.0)}
+        assert self._binds(usage) is True          # both blocked at 90
+        assert self._binds(usage, {"2": 98.0}) is False  # 92 < its own 98
+
+    def test_the_ranking_retries_on_5h_7d_when_every_account_is_blocked_on_its_own_line(
+        self, temp_home
+    ):
+        """Landing gate and predicate agree: candidates 2 and 3 are refused at
+        their own 80 line (Fable 85), so the model-gated pass is empty, and the
+        fleet-wide wall is what lets the ranking drop the model set."""
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic"
+        )
+        usage = {
+            "1": self._fable(95.0, five_hour=80.0),   # active: little 5h room too
+            "2": self._fable(85.0),
+            "3": self._fable(85.0),
+        }
+        ordered, _, _, _ = h.engine._rank_candidates(
+            trigger="proactive",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage=usage,
+            headroom=_headroom_by_account(usage, h.engine._models),
+            current="1",
+            active_headroom=5.0,
+            settings=h.settings,
+            now=h.clock.now,
+            thresholds=ThresholdMap({"2": 80.0, "3": 80.0}, GLOBAL),
+        )
+        assert ordered, "the model window binds everywhere: the retry must fire"
+
+
+class TestTheActiveAndTheEscapeTierReadTheirOwnLine:
+    """Two dynamic checks that kept the global line after the merge."""
+
+    def test_a_reset_ordered_departure_releases_once_the_active_reaches_its_own_line(
+        self, temp_home
+    ):
+        """`active_at_threshold` lifts the reset-ordering skip of the dominance
+        leg. Active at 85% (headroom 15) is at its own 80 line (<= 20) but not
+        at the global 90 (> 10); the peer clears the dominance margin."""
+        h = _fleet(temp_home, strategy="dynamic")
+        state = {
+            "lastSwitchFrom": 2,
+            "lastSwitchTo": "1",
+            "leftHeadroom": 100.0,
+            "leftRecoveryAt": None,
+            "leftTrigger": "consume-first",
+        }
+        common = dict(
+            usage={"1": _usage(85.0), "2": _usage(10.0)},
+            headroom={"1": 15.0, "2": 90.0},
+            active_headroom=15.0,
+            settings=h.settings,
+            now=h.clock.now,
+            current="1",
+        )
+        assert h.engine._left_account_recovered(
+            dict(state), thresholds=ThresholdMap({"1": 80.0}, GLOBAL), **common
+        ) is True
+        assert h.engine._left_account_recovered(
+            dict(state), thresholds=ThresholdMap({}, GLOBAL), **common
+        ) is False
+
+    def test_a_candidate_under_its_own_line_is_not_self_walled_at_the_global_one(
+        self, temp_home
+    ):
+        """At-limit on 7d. Account 2 (own line 99) sits at 5h 93%: under its
+        own line, so it lands untiered with 95 points on the blocked window.
+        Account 3 holds 40 there. Judged on the global 90 account 2 reads
+        self-walled and drops a tier behind 3."""
+        h = _fleet(temp_home, strategy="dynamic")
+        usage = {
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 100.0}},
+            "2": _usage(93.0),
+            "3": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 60.0}},
+        }
+        ordered, _, _, _ = h.engine._rank_candidates(
+            trigger="at-limit",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage=usage,
+            headroom=_headroom_by_account(usage, h.engine._models),
+            current="1",
+            active_headroom=0.0,
+            settings=h.settings,
+            now=h.clock.now,
+            thresholds=ThresholdMap({"2": 99.0}, GLOBAL),
+        )
+        assert ordered == ["2", "3"]
+
+
 def _tick(h: EngineHarness, snapshots: list[dict]):
     """Drive one real tick, serving `snapshots` to successive collector calls.
 
@@ -1316,3 +1487,169 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
             outcome, _ = _tick(h, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.ERROR
         assert any(isinstance(e, ErrorEvent) for e in h.events)
+
+
+_usage57 = test_autoswitch._usage57
+
+
+def _switch_trigger(h: EngineHarness) -> str | None:
+    return next((e.trigger for e in h.events if isinstance(e, SwitchEvent)), None)
+
+
+class TestWeeklyCap:
+    """`weeklyCap` is an eligibility veto on the weekly-resetting windows."""
+
+    @pytest.mark.parametrize(
+        "strategy", ["best", "consume-first", "dynamic", "priority-consume-first"]
+    )
+    def test_a_capped_active_leaves_for_the_walled_peer_that_returns_soonest(
+        self, temp_home, strategy
+    ):
+        h = _fleet(temp_home, strategy=strategy)
+        h.switcher.set_account_weekly_cap("1", 90)
+        outcome = h.tick_with_usage({
+            "1": _usage57(10, None, 92, _R_LATEST),
+            "2": _usage57(100, _R_LATEST, 0),
+            "3": _usage57(100, _R_SOON, 0),
+        })
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 3
+        assert _switch_trigger(h) == "weekly-capped"
+
+    def test_a_capped_active_with_no_eligible_peer_stays_and_reports_blocked(
+        self, temp_home
+    ):
+        h = _fleet(temp_home)
+        h.switcher.set_account_disabled("3", True)
+        for n in ("1", "2"):
+            h.switcher.set_account_weekly_cap(n, 80)
+        outcome = h.tick_with_usage({"1": _usage7(10, 85), "2": _usage7(10, 85)})
+        assert outcome is TickOutcome.BLOCKED and h.active_number() == 1
+        assert "no-candidates" in _reasons(h)
+        assert "weekly cap (7d 85%)" in _details(h)[-1]
+
+    @pytest.mark.parametrize(("cap", "lands"), [(None, 2), (75, 3)])
+    def test_a_capped_candidate_is_never_landed_on(self, temp_home, cap, lands):
+        h = _fleet(temp_home)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("2", cap)
+        h.tick_with_usage(
+            {"1": _usage7(95, 0), "2": _usage7(0, 80), "3": _usage7(85, 0)}
+        )
+        assert h.active_number() == lands
+
+    @pytest.mark.parametrize(
+        ("threshold", "pct5", "trigger"),
+        [(99.0, 90.0, None), (99.0, 95.0, None), (GLOBAL, 95.0, "proactive")],
+    )
+    def test_the_five_hour_window_follows_the_global_line_never_the_cap(
+        self, temp_home, threshold, pct5, trigger
+    ):
+        h = _fleet(temp_home, threshold=threshold)
+        h.switcher.set_account_weekly_cap("1", 50)
+        h.tick_with_usage({
+            "1": _usage7(pct5, 10), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert _switch_trigger(h) == trigger
+
+    @pytest.mark.parametrize(
+        ("weekly_line", "pct7", "trigger"),
+        [
+            (60.0, 91.0, "weekly-capped"),
+            (99.0, 91.0, "weekly-capped"),
+            (99.0, 89.0, None),
+            # A lower weekly line still leaves earlier, on the soft line.
+            (60.0, 75.0, "proactive"),
+        ],
+    )
+    def test_the_weekly_line_does_not_move_the_cap(
+        self, temp_home, weekly_line, pct7, trigger
+    ):
+        h = _fleet(temp_home, weekly_threshold=weekly_line)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({
+            "1": _usage7(10, pct7), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert _switch_trigger(h) == trigger
+
+    @pytest.mark.parametrize("cap", [None, 100])
+    def test_no_cap_and_a_cap_of_100_are_never_capped(self, temp_home, cap):
+        h = _fleet(temp_home, threshold=99.9)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("1", cap)
+        assert h.tick_with_usage({
+            "1": _usage7(10, 99), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        }) is TickOutcome.NO_ACTION
+
+    @pytest.mark.parametrize(
+        ("cap", "weekly", "expected"),
+        [(85.0, None, 85.0), (95.0, None, GLOBAL), (85.0, 97.0, 85.0), (None, 97.0, 97.0)],
+    )
+    def test_cadence_reads_the_cap_as_its_weekly_line(
+        self, temp_home, cap, weekly, expected
+    ):
+        h = _fleet(temp_home, weekly_threshold=weekly)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("1", cap)
+        h.tick_with_usage({n: _usage7(10, 10) for n in ("1", "2", "3")})
+        assert h.switcher._poll_inputs_override[1] == expected
+
+    @pytest.mark.parametrize(
+        ("pct7", "prev7", "recent_429", "lo", "hi"),
+        [
+            # Moved since the last poll: the band clamps (a 0.5 rise is under the
+            # movement rule, so urgent mode is not what sets 120 s).
+            (88.0, 87.5, False, 120.0, 120.0),
+            # In the band but flat: the band lets go, the normal cadence resumes.
+            (88.0, 88.0, False, 121.0, 300.0),
+            (80.0, 79.5, False, 121.0, 300.0),
+            (88.0, 87.5, True, 360.0, 1800.0),
+        ],
+    )
+    def test_the_active_polls_every_two_minutes_only_while_moving_in_the_band_below_its_cap(
+        self, temp_home, pct7, prev7, recent_429, lo, hi
+    ):
+        """The engine pins the cap; the planner reads it."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({n: _usage7(10, pct7) for n in ("1", "2", "3")})
+        before = UsageEntry(
+            last_good=_usage7(10, prev7), poll_interval_s=300.0,
+            last_429_at=h.switcher._usage_store.clock() if recent_429 else None,
+        )
+        plans = h.switcher._plans_after_fetch(
+            {"1": FetchRecord(usage=_usage7(10, pct7))}, {"1": before},
+            {"1": (None, None, None, None, True)},
+        )
+        assert lo <= plans["1"][1] <= hi, plans
+
+    @pytest.mark.parametrize(
+        ("start", "idle_polls", "bound"), [(70.0, 0, 1.0), (86.0, 0, 1.0), (89.0, 5, 1.7)]
+    )
+    def test_a_slow_burn_stepped_through_the_planned_intervals_trips_the_cap_inside_the_stated_overshoot(
+        self, temp_home, start, idle_polls, bound
+    ):
+        """0.3 points a minute, whole-number readings, the engine's pinned
+        inputs, every wait at its +10% jitter. Measured: 0.85 points burning, 1.45
+        after `idle_polls` flat polls in the band (one normal interval of burn,
+        300 s + 10% is 1.65 at most)."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({n: _usage7(10, 10) for n in ("1", "2", "3")})
+        threshold, weekly, models = h.switcher._poll_inputs_override
+        worst = 0.0
+        for phase in range(20):
+            true, t, polls, interval, prev = start + phase / 20, 0.0, 0, None, None
+            while not weekly_capped(90.0, usage := _usage7(10, float(int(true)))):
+                next_poll, interval = poll_policy.plan_after_fetch(
+                    prev_interval_s=interval, prev_usage=prev, new_usage=usage,
+                    is_active=True, threshold=threshold, weekly_threshold=weekly,
+                    models=models, recent_429=False, now=t,
+                    weekly_cap=h.switcher._poll_weekly_cap, rng=lambda: 1.0,
+                )
+                polls += 1
+                if polls > idle_polls:
+                    true += 0.3 * (next_poll - t) / 60
+                t, prev = next_poll, usage
+            worst = max(worst, true - 90.0)
+        assert 0.0 <= worst < bound
