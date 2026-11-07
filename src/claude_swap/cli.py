@@ -11,7 +11,11 @@ import sys
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
+from claude_swap.models import (
+    ACCOUNT_PRIORITY_MAX,
+    ACCOUNT_THRESHOLD_MAX,
+    ACCOUNT_THRESHOLD_MIN,
+)
 from claude_swap.printer import (
     accent,
     bolded,
@@ -21,7 +25,11 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings, load_update_settings
+from claude_swap.settings import (
+    AUTOSWITCH_STRATEGIES,
+    load_ui_settings,
+    load_update_settings,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -133,7 +141,7 @@ Examples:
   cswap run 2
   cswap run user@example.com
   cswap run 2 --no-share
-  cswap run 2 --share-history
+  cswap run 2 --no-share-history
   cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
@@ -151,19 +159,23 @@ Examples:
         help=(
             "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
             "from ~/.claude into the session profile (and remove previously "
-            "shared items)"
+            "shared items). Chat history is not affected: see "
+            "--no-share-history"
         ),
     )
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
-            "unified history. History the profile already accumulated is "
-            "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "unified history. This is the default; history the profile "
+            "already accumulated is merged into ~/.claude first. "
+            "--no-share-history keeps this account's history separate for "
+            "this launch, `cswap config set run.shareHistory false` for "
+            "every launch. Not supported on Windows, where each account "
+            "keeps its own history."
         ),
     )
     parser.add_argument(
@@ -190,6 +202,8 @@ Examples:
 
         manager = SessionManager(switcher)
 
+        # share_history goes through as given: None (neither flag) leaves it
+        # to run.shareHistory, which SessionManager.run resolves.
         if args.account is not None:
             manager.run(
                 args.account,
@@ -685,6 +699,47 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
         print(f"  Account-{num}  {value:g}%")
 
 
+def _priority_command(argv: list[str]) -> None:
+    """Set, clear, or inspect tiers without enabling the strategy implicitly."""
+    parser = argparse.ArgumentParser(
+        prog="cswap priority",
+        description=(
+            "Set or list account priority tiers for the optional "
+            "priority-consume-first strategy. Higher numbers are used first; "
+            "accounts in the same tier are ordered by soonest weekly reset."
+        ),
+    )
+    parser.add_argument("account", nargs="?", metavar="NUM|EMAIL|ALIAS")
+    parser.add_argument(
+        "priority", nargs="?", metavar="TIER",
+        help=f"Integer from 0 to {ACCOUNT_PRIORITY_MAX} (default 0)",
+    )
+    parser.add_argument("--unset", action="store_true", help="Return to priority 0")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+    if args.unset and args.priority is not None:
+        parser.error("--unset does not take a TIER argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL|ALIAS is required with --unset")
+    if args.account is not None and args.priority is None and not args.unset:
+        parser.error("TIER is required (or pass --unset)")
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if args.account is None:
+            print(bolded("Account priorities (higher first; default 0):"))
+            for num, policy in switcher.account_policies().items():
+                print(f"  Account-{num}  {switcher.account_email(num)}  {policy.priority}")
+            print(dimmed("Used only by: cswap auto --strategy priority-consume-first"))
+            return
+        switcher.set_account_priority(args.account, None if args.unset else args.priority)
+    except (ValueError, ClaudeSwitchError) as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -788,12 +843,15 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=AUTOSWITCH_STRATEGIES,
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
+            "'weekly-first' (switch at the threshold like best, onto the "
+            "account whose weekly window resets soonest), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'priority-consume-first' (highest account "
+            "priority, then soonest weekly reset; only targets below all switch lines)"
         ),
     )
     parser.add_argument(
@@ -1144,6 +1202,9 @@ def main() -> None:
     if argv and argv[0] == "threshold":
         _threshold_command(argv[1:])
         return
+    if argv and argv[0] == "priority":
+        _priority_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1181,6 +1242,8 @@ Commands:
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
   %(prog)s threshold                  list the global default and overrides
+  %(prog)s priority <num|email> <tier>  set priority (higher first; default 0)
+  %(prog)s priority                   list account priorities
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account

@@ -10,7 +10,6 @@ import shutil
 import sys
 import tempfile
 import threading
-import types
 from pathlib import Path
 from unittest.mock import patch
 
@@ -437,7 +436,7 @@ sys.addaudithook(_real_store_audit_hook)
 
 class _KeychainStore:
     """In-memory ``(service, account) -> secret`` map standing in for the real
-    macOS Keychain so unit tests never shell out to ``security`` or ``keyring``."""
+    macOS Keychain so unit tests never shell out to ``security``."""
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], str] = {}
@@ -454,41 +453,6 @@ class _KeychainStore:
 
     def delete_password(self, service: str, account: str) -> None:
         self.data.pop((service, account), None)  # absent = no-op (rc 44)
-
-
-def _make_fake_keyring() -> types.ModuleType:
-    """Build an in-memory stand-in for the ``keyring`` module (which would hit the
-    real Keychain on macOS) for code paths that lazily ``import keyring``."""
-
-    class _Errors:
-        class PasswordDeleteError(Exception):
-            pass
-
-        class PasswordSetError(Exception):
-            pass
-
-        class KeyringError(Exception):
-            pass
-
-    store: dict[tuple[str, str], str] = {}
-    mod = types.ModuleType("keyring")
-    mod.errors = _Errors  # type: ignore[attr-defined]
-
-    def get_password(service: str, username: str):
-        return store.get((service, username))
-
-    def set_password(service: str, username: str, password: str) -> None:
-        store[(service, username)] = password
-
-    def delete_password(service: str, username: str) -> None:
-        if (service, username) not in store:
-            raise _Errors.PasswordDeleteError("not found")
-        del store[(service, username)]
-
-    mod.get_password = get_password  # type: ignore[attr-defined]
-    mod.set_password = set_password  # type: ignore[attr-defined]
-    mod.delete_password = delete_password  # type: ignore[attr-defined]
-    return mod
 
 
 @pytest.fixture(autouse=True)
@@ -534,8 +498,7 @@ def block_real_keychain(request, monkeypatch):
     """Safety net: no test may touch the real macOS Keychain.
 
     Replaces the ``security``-CLI wrapper (``claude_swap.macos_keychain``) with an
-    in-memory fake and injects a fake ``keyring`` module (for the lazy
-    ``import keyring`` paths in purge/migrations). Tests marked
+    in-memory fake. Tests marked
     ``@pytest.mark.no_keychain_fake`` opt out — either because they mock
     ``subprocess`` themselves (the wrapper's own unit tests) or because they run
     against a temporary keychain on GitHub Actions.
@@ -550,7 +513,6 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "item_exists", store.item_exists)
     monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
     monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
-    monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
     yield store
 
 
@@ -573,6 +535,14 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
         yield
         return
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    # Same endpoint, same rule: the plan collector runs on every `list` and
+    # TUI snapshot, and test credentials carry an access token with no
+    # `expiresAt`, which reads as valid — so it would otherwise go live too.
+    from claude_swap import subscription
+
+    monkeypatch.setattr(
+        subscription, "fetch_plan", lambda token, *a, **k: subscription.PlanFetch()
+    )
     yield
 
 

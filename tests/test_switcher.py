@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -29,6 +30,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
+from claude_swap.settings import set_setting, settings_path
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -36,6 +38,7 @@ from claude_swap.switcher import (
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
+    _usage_entry_lines,
 )
 
 
@@ -1240,6 +1243,170 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
 
 
+class TestSetupTokenHeaderProbeWiring:
+    """``usage.headerProbe`` reaches every fetch, and a probed setup-token
+    account is paced by the store like any other fetch."""
+
+    CREDS = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-x", "scopes": ["user:inference"],
+    }})
+
+    def _info(self) -> tuple:
+        return (3, "setup-token-3@token.local", "", "", False, self.CREDS, "")
+
+    def test_setting_reaches_the_fetch_and_reloads_on_change(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None, error="http-429")) as mock_fetch:
+            switcher._fetch_account_usage(self._info())
+            # Opt-in: each probe is a real request on the subscription.
+            assert mock_fetch.call_args.kwargs["header_probe"] is False
+            set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+            # A same-second rewrite can keep the mtime; force a visible change.
+            path = settings_path(switcher.backup_dir)
+            os.utime(path, (time.time() + 5, time.time() + 5))
+            switcher._fetch_account_usage(self._info())
+            assert mock_fetch.call_args.kwargs["header_probe"] is True
+
+    def test_probe_is_paced_by_the_store(self, temp_home: Path):
+        """One collect pass sends one probe; a second pass inside the serve
+        TTL re-serves the stored reading without any request."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+        endpoint = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 429, "Too Many",
+            hdrs=None, fp=None,
+        )
+        probe = MagicMock()
+        probe.headers = {
+            "anthropic-ratelimit-unified-5h-utilization": "0.25",
+            "anthropic-ratelimit-unified-5h-reset": str(int(time.time()) + 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.5",
+            "anthropic-ratelimit-unified-7d-reset": str(int(time.time()) + 86400),
+        }
+        probe.__enter__ = lambda s: s
+        probe.__exit__ = MagicMock(return_value=False)
+        urls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            urls.append(req.full_url)
+            if req.full_url == oauth.USAGE_PROBE_URL:
+                return probe
+            raise endpoint
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            first = switcher._collect_usage_entries([self._info()])["3"]
+            second = switcher._collect_usage_entries([self._info()])["3"]
+
+        # The usage endpoint is never asked: it cannot read a setup-token.
+        assert urls == [oauth.USAGE_PROBE_URL]
+        assert first.last_error is None
+        assert first.last_good["five_hour"]["pct"] == 25.0
+        assert first.last_good["seven_day"]["pct"] == 50.0
+        assert first.next_poll_at is not None
+        assert oauth.account_headroom(second.decision_value()) == 50.0
+
+    def _probe_switcher(self, probe_result):
+        """A switcher with the probe on, its store on a fake clock, and a
+        urlopen fake answering every probe with ``probe_result``."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+        clock = {"now": time.time()}
+        switcher._usage_store.clock = lambda: clock["now"]
+        urls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            urls.append(req.full_url)
+            if isinstance(probe_result, Exception):
+                raise probe_result
+            return probe_result
+
+        return switcher, clock, urls, fake_urlopen
+
+    @staticmethod
+    def _probe_429(headers: dict):
+        import email.message
+        hdrs = email.message.Message()
+        for key, value in headers.items():
+            hdrs[key] = value
+        return urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 429, "Too Many", hdrs=hdrs, fp=None,
+        )
+
+    def test_bare_429_is_a_failure_not_an_exhausted_reading(self, temp_home: Path):
+        switcher, clock, urls, fake = self._probe_switcher(
+            self._probe_429({"Retry-After": "30"})
+        )
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake):
+            entry = switcher._collect_usage_entries([self._info()])["3"]
+        assert urls == [oauth.USAGE_PROBE_URL]
+        assert entry.last_good is None
+        assert entry.last_error == "http-429"
+        assert entry.backoff_until >= clock["now"] + 30
+        # Unknown, not at its limit: nothing for an at-limit switch to read.
+        assert oauth.account_headroom(entry.decision_value()) is None
+
+    @pytest.mark.parametrize("fetch", [None, {"3"}])
+    def test_no_probe_before_a_rejection_retry_deadline(
+        self, temp_home: Path, fetch
+    ):
+        """A confirmed rejection with Retry-After: 3600 blocks every collect,
+        plan-respecting or not, until the deadline passes."""
+        now = int(time.time())
+        rejected = self._probe_429({
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-5h-utilization": "0.2",
+            "anthropic-ratelimit-unified-5h-reset": str(now + 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.3",
+            "anthropic-ratelimit-unified-7d-reset": str(now + 86400),
+            "Retry-After": "3600",
+        })
+        switcher, clock, urls, fake = self._probe_switcher(rejected)
+        start = clock["now"]
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake):
+            first = switcher._collect_usage_entries([self._info()], fetch)["3"]
+            assert urls == [oauth.USAGE_PROBE_URL]
+            assert first.last_good["rejected"]["retry_after_s"] == 3600.0
+            assert first.backoff_until == start + 3600
+            for elapsed in (601, 1800, 3599):
+                clock["now"] = start + elapsed
+                switcher._collect_usage_entries([self._info()], fetch)
+            assert len(urls) == 1
+            clock["now"] = start + 3601
+            switcher._collect_usage_entries([self._info()], fetch)
+        assert len(urls) == 2
+
+    def test_probe_off_sends_no_request_and_says_why(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            entry = switcher._collect_usage_entries([self._info()])["3"]
+        urlopen.assert_not_called()
+        assert entry.last_good is None
+        assert entry.last_error == "setup-token"
+        lines = _usage_entry_lines(entry)
+        assert "usage.headerProbe true" in lines[0]
+
+    def test_partial_and_rejected_readings_stay_visible(self):
+        partial = {"five_hour": {"pct": 5.0}, "source": oauth.USAGE_SOURCE_HEADERS}
+        assert _format_usage_lines(partial) == ["5h:   5%"]
+        rejected = {
+            "five_hour": {"pct": 34.0},
+            "seven_day": {"pct": 60.0},
+            "rejected": {"retry_after_s": None, "resets_at": None},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        assert _format_usage_lines(rejected)[-1] == "probe: rejected"
+
+
 class TestAdoptSessionCredential:
     """An exited session's profile holds the slot's newest generation; the
     backup only learns about it through adoption."""
@@ -2108,7 +2275,7 @@ class TestActiveAccountRefresh:
             locks_held_during_post["config"] = config_lock_dir().is_dir()
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             from claude_swap.claude_locks import config_lock_dir
             assert is_active is True
             assert credentials == self._REFRESHED  # rotated token used for usage
@@ -2178,7 +2345,7 @@ class TestActiveAccountRefresh:
             }
         })
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             assert credentials == cc_rotated
             return oauth.UsageOutcome({"five_hour": {"pct": 7}})
 
@@ -2509,7 +2676,7 @@ class TestActiveAccountRefresh:
         })
         fetch_calls = []
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             fetch_calls.append(credentials)
             if credentials == valid_but_revoked:
                 return oauth.UsageOutcome(None, error="http-401")
@@ -5367,6 +5534,90 @@ class TestPurgeLegacyCleanup:
         assert "Legacy backup directory" not in out
 
 
+class TestPurgeQuarantineWarning:
+    """``purge`` removes the whole backup directory, and the history-migration
+    quarantine tree lives inside it.
+
+    Those files are the losing half of a collided transcript -- the only copy
+    left of it anywhere, since the merge that produced them deliberately
+    refuses to delete. The confirm prompt lists credentials and profiles and
+    reassures the user that their Claude Code login is safe; it must not stay
+    silent about the one thing purge destroys that nothing can recreate.
+    """
+
+    def _quarantine(self, switcher: ClaudeAccountSwitcher, count: int) -> Path:
+        run_dir = (
+            switcher.backup_dir / "history-conflicts" / "2026-07-27T12-00-00"
+        )
+        losers = run_dir / "profile" / "-home-user-app"
+        losers.mkdir(parents=True)
+        for i in range(count):
+            (losers / f"{i}.jsonl").write_text("the other half\n")
+        return run_dir
+
+    def test_prompt_names_the_quarantined_transcripts(
+        self, temp_home: Path, capsys
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        run_dir = self._quarantine(switcher, 3)
+
+        with patch("builtins.input", return_value="n"):
+            switcher.purge()
+
+        out = capsys.readouterr().out
+        assert "history-conflicts" in out
+        assert "3" in out
+        assert "only" in out.lower()  # "the only remaining copy"
+        assert run_dir.exists()  # declined, so nothing was removed
+
+    def test_prompt_omits_the_bullet_when_the_tree_is_empty(
+        self, temp_home: Path, capsys
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        # A migration that ran without collisions leaves the dir behind with
+        # nothing in it -- no warning to give.
+        (switcher.backup_dir / "history-conflicts" / "2026-07-27T12-00-00").mkdir(
+            parents=True
+        )
+
+        with patch("builtins.input", return_value="n"):
+            switcher.purge()
+
+        assert "history-conflicts" not in capsys.readouterr().out
+
+    def test_purge_still_removes_the_quarantine_tree(self, temp_home: Path):
+        """The warning is the fix, not a behavior change: purge is the user's
+        "remove everything" hammer and still removes everything."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        run_dir = self._quarantine(switcher, 1)
+
+        with patch("builtins.input", return_value="y"):
+            switcher.purge()
+
+        assert not run_dir.exists()
+
+    def test_purge_leaves_the_shared_history_lock(self, temp_home: Path):
+        """The lock in ``~/.claude`` is shared with every cswap store using
+        this home. Unlinking it under a launch that holds it lets the next
+        one take a fresh copy at the same time, so purge must not tidy it
+        away with the rest."""
+        from claude_swap.session import MIGRATION_LOCK
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        lock = temp_home / ".claude" / MIGRATION_LOCK
+        lock.touch()
+
+        with patch("builtins.input", return_value="y"):
+            switcher.purge()
+
+        assert not switcher.backup_dir.exists()  # purge did run
+        assert lock.exists()
+
+
 class TestAddAccountFromToken:
     """Tests for add_account_from_token (--add-token flow)."""
 
@@ -5638,7 +5889,8 @@ class TestPurge:
 
     def test_purge_removes_legacy_none_keychain_entry(self, temp_home):
         """Purge should clean account-None-* entries from older buggy runs — from
-        the new security service and best-effort from the legacy keyring."""
+        the new security service and, best-effort, from the service the legacy
+        keyring library used, both through ``security``."""
         switcher = ClaudeAccountSwitcher()
         switcher.platform = Platform.MACOS
         switcher._setup_directories()
@@ -5657,19 +5909,16 @@ class TestPurge:
             },
         })
 
-        mock_keyring = MagicMock()
         with patch("builtins.input", return_value="y"), \
-             patch("claude_swap.switcher.macos_keychain") as mock_kc, \
-             patch.dict(sys.modules, {"keyring": mock_keyring}):
+             patch("claude_swap.switcher.macos_keychain") as mock_kc:
             switcher.purge()
 
-        # New security service: account + legacy account-None both cleaned.
+        # New security service: account + legacy account-None both cleaned, then
+        # the old claude-code service swept the same way (item_exists is truthy
+        # on the mock, so every legacy item counts as present).
         mock_kc.delete_password.assert_has_calls([
             call("claude-swap", "account-1-user@example.com"),
             call("claude-swap", "account-None-user@example.com"),
-        ])
-        # Best-effort legacy keyring cleanup of the old claude-code service.
-        mock_keyring.delete_password.assert_has_calls([
             call("claude-code", "account-1-user@example.com"),
             call("claude-code", "account-None-user@example.com"),
         ])
@@ -6916,6 +7165,25 @@ class TestFormatUsageLines:
         lines = _format_usage_lines(usage)
         assert lines == ["Fable: 100%  (!)"]
 
+    def test_window_without_a_figure_renders_as_unknown_not_zero(self):
+        # ``utilization: null`` keeps its row and reset, with ``?`` in the number's
+        # column.
+        usage = {
+            "five_hour": {"pct": None, "clock": "20:39", "countdown": "1h 30m"},
+            "seven_day": {"pct": 72.0},
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0] == "5h:    ?   resets 20:39         in 1h 30m"
+        assert lines[1] == "7d:  72%"
+        assert _format_usage_lines({"seven_day": {"pct": None}}) == ["7d:    ?"]
+        # No figure, no pace: a week-old unknown 7d window gets no marker.
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        weekly = {"pct": None, "resets_at": (now + timedelta(days=1)).isoformat()}
+        line = _format_usage_lines({"seven_day": weekly}, fetched_at=now.timestamp())[0]
+        assert line.startswith("7d:    ?") and "pace" not in line
+
     def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
         # A measurement served from the store hours after its fetch still
         # carries the countdown frozen at fetch time; rendering must derive
@@ -8019,21 +8287,16 @@ class TestStashAndRetentionStore:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
-    def test_unreadable_current_backup_warns_instead_of_silent_no_op(
+    def test_unreadable_current_backup_is_logged_distinguishably_at_info(
         self, temp_home, caplog,
     ):
-        """I-2: ``_retain_previous_backup`` used the plain reader, so an
-        UNREADABLE current backup (``.enc`` exists but cannot be read) and a
-        genuinely ABSENT one both hit ``if not current: return`` — the same
-        silent no-op. Retention is best-effort, but "the backup is intact
-        and merely unreadable this instant" must not look identical in the
-        logs to "there was never anything to retain".
+        """I-2: an UNREADABLE current backup (``.enc`` exists but cannot be
+        read) must not look identical in the logs to a genuinely ABSENT one.
 
-        The WARNING is the whole contract here. Rounds 8-9 additionally
-        checkpointed the incoming bytes as a ``.prev``; round 10 withdrew
-        that (it shadowed a real Keychain ``.prev`` on a locked keychain),
-        so this asserts only that the unreadable case is distinguishable
-        from the absent one in the log.
+        The retention line is INFO: the reader already warned about the read
+        failure, so the underlying event is still reported once at WARNING.
+        Rounds 8-9 checkpointed the incoming bytes as a ``.prev``; round 10
+        withdrew that (it shadowed a real Keychain ``.prev``).
         """
         import logging
 
@@ -8045,20 +8308,25 @@ class TestStashAndRetentionStore:
         caplog.clear()
         enc.chmod(0o000)
         try:
-            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with caplog.at_level(logging.INFO, logger="claude-swap"):
                 store._retain_previous_backup("1", "a@b.c", "gen-2")
         finally:
             enc.chmod(0o600)
 
-        assert any(
-            "could not be retained" in r.message.lower()
-            or "could not be read" in r.message.lower()
-            for r in caplog.records
-            if "retain" in r.message.lower()
-        ), (
+        retention = [
+            r for r in caplog.records
+            if "could not retain previous credential generation" in r.message.lower()
+        ]
+        assert retention, (
             "DEFECT: an unreadable current backup at retention time produced "
-            "no warning distinguishing it from a genuinely absent one"
+            "no line distinguishing it from a genuinely absent one"
         )
+        assert all(r.levelno == logging.INFO for r in retention)
+        assert any(
+            r.levelno == logging.WARNING
+            and "Failed to read credentials file" in r.message
+            for r in caplog.records
+        ), "the read failure itself must still be reported once at WARNING"
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
@@ -8159,7 +8427,7 @@ class TestActiveRefreshProvenance:
             "expiresAt": 9_999_999_999_000,
         }})
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_kw):
             assert is_active is True
             assert credentials == refreshed  # rotated under the locks
             return oauth.UsageOutcome({"five_hour": {"pct": 10}})

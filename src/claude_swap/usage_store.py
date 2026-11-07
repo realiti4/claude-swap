@@ -548,6 +548,43 @@ def _rate_limited_trust_ok(
     return now < (min(soonest, ceiling) if soonest is not None else ceiling)
 
 
+def _rejection_backoff_until(usage: dict | None, now: float) -> float | None:
+    """When a reading from a refused setup-token header probe (``rejected``
+    with a Retry-After, see ``oauth.request_usage_via_probe``) allows the
+    next request, or None. Stored as ``backoffUntil``, which every fetch
+    path's eligibility (``_row_eligible``, ``due_candidate``) already honors,
+    so no collect probes the account again before the server's deadline.
+    Bounded by the same park cap as a 429's ask, so an absurd value cannot
+    wedge the row."""
+    rejected = usage.get("rejected") if isinstance(usage, dict) else None
+    retry_after = rejected.get("retry_after_s") if isinstance(rejected, dict) else None
+    if not isinstance(retry_after, (int, float)) or not retry_after > 0:
+        return None
+    return now + min(float(retry_after), RETRY_AFTER_FLOOR_CAP_S)
+
+
+def _rejection_deadline(usage: dict | None, now: float) -> float | None:
+    """Absolute end of the server's Retry-After on a confirmed probe
+    rejection a reading carries, bounded like
+    :func:`_rejection_backoff_until`, or None when it is unusable or already
+    past. For a reading taken on another machine (:meth:`UsageStore.adopt`)
+    the Retry-After was relative to that machine's fetch, so only the
+    absolute ``rejected.resets_at`` stamp carries over. Without a positive
+    ``retry_after_s`` that stamp is the quota reset the probe copied from the
+    unified headers, not a deadline: the local path installs no backoff for
+    it either, so bounded polling can still observe an early grant."""
+    rejected = usage.get("rejected") if isinstance(usage, dict) else None
+    if not isinstance(rejected, dict):
+        return None
+    retry_after = rejected.get("retry_after_s")
+    if not isinstance(retry_after, (int, float)) or not retry_after > 0:
+        return None
+    ts = parse_reset_ts(rejected.get("resets_at"))
+    if ts is None or ts <= now:
+        return None
+    return min(ts, now + RETRY_AFTER_FLOOR_CAP_S)
+
+
 def _failure_backoff_s(
     consecutive_failures: int,
     retry_after_s: float | None,
@@ -1118,7 +1155,9 @@ class UsageStore:
                     row["nextPollAt"], row["pollIntervalS"] = plan
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
-                row["backoffUntil"] = None
+                # A confirmed probe rejection's Retry-After is a deadline no
+                # collector may fetch before (see _rejection_backoff_until).
+                row["backoffUntil"] = _rejection_backoff_until(rec.usage, now)
                 row["rejectedFingerprint"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
             else:
@@ -1194,7 +1233,11 @@ class UsageStore:
         one, so a measurement this machine made itself is never downgraded.
         Fetch state (failures, backoff, poll plan, claim) is left alone: it
         describes this machine's own requests, and a fetch already in flight
-        still records normally when it lands.
+        still records normally when it lands. The one exception is a
+        confirmed probe rejection's deadline (``rejected.resets_at``, see
+        :func:`_rejection_deadline`): the server's refusal binds the account
+        on every machine, so an adopted one extends ``backoffUntil`` the way
+        :meth:`record` does for a local probe, never shortening a later one.
 
         ``hold_s`` > 0 stamps ``heldUntil``: no collector fetches the slot
         before then (``_row_eligible``, ``due_candidate``), and its last-good
@@ -1221,6 +1264,10 @@ class UsageStore:
                 row["fetchedAt"] = fetched_at
                 stored = fetched_at
                 adopted.add(num)
+                deadline = _rejection_deadline(usage, now)
+                current = _num_or_none(row.get("backoffUntil"))
+                if deadline is not None and (current is None or deadline > current):
+                    row["backoffUntil"] = deadline
             if hold_s is None:
                 return
             held_until = min(now + hold_s, stored + TRUST_MAX_AGE_S)

@@ -22,13 +22,16 @@ detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
 
-History sharing (``--share-history``, opt-in): additionally links
-``projects/`` (conversation transcripts — what ``claude --resume`` lists) and
-``history.jsonl`` (prompt history) from ``~/.claude``, so all accounts see one
-unified conversation history. POSIX-only: Windows shares by re-synced copy,
-which would fork history rather than share it. If the profile already
-accumulated its own history, it is merged into ``~/.claude`` first so nothing
-disappears from ``--resume``.
+History sharing (on by default; ``--no-share-history`` or ``run.shareHistory
+false`` turns it off): additionally links ``projects/`` (conversation
+transcripts — what ``claude --resume`` lists) and ``history.jsonl`` (prompt
+history) from ``~/.claude``, so all accounts see one unified conversation
+history. POSIX-only: Windows shares by re-synced copy, which would fork
+history rather than share it, so there every account keeps its own. If the
+profile already accumulated its own history, it is merged into ``~/.claude``
+first so nothing disappears from ``--resume``. A file that differs on both
+sides is never deleted: the copy not kept is parked under
+``<backup_dir>/history-conflicts/``.
 
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
@@ -44,14 +47,16 @@ import subprocess
 import sys
 import time
 import unicodedata
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    LockError,
     SessionError,
 )
 from claude_swap.fsutil import atomic_write_text
@@ -60,7 +65,11 @@ from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
-from claude_swap.settings import atomic_write_json
+from claude_swap.settings import (
+    atomic_write_json,
+    explicit_share_history,
+    load_run_settings,
+)
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -68,8 +77,8 @@ if TYPE_CHECKING:
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: plugins/,
 # sessions/, ide/, .claude.json, .credentials.json, statsig/ and other
-# telemetry. projects/ and history.jsonl are per-account by default and move
-# to HISTORY_ITEMS sharing only with the opt-in --share-history flag.
+# telemetry. projects/ and history.jsonl are shared too, but as HISTORY_ITEMS:
+# they have their own switch (run.shareHistory) and their own rules.
 # .claude.json stays excluded as a file, but its one user-scoped key —
 # top-level mcpServers — is mirrored separately by _sync_mcp_servers.
 SHARED_ITEMS = (
@@ -82,7 +91,7 @@ SHARED_ITEMS = (
     "rules",
 )
 
-# Conversation-history items linked additionally under --share-history.
+# Conversation-history items, linked unless history sharing is turned off.
 # POSIX symlinks only: Windows copy-mode would fork history, not share it.
 HISTORY_ITEMS = (
     "projects",
@@ -92,6 +101,11 @@ HISTORY_ITEMS = (
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
 SHARE_MANIFEST = ".cswap-shared.json"
+
+# Where a losing copy of a same-named transcript is parked. Never a delete:
+# a UUID collision after an un-share means two different halves of one
+# session, not a duplicate.
+QUARANTINE_DIRNAME = "history-conflicts"
 
 # Deferred-invalidation marker: backup credentials changed while a session was
 # live (we never pull credentials out from under a running claude), so the
@@ -110,6 +124,17 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # One-time migration stash: session-local MCP definitions displaced by the
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
+
+# The one lock every history migration takes. It lives IN the shared
+# destination (``~/.claude``), the only place every launch that can merge into
+# that tree agrees on: on Linux the backup root follows ``XDG_DATA_HOME``, so
+# two cswap stores can share one ``~/.claude``, and a lock inside either store
+# is invisible to the other. Never deleted, not even by ``--purge``: unlinking
+# a flock'd file lets a newcomer create a fresh one and hold "the" lock next
+# to a process still holding the old inode. A named constant rather than an
+# inline literal — after a rename, old and new launches would serialize on
+# different files.
+MIGRATION_LOCK = ".cswap-history-migration.lock"
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -204,6 +229,10 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # timeout) plus auth-status probes, so it needs more headroom than the
 # default 10s acquire used by the switch paths.
 _BOOTSTRAP_LOCK_TIMEOUT = 30.0
+
+# Migration moves every transcript in a profile, so it waits longer than the
+# bootstrap for a peer to finish rather than bailing and leaving a half state.
+_MIGRATION_LOCK_TIMEOUT = 30.0
 
 
 def slugify_email(email: str) -> str:
@@ -541,6 +570,83 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
+def _last_timestamp(path: Path) -> str | None:
+    """Last ISO-8601 ``timestamp`` in a JSONL transcript, scanning backwards.
+
+    Claude closes nearly every transcript with untimestamped state lines
+    (``last-prompt``, ``mode``, ``ai-title``, ``file-history-snapshot``), so
+    reading only the final line finds a timestamp in about 1% of real files.
+    Scanning back finds one within a line or two. Values are ISO-8601 Zulu
+    with milliseconds, so lexical comparison is chronological.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            stamp = entry.get("timestamp")
+            if isinstance(stamp, str) and stamp:
+                return stamp
+    return None
+
+
+def _line_count(path: Path) -> int:
+    """Lines in a file; 0 when it cannot be read (so it never wins a tiebreak)."""
+    try:
+        with path.open("rb") as handle:
+            return sum(1 for _ in handle)
+    except OSError:
+        return 0
+
+
+def _profile_copy_wins(target: Path, candidate: Path) -> bool:
+    """Whether the profile's ``candidate`` should replace the shared ``target``.
+
+    A same-named pair is *not* the same session: a transcript that straddled
+    an un-share event exists in both trees under one UUID with different
+    content. Order, applied in full so the outcome is deterministic: later
+    last-timestamp, then having a timestamp at all, then more lines, then the
+    incumbent. The loser is quarantined either way, never dropped.
+    """
+    target_stamp = _last_timestamp(target)
+    candidate_stamp = _last_timestamp(candidate)
+    if target_stamp != candidate_stamp:
+        if target_stamp is None:
+            return True
+        if candidate_stamp is None:
+            return False
+        return candidate_stamp > target_stamp
+    return _line_count(candidate) > _line_count(target)
+
+
+def _adds_nothing(target: Path, candidate: Path) -> bool:
+    """Whether the shared ``target`` already holds every byte of ``candidate``.
+
+    True for a byte-identical pair, and for a target that merely continues
+    the candidate — an older snapshot of an append-only transcript is a
+    prefix of the newer one. Either way the profile's copy is a true
+    duplicate, the one collision that is safe to drop rather than
+    quarantine. Unreadable means unknown, which is never "safe to drop".
+    """
+    try:
+        if candidate.stat().st_size > target.stat().st_size:
+            return False
+        with candidate.open("rb") as profile, target.open("rb") as shared:
+            while chunk := profile.read(1 << 20):
+                if shared.read(len(chunk)) != chunk:
+                    return False
+        return True
+    except OSError:
+        return False
+
+
 def _probe_env(session_dir: Path) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped."""
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
@@ -555,6 +661,15 @@ class SessionManager:
         self.switcher = switcher
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
+        # Filled by the most recent merge so the launch can report counts
+        # without re-deriving them from the filesystem.
+        self._last_merge_counts: tuple[int, int, Path | None] = (0, 0, None)
+        # A deferred migration is explained once per launch, not once per
+        # history item.
+        self._deferral_reported = False
+        # Whether this launch met history the profile holds on its own (and
+        # so tried to merge it), whatever came of the attempt.
+        self._own_history_found = False
 
     # -- launch ----------------------------------------------------------
 
@@ -563,10 +678,14 @@ class SessionManager:
         identifier: str,
         claude_args: list[str],
         share: bool = True,
-        share_history: bool = False,
+        share_history: bool | None = None,
         require_session: bool = False,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal.
+
+        ``share_history`` is the launch's own choice (``--share-history`` /
+        ``--no-share-history``); ``None`` leaves it to ``run.shareHistory``
+        (see ``_resolve_share_history``).
 
         ``require_session`` turns the same-account fast path (a plain claude
         launch on the default login) into a refusal: a wrapper that hands a
@@ -579,12 +698,9 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        if share_history and self.switcher.platform == Platform.WINDOWS:
-            raise SessionError(
-                "--share-history is not supported on Windows yet: sharing uses "
-                "re-synced copies there, which would fork the history instead "
-                "of sharing it."
-            )
+        # Before the fast path below: it never reaches setup_session, and it
+        # has to refuse the same request and handle the same history.
+        share_history = self._resolve_share_history(share_history)
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
@@ -592,37 +708,46 @@ class SessionManager:
         self._ensure_not_api_key(account_num, email)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
+        # Same-account fast path: never create a second credential copy
+        # for the account that is already the active default login —
+        # two copies of one account can drift if the server rotates the
+        # refresh token. With CLAUDE_CONFIG_DIR preset (we may be inside
+        # another session's terminal) the *default* login is still what a
+        # session for this account would copy, so it is read from the
+        # default profile rather than from the preset directory.
         if config_dir_preset:
-            # With CLAUDE_CONFIG_DIR set, "current default account" is
-            # meaningless (we may already be inside a session terminal), so
-            # the same-account fast path below must not trigger.
+            current = self._default_login_identity()
+        else:
+            current = self.switcher._get_current_account()
+        if current is not None and current == (email, org_uuid):
+            if require_session:
+                raise SessionError(
+                    f"Account-{account_num} ({email}) is the active default "
+                    "login, so this launch would run plain claude on the "
+                    "default login rather than in a session profile (a "
+                    "second copy of the active credential would drift). "
+                    "Switch the default login to another account first, "
+                    "or run `claude` directly."
+                )
+            print(
+                dimmed(
+                    f"Account-{account_num} ({email}) is already the active "
+                    "default login — launching claude directly."
+                )
+            )
+            self._history_on_the_fast_path(
+                session_dir_for(self.switcher.backup_dir, account_num, email),
+                share_history,
+            )
+            env = dict(os.environ)
+            # Run on the default login, not on the preset profile.
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            self._exec(claude_bin, claude_args, env=env)
+        if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-        else:
-            # Same-account fast path: never create a second credential copy
-            # for the account that is already the active default login —
-            # two copies of one account can drift if the server rotates the
-            # refresh token.
-            current = self.switcher._get_current_account()
-            if current is not None and current == (email, org_uuid):
-                if require_session:
-                    raise SessionError(
-                        f"Account-{account_num} ({email}) is the active default "
-                        "login, so this launch would run plain claude on the "
-                        "default login rather than in a session profile (a "
-                        "second copy of the active credential would drift). "
-                        "Switch the default login to another account first, "
-                        "or run `claude` directly."
-                    )
-                print(
-                    dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
-                    )
-                )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -644,6 +769,81 @@ class SessionManager:
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
+
+    def _history_on_the_fast_path(
+        self, session_dir: Path, share_history: bool
+    ) -> None:
+        """Deal with history the profile holds, on the launch that skips it.
+
+        The fast path is plain claude on ``~/.claude``, so what the account's
+        sessions wrote into its profile is not in front of the user (#239).
+        With sharing on it is merged now, by the steps a session launch
+        takes: an account that stays the default login would otherwise never
+        be migrated, however often it is run. With sharing off it stays
+        apart, and the launch says which history it is about to use.
+
+        History only. Nothing here seeds, validates or refreshes the
+        profile's credentials — a second live copy of the default login's
+        credential is what the fast path exists to avoid. A profile with no
+        history of its own (never used, or already linked) is left alone.
+        """
+        if not any(
+            (session_dir / name).exists() and not (session_dir / name).is_symlink()
+            for name in HISTORY_ITEMS
+        ):
+            return
+        if share_history:
+            self._sync_items(session_dir, HISTORY_ITEMS, scope=HISTORY_ITEMS)
+        else:
+            print(
+                dimmed(
+                    "   This launch uses the default login's chat history "
+                    "(~/.claude), not the account's own."
+                )
+            )
+
+    def _resolve_share_history(self, requested: bool | None) -> bool:
+        """Whether this launch shares chat history across accounts.
+
+        ``requested`` is the launch's own choice and wins. ``None`` defers to
+        ``run.shareHistory``, which is on unless the user turned it off.
+        Resolved here rather than by the caller so every launcher gets the
+        same answer from the same ``None``.
+
+        History links are POSIX-only (see the module docstring), so on
+        Windows the answer is always no, and what differs is how loudly:
+        asking on the command line is refused, having asked in settings is
+        worth a warning, and the built-in default simply does not apply.
+        """
+        windows = self.switcher.platform == Platform.WINDOWS
+        if requested is not None:
+            if requested and windows:
+                raise SessionError(
+                    "--share-history is not supported on Windows yet: sharing "
+                    "uses re-synced copies there, which would fork the history "
+                    "instead of sharing it."
+                )
+            return requested
+        if not windows:
+            return load_run_settings(self.switcher.backup_dir).share_history
+        if explicit_share_history(self.switcher.backup_dir):
+            warning(
+                "run.shareHistory is not supported on Windows yet — "
+                "using per-account history."
+            )
+        return False
+
+    @staticmethod
+    def _default_login_identity() -> tuple[str, str] | None:
+        """``(email, org_uuid)`` of the default profile's login, if any.
+
+        Ignores ``CLAUDE_CONFIG_DIR``, like ``_read_mcp_source``.
+        """
+        config = SessionManager._load_json_object(get_default_global_config_path())
+        oauth = config.get("oauthAccount") if config else None
+        if not isinstance(oauth, dict) or not oauth.get("emailAddress"):
+            return None
+        return oauth["emailAddress"], oauth.get("organizationUuid", "") or ""
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -696,9 +896,14 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self, identifier: str, share: bool, share_history: bool | None = None
     ) -> tuple[Path, str, str]:
-        """Ensure a valid session profile exists; returns (dir, num, email)."""
+        """Ensure a valid session profile exists; returns (dir, num, email).
+
+        ``share_history`` is read like ``run``'s: ``None`` means
+        ``run.shareHistory`` decides.
+        """
+        share_history = self._resolve_share_history(share_history)
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
@@ -998,7 +1203,7 @@ class SessionManager:
         # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
         try:
-            result = subprocess.run(
+            result = spawn.run(
                 [claude_bin, "auth", "status", "--json"],
                 env=_probe_env(session_dir),
                 capture_output=True,
@@ -1076,29 +1281,55 @@ class SessionManager:
         ``share`` governs SHARED_ITEMS (customizations) and the mcpServers
         mirror (see ``_sync_mcp_servers`` — its --no-share removal is gated
         on the adoption marker); ``share_history`` governs HISTORY_ITEMS
-        (conversation history) — independent concerns, so ``--no-share
-        --share-history`` gives a bare profile with unified history.
+        (conversation history) — independent concerns, so ``--no-share``
+        alone gives a bare profile that still has the unified history. Both
+        arrive here already decided (``_resolve_share_history`` for history).
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
         is set in the invoking environment. File/dir sharing is lock-free on
         the reuse path — concurrent runs with different flags are last-writer-
-        wins and self-heal on the next launch; only the MCP mirror takes
-        Claude's config lock, and only when it needs to write.
+        wins and self-heal on the next launch. The MCP mirror takes Claude's
+        config lock, and only when it needs to write; merging a profile's own
+        history into ``~/.claude`` takes ``MIGRATION_LOCK``.
         """
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
+        # History links are POSIX-only. _resolve_share_history already says
+        # no on Windows; repeated here for a caller that skipped it, and it
+        # also drops any links left by a POSIX→Windows profile move.
         if self.switcher.platform == Platform.WINDOWS:
             share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
+        self._sync_items(
+            session_dir,
+            (SHARED_ITEMS if share else ())
+            + (HISTORY_ITEMS if share_history else ()),
         )
+
+    def _sync_items(
+        self,
+        session_dir: Path,
+        active_items: tuple[str, ...],
+        scope: tuple[str, ...] = SHARED_ITEMS + HISTORY_ITEMS,
+    ) -> None:
+        """Link (or copy) ``active_items`` into the profile; undo the others.
+
+        ``scope`` is what this call decides about. An entry in it that is not
+        active is removed, and a managed entry outside it stays exactly as it
+        is, on disk and in the manifest. Everything by default; the fast
+        path passes the history items alone (``_history_on_the_fast_path``).
+        """
+        # Reset per call: _prepare_history_share accumulates into this as it
+        # runs (once per HISTORY_ITEMS entry), so a launch with nothing to
+        # migrate must not report counts left over from a previous one.
+        self._last_merge_counts = (0, 0, None)
+        self._deferral_reported = False
+        self._own_history_found = False
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
+        out_of_scope = [name for name in managed if name not in scope]
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
@@ -1106,17 +1337,17 @@ class SessionManager:
         # a stale manifest (lock-free launches race) must never be able to
         # delete real conversation history — only ever unlink symlinks.
         for name in managed:
-            if name not in active_items:
+            if name in scope and name not in active_items:
                 dest = session_dir / name
                 if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
                     continue
                 self._remove_managed(dest)
-        if not active_items:
+        if not active_items and not out_of_scope:
             manifest_path.unlink(missing_ok=True)
             return
 
         use_symlinks = self.switcher.platform != Platform.WINDOWS
-        new_managed: list[str] = []
+        new_managed: list[str] = list(out_of_scope)
 
         for name in active_items:
             src = source_root / name
@@ -1186,6 +1417,8 @@ class SessionManager:
         # write the manifest atomically so a concurrent reader never sees a
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
+        self._report_quarantine()
+        self._report_sharing_is_the_default()
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:
         """Mirror the default profile's user-scope ``mcpServers`` (issue #139).
@@ -1389,83 +1622,494 @@ class SessionManager:
         (created empty so there is something to link). Real history is merged
         even when the manifest claims the entry is managed: a stale manifest
         (lock-free launches race) must never let the generic loop delete it.
+
+        A merge runs under ``MIGRATION_LOCK`` together with everything it
+        depends on: the path and liveness checks are read again inside the
+        lock, and the link is installed before it is released (see
+        ``_migrate_under_lock``). A profile with nothing to merge never
+        takes it.
         """
         if dest.exists() and not dest.is_symlink():
-            # Real per-account history accumulated before the flag existed.
+            # Real per-account history: the profile kept its own while
+            # sharing was off (before it became the default, or by choice).
+            self._own_history_found = True
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
+            # This first look is a cheap early out — a profile that is always
+            # busy should not queue on the lock every launch for a merge that
+            # cannot run. The look that counts is taken under the lock.
             if not profile_is_quiescent(session_dir):
-                print(
-                    dimmed(
-                        f"Not sharing {dest.name} yet: another session is "
-                        "using this profile — retrying on the next launch."
-                    )
-                )
+                self._report_deferral(session_dir, dest)
                 return False
             try:
-                self._merge_history_into_source(src, dest)
+                # The lock sits beside the shared history, so that directory
+                # has to exist first — and with Claude Code's own mode, not
+                # the default one FileLock would create it with.
+                _mkdir_private(src.parent)
+                with FileLock(
+                    src.parent / MIGRATION_LOCK,
+                    timeout=_MIGRATION_LOCK_TIMEOUT,
+                ):
+                    if not self._migrate_under_lock(src, dest, session_dir):
+                        return False
+            except LockError:
+                # A peer is still merging — the timeout means "still busy",
+                # not "broken", so this degrades exactly like every other
+                # deferral instead of aborting the launch.
+                self._report_deferral(session_dir, dest, lock_busy=True)
+                return False
             except OSError as e:
+                # The lock file could not be created or opened (a read-only
+                # ~/.claude, say). No lock means no safe merge, and a history
+                # problem must not cost the launch.
                 self._logger.warning(
-                    f"Could not merge {dest.name} into {src}: {e}"
+                    f"Could not lock {src.parent} to merge {dest.name}: {e}"
                 )
                 print(
                     dimmed(
-                        f"Not sharing {dest.name}: merging the profile's "
-                        "existing history failed (see log)."
+                        f"Not sharing {dest.name}: the shared history could "
+                        "not be locked (see log)."
                     )
                 )
                 return False
-            print(
-                dimmed(
-                    f"Merged the profile's existing {dest.name} into "
-                    f"{src} — conversation history is now shared."
-                )
-            )
-        if not src.exists():
-            # Fresh ~/.claude (or first run): seed an empty share target so
-            # the generic loop below has something to link.
-            try:
-                # 0o600/0o700 to match Claude Code's own modes for history
-                # data — its mode= applies only at creation, so a loose seed
-                # here would stay world-readable forever.
-                if dest.name.endswith(".jsonl"):
-                    src.parent.mkdir(parents=True, exist_ok=True)
-                    src.touch(mode=0o600)
-                else:
-                    _mkdir_private(src)
-            except OSError as e:
-                self._logger.warning(f"Could not create {src}: {e}")
-                return False
+        return self._seed_history_source(src, dest)
+
+    def _seed_history_source(self, src: Path, dest: Path) -> bool:
+        """Create an empty share target when ``~/.claude`` has none yet."""
+        if src.exists():
+            return True
+        # Fresh ~/.claude (or first run): seed an empty share target so
+        # there is something to link.
+        try:
+            # 0o600/0o700 to match Claude Code's own modes for history
+            # data — its mode= applies only at creation, so a loose seed
+            # here would stay world-readable forever.
+            if dest.name.endswith(".jsonl"):
+                src.parent.mkdir(parents=True, exist_ok=True)
+                src.touch(mode=0o600)
+            else:
+                _mkdir_private(src)
+        except OSError as e:
+            self._logger.warning(f"Could not create {src}: {e}")
+            return False
         return True
 
-    @staticmethod
-    def _merge_history_into_source(src: Path, dest: Path) -> None:
+    def _migrate_under_lock(
+        self, src: Path, dest: Path, session_dir: Path
+    ) -> bool:
+        """Merge the profile's history into ``src`` and link it, as one step.
+
+        Runs with ``MIGRATION_LOCK`` held. That lock is keyed on the shared
+        destination — it is a file in it — rather than on the profile or the
+        backup store, because the destination is what two migrations contend
+        for: with a lock per profile (or per store), two DIFFERENT profiles
+        can each find a shared path missing, and the second move lands on
+        top of the first. It is its own file, so it cannot deadlock against
+        ``setup_session``'s bootstrap lock — still held across this call on
+        some paths, and never taken from in here.
+
+        Nothing decided before the wait is trusted. The peer we queued
+        behind may have merged this very item (``dest`` is gone: merging it
+        raises FileNotFoundError and reports a peer's success as our
+        failure), or linked it (``dest.is_dir()`` follows the link, so the
+        walk would file every shared transcript against itself), or a claude
+        may have started in the profile. Each is read again here.
+
+        The link goes in before the lock is released, so no peer ever finds
+        the profile in between — history moved out, nothing linked yet — and
+        takes that for a profile with nothing to share.
+        """
+        if not dest.exists() or dest.is_symlink():
+            return True  # a peer finished this item; the generic loop links
+        if not profile_is_quiescent(session_dir):
+            self._report_deferral(session_dir, dest)
+            return False
+        try:
+            self._merge_history_into_source(src, dest)
+        except (OSError, ValueError) as e:
+            # ValueError covers UnicodeDecodeError: a byte-corrupt history
+            # file is "nothing readable to merge", and losing a launch to a
+            # stray byte in ~/.claude/history.jsonl would strand every
+            # account that has not migrated yet.
+            self._logger.warning(f"Could not merge {dest.name} into {src}: {e}")
+            print(
+                dimmed(
+                    f"Not sharing {dest.name}: merging the profile's "
+                    "existing history failed (see log)."
+                )
+            )
+            return False
+        try:
+            if not self._seed_history_source(src, dest):
+                raise OSError(f"no {src} to link to")
+            # The same target the generic loop links to (see its note on a
+            # ~/.claude entry that is itself a symlink).
+            dest.symlink_to(src.resolve() if src.is_symlink() else src)
+        except OSError as e:
+            self._logger.warning(f"Failed to share {dest.name} into session: {e}")
+            print(
+                dimmed(
+                    f"Merged the profile's existing {dest.name} into {src}, "
+                    "but linking it back failed (see log) — retrying on the "
+                    "next launch."
+                )
+            )
+            return False
+        print(
+            dimmed(
+                f"Merged the profile's existing {dest.name} into "
+                f"{src} — conversation history is now shared."
+            )
+        )
+        return True
+
+    def _report_deferral(
+        self, session_dir: Path, dest: Path, lock_busy: bool = False
+    ) -> None:
+        """Explain a skipped migration loudly enough to be noticed.
+
+        The old one-line dimmed print was scrolled away by Claude's startup
+        banner and never logged, so a profile could sit unshared for days
+        with sharing asked for on every launch and no visible signal. Printed
+        once per launch: both history items defer for the same reason, and a
+        second copy of the block only buries the first.
+
+        ``lock_busy`` is the one deferral that has nothing to do with this
+        profile's own sessions: a peer cswap launch held ``MIGRATION_LOCK``
+        past the timeout, merging some profile's history (not necessarily
+        this one's) into the same shared tree.
+        """
+        account = session_dir.name
+        slot = account.split("-")[0]
+        blockers: list[ClaudeSession] = []
+        if lock_busy:
+            why = "the migration lock is held by a peer process"
+        else:
+            blockers, _ = scan_live_sessions(session_dir)
+            why = (
+                f"{len(blockers)} live session(s): "
+                + ", ".join(f"pid {b.pid} ({b.cwd})" for b in blockers)
+                if blockers
+                else "a session record could not be read"
+            )
+        self._logger.warning(
+            f"History migration of {dest.name} deferred for {account}: {why}"
+        )
+        if self._deferral_reported:
+            return
+        self._deferral_reported = True
+        warning(f"share-history: {account} keeps its own {dest.name} for now.")
+        retry = self._sharing_relaunch_command(slot)
+        if lock_busy:
+            # Nothing to close; the only useful action is to retry once the
+            # peer is done.
+            print(
+                dimmed(
+                    "   Another cswap launch is merging history into "
+                    "~/.claude right now."
+                )
+            )
+            print(dimmed(f"   Once it finishes, relaunch:  {retry}"))
+        elif blockers:
+            for live in blockers:
+                started = datetime.fromtimestamp(
+                    live.started_at / 1000, tz=UTC
+                ).astimezone()
+                print(
+                    dimmed(
+                        f"   pid {live.pid}  {live.cwd}  "
+                        f"(since {started:%Y-%m-%d %H:%M})"
+                    )
+                )
+            print(
+                dimmed(
+                    "   Sessions started here will not appear in "
+                    "`claude --resume` under other accounts."
+                )
+            )
+            print(dimmed(f"   Close them, then relaunch:  {retry}"))
+        else:
+            # Not quiescent, yet nobody to name: a record in the profile's
+            # sessions/ could not be read, and "cannot tell" is never
+            # treated as "nobody there".
+            print(
+                dimmed(
+                    "   A session record in this profile could not be read, "
+                    "so it may still be in use."
+                )
+            )
+            print(dimmed(f"   Close anything using it, then relaunch:  {retry}"))
+
+    def _sharing_relaunch_command(self, slot: str) -> str:
+        """The ``cswap run`` that shares history next time, as the user would
+        type it: the flag only where their settings turn sharing off."""
+        if load_run_settings(self.switcher.backup_dir).share_history:
+            return f"cswap run {slot}"
+        return f"cswap run {slot} --share-history"
+
+    def _report_sharing_is_the_default(self) -> None:
+        """Name the opt-out when the default reaches history a profile holds.
+
+        Sharing no longer has to be asked for, and for a profile with history
+        of its own that is not a silent change: this launch merged it into
+        ``~/.claude``, or explained why it could not yet. One line, and only
+        for a user who never chose — with ``run.shareHistory`` in the file
+        either way, there is nothing to tell them. It goes quiet by itself:
+        once the profile is linked there is no history of its own to meet.
+        """
+        if not self._own_history_found:
+            return
+        if explicit_share_history(self.switcher.backup_dir) is not None:
+            return
+        print(
+            dimmed(
+                "Chat history is shared between accounts by default now "
+                "(turn off: cswap config set run.shareHistory false)."
+            )
+        )
+
+    def _note_merge_progress(
+        self, moved: int, quarantined: int, run_dir: Path | None
+    ) -> None:
+        """Add one merge's counts to this launch's total.
+
+        HISTORY_ITEMS holds two entries (projects, history.jsonl), so a
+        launch merges up to twice — accumulate rather than overwrite, and
+        keep the first quarantine dir a run produces (the file-merge branch
+        never quarantines, so at most one of the two sets it).
+        """
+        prev_moved, prev_quarantined, prev_run_dir = self._last_merge_counts
+        self._last_merge_counts = (
+            prev_moved + moved,
+            prev_quarantined + quarantined,
+            prev_run_dir if prev_run_dir is not None else run_dir,
+        )
+
+    def _report_quarantine(self) -> None:
+        """Say where a merge parked the copies it did not keep.
+
+        One line per launch, after both history items. Without it the only
+        trace of a conflict is an INFO log line per file, and nothing tells
+        the user a second copy of anything exists. Printed after a merge that
+        failed halfway too: what it parked before failing is still parked.
+        """
+        _, quarantined, run_dir = self._last_merge_counts
+        if not quarantined or run_dir is None:
+            return
+        noun = "file" if quarantined == 1 else "files"
+        print(
+            dimmed(
+                f"Kept {quarantined} conflicting history {noun} aside in "
+                f"{run_dir} — nothing was deleted."
+            )
+        )
+        self._logger.warning(
+            f"History merge kept {quarantined} conflicting {noun} in {run_dir}"
+        )
+
+    def _shared_side_sessions(self, shared_root: Path) -> tuple[set[str], bool]:
+        """Ids of the sessions that appear to be writing the shared history.
+
+        A claude on the default login writes ``shared_root``'s history
+        directly, and one in a linked profile writes it through the link, so
+        ``shared_root`` and every profile of THIS store are read. The flag is
+        False when the answer cannot be trusted — a record that could not be
+        read, or a live session that names no transcript — and the caller
+        must then treat every shared file as in use: not knowing is not the
+        same as knowing nothing is there.
+
+        Best effort, not a guarantee. What is read is the ``sessionId``
+        Claude Code keeps in ``sessions/<pid>.json``. It follows ``--resume``
+        and ``/clear`` (read from the 2.1.319 bundle), but it is rewritten in
+        the background after the switch and a failed rewrite is only logged,
+        so a record read a moment ago can already be behind. Two kinds of
+        writer are not seen at all: a process that never registers a record
+        (a teammate or subagent process), and a session running in a profile
+        of ANOTHER cswap store that shares this ``~/.claude`` (a second
+        ``XDG_DATA_HOME``), whose records are kept where this store cannot
+        find them. Such a session goes undetected, and a transcript it is
+        writing can be replaced by a later profile copy — the copy it was
+        writing is then in the quarantine, not gone.
+        """
+        roots = [shared_root]
+        try:
+            roots.extend(p for p in self.sessions_dir.iterdir() if p.is_dir())
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return set(), False
+        ids: set[str] = set()
+        complete = True
+        for root in roots:
+            sessions, unreadable = scan_live_sessions(root)
+            if unreadable:
+                complete = False
+            for live in sessions:
+                if live.session_id:
+                    ids.add(live.session_id)
+                else:
+                    complete = False
+        return ids, complete
+
+    def _shared_copy_in_use(self, shared_root: Path, rel: Path) -> bool:
+        """Whether a live session appears to be writing the shared ``rel``.
+
+        Read fresh on every call and never kept for the rest of a merge: a
+        session can ``/resume`` another conversation while the merge is busy
+        with other files, and a snapshot taken at the first collision would
+        wave the newly live transcript through. What remains open is the
+        moment between this read and the rename, and the limits of the
+        records themselves (see ``_shared_side_sessions``).
+        """
+        live_ids, known = self._shared_side_sessions(shared_root)
+        if not known:
+            return True
+        # ``<slug>/<id>.jsonl`` is a session's transcript and ``<slug>/<id>/``
+        # holds its subagents: the id is a path component either way. Claude
+        # appends to both by path, so a file swapped in under a live session
+        # gets its next message.
+        names = {*rel.parts[:-1], rel.name.removesuffix(".jsonl")}
+        return not names.isdisjoint(live_ids)
+
+    def _quarantine(self, path: Path, rel: Path, run_dir: Path, side: str) -> Path:
+        """Move a losing copy under ``run_dir``, never over an existing file.
+
+        ``side`` is which tree the loser came from — ``"shared"`` or ``"profile"`` —
+        because both sides otherwise land at the same relative path and the operator
+        reconciling two disjoint halves of one session would have no way to tell which
+        half is which.
+        """
+        dest = run_dir / side / rel
+        _mkdir_private(dest.parent)
+        if dest.exists():
+            counter = 2
+            while True:
+                candidate = dest.parent / f"{dest.stem}.{counter}{dest.suffix}"
+                if not candidate.exists():
+                    dest = candidate
+                    break
+                counter += 1
+        shutil.move(str(path), str(dest))
+        self._logger.info(f"Quarantined colliding history file to {dest}")
+        return dest
+
+    def _merge_history_into_source(
+        self, src: Path, dest: Path
+    ) -> tuple[int, int, Path | None]:
         """Move the profile's own history at ``dest`` into ``src``.
 
-        Directories merge file-by-file (transcript filenames are UUIDs, so
-        collisions mean identical sessions — first writer wins and the
-        duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        Directories merge file-by-file, and a name collision does *not* mean
+        the same content: stable names (``memory/MEMORY.md``) diverge between
+        accounts, and a transcript that straddled an un-share event exists in
+        both trees under one UUID. Neither side's copy is ever deleted unless
+        the other side holds every byte of it:
+
+        - The shared copy already contains the profile's (identical, or it
+          continues it): the profile's is a true duplicate and is dropped.
+        - A transcript whose profile copy is the later one
+          (``_profile_copy_wins``) replaces the shared copy, which is
+          quarantined — unless a live session appears to be writing that
+          shared copy, in which case it stays where the session expects it.
+          That check is best effort (``_shared_side_sessions`` says what it
+          cannot see).
+        - Everything else keeps the shared copy and quarantines the
+          profile's. That covers every non-transcript file: nothing ties a
+          ``MEMORY.md`` to one session, so it can never be shown to be idle,
+          and a claude rewriting it in place would write straight over a
+          copy swapped in beneath it.
+
+        ``history.jsonl`` merges by appending lines not already present.
+        ``dest`` is removed once empty; any failure — an OSError, or a
+        UnicodeDecodeError on a byte-corrupt history file — propagates and
+        leaves remaining files in place for the next try. Returns
+        ``(moved, quarantined, run_dir)``: ``moved`` counts files relocated
+        into ``src`` — a plain (non-colliding) move, or the winning half of a
+        collision; ``quarantined`` counts losers parked instead of dropped. A
+        collision where the profile copy wins increments *both* for the one
+        file pair (the winner is moved, the incumbent is quarantined), so
+        callers must not sum the two counters as "files handled". The same
+        counts are added to ``_last_merge_counts`` however the walk ends,
+        so a merge that raises halfway still leaves what it parked on record.
         """
+        # Never merge the shared history into itself. ``is_dir()`` and
+        # ``rglob`` both follow a link, so a ``dest`` that is one — or that
+        # reaches ``src`` any other way — collides every shared file with
+        # itself. The caller already checks under the lock; it is repeated
+        # here because being wrong costs the whole shared history.
+        if dest.is_symlink() or (src.exists() and os.path.samefile(src, dest)):
+            raise OSError(f"{dest} is the shared history, not the profile's own")
+
+        run_dir: Path | None = None
+        moved = 0
+        quarantined = 0
+
+        def quarantine_root() -> Path:
+            nonlocal run_dir
+            if run_dir is None:
+                # Stamped per merge and named for the profile: several
+                # profiles migrate on the same day, and "profile" alone does
+                # not say whose MEMORY.md a parked copy is.
+                stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S")
+                run_dir = (
+                    self.switcher.backup_dir
+                    / QUARANTINE_DIRNAME
+                    / f"{stamp}-{dest.parent.name}"
+                )
+                _mkdir_private(run_dir)
+            return run_dir
+
         if dest.is_dir():
             _mkdir_private(src)
-            for path in sorted(dest.rglob("*"), reverse=True):
-                rel = path.relative_to(dest)
-                target = src / rel
-                if path.is_dir():
-                    path.rmdir()  # children already moved (reverse walk)
-                    continue
-                if target.exists():
-                    path.unlink()
-                    continue
-                _mkdir_private(target.parent)
-                shutil.move(str(path), str(target))
+            try:
+                for path in sorted(dest.rglob("*"), reverse=True):
+                    rel = path.relative_to(dest)
+                    target = src / rel
+                    if path.is_dir():
+                        path.rmdir()  # children already moved (reverse walk)
+                        continue
+                    if target.exists():
+                        if _adds_nothing(target, path):
+                            path.unlink()
+                            continue
+                        if (
+                            path.suffix == ".jsonl"
+                            and target.is_file()
+                            and _profile_copy_wins(target, path)
+                            and not self._shared_copy_in_use(src.parent, rel)
+                        ):
+                            # Park the incumbent first: a crash between the
+                            # two leaves the shared path empty, and the next
+                            # run moves the profile copy in cleanly. Counted
+                            # as parked right here, not after the move: if
+                            # the move fails, this is the copy the user has
+                            # to be pointed at.
+                            self._quarantine(
+                                target, rel, quarantine_root(), "shared"
+                            )
+                            quarantined += 1
+                            _mkdir_private(target.parent)
+                            shutil.move(str(path), str(target))
+                            moved += 1
+                        else:
+                            self._quarantine(
+                                path, rel, quarantine_root(), "profile"
+                            )
+                            quarantined += 1
+                        continue
+                    _mkdir_private(target.parent)
+                    shutil.move(str(path), str(target))
+                    moved += 1
+            finally:
+                # However the walk ends. A merge that stops halfway has
+                # still parked what it parked, and the launch must be able
+                # to say where.
+                self._note_merge_progress(moved, quarantined, run_dir)
             dest.rmdir()
         else:
-            existing: set[str] = set()
+            existing_text = ""
             if src.exists():
-                existing = set(src.read_text(encoding="utf-8").splitlines())
+                existing_text = src.read_text(encoding="utf-8")
+            existing = set(existing_text.splitlines())
             lines = [
                 line
                 for line in dest.read_text(encoding="utf-8").splitlines()
@@ -1475,9 +2119,16 @@ class SessionManager:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 if not src.exists():
                     src.touch(mode=0o600)  # match Claude Code's history mode
+                # A history.jsonl torn by a crashed append ends mid-line, and
+                # appending onto it would weld that tail to the first merged
+                # entry — one line that parses as neither, with no second
+                # copy to recover from once dest is unlinked below.
+                torn = bool(existing_text) and not existing_text.endswith("\n")
+                terminator = "\n" if torn else ""
                 with src.open("a", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
+                    f.write(terminator + "\n".join(lines) + "\n")
             dest.unlink()
+        return moved, quarantined, run_dir
 
     @staticmethod
     def _read_manifest(manifest_path: Path) -> list[str]:

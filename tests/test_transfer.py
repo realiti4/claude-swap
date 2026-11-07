@@ -2113,6 +2113,20 @@ class TestImportUsage:
         assert "Adopted usage for bob@example.com → slot 2" in err
         assert "Done: 1 adopted, 0 kept, 2 skipped" in err
 
+    def test_a_window_without_a_figure_is_adopted(self, temp_home: Path, capsys):
+        # ``list --json`` prints ``"pct": null`` for a window reported without a
+        # utilization figure; the document must still import, the window kept.
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        self._import(
+            s, temp_home, _usage_document(_usage_row("bob@example.com", pct=None)),
+        )
+
+        entry = s._usage_store.entries({"2": ("bob@example.com", "")})["2"]
+        assert entry.last_good["five_hour"]["pct"] is None
+        assert entry.last_good["five_hour"]["resets_at"] == "2099-01-01T00:00:00+00:00"
+        assert "Adopted usage for bob@example.com → slot 2" in capsys.readouterr().err
+
     def test_a_held_account_is_not_fetched(self, temp_home: Path):
         """Through the real collector: after a hand-over with a hold,
         ``list --json`` serves the adopted reading and sends no request for
