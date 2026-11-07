@@ -14739,7 +14739,7 @@ class TestDisableEnableAccount:
         s.set_account_disabled("2", True)
         self._make_live(temp_home, "b@example.com", 2)
 
-        s.add_account(slot=5)
+        s.add_account(slot=5, assume_yes=True)
 
         assert "2" not in s._get_sequence_data()["accounts"]
         assert s.is_account_disabled("5") is True
