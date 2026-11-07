@@ -108,6 +108,10 @@ _FORWARDED_ENV_KEYS = (
 # the installed one, whichever way the upgrade happened.
 STAMP_NAME = "menubar_worker.json"
 
+# A worker younger than this may simply not have written its stamp yet (the
+# bundle hop and the imports come first); a missing stamp says nothing then.
+_STAMP_GRACE_SECONDS = 60.0
+
 # `launchctl bootout` can return before launchd has finished tearing the
 # job down, and a `bootstrap` inside that window fails with "Operation
 # already in progress". Poll until the job is really gone instead of
@@ -173,16 +177,60 @@ def read_worker_stamp(backup_dir: Path | None = None) -> dict | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def worker_build_is_stale(pid: int, backup_dir: Path | None = None) -> bool:
-    """Whether the worker running as ``pid`` reports an older build than this one.
+def _parse_etime(text: str) -> float | None:
+    """Seconds from ``ps -o etime`` output: ``[[dd-]hh:]mm:ss``."""
+    text = text.strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        day_part, text = text.split("-", 1)
+        if not day_part.isdigit():
+            return None
+        days = int(day_part)
+    parts = text.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts):
+        return None
+    values = [int(part) for part in parts]
+    hours, minutes, seconds = (0, *values) if len(values) == 2 else values
+    return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
 
-    The stamp must be the running job's own (pid match); a stamp left by an
-    earlier instance says nothing about this one. Compares version and commit,
-    so a git install whose version string never moves still counts.
+
+def _process_age_seconds(pid: int) -> float | None:
+    """Seconds since ``pid`` started, or None when ``ps`` cannot say."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "etime="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return _parse_etime(proc.stdout)
+
+
+def worker_build_is_stale(pid: int, backup_dir: Path | None = None) -> bool:
+    """Whether the worker running as ``pid`` should be restarted onto this build.
+
+    With a stamp of its own (pid match) the answer is exact: version and commit
+    are compared, so a git install whose version string never moves still
+    counts. Without one — a worker from before stamps existed (the 0.30 and
+    1.0.0b1 builds), or one that could not write the data directory — the
+    build is unknown, and the worker is restarted once so that its successor
+    can be told apart. Not while it may still be writing its stamp, and not
+    when a stamp cannot be written here either: then every call would restart
+    it, which is worse than an unknown build.
     """
     stamp = read_worker_stamp(backup_dir)
     if not stamp or stamp.get("pid") != pid:
-        return False
+        age = _process_age_seconds(pid)
+        if age is None or age < _STAMP_GRACE_SECONDS:
+            return False
+        return os.access(worker_stamp_path(backup_dir).parent, os.W_OK)
     from claude_swap.update_check import install_identity
 
     current = install_identity()
@@ -680,9 +728,12 @@ def install(
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
     # A reinstall from a shell in another profile silently redirects the
-    # service; report what moved so the caller can say so.
+    # service; report what moved so the caller can say so. The previous
+    # configuration is in whichever home the plist currently has: the data
+    # directory while Start at login is off.
+    session_plist = session_plist_path(label, backup_dir)
     wanted = _plist_dict(program, label, home)
-    previous = _load_plist(target_plist)
+    previous = _load_plist(target_plist) or _load_plist(session_plist)
     profile_changes: list[tuple[str, str | None, str | None]] = []
     if previous is not None:
         old_env = previous.get("EnvironmentVariables") or {}
@@ -696,7 +747,6 @@ def install(
     # proxy URL can carry credentials, and a write cut short by Ctrl-C must
     # not leave a truncated plist for the next login to choke on.
     atomic_write_bytes(target_plist, plistlib.dumps(wanted))
-    session_plist = session_plist_path(label, backup_dir)
     if session_plist.exists():
         session_plist.unlink()
 

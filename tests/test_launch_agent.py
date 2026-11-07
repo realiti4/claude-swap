@@ -487,15 +487,21 @@ class _FakeLaunchd:
     when asked to. Records every argv so tests can assert the sequence.
     """
 
-    def __init__(self, *, loaded=False, pid=None, switched_off=False, launchd_disabled=False):
+    def __init__(
+        self, *, loaded=False, pid=None, switched_off=False, launchd_disabled=False,
+        etime="00:10",
+    ):
         self.loaded, self.pid = loaded, pid
         self.switched_off = switched_off  # the System Settings switch (BTM)
         self.launchd_disabled = launchd_disabled  # launchd's own override list
+        self.etime = etime  # what `ps -o etime=` says about the running job
         self.calls: list[list[str]] = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
         sub = argv[1]
+        if argv[0] == "ps":
+            return _completed(0, stdout=f"{self.etime}\n")
         if argv[0] == "sfltool":
             disposition = "disallowed" if self.switched_off else "allowed"
             return _completed(0, stdout=_btm_dump(disposition))
@@ -981,17 +987,94 @@ def test_write_worker_stamp_records_this_process_and_build(tmp_path):
     assert launch_agent.worker_build_is_stale(os.getpid(), data) is False
 
 
-def test_worker_build_is_stale_only_for_the_running_pids_own_older_stamp(tmp_path, monkeypatch):
+def test_worker_build_is_stale_for_the_running_pids_own_older_stamp(tmp_path, monkeypatch):
     _home, data = _homes(tmp_path)
     _stamp(data, pid=4242, version="0.0.0")
     monkeypatch.setattr(
         "claude_swap.update_check.install_identity",
         lambda: {"version": "1.0.0", "source": None},
     )
-    assert launch_agent.worker_build_is_stale(4242, data) is True
-    assert launch_agent.worker_build_is_stale(4243, data) is False  # someone else's stamp
-    launch_agent.worker_stamp_path(data).unlink()
-    assert launch_agent.worker_build_is_stale(4242, data) is False  # no stamp, no claim
+    with patch.object(launch_agent.subprocess, "run", side_effect=_FakeLaunchd()):
+        assert launch_agent.worker_build_is_stale(4242, data) is True
+
+
+def test_an_unstamped_worker_is_restarted_once_it_is_past_the_grace_period(tmp_path):
+    """Workers from before stamps existed (0.30, 1.0.0b1) never write one.
+
+    Without this rule an external upgrade would leave them running the old
+    build for ever: plain `cswap menubar` would read "no stamp" as "current".
+    """
+    _home, data = _homes(tmp_path)
+    old = _FakeLaunchd(etime="05:00")
+    with patch.object(launch_agent.subprocess, "run", side_effect=old):
+        assert launch_agent.worker_build_is_stale(4242, data) is True
+    # Someone else's stamp counts as no stamp of its own.
+    _stamp(data, pid=4243, version="1.0.0")
+    with patch.object(launch_agent.subprocess, "run", side_effect=old):
+        assert launch_agent.worker_build_is_stale(4242, data) is True
+
+
+def test_an_unstamped_worker_still_starting_up_is_left_alone(tmp_path):
+    _home, data = _homes(tmp_path)
+    young = _FakeLaunchd(etime="00:10")
+    with patch.object(launch_agent.subprocess, "run", side_effect=young):
+        assert launch_agent.worker_build_is_stale(4242, data) is False
+
+
+def test_an_unstamped_worker_is_left_alone_when_ps_cannot_date_it(tmp_path):
+    _home, data = _homes(tmp_path)
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.return_value = _completed(1)
+        assert launch_agent.worker_build_is_stale(4242, data) is False
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="needs a read-only directory"
+)
+def test_an_unstamped_worker_is_not_restarted_when_no_stamp_could_be_written(tmp_path):
+    # Otherwise every `cswap menubar` would restart it: the successor could
+    # not write a stamp either.
+    _home, data = _homes(tmp_path)
+    data.chmod(0o500)
+    try:
+        with patch.object(launch_agent.subprocess, "run", side_effect=_FakeLaunchd(etime="05:00")):
+            assert launch_agent.worker_build_is_stale(4242, data) is False
+    finally:
+        data.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "text, seconds",
+    [("00:10", 10), ("05:00", 300), ("01:02:03", 3723), ("2-01:00:00", 176400), ("", None), ("junk", None)],
+)
+def test_parse_etime(text, seconds):
+    assert launch_agent._parse_etime(text) == seconds
+
+
+def test_ensure_restarts_an_unstamped_worker_of_unknown_build(tmp_path):
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    fake = _FakeLaunchd(loaded=True, pid=4242, etime="05:00")
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "restarted"
+    assert result["stale_build"] is True
+    assert ["launchctl", "kickstart", "-k", f"gui/{UID}/{launch_agent.LABEL}"] in fake.calls
+
+
+def test_install_compares_against_the_session_plist_when_start_at_login_is_off(tmp_path, monkeypatch):
+    home, data = _homes(tmp_path)
+    session = launch_agent.session_plist_path(backup_dir=data)
+    session.write_bytes(
+        launch_agent.build_plist(PROGRAM, home=home, env={"CLAUDE_CONFIG_DIR": "/old/profile"})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/new/profile")
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
+    assert result["profile_changes"] == [("CLAUDE_CONFIG_DIR", "/old/profile", "/new/profile")]
+    assert not session.exists()
 
 
 def test_worker_build_compares_the_commit_too(tmp_path, monkeypatch):
