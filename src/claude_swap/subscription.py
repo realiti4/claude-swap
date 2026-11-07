@@ -15,6 +15,10 @@ Measured shapes, one account each:
     lapsed                 canceled    default_claude_ai       none
     =====================  ==========  ======================  ===================
 
+2026-11-07: an Ultra account carries ``default_claude_max_20x``, organization
+type ``claude_max`` and ``plan_display_name`` "Ultra", so the tier alone does
+not name the plan.
+
 ``subscription_status`` does not move at cancellation, only at lapse, so a
 cancelled-but-still-running subscription is indistinguishable from one that
 will renew. That is why renewal is not shown. Expired is ``canceled`` together
@@ -182,11 +186,14 @@ def plan_label(plan: dict | None) -> str | None:
     org_label = _ORG_TYPE_LABELS.get(plan.get("organizationType"))
     if org_label:
         return org_label
-    name = plan.get("planDisplayName")
-    if isinstance(name, str) and name:
-        return name
     tier = plan.get("tier")
-    return _TIER_LABELS.get(tier, tier)
+    label = _TIER_LABELS.get(tier, tier)
+    # The server's name wins unless the table names the same plan more
+    # precisely ("Max" vs "Max 5x"); Ultra shares the Max 20x tier string.
+    name = plan.get("planDisplayName")
+    if isinstance(name, str) and name and not label.startswith(name):
+        return name
+    return label
 
 
 def is_expired(plan: dict | None) -> bool:
