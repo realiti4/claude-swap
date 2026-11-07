@@ -2269,6 +2269,30 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num))
         return bool(record and record.get("disabled"))
 
+    #: The fields a user puts on a managed slot, as opposed to the identity
+    #: and provenance fields (email, uuid, org, added, kind) that a re-login
+    #: rewrites from the new credential. ``add_account`` and
+    #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
+    #: carry exactly these across; a new per-account setting belongs here.
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+
+    @classmethod
+    def _carried_settings(cls, record: dict | None) -> dict:
+        """The user-set fields of ``record``, to reattach to a rebuilt one.
+
+        Absent keys stay absent: every writer (``set_alias``,
+        ``set_account_disabled``, ``set_account_threshold``,
+        ``set_account_priority``) pops a cleared setting rather than storing a
+        default, and a copy must not reintroduce one.
+        """
+        if not record:
+            return {}
+        return {
+            key: record[key]
+            for key in cls.USER_ACCOUNT_SETTINGS
+            if record.get(key) is not None
+        }
+
     @staticmethod
     def _policy_from_data(data: dict, account_num: str) -> AccountPolicy:
         """Per-account auto-switch overrides from already-loaded data.
@@ -4866,6 +4890,10 @@ class ClaudeAccountSwitcher:
                   When specified, prompts for confirmation if the slot
                   is already occupied by a different account, or the
                   account already lives in another slot (which it empties).
+                  Re-adding the account that already holds the slot (or
+                  moving it there from another) refreshes the login and
+                  keeps the settings the user put on it: alias, disabled
+                  flag, threshold and priority.
             assume_yes: Skip that overwrite prompt (callers with their own
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
@@ -5035,27 +5063,24 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        # Capture the state the slot already holds before destructive cleanup
-        # below deletes the old record (same account moving slots, or refreshing
-        # in place). The alias and the disabled flag are settings the user put on
-        # the account, not part of the login being refreshed, so losing them here
-        # would silently return a parked account to automatic rotation. Only a
+        # Capture the settings the user put on the slot before the destructive
+        # cleanup below deletes the old record (same account moving slots, or
+        # refreshing in place). The alias, the disabled flag and the per-account
+        # threshold and priority belong to the account, not to the login being
+        # refreshed, so losing them here would silently return a parked account
+        # to automatic rotation or drop it back onto the global policy. Only a
         # record belonging to the SAME account is read: a displaced occupant's
         # lineage ends with it, and the newcomer must not inherit its state.
-        existing_alias = None
-        existing_disabled = False
+        carried: dict = {}
         if slot is not None:
             prior = data.get("accounts", {}).get(account_num) or {}
             if (
                 prior.get("email") == current_email
                 and prior.get("organizationUuid", "") == current_org_uuid
             ):
-                existing_alias = prior.get("alias")
-                existing_disabled = bool(prior.get("disabled"))
+                carried = self._carried_settings(prior)
             if migrate_from:
-                migrated = data["accounts"][migrate_from]
-                existing_alias = migrated.get("alias") or existing_alias
-                existing_disabled = bool(migrated.get("disabled")) or existing_disabled
+                carried.update(self._carried_settings(data["accounts"][migrate_from]))
 
         if alias is not None:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -5132,11 +5157,9 @@ class ClaudeAccountSwitcher:
             "organizationName": organization_name,
             "added": get_timestamp(),
         }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
-        if existing_disabled:
-            data["accounts"][account_num]["disabled"] = True
+        if alias is not None:
+            carried["alias"] = alias  # an explicit --alias wins over the carried one
+        data["accounts"][account_num].update(carried)
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
@@ -5174,7 +5197,10 @@ class ClaudeAccountSwitcher:
                    defaults to ``setup-token-{slot}@token.local`` (or
                    ``api-key-{slot}@token.local`` for API keys) since these tokens
                    carry no real email metadata.
-            slot:  Slot number to use; auto-assigned when ``None``.
+            slot:  Slot number to use; auto-assigned when ``None``. Re-adding
+                   to the slot the same account already holds refreshes the
+                   token and keeps its alias, disabled flag, threshold and
+                   priority.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
         """
@@ -5309,22 +5335,18 @@ class ClaudeAccountSwitcher:
 
         # Same carry-forward as ``add_account``, and for the same reason: a
         # slot-pinned token account is refreshed by re-running this with --slot,
-        # which rebuilds the record wholesale, and the alias and the disabled
-        # flag belong to the account rather than to the token being replaced.
-        existing_alias = None
-        existing_disabled = False
+        # which rebuilds the record wholesale, and the user's settings on it
+        # belong to the account rather than to the token being replaced.
+        carried: dict = {}
         if slot is not None:
             prior = data.get("accounts", {}).get(account_num) or {}
             if (
                 prior.get("email") == email
                 and prior.get("organizationUuid", "") == ""
             ):
-                existing_alias = prior.get("alias")
-                existing_disabled = bool(prior.get("disabled"))
+                carried = self._carried_settings(prior)
             if migrate_from:
-                migrated = data["accounts"][migrate_from]
-                existing_alias = migrated.get("alias") or existing_alias
-                existing_disabled = bool(migrated.get("disabled")) or existing_disabled
+                carried.update(self._carried_settings(data["accounts"][migrate_from]))
 
         if displace_slot:
             d_num, d_email, d_org = displace_slot
@@ -5363,10 +5385,7 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
-        if existing_alias:
-            record["alias"] = existing_alias
-        if existing_disabled:
-            record["disabled"] = True
+        record.update(carried)
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
