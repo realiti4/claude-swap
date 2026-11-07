@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import menubar
+from claude_swap import menubar, oauth
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import USAGE_API_KEY
 
@@ -383,6 +383,14 @@ def test_format_title_both_keeps_available_window():
     assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
 
 
+def test_format_title_and_summary_with_a_null_five_hour_window():
+    # Ultra accounts have no 5-hour limit; the usage API reports the window as null.
+    usage = oauth.build_usage_result({"five_hour": None, "seven_day": {"utilization": 25.0}})
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    assert menubar.format_title("loc@x.com", usage, s) == "⇄ 25%"
+    assert menubar.usage_summary(usage) == "7d 25%"
+
+
 # --- reset-time helpers --------------------------------------------------------
 
 def test_resets_at_ts_orders_and_handles_missing():
@@ -514,6 +522,34 @@ def test_adapt_snapshot_shape_and_active_selection():
 
 def test_adapt_snapshot_empty():
     assert menubar._adapt_snapshot(_FakeSnap([])) == menubar.EMPTY_SNAPSHOT
+
+
+def test_take_worker_snapshot_bypasses_store_only_on_explicit_refresh():
+    calls = []
+
+    class _FakeSource:
+        def take(self, *, full=False, store_only=False):
+            calls.append((full, store_only))
+            return _FakeSnap([])
+
+    source = _FakeSource()
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=False, has_engine=True
+    )
+    assert store_only is True
+    assert calls[-1] == (False, True)
+
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=True, has_engine=True
+    )
+    assert store_only is False
+    assert calls[-1] == (True, False)
+
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=False, has_engine=False
+    )
+    assert store_only is False
+    assert calls[-1] == (False, False)
 
 
 # --- weekly reset roll-forward (static 7-day cadence) --------------------------

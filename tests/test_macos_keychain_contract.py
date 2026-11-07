@@ -39,7 +39,7 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 # ---------------------------------------------------------------------------
-# Mocked keyring tests — backup-credentials path. Run everywhere.
+# Mocked Keychain tests — backup-credentials path. Run everywhere.
 # ---------------------------------------------------------------------------
 
 

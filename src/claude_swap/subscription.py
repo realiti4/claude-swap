@@ -3,7 +3,7 @@
 The plan comes from ``GET /api/oauth/profile`` — the same endpoint
 :func:`oauth.fetch_oauth_profile` calls to resolve identity. That function
 returns only the identity it needs; the response carries a good deal more, of
-which four ``organization`` fields are kept here.
+which five ``organization`` fields are kept here.
 
 Measured shapes, one account each:
 
@@ -14,6 +14,11 @@ Measured shapes, one account each:
     cancelled, in period   active      default_claude_max_20x  stripe_subscription
     lapsed                 canceled    default_claude_ai       none
     =====================  ==========  ======================  ===================
+
+2026-11-07: an Ultra account carries ``default_claude_max_20x``, organization
+type ``claude_max`` and ``plan_display_name`` "Ultra", so the tier alone does
+not name the plan. An Enterprise seat carries ``default_claude_zero`` and no
+plan name, so its organization type claims the label.
 
 ``subscription_status`` does not move at cancellation, only at lapse, so a
 cancelled-but-still-running subscription is indistinguishable from one that
@@ -70,6 +75,10 @@ MAX_RETRY_S = 24 * 3600
 
 FREE_TIER = "default_claude_ai"
 
+# Used when a record carries no planDisplayName (the server sent none, or the
+# record predates the name and is refetched on the next pass allowed to read
+# it), and when the server's name is only a prefix of the table label ("Max"
+# vs "Max 5x").
 # Only values that have actually been observed. An unknown tier falls back to
 # the raw string rather than a guessed label — a wrong "Pro" is worse than an
 # honest "default_claude_pro".
@@ -79,16 +88,26 @@ _TIER_LABELS = {
     "default_claude_max_20x": "Max 20x",
 }
 
-# A seat on a Team organization is not a personal subscription, whatever rate
-# tier the seat carries, so the organization type wins where it is known.
+# A seat on a Team or Enterprise organization is not a personal subscription,
+# whatever rate tier the seat carries, so the organization type wins where it
+# is known.
+#
+# ``claude_pro`` is the same story with a different label: a paying Pro
+# subscription reports the *default* rate-limit bucket (``default_claude_ai``),
+# which is also what a lapsed account falls back to, so the tier alone would
+# print "Free" for a subscriber who is paying. The organization type is the
+# field that still names the plan.
 _ORG_TYPE_LABELS = {
     "claude_team": "Team",
+    "claude_enterprise": "Enterprise",
+    "claude_pro": "Pro",
 }
 
 _KEPT_FIELDS = (
     ("organization_type", "organizationType"),
     ("billing_type", "billingType"),
     ("subscription_status", "subscriptionStatus"),
+    ("plan_display_name", "planDisplayName"),
 )
 
 
@@ -136,6 +155,8 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
         value = organization.get(source)
         if isinstance(value, str) and value:
             plan[key] = value
+    # Always present (None if unsent): is_due reads a missing key as an old record.
+    plan.setdefault("planDisplayName", None)
     account = data.get("account")
     account_uuid = account.get("uuid") if isinstance(account, dict) else None
     organization_uuid = organization.get("uuid")
@@ -173,14 +194,25 @@ def next_retry_at(now: float, retry_after_s: float | None) -> float:
 
 
 def plan_label(plan: dict | None) -> str | None:
-    """Human label: organization type where known, else tier, else raw tier."""
+    """Human label: organization type where known, else the server's plan name,
+    else tier, else raw tier."""
     if not plan:
         return None
     org_label = _ORG_TYPE_LABELS.get(plan.get("organizationType"))
     if org_label:
         return org_label
     tier = plan.get("tier")
-    return _TIER_LABELS.get(tier, tier)
+    label = _TIER_LABELS.get(tier, tier)
+    # The server's name wins unless the table names the same plan more
+    # precisely ("Max" vs "Max 5x"); Ultra shares the Max 20x tier string.
+    name = plan.get("planDisplayName")
+    if (
+        isinstance(name, str)
+        and name
+        and not (isinstance(label, str) and label.startswith(name))
+    ):
+        return name
+    return label
 
 
 def is_expired(plan: dict | None) -> bool:
@@ -237,6 +269,8 @@ def is_due(record: object, now: float, ttl: float = PLAN_TTL_S) -> bool:
         if _is_number(retry_at) and now < retry_at <= now + MAX_RETRY_S:
             return False
     if not valid_record(record):
+        return True
+    if "planDisplayName" not in record["plan"]:  # stored before the name was kept
         return True
     fetched_at = record["fetchedAt"]
     return fetched_at > now or now - fetched_at >= ttl
