@@ -281,11 +281,13 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 `cswap menubar` runs from a small wrapper app, `/Applications/claude-swap Menubar.app`, that it builds (and refreshes after upgrades) on every start. The wrapper gives it the bundle identifier `com.claude-swap.menubar`, which menu bar managers (Dimble, Ice, Bartender, SaneBar) need to list, hide and order the icon. If `/Applications` is not writable the bundle lands in the data directory with a one-line warning; there, the first time a manager hides anything the icon goes down with it. Set `CLAUDE_SWAP_NO_BUNDLE=1` to run in the plain interpreter instead.
 
-**Keep it running without a terminal.** `cswap menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash:
+**Keep it running without a terminal.** `cswap menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash. Auto-switch is a menu toggle that starts off, so a service installed from a terminal only shows usage until you turn it on; `--auto-switch` does that at install time (`--no-auto-switch` turns it off), and both commands say which it is:
 
 ```bash
 cswap menubar --install-service     # start now, and at every login
-cswap menubar --service-status      # installed? loaded? pid?
+cswap menubar --install-service --auto-switch  # same, with auto-switch turned on
+cswap menubar --install-service --no-auto-switch  # same, with auto-switch turned off
+cswap menubar --service-status      # installed? loaded? pid? auto-switch on?
 cswap menubar --uninstall-service   # stop it and remove the plist
 ```
 
