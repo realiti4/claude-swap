@@ -359,7 +359,12 @@ def subscription_plan_fields(record: dict) -> dict:
         "label": subscription.plan_label(plan),
         "tier": plan["tier"],
     }
-    for key in ("organizationType", "billingType", "subscriptionStatus"):
+    for key in (
+        "organizationType",
+        "planDisplayName",
+        "billingType",
+        "subscriptionStatus",
+    ):
         if key in plan:
             fields[key] = plan[key]
     fields["expired"] = subscription.is_expired(plan)

@@ -38,6 +38,12 @@ TEAM = {
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
 }
+# Ultra shares the Max 20x tier string; only the server's plan name separates it.
+ULTRA = {
+    "tier": "default_claude_max_20x",
+    "organizationType": "claude_max",
+    "planDisplayName": "Ultra",
+}
 
 
 def _creds(token: str | None = "tok", expires_ms: int | None = None) -> str:
@@ -91,6 +97,17 @@ class TestFetchPlan:
             result = subscription.fetch_plan("tok")
         assert result.plan == TEAM
         assert (result.account_uuid, result.organization_uuid) == ("u", "o")
+
+    def test_keeps_the_plan_display_name(self):
+        payload = {
+            "organization": {
+                "rate_limit_tier": "default_claude_max_20x",
+                "organization_type": "claude_max",
+                "plan_display_name": "Ultra",
+            }
+        }
+        with patch("urllib.request.urlopen", return_value=_response(payload)):
+            assert subscription.fetch_plan("tok").plan == ULTRA
 
     def test_no_tier_is_no_answer(self):
         payload = {"organization": {"billing_type": "stripe_subscription"}}
@@ -154,6 +171,11 @@ class TestFetchPlan:
 class TestPlanLabel:
     def test_team_organization_wins_over_the_seat_tier(self):
         assert subscription.plan_label(TEAM) == "Team"
+        assert subscription.plan_label({**TEAM, "planDisplayName": "Ultra"}) == "Team"
+
+    @pytest.mark.parametrize("name, label", [("Ultra", "Ultra"), ("", "Max 20x")])
+    def test_plan_display_name_names_the_plan_when_present(self, name, label):
+        assert subscription.plan_label({**ULTRA, "planDisplayName": name}) == label
 
     @pytest.mark.parametrize(
         "tier, label",
@@ -710,10 +732,12 @@ class TestJson:
         assert "plan" not in self._row()
 
     def test_plan_object(self):
-        row = self._row(subscription_plan={"plan": LAPSED, "fetchedAt": 0.0})
+        plan = {**LAPSED, "planDisplayName": "Free"}
+        row = self._row(subscription_plan={"plan": plan, "fetchedAt": 0.0})
         assert row["plan"] == {
             "label": "Free",
             "tier": "default_claude_ai",
+            "planDisplayName": "Free",
             "billingType": "none",
             "subscriptionStatus": "canceled",
             "expired": True,

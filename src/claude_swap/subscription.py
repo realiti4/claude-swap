@@ -3,7 +3,7 @@
 The plan comes from ``GET /api/oauth/profile`` — the same endpoint
 :func:`oauth.fetch_oauth_profile` calls to resolve identity. That function
 returns only the identity it needs; the response carries a good deal more, of
-which four ``organization`` fields are kept here.
+which five ``organization`` fields are kept here.
 
 Measured shapes, one account each:
 
@@ -70,6 +70,7 @@ MAX_RETRY_S = 24 * 3600
 
 FREE_TIER = "default_claude_ai"
 
+# Fallback for a record with no planDisplayName, until PLAN_TTL_S renews it.
 # Only values that have actually been observed. An unknown tier falls back to
 # the raw string rather than a guessed label — a wrong "Pro" is worse than an
 # honest "default_claude_pro".
@@ -89,6 +90,7 @@ _KEPT_FIELDS = (
     ("organization_type", "organizationType"),
     ("billing_type", "billingType"),
     ("subscription_status", "subscriptionStatus"),
+    ("plan_display_name", "planDisplayName"),
 )
 
 
@@ -173,12 +175,16 @@ def next_retry_at(now: float, retry_after_s: float | None) -> float:
 
 
 def plan_label(plan: dict | None) -> str | None:
-    """Human label: organization type where known, else tier, else raw tier."""
+    """Human label: organization type where known, else the server's plan name,
+    else tier, else raw tier."""
     if not plan:
         return None
     org_label = _ORG_TYPE_LABELS.get(plan.get("organizationType"))
     if org_label:
         return org_label
+    name = plan.get("planDisplayName")
+    if isinstance(name, str) and name:
+        return name
     tier = plan.get("tier")
     return _TIER_LABELS.get(tier, tier)
 
