@@ -447,7 +447,6 @@ EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
     ("switcher.py", "_resync_rotated_backup"): 1,
     ("switcher.py", "_perform_switch_locked"): 1,
     ("transfer.py", "import_accounts"): 1,
-    ("migrations.py", "migrate_windows_keyring_to_files"): 1,
 }
 
 # The chokepoint's own forwarding bodies: present in the AST but not

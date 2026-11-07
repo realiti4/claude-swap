@@ -207,7 +207,7 @@ def pin_is_broken(acc: AccountSnapshot) -> bool:
 
 
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
-    """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
+    """``· Ultra`` after the header — the same marker ``cswap list`` prints:
     a lapsed subscription is a highlighted ``Free`` rather than an appended
     "expired", and the age follows once the plan has gone two TTLs without
     refreshing."""

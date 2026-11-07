@@ -439,7 +439,7 @@ def import_accounts(
         )
 
     # Pass 2: writes. Validation is complete; remaining failures (disk I/O,
-    # keyring) are environmental and don't reflect on the file's integrity.
+    # Keychain) are environmental and don't reflect on the file's integrity.
     switcher._setup_directories()
     switcher._init_sequence_file()
 
