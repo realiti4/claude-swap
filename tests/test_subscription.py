@@ -23,6 +23,7 @@ ACTIVE_MAX = {
     "tier": "default_claude_max_20x",
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
+    "planDisplayName": None,
 }
 # Cancelled but still inside the paid period: indistinguishable from ACTIVE_MAX,
 # which is the whole reason renewal is not shown.
@@ -31,13 +32,17 @@ LAPSED = {
     "tier": "default_claude_ai",
     "billingType": "none",
     "subscriptionStatus": "canceled",
+    "planDisplayName": None,
 }
 TEAM = {
     "tier": "default_claude_max_5x",
     "organizationType": "claude_team",
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
+    "planDisplayName": None,
 }
+# A plan stored before the name was kept: no key at all, unlike a null one.
+UNNAMED = {"tier": "default_claude_max_5x"}
 # Ultra shares the Max 20x tier string; only the server's plan name separates it.
 ULTRA = {
     "tier": "default_claude_max_20x",
@@ -125,10 +130,14 @@ class TestFetchPlan:
                 "rate_limit_tier": "default_claude_ai",
                 "subscription_status": None,
                 "billing_type": 3,
+                "plan_display_name": "",
             }
         }
         with patch("urllib.request.urlopen", return_value=_response(payload)):
-            assert subscription.fetch_plan("tok").plan == {"tier": "default_claude_ai"}
+            assert subscription.fetch_plan("tok").plan == {
+                "tier": "default_claude_ai",
+                "planDisplayName": None,
+            }
 
     @pytest.mark.parametrize(
         "error",
@@ -178,6 +187,7 @@ class TestPlanLabel:
         [
             ("default_claude_max_20x", "Ultra", "Ultra"),
             ("default_claude_max_20x", "", "Max 20x"),
+            ("default_claude_max_20x", None, "Max 20x"),
             ("default_claude_max_5x", "Max", "Max 5x"),
             ("default_claude_max_5x", "", "Max 5x"),
             ("default_claude_pro", "Pro", "Pro"),
@@ -245,9 +255,10 @@ class TestRecords:
     def test_missing_is_due(self):
         assert subscription.is_due(None, now=1000.0)
 
-    def test_fresh_is_not_due(self):
-        record = {"plan": TEAM, "fetchedAt": 1000.0}
-        assert not subscription.is_due(record, now=1000.0 + 60)
+    @pytest.mark.parametrize("plan, due", [(TEAM, False), (UNNAMED, True)])
+    def test_fresh_is_due_only_when_the_name_key_is_missing(self, plan, due):
+        record = {"plan": plan, "fetchedAt": 1000.0}
+        assert subscription.is_due(record, now=1000.0 + 60) is due
 
     def test_due_at_ttl(self):
         record = {"plan": TEAM, "fetchedAt": 1000.0}
@@ -271,8 +282,9 @@ class TestRecords:
         assert not subscription.valid_record(record)
         assert subscription.is_due(record, now=1000.0)
 
-    def test_a_live_retry_holds_an_overdue_record(self):
-        record = {"plan": TEAM, "fetchedAt": 0.0, "retryAt": 2000.0}
+    @pytest.mark.parametrize("plan", [TEAM, UNNAMED])
+    def test_a_live_retry_holds_an_overdue_record(self, plan):
+        record = {"plan": plan, "fetchedAt": 0.0, "retryAt": 2000.0}
         assert not subscription.is_due(record, now=1000.0)
 
     def test_a_passed_retry_does_not_hold_it(self):
@@ -494,6 +506,22 @@ class TestCollector:
         assert calls == ["live"]
         assert plans["1"]["plan"] == TEAM
         assert plans["1"]["fetchedAt"] == 1_000_000.0
+
+    def test_a_record_without_the_name_key_is_refetched_once(
+        self, switcher, monkeypatch
+    ):
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        key = subscription.identity_key("a@x", "o1")
+        switcher._subscription_store().save(
+            {key: {"plan": UNNAMED, "fetchedAt": 1_000_000.0}}
+        )
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
+        )
+        assert switcher._collect_subscription_plans(info)["1"]["plan"] == TEAM
+        switcher._collect_subscription_plans(info)
+        assert calls == ["live"]
 
     def test_a_fresh_record_is_served_without_a_call(self, switcher, monkeypatch):
         monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
@@ -762,10 +790,15 @@ class TestJson:
             "Ultra",
         )
 
-    def test_absent_source_fields_are_omitted_not_nulled(self):
-        row = self._row(
-            subscription_plan={"plan": {"tier": "default_claude_ai"}, "fetchedAt": 0.0}
-        )
+    @pytest.mark.parametrize(
+        "plan",
+        [
+            {"tier": "default_claude_ai"},
+            {"tier": "default_claude_ai", "planDisplayName": None},
+        ],
+    )
+    def test_absent_source_fields_are_omitted_not_nulled(self, plan):
+        row = self._row(subscription_plan={"plan": plan, "fetchedAt": 0.0})
         assert set(row["plan"]) == {"label", "tier", "expired", "fetchedAt"}
 
 

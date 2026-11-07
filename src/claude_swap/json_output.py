@@ -359,14 +359,12 @@ def subscription_plan_fields(record: dict) -> dict:
         "label": subscription.plan_label(plan),
         "tier": plan["tier"],
     }
-    for key in (
-        "organizationType",
-        "planDisplayName",
-        "billingType",
-        "subscriptionStatus",
-    ):
+    for key in ("organizationType", "billingType", "subscriptionStatus"):
         if key in plan:
             fields[key] = plan[key]
+    name = plan.get("planDisplayName")
+    if isinstance(name, str) and name:
+        fields["planDisplayName"] = name
     fields["expired"] = subscription.is_expired(plan)
     fields["fetchedAt"] = _timestamp(record["fetchedAt"])
     return fields

@@ -143,6 +143,8 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
         value = organization.get(source)
         if isinstance(value, str) and value:
             plan[key] = value
+    # Always present (None if unsent): is_due reads a missing key as an old record.
+    plan.setdefault("planDisplayName", None)
     account = data.get("account")
     account_uuid = account.get("uuid") if isinstance(account, dict) else None
     organization_uuid = organization.get("uuid")
@@ -255,6 +257,8 @@ def is_due(record: object, now: float, ttl: float = PLAN_TTL_S) -> bool:
         if _is_number(retry_at) and now < retry_at <= now + MAX_RETRY_S:
             return False
     if not valid_record(record):
+        return True
+    if "planDisplayName" not in record["plan"]:  # stored before the name was kept
         return True
     fetched_at = record["fetchedAt"]
     return fetched_at > now or now - fetched_at >= ttl
