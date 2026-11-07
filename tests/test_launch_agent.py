@@ -915,3 +915,148 @@ def test_uninstall_reports_a_bundle_it_could_not_remove(tmp_path, monkeypatch):
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
     assert result["bundle_error"] == "busy"
+
+
+# --- the installing shell's profile travels with the service ------------------
+
+
+def test_build_plist_forwards_the_profile_of_the_installing_shell(tmp_path):
+    env = {
+        "CLAUDE_CONFIG_DIR": "/Users/x/.claude-work",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/Users/x/.claude-work",
+        "XDG_DATA_HOME": "/Users/x/.local/share",
+        "UNRELATED": "no",
+    }
+    parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path, env=env))
+    forwarded = parsed["EnvironmentVariables"]
+    assert forwarded["CLAUDE_CONFIG_DIR"] == "/Users/x/.claude-work"
+    assert forwarded["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/Users/x/.claude-work"
+    assert forwarded["XDG_DATA_HOME"] == "/Users/x/.local/share"
+    assert "UNRELATED" not in forwarded
+
+
+def test_install_reports_a_profile_that_moved(tmp_path, monkeypatch):
+    # Reinstalling from a shell in another profile redirects the service;
+    # that must be said, not done silently.
+    home, data = _homes(tmp_path)
+    _login_plist(home, CLAUDE_CONFIG_DIR="/old/profile")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/new/profile")
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
+    assert result["profile_changes"] == [("CLAUDE_CONFIG_DIR", "/old/profile", "/new/profile")]
+    written = plistlib.loads(launch_agent.plist_path(home=home).read_bytes())
+    assert written["EnvironmentVariables"]["CLAUDE_CONFIG_DIR"] == "/new/profile"
+
+
+def test_a_first_install_has_no_profile_to_compare_against(tmp_path, monkeypatch):
+    home, data = _homes(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/new/profile")
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
+    assert result["profile_changes"] == []
+
+
+# --- the worker's build stamp ------------------------------------------------
+
+
+def _stamp(data, pid, version="0.0.0", source=None):
+    path = launch_agent.worker_stamp_path(data)
+    path.write_text(
+        '{"pid": %d, "started_at": 1.0, "version": "%s", "source": %s}'
+        % (pid, version, "null" if source is None else '"%s"' % source)
+    )
+    return path
+
+
+def test_write_worker_stamp_records_this_process_and_build(tmp_path):
+    from claude_swap.update_check import install_identity
+
+    home, data = _homes(tmp_path)
+    launch_agent.write_worker_stamp(data)
+    stamp = launch_agent.read_worker_stamp(data)
+    assert stamp["pid"] == os.getpid()
+    assert stamp["version"] == install_identity()["version"]
+    assert launch_agent.worker_build_is_stale(os.getpid(), data) is False
+
+
+def test_worker_build_is_stale_only_for_the_running_pids_own_older_stamp(tmp_path, monkeypatch):
+    home, data = _homes(tmp_path)
+    _stamp(data, pid=4242, version="0.0.0")
+    monkeypatch.setattr(
+        "claude_swap.update_check.install_identity",
+        lambda: {"version": "1.0.0", "source": None},
+    )
+    assert launch_agent.worker_build_is_stale(4242, data) is True
+    assert launch_agent.worker_build_is_stale(4243, data) is False  # someone else's stamp
+    launch_agent.worker_stamp_path(data).unlink()
+    assert launch_agent.worker_build_is_stale(4242, data) is False  # no stamp, no claim
+
+
+def test_worker_build_compares_the_commit_too(tmp_path, monkeypatch):
+    # A git install keeps its version string across commits.
+    home, data = _homes(tmp_path)
+    _stamp(data, pid=4242, version="1.0.0b1", source="aaaaaaa")
+    monkeypatch.setattr(
+        "claude_swap.update_check.install_identity",
+        lambda: {"version": "1.0.0b1", "source": "bbbbbbb"},
+    )
+    assert launch_agent.worker_build_is_stale(4242, data) is True
+
+
+def test_ensure_restarts_a_running_worker_of_an_older_build(tmp_path, monkeypatch):
+    """`uv tool upgrade` by hand leaves the old build running; `cswap menubar` fixes that."""
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    _stamp(data, pid=4242, version="0.0.0")
+    monkeypatch.setattr(
+        "claude_swap.update_check.install_identity",
+        lambda: {"version": "1.0.0", "source": None},
+    )
+    fake = _FakeLaunchd(loaded=True, pid=4242)
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "restarted"
+    assert result["stale_build"] is True
+    assert ["launchctl", "kickstart", "-k", f"gui/{UID}/{launch_agent.LABEL}"] in fake.calls
+
+
+def test_ensure_leaves_a_current_build_alone(tmp_path, monkeypatch):
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    _stamp(data, pid=4242, version="1.0.0")
+    monkeypatch.setattr(
+        "claude_swap.update_check.install_identity",
+        lambda: {"version": "1.0.0", "source": None},
+    )
+    result = _ensure(_FakeLaunchd(loaded=True, pid=4242), home, data)
+    assert result["action"] == "already-running"
+    assert result["stale_build"] is False
+
+
+def test_status_reports_the_running_build_and_whether_it_is_stale(tmp_path, monkeypatch):
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    _stamp(data, pid=4242, version="0.9.0", source="abcdef0123")
+    monkeypatch.setattr(
+        "claude_swap.update_check.install_identity",
+        lambda: {"version": "1.0.0", "source": None},
+    )
+    fake = _FakeLaunchd(loaded=True, pid=4242)
+    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+        result = launch_agent.status(home=home, uid=UID, backup_dir=data)
+    assert result["running_build"] == "0.9.0 (abcdef0)"
+    assert result["installed_build"] == "1.0.0"
+    assert result["stale_build"] is True
+
+
+def test_uninstall_removes_the_worker_stamp(tmp_path):
+    home, data = _homes(tmp_path)
+    stamp = _stamp(data, pid=1)
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
+    assert not stamp.exists()
+    assert str(stamp) in result["removed"]

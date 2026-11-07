@@ -49,6 +49,7 @@ functions refuse rather than half-work elsewhere.
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -91,10 +92,21 @@ _BASE_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 # name as cancelling its uppercase twin (`https_proxy=` switches off an
 # `HTTPS_PROXY`), so dropping it would hand the agent a proxy the shell had
 # turned off. launchd sets an empty string as an empty variable.
+_PROFILE_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME")
 _FORWARDED_ENV_KEYS = (
     "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
     "no_proxy", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    # The profile the installing shell was in. Without these the service
+    # would manage the default profile while the shell that set it up manages
+    # another. There is one service per user, and it follows the shell that
+    # installed it; `--install-service` from a different profile says so.
+    *_PROFILE_ENV_KEYS,
 )
+
+# Written by the worker at start: its pid and build. Lets a later `cswap
+# menubar` (or `cswap upgrade`) tell a running instance of an old build from
+# the installed one, whichever way the upgrade happened.
+STAMP_NAME = "menubar_worker.json"
 
 # `launchctl bootout` can return before launchd has finished tearing the
 # job down, and a `bootstrap` inside that window fails with "Operation
@@ -132,6 +144,52 @@ def session_plist_path(label: str = LABEL, backup_dir: Path | None = None) -> Pa
 def start_at_login_enabled(label: str = LABEL, home: Path | None = None) -> bool:
     """Whether launchd will start the menu bar at the next login."""
     return plist_path(label, home).exists()
+
+
+def worker_stamp_path(backup_dir: Path | None = None) -> Path:
+    if backup_dir is None:
+        from claude_swap.paths import get_backup_root
+
+        backup_dir = get_backup_root()
+    return Path(backup_dir) / STAMP_NAME
+
+
+def write_worker_stamp(backup_dir: Path | None = None) -> Path:
+    """Record this process's pid and build; called by the menu bar at start."""
+    from claude_swap.update_check import install_identity
+
+    path = worker_stamp_path(backup_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"pid": os.getpid(), "started_at": time.time(), **install_identity()}
+    atomic_write_bytes(path, json.dumps(data, indent=2).encode("utf-8"))
+    return path
+
+
+def read_worker_stamp(backup_dir: Path | None = None) -> dict | None:
+    try:
+        loaded = json.loads(worker_stamp_path(backup_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def worker_build_is_stale(pid: int, backup_dir: Path | None = None) -> bool:
+    """Whether the worker running as ``pid`` reports an older build than this one.
+
+    The stamp must be the running job's own (pid match); a stamp left by an
+    earlier instance says nothing about this one. Compares version and commit,
+    so a git install whose version string never moves still counts.
+    """
+    stamp = read_worker_stamp(backup_dir)
+    if not stamp or stamp.get("pid") != pid:
+        return False
+    from claude_swap.update_check import install_identity
+
+    current = install_identity()
+    return (stamp.get("version"), stamp.get("source")) != (
+        current["version"],
+        current["source"],
+    )
 
 
 def log_paths(label: str = LABEL, home: Path | None = None) -> tuple[Path, Path]:
@@ -432,10 +490,14 @@ def status(
     reports the System Settings switch (a slow read, see
     :func:`switched_off_in_system_settings`).
     """
+    from claude_swap.update_check import describe_identity, install_identity
+
     _require_macos()
     loaded, state, pid = _job_state(label, uid)
     login = plist_path(label, home)
     session = session_plist_path(label, backup_dir)
+    stamp = read_worker_stamp(backup_dir)
+    own_stamp = stamp if (stamp and pid is not None and stamp.get("pid") == pid) else None
     return {
         "label": label,
         "installed": login.exists(),
@@ -447,6 +509,9 @@ def status(
         "pid": pid,
         "plist": str(login),
         "switched_off": switched_off_in_system_settings(label, uid),
+        "running_build": describe_identity(own_stamp) if own_stamp else None,
+        "installed_build": describe_identity(install_identity()),
+        "stale_build": pid is not None and worker_build_is_stale(pid, backup_dir),
     }
 
 
@@ -559,7 +624,13 @@ def ensure(
 
     loaded, _state, pid = _job_state(label, uid)
     switched_off = False
-    if pid is not None and not repaired and not restart:
+    # A running worker of an older build is restarted onto this one: that is
+    # what makes "ensure" cover an upgrade made by `uv tool upgrade` by hand.
+    stale_build = (
+        pid is not None and not repaired and not restart
+        and worker_build_is_stale(pid, backup_dir)
+    )
+    if pid is not None and not repaired and not restart and not stale_build:
         action = "already-running"
     else:
         # Asked only when something is about to start: the read takes ~2 s and
@@ -582,6 +653,7 @@ def ensure(
         "stderr_log": str(err_log),
         "pid": pid,
         "switched_off": switched_off,
+        "stale_build": stale_build,
     }
 
 
@@ -607,10 +679,23 @@ def install(
 
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
+    # A reinstall from a shell in another profile silently redirects the
+    # service; report what moved so the caller can say so.
+    wanted = _plist_dict(program, label, home)
+    previous = _load_plist(target_plist)
+    profile_changes: list[tuple[str, str | None, str | None]] = []
+    if previous is not None:
+        old_env = previous.get("EnvironmentVariables") or {}
+        new_env = wanted["EnvironmentVariables"]
+        profile_changes = [
+            (key, old_env.get(key), new_env.get(key))
+            for key in _PROFILE_ENV_KEYS
+            if old_env.get(key) != new_env.get(key)
+        ]
     # Owner-only and atomic, not the umask's 0644 via write_bytes: a forwarded
     # proxy URL can carry credentials, and a write cut short by Ctrl-C must
     # not leave a truncated plist for the next login to choke on.
-    atomic_write_bytes(target_plist, build_plist(program, label, home))
+    atomic_write_bytes(target_plist, plistlib.dumps(wanted))
     session_plist = session_plist_path(label, backup_dir)
     if session_plist.exists():
         session_plist.unlink()
@@ -620,10 +705,11 @@ def install(
     return {
         "label": label,
         "plist": str(target_plist),
-        "program": program_arguments(program),
+        "program": wanted["ProgramArguments"],
         "start_at_login": True,
         "stdout_log": str(out_log),
         "stderr_log": str(err_log),
+        "profile_changes": profile_changes,
     }
 
 
@@ -668,6 +754,10 @@ def uninstall(
         if log.exists():
             log.unlink()
             removed_paths.append(log)
+    stamp = worker_stamp_path(backup_dir)
+    if stamp.exists():
+        stamp.unlink()
+        removed_paths.append(stamp)
 
     from claude_swap import app_bundle
 

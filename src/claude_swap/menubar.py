@@ -625,6 +625,13 @@ def run(switcher) -> int:
     app_bundle.maybe_reexec(switcher.backup_dir)
     if not app_bundle.in_bundle():
         ensure_notification_identity()
+    try:
+        # Pid and build of this worker, so a later `cswap menubar` or
+        # `cswap upgrade` can tell an instance of an old build from the
+        # installed one. Never worth failing the start over.
+        launch_agent.write_worker_stamp(switcher.backup_dir)
+    except OSError:
+        switcher._logger.debug("could not write the menu bar worker stamp", exc_info=True)
     _warn = framework_build_warning()
     if _warn:
         # stderr, not stdout: launchd sends stdout to the .log file where it
@@ -1104,14 +1111,16 @@ def run(switcher) -> int:
             try:
                 self.switcher.add_account(slot=None)
             except CredentialReadError:
-                # Almost always a launchd/login-agent Keychain block: the active
-                # credential lives in the macOS Keychain, which a background agent
-                # can't read (the security call times out). Point at the fix.
+                # The Keychain did not answer (locked, or `security` timed out).
+                # A launchd agent reads the Keychain like any other process of
+                # the user's session, so relaunching from a Terminal is not a
+                # fix; an earlier version of this alert claimed it was.
                 rumps.alert(
                     title="claude-swap",
-                    message="Couldn't read the active credential. If the menu bar is running "
-                            "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: cswap --menubar",
+                    message="Couldn't read the active credential: the Keychain didn't "
+                            "answer (locked, or the security call timed out). Unlock it "
+                            "or try again in a moment; `cswap add` in a Terminal shows "
+                            "the full error.",
                 )
                 return
             except ClaudeSwitchError as e:
