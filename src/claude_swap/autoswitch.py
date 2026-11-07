@@ -453,6 +453,88 @@ def _perish_then_room_key(usage: dict | str | None, headroom: float, now: float)
     return (1, 0.0, -headroom)
 
 
+# The window-read rate overstates the real one on a fill-then-idle fleet: 6.9 against
+# 4.64 pts/h over 7 d of usage.jsonl, 1.49x (2026-11-06). Start that much early.
+EXPIRING_RATE_MARGIN = 1.5
+_SEVEN_DAYS_S = 7 * 24 * 3600.0
+
+
+def expiring_order(
+    accounts: Sequence[str],
+    usage: Mapping[str, dict | str | None],
+    headroom: Mapping[str, float | None],
+    bars: Mapping[str, float],
+    caps: Mapping[str, float | None],
+    plans: Mapping[str, str | None],
+    landing_cost: Callable[[str], float],
+    now: float,
+) -> list[str]:
+    """The accounts whose 7d room must be spent now to be spent at all (T3310):
+    soonest reset first, up to and including the last account whose deadline has
+    come (one after it is not expiring); ``[]`` when every deadline can be met
+    or no burn rate is measurable.
+
+    ``accounts[0]`` is the active, the rest the admissible OAuth candidates (an
+    equal reset keeps the active ahead). Room is what is left under the
+    account's own bar and the weekly cap on its fullest weekly window. An
+    account is not walked now when it cannot serve (``headroom`` at its wall),
+    when its 5h window cannot absorb ``landing_cost`` (5h points, 0 for the
+    active or a warm one: it lands once that window rolls), or when its room
+    does not exceed that cost in 7d points. Rooms add up in reset order, in
+    Ultra points (``_PLAN_COST_SCALE``), and are spent at the fleet's rate: an
+    account is due once ``need * EXPIRING_RATE_MARGIN / rate`` reaches its
+    reset. The rate is every readable account's 7d level over their mean
+    elapsed time: account-global and stateless, so a restart, a dry run and the
+    panel read one number.
+
+    shortcut: the rate is read off the current windows, not sampled; upgrade to a
+    rolling sample if a burst makes it misjudge a deadline. Checked against the
+    live 6.9 pts/h: 6.17 (24 h) and 4.64 (7 d) measured from usage.jsonl, 2026-11-06.
+    """
+    def weight(n: str) -> float:
+        return 1.0 / _PLAN_COST_SCALE.get(plans.get(n), 1.0)
+
+    seen: dict[str, tuple[float, float]] = {}
+    for n, value in usage.items():
+        pct = _window_pcts(value if isinstance(value, dict) else None, ()).get("7d")
+        reset = _seven_day_reset_ts(value, now)
+        if pct is not None and reset is not None:
+            seen[n] = (pct, reset)
+    if not seen:
+        return []
+    elapsed = sum(max(_SEVEN_DAYS_S - (r - now), 0.0) for _, r in seen.values()) / len(seen)
+    spent = sum(pct * weight(n) for n, (pct, _) in seen.items())
+    if spent <= 0 or elapsed <= 0:
+        return []
+    rate = spent / elapsed
+    walked: list[str] = []
+    need = 0.0
+    last_due = 0
+    for n in sorted((n for n in accounts if n in seen), key=lambda n: seen[n][1]):
+        pct, reset = seen[n]
+        wall = _wall_headroom(bars.get(n))
+        room = 100.0 - pct - wall
+        if caps.get(n) is not None and caps[n] < 100.0:  # 100 is no cap (models.py)
+            weekly = max(  # a header-probe reading shows no `all` window: its 7d is what is known
+                (p for w, p, _ in oauth.relevant_windows(usage[n], ("all",)) if w != "5h"),
+                default=pct,
+            )
+            room = min(room, caps[n] - weekly)
+        cost = landing_cost(n)
+        five = _window_pcts(usage[n], ()).get("5h")
+        if (
+            (headroom.get(n) or 0.0) <= wall
+            or room <= cost / WEEKLY_OVER_FIVE_HOUR
+            or (five is not None and 100.0 - five - cost <= wall)
+        ):
+            continue
+        walked.append(n)
+        need += room * weight(n)
+        if need * EXPIRING_RATE_MARGIN / rate >= reset - now:
+            last_due = len(walked)
+    return walked[:last_due]
+
+
 def _stay_progress(
     saved: object, account: str, since: float | None, levels: dict[str, float]
 ) -> dict:
@@ -757,6 +839,30 @@ def _read_state_file(path: Path) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def last_engine_switch(backup_dir: Path) -> tuple[str, str] | None:
+    """The newest switch on record as (target slot, trigger): the engine's
+    (``lastSwitchTrigger``, else ``leftTrigger``) or a hand's (``manual``).
+    cswap-pin's session-affinity keep reads it and yields its keep to
+    ``expiring-window`` and ``manual``. A missing or malformed field drops that
+    entry; ``None`` when neither is left. No lock: the writers are atomic."""
+    state = _read_state_file(backup_dir / STATE_FILENAME)
+    engine_trigger = state.get("lastSwitchTrigger") or state.get("leftTrigger")
+    entries = []
+    for at, to, trigger in (
+        ("lastManualSwitchAt", "lastManualSwitchTo", "manual"),
+        ("lastSwitchAt", "lastSwitchTo", engine_trigger),
+    ):
+        when, slot = state.get(at), state.get(to)
+        if (
+            isinstance(when, (int, float))
+            and isinstance(slot, (str, int))
+            and isinstance(trigger, str)
+        ):
+            entries.append((when, str(slot), trigger))
+    # max keeps the first of equal times, so a tie reads as the hand switch.
+    return max(entries, key=lambda e: e[0])[1:] if entries else None
+
+
 def pct_label(value: float) -> str:
     """A percentage for display, as configured: 85.555555 stays itself
     (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
@@ -942,7 +1048,7 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     # proactive | at-limit | failover | consume-first | priority | alternation
-    # | disabled-active | weekly-capped
+    # | expiring-window | disabled-active | weekly-capped
     trigger: str
     from_ref: dict | None
     to_ref: dict | None
@@ -1583,6 +1689,9 @@ def record_manual_switch(
                         stamps[str(ref["number"])] = now
                 state["schemaVersion"] = STATE_SCHEMA_VERSION
                 state["lastActiveAt"] = stamps
+                if to_ref and to_ref.get("number") is not None:
+                    state["lastManualSwitchAt"] = now
+                    state["lastManualSwitchTo"] = str(to_ref["number"])
                 atomic_write_json(path, state)
     except Exception:  # noqa: BLE001 -- a record must never fail the switch
         _logger.warning("could not record the manual switch", exc_info=True)
@@ -2803,6 +2912,44 @@ class AutoSwitchEngine:
                 bar_active = False
             return warm, cold, bar_active
 
+        # T3310: an account whose 7d window expires with room left pulls the
+        # switch (`expiring_order`); its logged trigger is `expiring-window`,
+        # while every gate downstream keeps reading `alternation`.
+        expiring: list[str] = []
+        logged_trigger: str | None = None
+        if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
+            now = self.clock()
+
+            def _landing_cost(n: str) -> float:
+                """A cold landing's cost in 5h points, scaled by plan."""
+                if n == current or _is_warm(n, last_active_at, now, settings.cache_ttl_seconds):
+                    return 0.0
+                return _cold_landing_cost_pct(
+                    None, settings.cold_switch_cost_pct, getattr(entries.get(n), "plan", None)
+                )
+
+            expiring = expiring_order(
+                [current, *oauth_candidates], usage, headroom, self._bars,
+                {n: p.weekly_cap for n, p in policies.items()},
+                {n: getattr(e, "plan", None) for n, e in entries.items()},
+                _landing_cost, now,
+            )
+
+        # On a healthy active, the expiring accounts ahead of its own window pull the
+        # switch. An active walled on its own model-gated axis leaves by the walled
+        # escape below (#403), which prices the landing and breaks ties by warmth.
+        ahead: list[str] = []
+        spend_first = False
+        if (
+            trigger == "dynamic-healthy"
+            and expiring
+            and not _about_to_wall(raw_active_headroom, self._active_wall)
+        ):
+            ahead = expiring[: expiring.index(current)] if current in expiring else expiring
+            # The active is itself the soonest expiring window: it spends it, and
+            # only a candidate whose own window perishes sooner may take over.
+            spend_first = not ahead
+
         dynamic_ordered: list[str] | None = None
         dynamic_any_known = True
         if settings.strategy == "dynamic" and trigger == "proactive":
@@ -2876,6 +3023,9 @@ class AutoSwitchEngine:
                     key=lambda n: floor_headroom.get(n, 0.0) < _cold_cost(n),
                 )
             dynamic_ordered = warm_ordered + cold_clears_floor
+            dynamic_ordered = [n for n in expiring if n in dynamic_ordered] + [
+                n for n in dynamic_ordered if n not in expiring
+            ]
             if not dynamic_ordered and bar_active:
                 # The no-return bar (item 2) is holding this, not a
                 # genuinely viable-free fleet -- a deliberate hold pending
@@ -2896,6 +3046,13 @@ class AutoSwitchEngine:
                 dynamic_any_known = any(
                     floor_headroom.get(n) is not None for n in oauth_candidates
                 )
+        elif ahead:
+            if self._in_cooldown(state):
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+            trigger = "alternation"
+            logged_trigger = "expiring-window"
+            dynamic_ordered = ahead
         elif settings.strategy == "dynamic" and trigger == "dynamic-healthy":
             now = self.clock()
             # NOT `_dynamic_rank`: the no-return bar would permanently
@@ -3045,6 +3202,13 @@ class AutoSwitchEngine:
                     active_headroom=active_headroom, cold_cost=_cold_cost,
                 )
             partner = next(iter(alternation_admissible), None)
+            # T3310: an active spending its own expiring window yields only to a
+            # candidate that perishes sooner; `partner` (unfiltered) still labels a hold.
+            if spend_first:
+                alternation_admissible = [
+                    n for n in alternation_admissible
+                    if _perishes_before_active(usage.get(n), usage.get(current), now)
+                ]
             # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
             # NEVER-widened model-gated reading — the widen above can call
             # this active "healthy" (dynamic-healthy, not at-limit) purely
@@ -3196,7 +3360,7 @@ class AutoSwitchEngine:
                 # is already `warm_ordered + [floor-clearing cold]` for the
                 # same reason).
                 dynamic_ordered = escapees
-            elif partner is None or not rotation_due:
+            elif not alternation_admissible or not rotation_due:
                 # One label per story (item 5): a warm partner not yet
                 # dwelt on, or a cold one below the floor. T0758:
                 # `partner is not None` (a perishing candidate, or now
@@ -3230,7 +3394,13 @@ class AutoSwitchEngine:
                         detail=(
                             f"active account is healthy ({pct_label(active_headroom)}"
                             "% headroom, not about to wall)"
-                            + ("; the alternation step is not reached" if step_holds else "")
+                            + (
+                                "; spending its expiring window first"
+                                if spend_first and not alternation_admissible
+                                else "; the alternation step is not reached"
+                                if step_holds
+                                else ""
+                            )
                         ),
                     )
                 )
@@ -3698,7 +3868,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, logged_trigger)
             status = self._freshen_target(num, email)
             if self._stop.is_set():
                 # `_freshen_target` POSTs the consume-gate refresh, the one
@@ -3738,8 +3908,22 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, logged_trigger)
 
+        if logged_trigger:
+            # A discretionary pull never blocks or fails a healthy active.
+            self._emit(
+                NoSwitchEvent(
+                    reason="below-threshold",
+                    detail=(
+                        f"active account is healthy ({pct_label(active_headroom)}% headroom, "
+                        f"not about to wall); {len(ordered)} expiring account(s) "
+                        "could not be landed on"
+                        + (f"; {_SYSTEMIC_MESSAGES[systemic]}" if systemic else "")
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
         if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
@@ -5181,7 +5365,10 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        logged_trigger: str | None = None,
     ) -> TickOutcome:
+        # `trigger` keys every gate here and the recorded `leftTrigger`;
+        # `logged_trigger`, when given, is only what the SwitchEvent names.
         # ASK `_stop`, NOT `dry_run`. `stop()` sets `dry_run = True` so the
         # badge cannot read " LIVE " for a dead engine; that is a DISPLAY
         # fact, and reading it here as "the user asked for dry-run" makes a
@@ -5196,7 +5383,7 @@ class AutoSwitchEngine:
             current_email = self.switcher.account_email(current) if current else ""
             self._emit(
                 SwitchEvent(
-                    trigger=trigger,
+                    trigger=logged_trigger or trigger,
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
@@ -5289,6 +5476,8 @@ class AutoSwitchEngine:
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
             state["leftTrigger"] = trigger
+            # What the pin reads (`last_engine_switch`); `leftTrigger` stays the gate's.
+            state["lastSwitchTrigger"] = logged_trigger or trigger
             # #375: per-account "last touched" epoch — the outgoing account
             # (so a LATER tick can tell its cache has gone cold) and the
             # incoming one (`number`, so alternation's chunk timer knows
@@ -5331,7 +5520,7 @@ class AutoSwitchEngine:
                 )
         self._emit(
             SwitchEvent(
-                trigger=trigger,
+                trigger=logged_trigger or trigger,
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=warnings,

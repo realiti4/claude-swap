@@ -34,8 +34,10 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    _SYSTEMIC_MESSAGES,
     _seven_day_reset_ts,
     classify_candidate_block,
+    last_engine_switch,
     pct_label,
     proactive_switch_bar_pct,
 )
@@ -6419,6 +6421,10 @@ class TestDynamicStrategy:
         clears the floor, so the hold survives unchanged."""
         h = self._owner_harness(temp_home, active_num=2)
         fleet_usage = self._owner_fleet(h.clock.now)
+        # T3310: a 7d window about to expire with room pulls the switch whatever
+        # the model axis reads; moved out of reach so this stays the floor's hold.
+        for num in ("1", "3", "4", "5"):
+            fleet_usage[num]["seven_day"]["resets_at"] = _iso_at(h.clock.now + 4 * 86400)
         outcome = h.tick_with_usage(fleet_usage)
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — account 2's headroom (6) is not "
@@ -7695,6 +7701,26 @@ class TestWarmthAndAlternation375:
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "alternation", sw.trigger
+
+    def test_last_engine_switch_is_the_later_of_the_engine_and_the_hand(self, temp_home):
+        """The pin reads one answer: a hand switch is `manual` and leaves the
+        no-return family alone; an engine switch after it wins again."""
+        h = self._harness(temp_home)
+        backup = h.switcher.backup_dir
+        assert last_engine_switch(backup) is None
+        assert h.tick_with_usage({"1": _usage(97.0), "2": _usage(10.0)}) is TickOutcome.SWITCHED
+        assert last_engine_switch(backup) == ("2", "proactive")
+        engine_keys = ("lastSwitchAt", "lastSwitchTo", "lastSwitchFrom", "leftTrigger")
+        before = h.engine._read_state()
+        h.clock.advance(270.0)
+        h.switcher.switch_to("1", json_output=True, manual_source="tui")
+        assert last_engine_switch(backup) == ("1", "manual")
+        after = h.engine._read_state()
+        assert [after[k] for k in engine_keys] == [before[k] for k in engine_keys]
+        h.clock.advance(h.engine.settings.alternation_chunk_seconds)
+        usage = {"1": _usage(30.0), "2": _usage(30.0)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert last_engine_switch(backup) == (str(h.active_number()), "alternation")
 
     def test_t1850_a_hand_record_is_opt_in_and_never_the_engines(self, temp_home):
         """Controls: the engine's own call (no `manual_source`) writes no hand line
@@ -16513,9 +16539,9 @@ class TestPerAccountSwitchThreshold:
         h.switcher._write_json(h.switcher.sequence_file, data)
 
     @staticmethod
-    def _use(h, pct, resets_in_s=None):
-        """5h at ``pct``; 7d at 10% resetting ``resets_in_s`` from now."""
-        window = {"pct": 10.0}
+    def _use(h, pct, resets_in_s=None, seven=10.0):
+        """5h at ``pct``; 7d at ``seven``% resetting ``resets_in_s`` from now."""
+        window = {"pct": seven}
         if resets_in_s is not None:
             window["resets_at"] = _iso_at(h.clock.now + resets_in_s)
         return {"five_hour": {"pct": pct}, "seven_day": window}
@@ -16604,10 +16630,12 @@ class TestPerAccountSwitchThreshold:
     def test_the_soonest_reset_ordering(self, temp_home, strategy, third_resets_in, expect):
         h = self._harness(temp_home, strategy)
         self._set(h, 1, 80.0)
+        # 7d at 50 (T3310): at 10 the fleet burns so slowly that the 2-day window
+        # is about to expire with room and pulls the switch, not the room order.
         outcome = h.tick_with_usage({
-            "1": self._use(h, 85, 9 * 86400),
-            "2": self._use(h, 40, 5 * 86400),
-            "3": self._use(h, 60, third_resets_in),
+            "1": self._use(h, 85, 9 * 86400, 50.0),
+            "2": self._use(h, 40, 5 * 86400, 50.0),
+            "3": self._use(h, 60, third_resets_in, 50.0),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == expect
@@ -17424,3 +17452,434 @@ class TestHeaderProbeReadings:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+_ENG = {"lastSwitchAt": 5, "lastSwitchTo": "2", "leftTrigger": "failover"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (_ENG, ("2", "failover")),  # written before lastSwitchTrigger existed
+        ({**_ENG, "lastManualSwitchAt": 6, "lastManualSwitchTo": 3}, ("3", "manual")),
+        ({**_ENG, "lastManualSwitchAt": 4, "lastManualSwitchTo": "3"}, ("2", "failover")),
+        ({**_ENG, "lastManualSwitchAt": "x", "lastManualSwitchTo": "3"}, ("2", "failover")),
+        ({"lastSwitchAt": 5, "lastSwitchTo": "2"}, None),  # no trigger recorded
+        ({**_ENG, "lastSwitchAt": "x"}, None),
+    ],
+)
+def test_last_engine_switch_drops_a_malformed_entry_and_never_raises(tmp_path, raw, expected):
+    (tmp_path / "autoswitch_state.json").write_text(raw if isinstance(raw, str) else json.dumps(raw))
+    assert last_engine_switch(tmp_path) == expected
+
+
+# -- an expiring 7d window pulls the switch (T3310) --------------------------
+
+_H = 3600.0
+_D = 24 * _H
+
+
+def _xw(h, five: float, seven: float, left_s: float) -> dict:
+    """5h at ``five``; 7d at ``seven``% resetting ``left_s`` seconds from now."""
+    return {
+        "five_hour": {"pct": five},
+        "seven_day": {"pct": seven, "resets_at": _iso_at(h.clock.now + left_s)},
+    }
+
+
+def _xw_harness(temp_home, **settings) -> EngineHarness:
+    """Four dynamic accounts, 1 active. Account 4 is spent on 5h and 7d: never a
+    candidate, but its reading is what makes the fleet's burn rate measurable."""
+    h = EngineHarness(temp_home, strategy="dynamic", **settings)
+    for n in (1, 2, 3, 4):
+        h.seed(n, f"acct{n}@example.invalid")
+    h.make_live("acct1@example.invalid", 1)
+    return h
+
+
+def _xw_tick(h, usage) -> TickOutcome:
+    """One tick on a NEW engine, as `cswap auto --once` runs."""
+    h.engine = h._make_engine()
+    return h.tick_with_usage(usage)
+
+
+def _xw_stamp(h, **ages: float) -> None:
+    """lastActiveAt: account number -> seconds ago."""
+    path = h.switcher.backup_dir / "autoswitch_state.json"
+    raw = json.loads(path.read_text()) if path.exists() else {"schemaVersion": 1}
+    raw["lastActiveAt"] = {n: h.clock.now - age for n, age in ages.items()}
+    path.write_text(json.dumps(raw))
+
+
+def _xw_switch(h) -> SwitchEvent:
+    return next(e for e in h.events if isinstance(e, SwitchEvent))
+
+
+def _xw_hold(h) -> NoSwitchEvent:
+    return [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+
+
+class TestAnExpiringWindowPullsTheSwitch:
+    """The 2026-11-06 specimen: the active at 7d 32% (6.5 d to reset) held
+    `below-threshold` while two peers at 86-87% (2-3 h to reset) let their last
+    points expire, because the percent step only rotates after the active has
+    spent a step."""
+
+    @staticmethod
+    def _fleet(h, **over) -> dict:
+        usage = {
+            "1": _xw(h, 10.0, 32.0, 6 * _D),
+            "2": _xw(h, 10.0, 87.0, 2 * _H),
+            "3": _xw(h, 10.0, 10.0, 5 * _D),
+            "4": _xw(h, 100.0, 100.0, 6.9 * _D),
+        }
+        usage.update(over)
+        return usage
+
+    def test_a_far_reset_active_gives_way_to_a_window_about_to_expire(self, temp_home):
+        h = _xw_harness(temp_home)
+        assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _xw_switch(h).trigger == "expiring-window"
+
+    def test_the_pin_reads_the_pull_while_every_gate_keeps_alternation(self, temp_home):
+        """cswap-pin's session-affinity keep yields to `expiring-window`, which
+        only the decisions log named; `leftTrigger` stays the gate trigger."""
+        h = _xw_harness(temp_home)
+        assert last_engine_switch(h.switcher.backup_dir) is None
+        assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
+        assert last_engine_switch(h.switcher.backup_dir) == ("2", "expiring-window")
+        assert h.engine._read_state()["leftTrigger"] == "alternation"
+
+    def test_it_is_the_sooner_expiring_window_and_the_active_then_holds_it(
+        self, temp_home
+    ):
+        h = _xw_harness(temp_home)
+        # 2 and 3 both expire with room left; 3 expires first and has less of it.
+        usage = self._fleet(
+            h, **{"2": _xw(h, 10.0, 60.0, 3 * _H), "3": _xw(h, 10.0, 85.0, 2 * _H)}
+        )
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        # Now on the sooner one with the dwell served, the step due (traffic ran,
+        # the 7d reading unmoved) and roomy warm peers: no rotation away.
+        h.events.clear()
+        h.clock.advance(1000.0)
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        state = json.loads(path.read_text())
+        state["alternation"] = {
+            "account": "3", "since": state["lastActiveAt"]["3"], "anchor": 85.0,
+            "rise": 0.0, "ran": True, "levels": {"5h": 10.0, "7d": 85.0},
+        }
+        path.write_text(json.dumps(state))
+        usage = self._fleet(h, **{
+            "1": _xw(h, 10.0, 5.0, 5 * _D),
+            "2": _xw(h, 10.0, 60.0, 3 * _H - 1000.0),
+            "3": _xw(h, 10.0, 85.0, 2 * _H - 1000.0),
+        })
+        assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+        assert _xw_hold(h).reason == "below-threshold"
+        assert "spending its expiring window first" in _xw_hold(h).detail
+
+    def test_a_far_reset_window_does_not_pull_and_the_step_holds(self, temp_home):
+        h = _xw_harness(temp_home)
+        usage = self._fleet(h, **{"2": _xw(h, 10.0, 87.0, 5 * _D)})
+        assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _xw_hold(h).reason == "below-threshold"
+        assert "the alternation step is not reached" in _xw_hold(h).detail
+
+    @pytest.mark.parametrize("how", ["own-bar", "weekly-cap", "disabled", "five-hour-bound"])
+    def test_a_candidate_that_cannot_serve_does_not_pull(self, temp_home, how):
+        h = _xw_harness(temp_home)
+        usage = self._fleet(h)
+        if how == "own-bar":  # 2's own line is under its 87% level
+            data = h.switcher._get_sequence_data()
+            data["accounts"]["2"]["threshold"] = 85.0
+            h.switcher._write_json(h.switcher.sequence_file, data)
+        elif how == "weekly-cap":
+            h.switcher.set_account_weekly_cap("2", 80)
+        elif how == "disabled":
+            h.switcher.set_account_disabled("2", True)
+        else:  # 5h at 97: headroom 3 is at the wall
+            usage["2"] = _xw(h, 97.0, 87.0, 2 * _H)
+        assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _xw_hold(h).reason == "below-threshold"
+
+    @pytest.mark.parametrize("warm", [False, True])
+    def test_a_cold_landing_that_costs_the_room_does_not_pull_a_warm_one_does(
+        self, temp_home, warm
+    ):
+        h = _xw_harness(temp_home)
+        if warm:
+            _xw_stamp(h, **{"2": 120.0})
+        # 4 points of room against a 20/4.4 = 4.5 point cold landing; at 3.9 pts/h the
+        # 1.5 x margin starts them 1.5 h out, so the reset is 1 h away.
+        usage = self._fleet(h, **{"2": _xw(h, 10.0, 93.0, 1 * _H)})
+        assert (_xw_tick(h, usage) is TickOutcome.SWITCHED) is warm
+
+    @pytest.mark.parametrize("warm", [False, True])
+    def test_a_cold_landing_that_overruns_the_five_hour_window_waits_for_its_roll(
+        self, temp_home, warm
+    ):
+        h = _xw_harness(temp_home)
+        if warm:
+            _xw_stamp(h, **{"2": 120.0})
+        # 5h at 90: the 20-point cold re-write overruns the 10 left, whatever the 7d room.
+        usage = self._fleet(h, **{"2": _xw(h, 90.0, 87.0, 2 * _H)})
+        assert (_xw_tick(h, usage) is TickOutcome.SWITCHED) is warm
+
+    def test_a_cold_account_with_an_idle_five_hour_window_still_pulls(self, temp_home):
+        h = _xw_harness(temp_home)
+        idle = {**_xw(h, 0.0, 87.0, 2 * _H), "five_hour": {"pct": 0, "resets_at": None}}
+        usage = self._fleet(h, **{"2": idle})
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @staticmethod
+    def _two_expiring(h) -> dict:
+        """3 expires first, 2 next: both with room, the queue is [3, 2]."""
+        return TestAnExpiringWindowPullsTheSwitch._fleet(
+            h, **{"2": _xw(h, 10.0, 60.0, 3 * _H), "3": _xw(h, 10.0, 85.0, 2 * _H)}
+        )
+
+    def test_a_first_target_that_cannot_be_landed_on_gives_way_to_the_next(self, temp_home):
+        h = _xw_harness(temp_home)
+        with patch.object(
+            h.switcher, "live_session_pids_for",
+            side_effect=lambda num, email: [4242] if num == "3" else [],
+        ):
+            assert _xw_tick(h, self._two_expiring(h)) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "expiring-window")
+
+    @pytest.mark.parametrize(
+        "status, systemic",
+        [
+            ("skip-live-session", None),
+            ("transient", None),
+            ("consume-busy", "consume-busy"),
+            ("invalid_client", "invalid_client"),
+        ],
+    )
+    def test_every_target_refused_leaves_a_healthy_active_unblocked(
+        self, temp_home, status, systemic
+    ):
+        h = _xw_harness(temp_home)
+        with patch(
+            "claude_swap.autoswitch.AutoSwitchEngine._freshen_target", return_value=status
+        ):
+            assert _xw_tick(h, self._two_expiring(h)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _xw_hold(h).reason == "below-threshold"
+        # A systemic cause is named: the hold would otherwise read as nothing worth doing.
+        assert _xw_hold(h).detail == (
+            "active account is healthy (68% headroom, not about to wall); "
+            "2 expiring account(s) could not be landed on"
+            + (f"; {_SYSTEMIC_MESSAGES[systemic]}" if systemic else "")
+        )
+        assert not [e for e in h.events if isinstance(e, ErrorEvent)]
+
+    def test_an_account_after_the_last_due_one_is_not_pulled_to(self, temp_home):
+        """The owner's shape: 2 is due and refused downstream, 3 (40%, 5 d out)
+        is not due: the tick does not land on it under `expiring-window`."""
+        h = _xw_harness(temp_home)
+        usage = self._fleet(h, **{"3": _xw(h, 10.0, 40.0, 5 * _D)})
+        with patch.object(
+            h.switcher, "live_session_pids_for",
+            side_effect=lambda num, email: [4242] if num == "2" else [],
+        ):
+            assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _xw_hold(h).detail == (
+            "active account is healthy (68% headroom, not about to wall); "
+            "1 expiring account(s) could not be landed on"
+        )
+
+    def test_the_proactive_arm_keeps_the_warm_first_order_past_the_due_account(
+        self, temp_home
+    ):
+        """1 is at its wall; 2 is due and refused. 3 (cold, resets sooner, more
+        room) and 4 (warm) are not due: warm still comes first."""
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"4": 120.0})
+        usage = {
+            "1": _xw(h, 98.0, 32.0, 6 * _D),
+            "2": _xw(h, 10.0, 87.0, 2.4 * _H),
+            "3": _xw(h, 10.0, 20.0, 4 * _D),
+            "4": _xw(h, 10.0, 45.0, 5 * _D),
+        }
+        with patch.object(
+            h.switcher, "live_session_pids_for",
+            side_effect=lambda num, email: [4242] if num == "2" else [],
+        ):
+            assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (4, "proactive")
+
+    @pytest.mark.parametrize("far", [False, True])
+    def test_an_active_at_its_switch_point_moves_on_to_the_next_expiring_account(
+        self, temp_home, far
+    ):
+        h = _xw_harness(temp_home)
+        usage = {
+            "1": _xw(h, 97.0, 10.0, 6 * _D),  # headroom 3: at its own switch point
+            "2": _xw(h, 10.0, 40.0, 6 * _D if far else 30 * _H),  # 57 points, 30 h
+            "3": _xw(h, 10.0, 2.0, 6 * _D),  # 98 points, far
+            "4": _xw(h, 100.0, 1.0, 6 * _D),
+        }
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == ((3 if far else 2), "proactive")
+
+    def test_with_nothing_expiring_a_walled_active_leaves_for_the_perishing_peer(self, temp_home):
+        """`_perish_then_room_key` decides here: 2 resets inside a day with less
+        headroom, 3 has more; the fleet burns fast enough that neither is due."""
+        h = _xw_harness(temp_home)
+        usage = {
+            "1": _xw(h, 98.0, 10.0, 6 * _D),  # headroom 2: at the wall
+            "2": _xw(h, 10.0, 75.0, 20 * _H),  # 25 points, resets inside a day
+            "3": _xw(h, 10.0, 20.0, 4 * _D),  # 80 points, resets later
+            "4": _xw(h, 100.0, 100.0, 6.9 * _D),
+        }
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "proactive")
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_the_other_strategies_are_unmoved(self, temp_home, strategy):
+        h = EngineHarness(temp_home, strategy=strategy)
+        for n in (1, 2, 3, 4):
+            h.seed(n, f"acct{n}@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+        outcome = _xw_tick(h, self._fleet(h))
+        assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == (
+            ["consume-first"] if strategy == "consume-first" else []
+        )
+        assert (outcome, h.active_number()) == (
+            (TickOutcome.SWITCHED, 2) if strategy == "consume-first"
+            else (TickOutcome.NO_ACTION, 1)
+        )
+
+
+def _xw_unit(now: float, **accounts: tuple[float, float]) -> dict:
+    """Usage for a direct `expiring_order` call: number -> (7d %, seconds to reset)."""
+    return {
+        n: {"seven_day": {"pct": pct, "resets_at": _iso_at(now + left)}}
+        for n, (pct, left) in accounts.items()
+    }
+
+
+def test_hosts_sharing_accounts_pick_the_same_expiring_target():
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    usage = _xw_unit(
+        now, **{"8": (32.0, 6.5 * _D), "7": (87.0, 2.4 * _H), "5": (93.0, 3.4 * _H)}
+    )
+    headroom = {"8": 68.0, "7": 13.0, "5": 7.0}
+
+    def order(accounts: list[str], warm: set[str]) -> list[str]:
+        """One host: its account order and which accounts it holds warm."""
+        def cost(n: str) -> float:
+            return 0.0 if n == accounts[0] or n in warm else 20.0
+
+        return expiring_order(accounts, usage, headroom, {}, {}, {}, cost, now)
+
+    # Warmth is the per-host input: 5's 4 points of room clear a warm landing, not a cold one.
+    here, there = order(["8", "7", "5"], {"5"}), order(["8", "5", "7"], set())
+    assert "5" in here and "5" not in there
+    assert next(n for n in here if n in there) == next(n for n in there if n in here) == "7"
+
+
+def test_a_max_5x_candidates_room_counts_a_quarter():
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (87.0, 10 * _H)})
+    headroom = {"1": 0.0, "2": 13.0}  # the active is not walked: only 2's room is queued
+
+    def order(plans: dict) -> list[str]:
+        return expiring_order(["1", "2"], usage, headroom, {}, {}, plans, lambda n: 0.0, now)
+
+    assert order({}) == ["2"]  # ten points at 1.3 pts/h, doubled, reach the reset
+    assert order({"2": "Max 5x"}) == []  # a quarter of them do not
+
+
+def test_it_names_nothing_without_a_measurable_rate():
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    headroom = {"1": 68.0, "2": 13.0}
+
+    def order(usage: dict) -> list[str]:
+        return expiring_order(["1", "2"], usage, headroom, {}, {}, {}, lambda n: 0.0, now)
+
+    assert order({}) == []
+    assert order({"1": {"seven_day": {"pct": 32.0}}, "2": "token expired"}) == []  # no resets
+    assert order(_xw_unit(now, **{"1": (0.0, 6 * _D), "2": (0.0, 2 * _H)})) == []  # nothing spent
+
+
+@pytest.mark.parametrize("left, expect", [(36 * _H, ["2"]), (48 * _H, [])])
+def test_the_start_is_early_by_a_factor_of_the_room_not_by_a_fixed_slack(left, expect):
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    # About 1.1 pts/h; 2's 30 points of room take 27 h: 1.5 x is due at 36 h out, not at
+    # 48 h (2 x would be: the margin is 1.49 x measured, 6.9 against 4.64 pts/h).
+    usage = _xw_unit(now, **{"1": (20.0, 6 * _D), "2": (67.0, left)})
+    headroom = {"1": 0.0, "2": 33.0}  # the active is at its wall: not walked, still read
+    assert expiring_order(["1", "2"], usage, headroom, {}, {}, {}, lambda n: 0.0, now) == expect
+
+
+@pytest.mark.parametrize(
+    "left_3, expect", [(50 * _H, ["2", "4", "3"]), (100 * _H, ["2"])]
+)
+def test_the_walk_is_cut_after_the_last_due_account(left_3, expect):
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    # 2 is due; 4 (7 points) is not on its own but sits before 3; 3's 67 points are due at
+    # 50 h out (95 h of spending at 1.9 pts/h) and not at 100 h (83 h at 2.2).
+    usage = _xw_unit(
+        now, **{"1": (20.0, 6.5 * _D), "2": (50.0, 20 * _H), "4": (90.0, 2 * _D), "3": (30.0, left_3)}
+    )
+    headroom = {"1": 0.0, "2": 50.0, "4": 10.0, "3": 70.0}
+    order = expiring_order(["1", "2", "4", "3"], usage, headroom, {}, {}, {}, lambda n: 0.0, now)
+    assert order == expect
+
+
+def test_a_weekly_cap_leaves_room_to_the_fullest_weekly_window():
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (60.0, 8 * _H)})
+    scoped = {"name": "Fable", "pct": 79.0, "resets_at": _iso_at(now + 8 * _H)}
+    headroom = {"1": 0.0, "2": 40.0}
+
+    def order(cap_usage: dict) -> list[str]:
+        usage["2"] = cap_usage
+        return expiring_order(["1", "2"], usage, headroom, {}, {"2": 80.0}, {}, lambda n: 0.0, now)
+
+    plain = dict(usage["2"])
+    assert order(plain) == ["2"]  # cap 80, 7d 60: 20 points, due at 1 pt/h
+    assert order({**plain, "scoped": [scoped]}) == []  # cap 80, scoped 79: 1 point, not due
+
+
+def test_a_header_probe_reading_under_a_weekly_cap_keeps_its_seven_day_room():
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (60.0, 8 * _H)})
+    usage["2"].update(source="headers", five_hour={"pct": 10.0})  # `all` is never complete
+    headroom = {"1": 0.0, "2": 40.0}
+    assert expiring_order(["1", "2"], usage, headroom, {}, {"2": 80.0}, {}, lambda n: 0.0, now) == ["2"]
+
+
+def test_a_weekly_cap_of_one_hundred_is_no_cap():
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (60.0, 8 * _H)})
+    usage["2"]["scoped"] = [{"name": "Fable", "pct": 100.0, "resets_at": _iso_at(now + 8 * _H)}]
+    headroom = {"1": 0.0, "2": 40.0}
+    # The room is 7d's 37 points (a cap of 100 is none, as models.py reads it), not 100 - 100.
+    assert expiring_order(["1", "2"], usage, headroom, {}, {"2": 100.0}, {}, lambda n: 0.0, now) == ["2"]
