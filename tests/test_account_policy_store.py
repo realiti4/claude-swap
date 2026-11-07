@@ -452,9 +452,10 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         s.set_account_disabled(num, True)
         s.set_account_threshold(num, 85.0)
         s.set_account_priority(num, 2)
+        s.set_account_weekly_cap(num, 90)
 
     def test_every_setter_written_key_is_carried(self, temp_home: Path):
-        """Whatever the four setters put on a record is exactly what a rebuild
+        """Whatever the setters put on a record is exactly what a rebuild
         keeps, so a new per-account setting cannot be added to one side only."""
         s = self._fleet(temp_home, count=1)
         before = dict(self._record(s, "1"))
@@ -475,7 +476,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         assert record["threshold"] == pytest.approx(85.0)
         assert record["priority"] == 2
         assert record["alias"] == "work" and record["disabled"] is True
-        assert s.account_policies()["2"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["2"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
 
     def test_slot_migration_keeps_threshold_and_priority(self, temp_home: Path):
         s = self._fleet(temp_home, count=2)
@@ -485,7 +486,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         s.add_account(slot=5)
 
         assert "2" not in (s._get_sequence_data() or {})["accounts"]
-        assert s.account_policies()["5"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["5"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
         assert self._record(s, "5")["alias"] == "work"
 
     def test_explicit_alias_still_wins_over_the_carried_one(self, temp_home: Path):
@@ -520,7 +521,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
 
         s.add_account_from_token("token-v2", slot=3)
 
-        assert s.account_policies()["3"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["3"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
         record = self._record(s, "3")
         assert record["alias"] == "work" and record["disabled"] is True
 
@@ -533,7 +534,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         s.add_account_from_token("token-v1", email, slot=6)
 
         assert "3" not in (s._get_sequence_data() or {})["accounts"]
-        assert s.account_policies()["6"] == AccountPolicy(threshold=85.0, priority=2)
+        assert s.account_policies()["6"] == AccountPolicy(threshold=85.0, priority=2, weekly_cap=90.0)
 
     def test_token_displacement_does_not_inherit_policy(self, temp_home: Path):
         s = self._setup(temp_home)

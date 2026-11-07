@@ -2094,7 +2094,9 @@ class ClaudeAccountSwitcher:
     #: rewrites from the new credential. ``add_account`` and
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
-    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
+        "alias", "disabled", "threshold", "priority", "weeklyCap",
+    )
 
     @classmethod
     def _carried_settings(cls, record: dict | None) -> dict:
@@ -2102,8 +2104,9 @@ class ClaudeAccountSwitcher:
 
         Absent keys stay absent: every writer (``set_alias``,
         ``set_account_disabled``, ``set_account_threshold``,
-        ``set_account_priority``) pops a cleared setting rather than storing a
-        default, and a copy must not reintroduce one.
+        ``set_account_priority``, ``set_account_weekly_cap``) pops a cleared
+        setting rather than storing a default, and a copy must not reintroduce
+        one.
         """
         if not record:
             return {}
@@ -4258,7 +4261,7 @@ class ClaudeAccountSwitcher:
                   the account that already holds the slot (or moving it
                   there from another) refreshes the login and keeps the
                   settings the user put on it: alias, disabled flag,
-                  threshold and priority.
+                  threshold, priority and weekly cap.
             assume_yes: Skip that overwrite prompt (callers with their own
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
@@ -4538,8 +4541,8 @@ class ClaudeAccountSwitcher:
                    carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``. Re-adding
                    to the slot the same account already holds refreshes the
-                   token and keeps its alias, disabled flag, threshold and
-                   priority.
+                   token and keeps its alias, disabled flag, threshold,
+                   priority and weekly cap.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
         """
