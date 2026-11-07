@@ -51,10 +51,12 @@ def _router(responses: dict[str, subprocess.CompletedProcess]):
 # --- plist shape -----------------------------------------------------------
 
 
-def test_build_plist_is_parseable_and_runs_the_menubar_subcommand(tmp_path):
+def test_build_plist_is_parseable_and_runs_the_menubar_worker(tmp_path):
+    # Plain `cswap menubar` asks launchd to run the service; --foreground is the
+    # one invocation that draws the status item in place, so that is the job.
     parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path))
     assert parsed["Label"] == launch_agent.LABEL
-    assert parsed["ProgramArguments"] == [*PROGRAM, "menubar"]
+    assert parsed["ProgramArguments"] == [*PROGRAM, "menubar", "--foreground"]
     assert parsed["RunAtLoad"] is True
 
 
@@ -211,7 +213,7 @@ def test_resolve_program_ignores_an_argv0_that_is_not_cswap(tmp_path):
 def test_install_writes_the_plist_and_bootstraps_it(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+        result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
     written = Path(result["plist"])
     assert written.exists()
@@ -222,7 +224,7 @@ def test_install_writes_the_plist_and_bootstraps_it(tmp_path):
 def test_install_creates_the_log_directory(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+        result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
     assert Path(result["stderr_log"]).parent.is_dir()
 
 
@@ -232,7 +234,7 @@ def test_install_writes_the_plist_owner_only(tmp_path):
     # rather than whatever the umask leaves write_bytes with.
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+        result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
     assert stat.S_IMODE(Path(result["plist"]).stat().st_mode) == 0o600
 
 
@@ -251,7 +253,7 @@ def test_install_boots_out_first_when_already_loaded(tmp_path):
         return _completed(0)
 
     with patch.object(launch_agent.subprocess, "run", side_effect=run) as ran:
-        launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+        launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
     subcommands = [c.args[0][1] for c in ran.call_args_list]
     assert subcommands.index("bootout") < subcommands.index("bootstrap")
@@ -260,7 +262,7 @@ def test_install_boots_out_first_when_already_loaded(tmp_path):
 def test_install_does_not_boot_out_when_nothing_is_loaded(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+        launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
     assert "bootout" not in [c.args[0][1] for c in run.call_args_list]
 
@@ -281,7 +283,7 @@ def test_install_waits_for_the_old_job_to_go_away_before_bootstrapping(tmp_path)
 
     with patch.object(launch_agent.time, "sleep") as slept:
         with patch.object(launch_agent.subprocess, "run", side_effect=run) as ran:
-            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
     assert slept.called, "did not wait for the old job at all"
     subcommands = [c.args[0][1] for c in ran.call_args_list]
@@ -304,7 +306,7 @@ def test_install_names_the_lingering_predecessor_when_bootstrap_fails(tmp_path):
                 {"print": _completed(0), "bootstrap": _completed(5, stderr="Operation already in progress")}
             )
             with pytest.raises(ClaudeSwitchError, match="still shutting down"):
-                launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+                launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
 
 def test_install_raises_with_launchctl_detail_when_bootstrap_fails(tmp_path):
@@ -313,13 +315,13 @@ def test_install_raises_with_launchctl_detail_when_bootstrap_fails(tmp_path):
             {"print": _completed(1), "bootstrap": _completed(5, stderr="Input/output error")}
         )
         with pytest.raises(ClaudeSwitchError, match="Input/output error"):
-            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
 
 def test_install_refuses_off_macos(tmp_path):
     with patch.object(launch_agent.sys, "platform", "linux"):
         with pytest.raises(ClaudeSwitchError, match="only available on macOS"):
-            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
 
 # --- uninstall -------------------------------------------------------------
@@ -332,7 +334,7 @@ def test_uninstall_boots_out_and_removes_the_plist(tmp_path):
 
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0)})
-        result = launch_agent.uninstall(home=tmp_path, uid=UID)
+        result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
     assert result == {"label": launch_agent.LABEL, "was_loaded": True, "removed_plist": True}
     assert not target.exists()
@@ -344,7 +346,7 @@ def test_uninstall_boots_out_and_removes_the_plist(tmp_path):
 def test_uninstall_is_quiet_when_nothing_is_installed(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        result = launch_agent.uninstall(home=tmp_path, uid=UID)
+        result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["was_loaded"] is False and result["removed_plist"] is False
 
 
@@ -354,7 +356,7 @@ def test_uninstall_removes_a_plist_that_was_never_bootstrapped(tmp_path):
     target.write_bytes(b"x")
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        result = launch_agent.uninstall(home=tmp_path, uid=UID)
+        result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["removed_plist"] is True and not target.exists()
 
 
@@ -362,7 +364,7 @@ def test_uninstall_raises_when_bootout_fails_and_the_service_stays_loaded(tmp_pa
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0), "bootout": _completed(3, stderr="in use")})
         with pytest.raises(ClaudeSwitchError, match="in use"):
-            launch_agent.uninstall(home=tmp_path, uid=UID)
+            launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
 
 def test_uninstall_tolerates_a_bootout_race_that_already_unloaded_it(tmp_path):
@@ -379,7 +381,7 @@ def test_uninstall_tolerates_a_bootout_race_that_already_unloaded_it(tmp_path):
         return _completed(0)
 
     with patch.object(launch_agent.subprocess, "run", side_effect=run):
-        result = launch_agent.uninstall(home=tmp_path, uid=UID)
+        result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["was_loaded"] is True
 
 
@@ -390,7 +392,7 @@ def test_status_reads_state_and_pid_from_launchctl_print(tmp_path):
     printed = "\tstate = running\n\tpid = 25026\n\tlast exit code = (never exited)\n"
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout=printed)})
-        result = launch_agent.status(home=tmp_path, uid=UID)
+        result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
     assert result["loaded"] is True
     assert result["state"] == "running"
@@ -400,7 +402,7 @@ def test_status_reads_state_and_pid_from_launchctl_print(tmp_path):
 def test_status_reports_not_loaded_without_inventing_a_pid(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        result = launch_agent.status(home=tmp_path, uid=UID)
+        result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["loaded"] is False
     assert result["pid"] is None and result["state"] is None
 
@@ -413,7 +415,7 @@ def test_status_separates_installed_from_loaded(tmp_path):
     target.write_bytes(b"x")
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
-        result = launch_agent.status(home=tmp_path, uid=UID)
+        result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["installed"] is True and result["loaded"] is False
 
 
@@ -437,7 +439,7 @@ def test_status_reads_the_jobs_own_state_not_a_nested_blocks(tmp_path):
     )
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout=printed)})
-        result = launch_agent.status(home=tmp_path, uid=UID)
+        result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
     assert result["state"] == "running"
     assert result["pid"] == 25026
@@ -447,12 +449,343 @@ def test_status_keeps_multi_word_launchd_states(tmp_path):
     # Before the process spawns, launchd reports "spawn scheduled".
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout="\tstate = spawn scheduled\n")})
-        result = launch_agent.status(home=tmp_path, uid=UID)
+        result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["state"] == "spawn scheduled"
 
 
 def test_status_ignores_a_non_numeric_pid_line(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout="\tpid = (none)\n")})
-        result = launch_agent.status(home=tmp_path, uid=UID)
+        result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["pid"] is None
+
+
+# --- ensure: plain `cswap menubar` -----------------------------------------
+
+
+class _FakeLaunchd:
+    """launchctl as far as this module drives it.
+
+    Tracks loaded/pid state through bootstrap, bootout and kickstart, answers
+    ``print`` the way launchd does, and lists the service in ``print-disabled``
+    when asked to. Records every argv so tests can assert the sequence.
+    """
+
+    def __init__(self, *, loaded=False, pid=None, disabled=False):
+        self.loaded, self.pid, self.disabled = loaded, pid, disabled
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        sub = argv[1]
+        if sub == "print":
+            if not self.loaded:
+                return _completed(1)
+            lines = [f"\tstate = {'running' if self.pid else 'not running'}"]
+            if self.pid:
+                lines.append(f"\tpid = {self.pid}")
+            return _completed(0, stdout="\n".join(lines) + "\n")
+        if sub == "print-disabled":
+            flag = "disabled" if self.disabled else "enabled"
+            listing = f'\tdisabled services = {{\n\t\t"{launch_agent.LABEL}" => {flag}\n\t}}\n'
+            return _completed(0, stdout=listing)
+        if sub == "bootstrap":
+            self.loaded, self.pid = True, 7001
+        elif sub == "bootout":
+            self.loaded, self.pid = False, None
+        elif sub == "kickstart":
+            self.pid = 7002
+        return _completed(0)
+
+    @property
+    def subcommands(self):
+        return [c[1] for c in self.calls]
+
+
+def _homes(tmp_path):
+    home, data = tmp_path / "home", tmp_path / "data"
+    home.mkdir()
+    data.mkdir()
+    return home, data
+
+
+def _login_plist(home, program=PROGRAM, **env):
+    path = launch_agent.plist_path(home=home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(launch_agent.build_plist(program, home=home, env=env))
+    return path
+
+
+def _session_plist(home, data):
+    path = launch_agent.session_plist_path(backup_dir=data)
+    path.write_bytes(launch_agent.build_plist(PROGRAM, home=home))
+    return path
+
+
+def _ensure(fake, home, data, **kw):
+    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+        return launch_agent.ensure(
+            home=home, backup_dir=data, program=PROGRAM, uid=UID, **kw
+        )
+
+
+WORKER = [*PROGRAM, "menubar", "--foreground"]
+
+
+def test_ensure_first_setup_registers_at_login_and_bootstraps(tmp_path):
+    home, data = _homes(tmp_path)
+    fake = _FakeLaunchd()
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "first-setup"
+    assert result["start_at_login"] is True
+    assert result["pid"] == 7001
+    login = launch_agent.plist_path(home=home)
+    assert login.exists()
+    assert not launch_agent.session_plist_path(backup_dir=data).exists()
+    assert ["launchctl", "bootstrap", f"gui/{UID}", str(login)] in fake.calls
+    assert "bootout" not in fake.subcommands
+    assert plistlib.loads(login.read_bytes())["ProgramArguments"] == WORKER
+
+
+def test_ensure_leaves_a_running_service_alone(tmp_path):
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    fake = _FakeLaunchd(loaded=True, pid=4242)
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "already-running"
+    assert result["pid"] == 4242
+    assert not {"bootstrap", "bootout", "kickstart"} & set(fake.subcommands)
+
+
+def test_ensure_kickstarts_a_quit_service(tmp_path):
+    # After Quit (a clean exit 0) launchd keeps the job loaded but idle until
+    # the next login; kickstart runs it again without re-reading anything.
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    fake = _FakeLaunchd(loaded=True, pid=None)
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "started"
+    assert ["launchctl", "kickstart", f"gui/{UID}/{launch_agent.LABEL}"] in fake.calls
+    assert "bootstrap" not in fake.subcommands
+
+
+def test_ensure_restart_kickstarts_a_running_service_with_kill(tmp_path):
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    fake = _FakeLaunchd(loaded=True, pid=4242)
+
+    result = _ensure(fake, home, data, restart=True)
+
+    assert result["action"] == "restarted"
+    assert ["launchctl", "kickstart", "-k", f"gui/{UID}/{launch_agent.LABEL}"] in fake.calls
+
+
+def test_ensure_respects_start_at_login_turned_off(tmp_path):
+    """A plist in the data dir is the user's explicit "off".
+
+    Bootstrap from there for this session, and never move it back: a missing
+    plist would mean "never set up" and re-register the login start.
+    """
+    home, data = _homes(tmp_path)
+    session = _session_plist(home, data)
+    fake = _FakeLaunchd()
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "started"
+    assert result["start_at_login"] is False
+    assert not launch_agent.plist_path(home=home).exists()
+    assert session.exists()
+    assert ["launchctl", "bootstrap", f"gui/{UID}", str(session)] in fake.calls
+
+
+def test_ensure_repairs_a_plist_from_before_the_worker_flag_and_keeps_its_env(tmp_path):
+    home, data = _homes(tmp_path)
+    login = _login_plist(home, https_proxy="http://proxy:3128")
+    old = plistlib.loads(login.read_bytes())
+    old["ProgramArguments"] = [*PROGRAM, "menubar"]  # written by a pre-1.0 cswap
+    old["EnvironmentVariables"]["PATH"] = "/stale"
+    login.write_bytes(plistlib.dumps(old))
+    fake = _FakeLaunchd(loaded=True, pid=4242)
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "restarted"
+    repaired = plistlib.loads(login.read_bytes())
+    assert repaired["ProgramArguments"] == WORKER
+    # The installing shell's environment survives; this shell may lack it.
+    assert repaired["EnvironmentVariables"]["https_proxy"] == "http://proxy:3128"
+    assert repaired["EnvironmentVariables"]["PATH"] != "/stale"
+    subs = fake.subcommands
+    # launchd holds the old definition in memory: only a reload applies the
+    # new plist, kickstart would rerun the old one.
+    assert subs.index("bootout") < subs.index("bootstrap")
+    assert "kickstart" not in subs
+
+
+def test_ensure_repairs_a_plist_pinning_a_moved_console_script(tmp_path):
+    home, data = _homes(tmp_path)
+    login = _login_plist(home, program=["/old/venv/bin/cswap"])
+    fake = _FakeLaunchd(loaded=True, pid=None)
+
+    result = _ensure(fake, home, data)
+
+    assert result["action"] == "started"
+    assert plistlib.loads(login.read_bytes())["ProgramArguments"] == WORKER
+    assert "bootstrap" in fake.subcommands
+
+
+def test_ensure_prefers_the_login_plist_when_both_exist(tmp_path):
+    home, data = _homes(tmp_path)
+    _login_plist(home)
+    session = _session_plist(home, data)
+
+    result = _ensure(_FakeLaunchd(), home, data)
+
+    assert result["start_at_login"] is True
+    assert not session.exists()
+
+
+def test_ensure_refuses_a_service_disabled_in_system_settings(tmp_path):
+    home, data = _homes(tmp_path)
+    fake = _FakeLaunchd(disabled=True)
+
+    with pytest.raises(ClaudeSwitchError) as exc:
+        _ensure(fake, home, data)
+
+    assert "System Settings" in str(exc.value)
+    assert "bootstrap" not in fake.subcommands
+    assert not launch_agent.plist_path(home=home).exists()
+
+
+def test_ensure_refuses_off_macos(tmp_path):
+    with patch.object(launch_agent.sys, "platform", "linux"):
+        with pytest.raises(ClaudeSwitchError):
+            launch_agent.ensure(home=tmp_path, backup_dir=tmp_path, program=PROGRAM, uid=UID)
+
+
+# --- is_disabled / the job's pid -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, disabled",
+    [("disabled", True), ("true", True), ("enabled", False), ("false", False)],
+)
+def test_is_disabled_reads_both_launchctl_spellings(value, disabled):
+    listing = (
+        "\tdisabled services = {\n"
+        f'\t\t"{launch_agent.LABEL}" => {value}\n'
+        '\t\t"com.other.agent" => disabled\n'
+        "\t}\n"
+    )
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print-disabled": _completed(0, stdout=listing)})
+        assert launch_agent.is_disabled(uid=UID) is disabled
+
+
+def test_is_disabled_is_false_when_the_list_cannot_be_read():
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print-disabled": _completed(1, stderr="nope")})
+        assert launch_agent.is_disabled(uid=UID) is False
+
+
+def test_running_as_service_matches_the_jobs_pid_to_this_process():
+    mine = f"\tstate = running\n\tpid = {os.getpid()}\n"
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(0, stdout=mine)})
+        assert launch_agent.running_as_service(uid=UID) is True
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(0, stdout="\tstate = running\n\tpid = 1\n")})
+        assert launch_agent.running_as_service(uid=UID) is False
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        assert launch_agent.service_pid(uid=UID) is None
+
+
+# --- Start at login toggle ---------------------------------------------------
+
+
+def _never_called(argv, **kwargs):
+    raise AssertionError(f"launchctl must not be driven here, got {argv}")
+
+
+def test_set_start_at_login_off_moves_the_plist_without_touching_launchd(tmp_path):
+    # The menu calls this from inside the running job; a bootout would kill it.
+    home, data = _homes(tmp_path)
+    login = _login_plist(home, https_proxy="http://proxy:3128")
+    original = login.read_bytes()
+
+    with patch.object(launch_agent.subprocess, "run", side_effect=_never_called):
+        result = launch_agent.set_start_at_login(False, home=home, backup_dir=data)
+
+    session = launch_agent.session_plist_path(backup_dir=data)
+    assert result["start_at_login"] is False
+    assert session.read_bytes() == original  # the forwarded env survives the move
+    assert not login.exists()
+
+
+def test_set_start_at_login_on_moves_it_back(tmp_path):
+    home, data = _homes(tmp_path)
+    session = _session_plist(home, data)
+
+    with patch.object(launch_agent.subprocess, "run", side_effect=_never_called):
+        launch_agent.set_start_at_login(True, home=home, backup_dir=data)
+
+    assert launch_agent.start_at_login_enabled(home=home) is True
+    assert not session.exists()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_set_start_at_login_with_no_plist_writes_one_so_the_choice_is_kept(tmp_path, enabled):
+    # A --foreground run from a shell has no plist anywhere yet.
+    home, data = _homes(tmp_path)
+
+    with patch.object(launch_agent.subprocess, "run", side_effect=_never_called):
+        result = launch_agent.set_start_at_login(
+            enabled, home=home, backup_dir=data, program=PROGRAM
+        )
+
+    written = Path(result["plist"])
+    assert written.exists()
+    assert launch_agent.start_at_login_enabled(home=home) is enabled
+    assert plistlib.loads(written.read_bytes())["ProgramArguments"] == WORKER
+
+
+def test_uninstall_removes_the_session_plist_too(tmp_path):
+    home, data = _homes(tmp_path)
+    session = _session_plist(home, data)
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
+    assert result["removed_plist"] is True
+    assert not session.exists()
+
+
+def test_install_removes_a_session_plist_so_login_wins(tmp_path):
+    home, data = _homes(tmp_path)
+    session = _session_plist(home, data)
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
+    assert result["start_at_login"] is True
+    assert not session.exists()
+    assert launch_agent.start_at_login_enabled(home=home)
+
+
+def test_status_reports_start_at_login_and_the_system_settings_switch(tmp_path):
+    home, data = _homes(tmp_path)
+    session = _session_plist(home, data)
+    fake = _FakeLaunchd(loaded=True, pid=4242, disabled=True)
+    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+        result = launch_agent.status(home=home, uid=UID, backup_dir=data)
+    assert result["start_at_login"] is False
+    assert result["configured"] is True
+    assert result["session_plist"] == str(session)
+    assert result["disabled"] is True
+    assert result["pid"] == 4242

@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import launch_agent, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.printer import warning
@@ -963,6 +963,14 @@ def run(switcher) -> int:
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
 
+            menu.add(None)
+            # Checked = the plist sits in ~/Library/LaunchAgents, where launchd
+            # scans at login. The state is read from disk on every rebuild so a
+            # change made from the CLI shows up here too.
+            login_item = rumps.MenuItem("Start at login", callback=self.on_toggle_login)
+            login_item.state = 1 if launch_agent.start_at_login_enabled() else 0
+            menu.add(login_item)
+
             return menu
 
         # ---- callbacks --------------------------------------------------------
@@ -1114,6 +1122,21 @@ def run(switcher) -> int:
                 self.refresh_timer.start()
                 self._save_and_rebuild()
             return cb
+
+        def on_toggle_login(self, _sender):
+            # Moves the plist between its two homes; launchd is not touched, so
+            # the app whose menu was just clicked keeps running either way.
+            enabled = not launch_agent.start_at_login_enabled()
+            try:
+                launch_agent.set_start_at_login(
+                    enabled, backup_dir=self.switcher.backup_dir
+                )
+            except (ClaudeSwitchError, OSError) as e:
+                rumps.alert(
+                    title="claude-swap", message=f"Couldn't change Start at login: {e}"
+                )
+                return
+            self.rebuild_menu()
 
         def on_toggle_autoswitch(self, _sender):
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
