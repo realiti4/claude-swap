@@ -17886,7 +17886,7 @@ def test_a_weekly_cap_of_one_hundred_is_no_cap():
 
 
 def _dco(
-    pool, *, expiring=(), plans=None, trigger="proactive", partition=True,
+    pool, *, expiring=(), plans=None, trigger="proactive", dropped=False,
     active_headroom=2.0, raw_active_headroom=60.0, **settings,
 ):
     """`dynamic_candidate_order` on three cold peers: 2 resets within a day with 60
@@ -17909,7 +17909,7 @@ def _dco(
     return dynamic_candidate_order(
         pool, headroom, usage, entries, {}, {}, AutoSwitchSettings(strategy="dynamic", **settings),
         now, current="1", active_headroom=active_headroom, expiring=expiring,
-        trigger=trigger, partition=partition, raw_active_headroom=raw_active_headroom,
+        trigger=trigger, model_window_dropped=dropped, raw_active_headroom=raw_active_headroom,
     )
 
 
@@ -17926,7 +17926,7 @@ class TestDynamicCandidateOrder:
         """Cost 20 (Ultra); on Max 5x it is 80, which 2's 60 points do not clear."""
         assert _dco(["2", "3"]) == (["2", "3"], self.COLD_SPLIT)
         assert _dco(["2", "3"], plans={"2": "Max 5x"}) == (["3", "2"], self.COLD_SPLIT)
-        assert _dco(["2", "3"], plans={"2": "Max 5x"}, partition=False) == (["2", "3"], self.WARM)
+        assert _dco(["2", "3"], plans={"2": "Max 5x"}, dropped=True) == (["2", "3"], self.WARM)
 
     def test_the_expiring_accounts_go_first_and_the_key_says_so(self):
         order = _dco(["2", "3", "4"], expiring=["3", "1", "2"])
@@ -17939,9 +17939,10 @@ class TestDynamicCandidateOrder:
         ahead = _dco(peers, expiring=["3", "1", "2"], trigger="dynamic-healthy")
         assert ahead == (["3", "2", "4"], f"expiring window, then {self.ROOM}")
 
-    def test_the_time_only_alternation_ranks_warm_first_and_the_step_does_not(self):
-        """The percent step (the default) ranks warm and cold in one list; with
-        `alternation_chunk_pct` 0 the time-only arm lists warm before cold."""
+    def test_the_time_only_alternation_names_warm_first_and_the_step_does_not(self):
+        """The header only (the fixture has no warm candidate): the percent step
+        (the default) ranks warm and cold in one list; with `alternation_chunk_pct`
+        0 the time-only arm lists warm before cold."""
         assert _dco(["3", "2"], trigger="dynamic-healthy")[1] == self.ROOM
         assert _dco(["3", "2"], trigger="dynamic-healthy", alternation_chunk_pct=0.0)[1] == self.WARM
 

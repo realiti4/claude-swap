@@ -1819,16 +1819,11 @@ class TestOrderedAccounts:
         assert order == ["1", "2", "3"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
-    def test_a_disabled_spend_only_row_sorts_with_the_uniform_spend_tier(self):
-        """`acc.disabled or acc.usage.sentinel is not None` used to fold a
-        disabled SPEND-ONLY row into the same tier as a disabled WINDOW-
-        based one -- but the auto view's own key (autoview.py:485-488)
-        keys every spend-only row at its own, later tier, disabled or not:
-        a spend axis carries no window pct to gate `disabled` against. "3"
-        (disabled, window-based) and "2" (disabled, no window/spend-only)
-        used to tie-break on account NUMBER inside the one shared bucket,
-        printing "2" before "3" -- the reverse of the auto view's own
-        order, which puts the window-based row ("3") first."""
+    def test_a_disabled_spend_only_row_sorts_by_the_one_non_candidate_key(self):
+        """Both screens key a row the engine does not pick by `non_candidate_key`
+        (soonest 7d reset, an unknown one last). "3" (disabled, window-based, a
+        7d reset in a day) lists before "2" (disabled, spend-only, no reset),
+        though account NUMBER alone would print "2" first."""
         active = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
         window_based_disabled = {
             "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
@@ -2477,6 +2472,57 @@ class TestPanelOrderIsTheEnginesOrder:
         )
         assert engine_pick == "3"
         assert ordered == ["3", "2"], ordered
+        assert f"Next best ({ESCAPE_KEY})" in rendered, rendered
+
+    def test_a_walled_active_with_no_escape_lists_the_rotation_order(self, temp_home):
+        """Active 1 is walled on Fable but its own 5h/7d room (80) clears the
+        cold cost, so there is no blackout to escape: the escape admits nobody
+        and the tick rotates by the step, most room first. 3 (80 room, back in
+        5h) goes ahead of 2 (60, back in 1h), which the escape would list first;
+        the header is the rotation's."""
+        def u(seven, fable_secs):
+            return {
+                "five_hour": {"pct": 20.0},
+                "seven_day": {"pct": seven, "resets_at": _iso_in(3 * 86400)},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(fable_secs)}],
+            }
+
+        now = time.time()
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, {"1": u(20.0, 4 * 3600), "2": u(40.0, 3600), "3": u(10.0, 5 * 3600)},
+            strategy="dynamic", threshold=90.0, model="Fable", cooldown_seconds=0.0, now=now,
+            state={
+                "lastActiveAt": {"1": now - 700},
+                "alternation": {
+                    "account": "1", "since": now - 700, "anchor": 20.0, "rise": 20.0,
+                    "ran": True,
+                },
+            },
+        )
+        assert engine_pick == "3"
+        assert ordered == ["3", "2"], ordered
+        assert f"Next best ({ROOM_KEY})" in rendered, rendered
+
+    def test_a_walled_active_lists_only_the_accounts_the_escape_admits(self, temp_home):
+        """Every account is over the 40 line on Fable, the active's at 100. Warm 2
+        holds 50 and is back in 5h; cold 3 holds 15, under its cost of 20, and
+        is back in 1h. A qualified warm partner exists, so the escape refuses
+        3 whatever its recovery: the tick takes 2 and the panel lists only 2."""
+        def u(fable, fable_secs):
+            return {
+                "five_hour": {"pct": 10.0},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_in(3 * 86400)},
+                "scoped": [{"name": "Fable", "pct": fable, "resets_at": _iso_in(fable_secs)}],
+            }
+
+        now = time.time()
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, {"1": u(100.0, 4 * 3600), "2": u(50.0, 5 * 3600), "3": u(85.0, 3600)},
+            strategy="dynamic", threshold=40.0, model="Fable", cooldown_seconds=0.0, now=now,
+            state={"lastActiveAt": {"2": now - 100}},
+        )
+        assert engine_pick == "2"
+        assert ordered == ["2"], ordered
         assert f"Next best ({ESCAPE_KEY})" in rendered, rendered
 
     def test_rows_that_are_not_candidates_follow_every_candidate_soonest_7d_reset_first(self):

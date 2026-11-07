@@ -344,8 +344,10 @@ def rank_switch_candidates(
         model-gated headroom, as the tick prices it, also on the unmodeled retry
         (`dropped`, whose cold floor is a tick-only admission and is not applied
         here). The active's own never-widened reading picks the healthy arm's walled
-        escape order. Whether a rotation happens now (the step, the dwell, the landing
-        floor) is a tick-only decision: the list is the order it would take them in.
+        escape, over the candidates the tick's escape admits; where it admits nobody
+        the list is the rotation's. Whether a rotation happens now (the step, the
+        dwell, the landing floor) is a tick-only decision: the list is the order it
+        would take them in.
         """
         last = last_active_at or {}
         headroom = _headroom_by_account(usage, axis)
@@ -359,7 +361,7 @@ def rank_switch_candidates(
                 active_number, oauth_candidates, usage, model_headroom, bars, policies,
                 entries, last, settings, now,
             ),
-            trigger=trigger, partition=not dropped, reasons=reasons,
+            trigger=trigger, model_window_dropped=dropped, reasons=reasons,
             raw_active_headroom=model_headroom.get(active_number), models=models,
         )
         return ordered, (rank_axis if ordered else None)
