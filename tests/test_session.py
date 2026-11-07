@@ -24,11 +24,17 @@ from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
     CredentialReadError,
+    LockError,
     SessionError,
     SwitchError,
     ValidationError,
 )
-from claude_swap.fsutil import is_link, link_points_at, make_dir_link
+from claude_swap.fsutil import (
+    is_link,
+    link_points_at,
+    make_dir_link,
+    replace_with_retry,
+)
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_global_config_path
@@ -3585,6 +3591,119 @@ class TestShareHistoryWindows:
         assert is_link(session_dir / "projects")
         assert (source / "projects" / "-home-user-app" / "bbb.jsonl").read_text() == "profile-b\n"
         assert not list(session_dir.glob("projects.*"))
+
+    def test_a_staging_link_is_cleared_when_the_history_is_already_gone(
+        self, win_history
+    ):
+        """Killed after the merge removed the profile's history and before the
+        rename: the next launch links ``projects`` afresh — and must not walk
+        past the leftover forever."""
+        source, session_dir, mgr = win_history
+        make_dir_link(source / "projects", session_dir / "projects.cswap-link-staging")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert is_link(session_dir / "projects")
+        assert not list(session_dir.glob("projects.*"))
+
+    def test_a_staging_link_is_cleared_by_a_launch_that_does_not_share(
+        self, win_history
+    ):
+        source, session_dir, mgr = win_history
+        make_dir_link(source / "projects", session_dir / "projects.cswap-link-staging")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=False)
+
+        assert not list(session_dir.glob("projects.*"))
+        assert (source / "projects" / "-home-user-app" / "aaa.jsonl").exists()
+
+    def test_only_a_link_is_cleared_from_the_staging_name(self, win_history):
+        source, session_dir, mgr = win_history
+        odd = session_dir / "projects.cswap-link-staging"
+        odd.mkdir()
+        (odd / "keep.jsonl").write_text("not a link\n")
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (odd / "keep.jsonl").read_text() == "not a link\n"
+        assert is_link(session_dir / "projects")
+
+    def test_a_staging_link_is_left_while_a_peer_holds_the_lock(
+        self, win_history, monkeypatch
+    ):
+        """A busy migration lock means the link may be a peer's live staging
+        link, not a leftover: left for the next launch, and the launch goes on."""
+        source, session_dir, mgr = win_history
+        make_dir_link(source / "projects", session_dir / "projects.cswap-link-staging")
+
+        class Busy:
+            def __init__(self, path, timeout=None):
+                pass
+
+            def __enter__(self):
+                raise LockError("held by a peer")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(session_mod, "FileLock", Busy)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert is_link(session_dir / "projects.cswap-link-staging")
+        assert is_link(session_dir / "projects")
+
+    def test_a_failed_rename_is_retried_as_a_direct_link(
+        self, win_history, monkeypatch
+    ):
+        source, session_dir, mgr = win_history
+        own = session_dir / "projects" / "-home-user-app"
+        own.mkdir(parents=True)
+        (own / "bbb.jsonl").write_text("profile-b\n")
+
+        def refuse(src, dst, **_kwargs):
+            raise OSError(5, "Access is denied")
+
+        monkeypatch.setattr(session_mod, "replace_with_retry", refuse)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert is_link(session_dir / "projects")
+        assert link_points_at(session_dir / "projects", source / "projects")
+        assert (source / "projects" / "-home-user-app" / "bbb.jsonl").read_text() == "profile-b\n"
+        assert not list(session_dir.glob("projects.*"))
+
+    def test_when_the_link_cannot_be_installed_the_next_launch_links_it(
+        self, win_history, monkeypatch, capsys
+    ):
+        """Both the rename and the direct attempt failed, after the merge: the
+        history is in ~/.claude, the launch says so, nothing is left behind,
+        and the next launch links the profile."""
+        source, session_dir, mgr = win_history
+        own = session_dir / "projects" / "-home-user-app"
+        own.mkdir(parents=True)
+        (own / "bbb.jsonl").write_text("profile-b\n")
+        real_make_link = session_mod.SessionManager._make_link
+
+        def staging_only(self, target, dest):
+            if dest.name == "projects":
+                raise OSError(5, "Access is denied")
+            return real_make_link(self, target, dest)
+
+        def refuse(src, dst, **_kwargs):
+            raise OSError(5, "Access is denied")
+
+        monkeypatch.setattr(session_mod.SessionManager, "_make_link", staging_only)
+        monkeypatch.setattr(session_mod, "replace_with_retry", refuse)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (source / "projects" / "-home-user-app" / "bbb.jsonl").read_text() == "profile-b\n"
+        assert not (session_dir / "projects").exists()
+        assert not list(session_dir.glob("projects.*"))
+        assert "linking it back failed" in capsys.readouterr().out
+
+        monkeypatch.setattr(session_mod.SessionManager, "_make_link", real_make_link)
+        monkeypatch.setattr(session_mod, "replace_with_retry", replace_with_retry)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        assert is_link(session_dir / "projects")
 
 
 class TestShareHistoryWindowsSymlinks:

@@ -170,6 +170,11 @@ MIGRATION_LOCK = ".cswap-history-migration.lock"
 # holds nothing; the next launch removes it.
 _STAGED_LINK_SUFFIX = ".cswap-link-staging"
 
+# How long a launch waits for the migration lock only to clear such a
+# leftover. A busy lock means a migration is under way and the "leftover"
+# may be its live staging link, so the wait is short and giving up is fine.
+_STAGED_CLEANUP_LOCK_TIMEOUT = 5.0
+
 
 def stale_marker_for(session_dir: Path) -> Path:
     """Where a profile's stale marker is WRITTEN: a SIBLING of the profile dir.
@@ -1389,6 +1394,7 @@ class SessionManager:
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
         out_of_scope = [name for name in managed if name not in scope]
+        self._clear_staged_links(session_dir, source_root, scope)
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
@@ -1515,6 +1521,46 @@ class SessionManager:
         self._write_manifest(manifest_path, new_managed)
         self._report_quarantine()
         self._report_sharing_is_the_default()
+
+    def _clear_staged_links(
+        self, session_dir: Path, source_root: Path, scope: tuple[str, ...]
+    ) -> None:
+        """Remove a staging link that an interrupted launch left behind.
+
+        ``_migrate_under_lock`` makes the link that will replace a profile's
+        history under a staging name first and renames it into place last.
+        A launch killed in between leaves that link there, and nothing else
+        looks at the staging name: the next launch links ``dest`` afresh and
+        would walk past the leftover forever. It is a link and holds nothing,
+        so removing it costs nothing — except that a peer launch may be in
+        the middle of a migration with its own staging link live. So the
+        lock every migration holds is taken here too, briefly: a busy lock
+        means the "leftover" may be someone's work in progress, and it is
+        left for the next launch. Nothing but a link is ever removed.
+        """
+        leftovers = [
+            session_dir / (name + _STAGED_LINK_SUFFIX)
+            for name in HISTORY_ITEMS
+            if name in scope
+        ]
+        if not any(is_link(staged) for staged in leftovers):
+            return
+        try:
+            _mkdir_private(source_root)
+            with FileLock(
+                source_root / MIGRATION_LOCK, timeout=_STAGED_CLEANUP_LOCK_TIMEOUT
+            ):
+                for staged in leftovers:
+                    if is_link(staged):
+                        remove_link(staged)
+                        self._logger.info(
+                            f"Removed the staging link an interrupted launch "
+                            f"left at {staged}"
+                        )
+        except (LockError, OSError) as e:
+            self._logger.warning(
+                f"Could not clear a staging link in {session_dir}: {e}"
+            )
 
     def _can_link(self, name: str, session_dir: Path, source_root: Path) -> bool:
         """Whether ``name`` can be shared into ``session_dir`` by link.
@@ -1952,17 +1998,29 @@ class SessionManager:
             # The merge has emptied and removed ``dest``; the link slides
             # into its place by rename, which moves the link, not its target.
             replace_with_retry(staged, dest)
-        except OSError as e:
-            self._discard_staged_link(staged)
-            self._logger.warning(f"Failed to share {dest.name} into session: {e}")
-            print(
-                dimmed(
-                    f"Merged the profile's existing {dest.name} into {src}, "
-                    "but linking it back failed (see log) — retrying on the "
-                    "next launch."
+        except OSError as rename_error:
+            # The link beside it stands, so making one is possible here; the
+            # rename is what failed (a hold on the directory, say). One more
+            # try, made at ``dest`` directly, before the launch goes on with
+            # the merged history in ~/.claude and the profile unlinked until
+            # the next launch, which links it afresh.
+            try:
+                self._make_link(link_target, dest)
+            except OSError as e:
+                self._discard_staged_link(staged)
+                self._logger.warning(
+                    f"Failed to share {dest.name} into session: {rename_error}; "
+                    f"then {e}"
                 )
-            )
-            return False
+                print(
+                    dimmed(
+                        f"Merged the profile's existing {dest.name} into {src}, "
+                        "but linking it back failed (see log) — retrying on "
+                        "the next launch."
+                    )
+                )
+                return False
+            self._discard_staged_link(staged)
         print(
             dimmed(
                 f"Merged the profile's existing {dest.name} into "
