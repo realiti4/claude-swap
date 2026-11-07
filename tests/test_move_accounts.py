@@ -1,5 +1,6 @@
 """Tests for `cswap move` (ClaudeAccountSwitcher.move_account)."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialError,
+    SessionError,
     ValidationError,
 )
 from claude_swap.models import Platform
@@ -621,3 +623,111 @@ class TestMoveSessionProfileKeychain:
         assert not old_dir.exists()
         assert switcher._session_dir("5", email).exists()
         assert macos_keychain.get_password(old_service, account) is None
+
+
+_STORED = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "stored-access",
+            "refreshToken": "stored-refresh",
+            "expiresAt": 1,
+        }
+    }
+)
+_ROTATED = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "fresh-access",
+            "refreshToken": "rotated-refresh",
+            "expiresAt": 9999999999999,
+        }
+    }
+)
+
+
+class TestMoveAdoptsSessionCredential:
+    """``move`` relocates the BACKUP; a profile's rotated credential must get
+    into that backup first.
+
+    Claude rotates the token family inside the session profile and nothing
+    syncs it back, so after a session that refreshed, the backup is a consumed
+    generation. The profile's Keychain item cannot follow the relocation (its
+    service name hashes the old path) and is deleted with the old slot key, so
+    without adoption the destination profile is seeded from a grant whose
+    first refresh gets invalid_grant -- and the fresh generation is gone.
+    """
+
+    EMAIL = "account2@example.com"
+
+    def _switcher(self, sample_sequence_data: dict) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def _seed(
+        self,
+        switcher: ClaudeAccountSwitcher,
+        backup: str,
+        profile: str,
+        identity: str | None = None,
+    ) -> Path:
+        # The pure store write: the post-write hook invalidates the profile
+        # written next, which a real backup write must do but is not what this
+        # models (a session that rotated AFTER the backup was taken).
+        switcher._store._write_account_credentials("2", self.EMAIL, backup)
+        session_dir = switcher._session_dir("2", self.EMAIL)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(profile)
+        if identity is None:
+            identity = json.dumps(
+                {"oauthAccount": {"emailAddress": self.EMAIL, "organizationUuid": ""}}
+            )
+        (session_dir / ".claude.json").write_text(identity)
+        return session_dir
+
+    def test_move_carries_the_profiles_newer_generation(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, backup=_STORED, profile=_ROTATED)
+
+        switcher.move_account("2", "5")
+
+        assert switcher.read_account_credentials("5", self.EMAIL) == _ROTATED
+        assert switcher._session_dir("5", self.EMAIL).exists()
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["5"]["email"] == self.EMAIL
+
+    def test_move_keeps_a_backup_that_is_ahead_of_the_profile(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A re-login landed in the backup after the profile last ran: the
+        backup is the later generation and must not be downgraded."""
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, backup=_ROTATED, profile=_STORED)
+
+        switcher.move_account("2", "5")
+
+        assert switcher.read_account_credentials("5", self.EMAIL) == _ROTATED
+
+    def test_move_refuses_when_the_ahead_profile_cannot_be_adopted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Profile ahead but its identity unreadable: adoption cannot tell
+        whose credential that is, and the move must not carry the consumed
+        backup silently. Nothing moves."""
+        switcher = self._switcher(sample_sequence_data)
+        session_dir = self._seed(
+            switcher, backup=_STORED, profile=_ROTATED, identity="not json{{{"
+        )
+
+        with pytest.raises(SessionError, match="could not be adopted"):
+            switcher.move_account("2", "5")
+
+        data = switcher._get_sequence_data()
+        assert "5" not in data["accounts"]
+        assert data["accounts"]["2"]["email"] == self.EMAIL
+        assert switcher.read_account_credentials("2", self.EMAIL) == _STORED
+        assert session_dir.exists()
+        assert (session_dir / ".credentials.json").read_text() == _ROTATED

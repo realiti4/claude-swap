@@ -1175,6 +1175,14 @@ class ClaudeAccountSwitcher:
         self._ensure_no_live_session(num_a, email_a, "--swap-accounts")
         self._ensure_no_live_session(num_b, email_b, "--swap-accounts")
 
+        # A profile that rotated past its backup advances the backup first:
+        # the backup is what moves, and the profile's Keychain item is deleted
+        # with the old slot key (see _adopt_before_relocation).
+        org_a = record_a.get("organizationUuid", "") or ""
+        org_b = record_b.get("organizationUuid", "") or ""
+        self._adopt_before_relocation(num_a, email_a, org_a, "--swap-accounts")
+        self._adopt_before_relocation(num_b, email_b, org_b, "--swap-accounts")
+
         # Read both slots' backup material up front so a read failure aborts
         # before anything has been moved. Missing material reads as "" (an
         # api-key or never-backed-up slot) and stays missing after the swap
@@ -1625,6 +1633,12 @@ class ClaudeAccountSwitcher:
         # Relocating backups/session under a live session-mode claude would
         # pull state out from under a running process.
         self._ensure_no_live_session(num_src, email, "--move-account")
+
+        # Same as swap: the backup is what moves, and the profile's Keychain
+        # item is deleted with the old slot key, so a profile that rotated
+        # past its backup advances the backup first.
+        org_uuid = record.get("organizationUuid", "") or ""
+        self._adopt_before_relocation(num_src, email, org_uuid, "--move-account")
 
         # Read backup material up front so a read failure aborts before any
         # move. Missing material reads as "" (api-key or never-backed-up
@@ -3240,23 +3254,68 @@ class ClaudeAccountSwitcher:
           Checked after the generation test, so a profile provably on the
           backup's generation still answers False with its identity gone.
         """
+        with FileLock(self.lock_file):
+            return self._adopt_session_credential_locked(account_num, email, org_uuid)
+
+    def _adopt_session_credential_locked(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> bool | None:
+        """Body of :meth:`_adopt_session_credential`; the caller holds
+        ``self.lock_file``.
+
+        Split out so swap and move, which hold the lock across their whole
+        resolve-validate-mutate span (FileLock is non-reentrant), can adopt a
+        slot's rotated session credential before relocating its backup.
+        """
         from claude_swap.session import profile_is_quiescent, read_session_identity
 
         session_dir = self._session_dir(account_num, email)
-        with FileLock(self.lock_file):
-            if not profile_is_quiescent(session_dir):
-                return None
-            profile = self._session_profile_ahead(account_num, email, org_uuid)
-            if profile is None:
-                return False
-            if read_session_identity(session_dir) is None:
-                return None
-            self._store._write_account_credentials(account_num, email, profile)
+        if not profile_is_quiescent(session_dir):
+            return None
+        profile = self._session_profile_ahead(account_num, email, org_uuid)
+        if profile is None:
+            return False
+        if read_session_identity(session_dir) is None:
+            return None
+        self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
             "into its backup"
         )
         return True
+
+    def _adopt_before_relocation(
+        self, account_num: str, email: str, org_uuid: str, action: str
+    ) -> None:
+        """Advance a slot's backup to its session profile's generation before
+        swap or move relocates that backup. The caller holds ``self.lock_file``
+        and has passed ``_ensure_no_live_session`` for the slot.
+
+        Swap and move carry the BACKUP to the new slot key. The profile's
+        hashed Keychain item cannot follow (its service name hashes the old
+        path) and is deleted with the old key. After a session that refreshed,
+        that item holds the family's newest generation and the backup a
+        consumed one, so relocating without adopting seeds the destination
+        profile from a grant whose first refresh gets invalid_grant -- and the
+        fresh generation is gone with the old item. Same contract as the switch
+        guard: adopt when the profile is ahead and nothing runs against it;
+        refuse only when adoption is undecidable while the profile is provably
+        ahead, since proceeding would carry the consumed generation silently.
+        """
+        adopted = self._adopt_session_credential_locked(account_num, email, org_uuid)
+        if adopted is None and self._session_profile_ahead(
+            account_num, email, org_uuid
+        ):
+            raise SessionError(
+                f"Account-{account_num} ({email}) has a session profile whose "
+                "credential has rotated past the stored backup, and it could "
+                "not be adopted into the backup: the profile's identity file "
+                "(.claude.json) could not be read, or a Claude instance started "
+                "against it just now. Relocating the backup would carry a "
+                "consumed generation and lose the fresh one. Re-login inside "
+                f"the profile ('cswap run {account_num}', then /login) so its "
+                f"identity is rewritten, then retry {action}."
+            )
 
     def _delete_session_profile(self, account_num: str, email: str) -> None:
         """Remove an account's session profile dir and its keychain entry.
