@@ -2994,7 +2994,7 @@ class TestUnswitchableRowsAreListed:
         `model`-blocked row used to name the scoped window in its label
         while the chips, built from a literal 5h/7d pair, never printed it
         at all. Account #4's real values: 5h 28%, 7d 70%, Fable 91%,
-        threshold 90, model Fable — the label already read `Fable limit reached`;
+        threshold 90, model Fable: the label already read `Fable limit reached`;
         the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%`."""
         from claude_swap.settings import AutoSwitchSettings
 
