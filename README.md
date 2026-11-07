@@ -188,6 +188,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+In the auto-switch view (`g`), `s` cycles the [strategy](#automatic-switching) (`best` → `weekly-first` → `consume-first` → `priority-consume-first`) and `t` then ← → adjusts the threshold, both for that session only and applied to the running engine at once (the *Next* list re-ranks to match: by soonest weekly reset under `weekly-first` / `consume-first`, by priority then reset under `priority-consume-first`); `d` saves the current strategy and threshold as your defaults (after a y/n confirm), and `l` toggles dry-run / live.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens

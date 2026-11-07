@@ -60,7 +60,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AUTOSWITCH_STRATEGIES,
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -2664,6 +2669,21 @@ class AutoSwitchEngine:
             self.settings.weekly_threshold,
             self._models,
         )
+
+    def apply_strategy(self, strategy: str) -> None:
+        """Session override from the TUI: change target selection mid-run.
+
+        Same atomic frozen-settings swap as ``apply_threshold``; the strategy
+        is read per tick, never cached, so the next tick ranks with it. Poll
+        planning keys on the lines and models, not the strategy, so nothing
+        to re-pin.
+        """
+        if strategy not in AUTOSWITCH_STRATEGIES:
+            raise ValueError(
+                f"unknown auto-switch strategy {strategy!r} "
+                f"(choose from {', '.join(AUTOSWITCH_STRATEGIES)})"
+            )
+        self.settings = replace(self.settings, strategy=strategy)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

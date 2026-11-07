@@ -187,6 +187,35 @@ class TestCLI:
 
         assert excinfo.value.code == 2
 
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["claude-swap", "--strategy", "consume-first"],
+            ["claude-swap", "switch", "--strategy", "consume-first"],
+        ],
+    )
+    def test_auto_only_strategy_points_at_cswap_auto(self, argv, capsys):
+        """consume-first is an `auto` strategy; the one-shot switch must say
+        where it lives instead of a bare 'invalid choice'."""
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        # prog name follows what the user typed (argv[0] here: claude-swap)
+        assert "claude-swap auto --strategy consume-first" in err
+        assert "invalid choice" not in err
+
+    def test_unknown_strategy_keeps_the_plain_choice_error(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "bogus"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        err = capsys.readouterr().err
+        assert "invalid choice: 'bogus'" in err
+        assert "auto --strategy" not in err
+
     def test_switch_strategy_forwarded(self):
         """--switch --strategy best forwards the strategy to switch()."""
         from claude_swap.settings import AutoSwitchSettings
