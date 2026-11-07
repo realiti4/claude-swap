@@ -326,7 +326,7 @@ def last_seen_note(entry: UsageEntry) -> str | None:
 
 
 def _plan_marker(record: dict | None, now: float) -> str:
-    """`` · Max 20x`` after a slot's header; a lapsed subscription is a
+    """`` · Ultra`` after a slot's header; a lapsed subscription is a
     highlighted ``Free``. No words: a bare "expired" beside an account reads
     as the OAuth token, which this tool also calls expired, the row is long
     already, and ``--json`` carries ``expired``/``subscriptionStatus``.

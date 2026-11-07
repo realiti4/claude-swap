@@ -541,6 +541,34 @@ def test_adapt_snapshot_empty():
     assert menubar._adapt_snapshot(_FakeSnap([])) == menubar.EMPTY_SNAPSHOT
 
 
+def test_take_worker_snapshot_bypasses_store_only_on_explicit_refresh():
+    calls = []
+
+    class _FakeSource:
+        def take(self, *, full=False, store_only=False):
+            calls.append((full, store_only))
+            return _FakeSnap([])
+
+    source = _FakeSource()
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=False, has_engine=True
+    )
+    assert store_only is True
+    assert calls[-1] == (False, True)
+
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=True, has_engine=True
+    )
+    assert store_only is False
+    assert calls[-1] == (True, False)
+
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=False, has_engine=False
+    )
+    assert store_only is False
+    assert calls[-1] == (False, False)
+
+
 # --- weekly reset roll-forward (static 7-day cadence) --------------------------
 
 def test_rolled_weekly_window_advances_passed_reset():

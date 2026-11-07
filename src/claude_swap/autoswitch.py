@@ -3822,7 +3822,18 @@ class AutoSwitchEngine:
         ):
             plan.add(current)
         if self._idle_hold_since is None:
-            plan.update(due_candidates(candidates, pre, now))
+            due = due_candidates(candidates, pre, now)
+            if not due:
+                # Disabled accounts are never ranked; one is polled per tick,
+                # and only when no switchable candidate is due, for the
+                # store-only display surfaces (menu bar, TUI auto screen).
+                disabled = [
+                    n
+                    for n in self.switcher.disabled_account_numbers()
+                    if n != current and n not in quarantined
+                ]
+                due = due_candidates(disabled, pre, now)[:1]
+            plan.update(due)
         # A STOPPED ENGINE ISSUES NO FETCHES, and an entry gate is not enough:
         # `stop()` returns while a worker is parked in an emit (the exemption
         # that keeps the TUI from deadlocking), and that worker then wakes and
