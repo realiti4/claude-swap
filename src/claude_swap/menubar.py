@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import oauth, pace
+from claude_swap import launch_agent, oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.printer import warning
@@ -232,6 +232,32 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
     return rolled
 
 
+MENU_NOTE_LIMIT = 40
+
+
+def menu_note(note: str, limit: int = MENU_NOTE_LIMIT) -> str:
+    """The state half of a sentinel note, sized for a menu row.
+
+    ``SENTINEL_NOTES`` carry a remedy after an em dash ("re-login needed —
+    refresh token dead; log in with Claude Code, then run: cswap add"), which
+    ``cswap list`` has the width for. A menu is as wide as its widest row, so
+    one expired account otherwise doubles the menu and pushes every other
+    row's numbers to the far edge. The row keeps the state; the full note
+    travels as the row's tooltip (see ``rebuild_menu``).
+    """
+    state = note.split(" — ", 1)[0].strip()
+    if len(state) > limit:
+        state = state[: limit - 1].rstrip() + "…"
+    return state
+
+
+def _set_tooltip(item, text: str) -> None:
+    """Attach ``text`` as the row's hover tooltip; NSMenuItem carries one natively."""
+    ns_item = getattr(item, "_menuitem", None)
+    if ns_item is not None and hasattr(ns_item, "setToolTip_"):
+        ns_item.setToolTip_(text)
+
+
 def usage_summary(
     usage: dict | str | None, now: float | None = None, fetched_at: float | None = None
 ) -> str:
@@ -242,7 +268,7 @@ def usage_summary(
     window that's meaningfully ahead of pace (issue #125), never the 5h one.
     """
     if isinstance(usage, str):
-        return usage
+        return menu_note(usage)
     if usage is None:
         return "usage unavailable"
     if now is None:
@@ -871,6 +897,9 @@ def run(switcher) -> int:
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
+                if isinstance(display, str) and display != menu_note(display):
+                    # The row shows the state; the remedy is a hover away.
+                    _set_tooltip(item, display)
                 account_items.append(item)
             if not account_items:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))
@@ -988,6 +1017,14 @@ def run(switcher) -> int:
                 ch.state = 1 if current == pct else 0
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
+
+            menu.add(None)
+            # Checked = the plist sits in ~/Library/LaunchAgents, where launchd
+            # scans at login. The state is read from disk on every rebuild so a
+            # change made from the CLI shows up here too.
+            login_item = rumps.MenuItem("Start at login", callback=self.on_toggle_login)
+            login_item.state = 1 if launch_agent.start_at_login_enabled() else 0
+            menu.add(login_item)
 
             return menu
 
@@ -1140,6 +1177,21 @@ def run(switcher) -> int:
                 self.refresh_timer.start()
                 self._save_and_rebuild()
             return cb
+
+        def on_toggle_login(self, _sender):
+            # Moves the plist between its two homes; launchd is not touched, so
+            # the app whose menu was just clicked keeps running either way.
+            enabled = not launch_agent.start_at_login_enabled()
+            try:
+                launch_agent.set_start_at_login(
+                    enabled, backup_dir=self.switcher.backup_dir
+                )
+            except (ClaudeSwitchError, OSError) as e:
+                rumps.alert(
+                    title="claude-swap", message=f"Couldn't change Start at login: {e}"
+                )
+                return
+            self.rebuild_menu()
 
         def on_toggle_autoswitch(self, _sender):
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
