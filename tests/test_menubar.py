@@ -824,7 +824,7 @@ def test_menu_note_keeps_the_state_and_drops_the_remedy():
 
     note = menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
     assert "cswap add" in note, "premise: the note carries a remedy"
-    assert menubar.menu_note(note) == "re-login needed"
+    assert menubar.menu_note(note) == "re-login may be needed"
 
 
 def test_every_sentinel_note_fits_a_menu_row():
@@ -853,7 +853,7 @@ def test_account_row_shows_the_sentinel_state_not_the_remedy():
     label = menubar.format_account_label(
         2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
     )
-    assert label.endswith("re-login needed")
+    assert label.endswith("re-login may be needed")
     assert "cswap add" not in label
 
 
