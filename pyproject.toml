@@ -1,6 +1,6 @@
 [project]
 name = "claude-swap"
-version = "1.0.0b1"
+version = "1.0.0b"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
