@@ -8,14 +8,17 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialError,
+    SessionError,
     ValidationError,
 )
 from claude_swap.models import Platform
+from claude_swap.session import keychain_service_name
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -724,3 +727,149 @@ def test_staging_interrupted_after_fdopen_leaves_no_files(
     assert len(owned) == 2
     assert all(fh.closed for fh in owned)
     assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+class TestSwapSessionProfileKeychain:
+    """A swapped session profile must not strand its keychain entry.
+
+    On macOS the profile's credential lives in a keychain item whose service
+    name is the hash of the profile DIR PATH
+    (``session.keychain_service_name``), so ``os.replace`` on the dir leaves
+    the item behind at the old name. Nothing in cswap ever names that service
+    again -- ``purge`` enumerates the profile dirs that still exist -- so an
+    entry missed here is permanent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def as_macos(self, monkeypatch):
+        """Take the keychain arm of the session helpers on any host."""
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.MACOS)
+        )
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def test_swap_deletes_both_old_paths_session_keychain_entries(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        account = macos_keychain.keychain_account_name()
+        services = {}
+        slots = (("1", "account1@example.com"), ("2", "account2@example.com"))
+        for num, email in slots:
+            old_dir = switcher._session_dir(num, email)
+            old_dir.mkdir(parents=True)
+            (old_dir / ".credentials.json").write_text("plaintext-seed")
+            services[num] = keychain_service_name(old_dir)
+            # The rotated generation claude wrote back into the profile: the
+            # newest tokens this account ever had, and what is left exposed.
+            macos_keychain.set_password(services[num], account, f"rotated-{num}")
+
+        switcher.swap_accounts("1", "2")
+
+        assert switcher._session_dir("2", "account1@example.com").exists()
+        assert switcher._session_dir("1", "account2@example.com").exists()
+        assert macos_keychain.get_password(services["1"], account) is None
+        assert macos_keychain.get_password(services["2"], account) is None
+
+
+def _creds(token: str, expires_at: int) -> str:
+    return json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": f"rt-{token}",
+                "expiresAt": expires_at,
+            }
+        }
+    )
+
+
+class TestSwapAdoptsSessionCredentials:
+    """``swap`` relocates both BACKUPS; each profile's rotated credential must
+    get into its backup first.
+
+    Same reasoning as the move counterpart: the profile's Keychain item cannot
+    follow the relocation (its service name hashes the old path) and is
+    deleted with the old slot key, so an unadopted rotation is lost and the
+    destination is seeded from a consumed generation.
+    """
+
+    SLOTS = (("1", "account1@example.com"), ("2", "account2@example.com"))
+
+    def _switcher(self, sample_sequence_data: dict) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def _seed(
+        self,
+        switcher: ClaudeAccountSwitcher,
+        num: str,
+        email: str,
+        backup: str,
+        profile: str,
+        identity: str | None = None,
+    ) -> Path:
+        # The pure store write; see the move counterpart for why.
+        switcher._store._write_account_credentials(num, email, backup)
+        session_dir = switcher._session_dir(num, email)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(profile)
+        if identity is None:
+            identity = json.dumps(
+                {"oauthAccount": {"emailAddress": email, "organizationUuid": ""}}
+            )
+        (session_dir / ".claude.json").write_text(identity)
+        return session_dir
+
+    def test_swap_carries_both_profiles_newer_generations(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        for num, email in self.SLOTS:
+            self._seed(
+                switcher, num, email,
+                backup=_creds(f"stored-{num}", 1),
+                profile=_creds(f"fresh-{num}", 9999999999999),
+            )
+
+        switcher.swap_accounts("1", "2")
+
+        assert switcher.read_account_credentials(
+            "2", "account1@example.com"
+        ) == _creds("fresh-1", 9999999999999)
+        assert switcher.read_account_credentials(
+            "1", "account2@example.com"
+        ) == _creds("fresh-2", 9999999999999)
+
+    def test_swap_refuses_when_an_ahead_profile_cannot_be_adopted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """One profile ahead with an unreadable identity: the swap refuses
+        before anything moves, and the records and backups stay put."""
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(
+            switcher, "1", "account1@example.com",
+            backup=_creds("stored-1", 1),
+            profile=_creds("fresh-1", 9999999999999),
+            identity="not json{{{",
+        )
+        self._seed(
+            switcher, "2", "account2@example.com",
+            backup=_creds("stored-2", 1),
+            profile=_creds("fresh-2", 9999999999999),
+        )
+
+        with pytest.raises(SessionError, match="could not be adopted"):
+            switcher.swap_accounts("1", "2")
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["email"] == "account1@example.com"
+        assert data["accounts"]["2"]["email"] == "account2@example.com"
+        assert switcher.read_account_credentials(
+            "1", "account1@example.com"
+        ) == _creds("stored-1", 1)
+        assert switcher._session_dir("1", "account1@example.com").exists()

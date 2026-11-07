@@ -2584,6 +2584,7 @@ class TestActiveAccountRefresh:
         def fast_init(self, lock_path, timeout=0.05):
             real_init(self, lock_path, timeout)
 
+        started = time.monotonic()
         try:
             with patch.object(
                 switcher, "_read_credentials", return_value=self._EXPIRED
@@ -2604,6 +2605,9 @@ class TestActiveAccountRefresh:
             "POSTed a backup grant while another consume held its lock"
         )
         assert result.sentinel == USAGE_TOKEN_EXPIRED
+        # The default 10s wait made this one case the longest pole of the
+        # parallel run; the deferral needs only that the wait ends.
+        assert time.monotonic() - started < 5
 
     def test_filelock_contention_defers_instead_of_raising(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
