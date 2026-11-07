@@ -433,8 +433,8 @@ class TestRefreshOAuthCredentials:
             }
         })
 
-    def test_refresh_sends_correct_body(self):
-        seen_body = {}
+    @staticmethod
+    def _mock_response():
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps({
             "access_token": "new-access",
@@ -443,19 +443,58 @@ class TestRefreshOAuthCredentials:
         }).encode()
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+
+    @classmethod
+    def _request_body(cls, credentials):
+        seen_body = {}
 
         def mock_urlopen(req, timeout=0):
             seen_body.update(json.loads(req.data.decode()))
-            return mock_response
+            return cls._mock_response()
 
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
-            refreshed = oauth.refresh_oauth_credentials(self._make_credentials())
+            refreshed = oauth.refresh_oauth_credentials(credentials)
 
         assert refreshed is not None
-        assert seen_body["grant_type"] == "refresh_token"
-        assert seen_body["refresh_token"] == "old-refresh"
-        assert seen_body["client_id"] == oauth.OAUTH_CLIENT_ID
-        assert "scope" not in seen_body
+        return seen_body
+
+    def test_refresh_posts_stored_client_and_scopes(self):
+        credentials = json.loads(self._make_credentials())
+        credentials["claudeAiOauth"].update({
+            "clientId": "stored-client",
+            "scopes": ["scope:a", "scope:b"],
+        })
+
+        assert self._request_body(json.dumps(credentials)) == {
+            "grant_type": "refresh_token",
+            "refresh_token": "old-refresh",
+            "client_id": "stored-client",
+            "scope": "scope:a scope:b",
+        }
+
+    def test_refresh_posts_defaults_without_optional_metadata(self):
+        credentials = json.loads(self._make_credentials())
+        del credentials["claudeAiOauth"]["scopes"]
+
+        assert self._request_body(json.dumps(credentials)) == {
+            "grant_type": "refresh_token",
+            "refresh_token": "old-refresh",
+            "client_id": oauth.OAUTH_CLIENT_ID,
+        }
+
+    def test_refresh_omits_invalid_optional_metadata(self):
+        credentials = json.loads(self._make_credentials())
+        credentials["claudeAiOauth"].update({
+            "clientId": ["not-a-client-id"],
+            "scopes": ["scope:a", 1],
+        })
+
+        assert self._request_body(json.dumps(credentials)) == {
+            "grant_type": "refresh_token",
+            "refresh_token": "old-refresh",
+            "client_id": oauth.OAUTH_CLIENT_ID,
+        }
 
 
 class TestTryRefreshOAuthCredentials:
