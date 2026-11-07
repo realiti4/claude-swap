@@ -75,8 +75,10 @@ MAX_RETRY_S = 24 * 3600
 
 FREE_TIER = "default_claude_ai"
 
-# Used when a record has no planDisplayName (until PLAN_TTL_S renews it), and
-# when the server's name is only a prefix of the table label ("Max" vs "Max 5x").
+# Used when a record carries no planDisplayName (the server sent none, or the
+# record predates the name and is refetched on the next pass allowed to read
+# it), and when the server's name is only a prefix of the table label ("Max"
+# vs "Max 5x").
 # Only values that have actually been observed. An unknown tier falls back to
 # the raw string rather than a guessed label — a wrong "Pro" is worse than an
 # honest "default_claude_pro".
