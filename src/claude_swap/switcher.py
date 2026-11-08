@@ -150,9 +150,13 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
     return "  (ahead of pace)" if result and result.ahead else ""
 
 
-def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
-    # Collect (label, body) rows first, then pad every label to the widest one so
-    # per-model names (e.g. "Fable") don't shift the columns of the other lines.
+def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str, str]]:
+    """(label, body) rows for one usage measurement, unpadded.
+
+    Shared by ``_format_usage_lines`` (pads and joins these alone) and
+    ``_usage_entry_lines`` (pads them together with the login-expiry row so
+    both share one label column).
+    """
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
@@ -192,8 +196,45 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
         cell = oauth.fresh_reset_strings(rejected)
         body = f"rejected   until {cell[1]:<12}  in {cell[0]}" if cell else "rejected"
         rows.append(("probe", body))
+    return rows
+
+
+def _pad_row(label: str, body: str, width: int) -> str:
+    """One "label: body" line, label padded to ``width`` (label + ':')."""
+    return f"{label + ':':<{width}} {body}"
+
+
+def _format_usage_lines(
+    usage: dict,
+    fetched_at: float | None = None,
+    extra_rows: tuple[tuple[str, str], ...] = (),
+) -> list[str]:
+    """Padded "label: body" lines for one usage measurement.
+
+    ``extra_rows`` (the caller's login-expiry row, in ``_usage_entry_lines``)
+    join the width computation and the output, appended after the usage
+    rows, so a wider label there still lines every column up.
+    """
+    rows = [*_usage_rows(usage, fetched_at), *extra_rows]
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
-    return [f"{label + ':':<{width}} {body}" for label, body in rows]
+    return [_pad_row(label, body, width) for label, body in rows]
+
+
+def _login_row(login_expires_at: float | None, quarantined: bool) -> tuple[str, str] | None:
+    """(label, body) for the login-expiry row, or None while there is nothing
+    to say (``oauth.login_time_left``). Shaped like a window row, with the
+    stamp where their reset clock is and the countdown in the same column::
+
+        ├ 7d:     18%   resets Nov 10 16:26  in 2d 23h
+        └ login:        expires Nov 14 03:00  in 5d 12h
+    """
+    left = oauth.login_time_left(login_expires_at, quarantined)
+    if left is None:
+        return None
+    clock = oauth.login_expiry_clock(login_expires_at)
+    if left <= 0:
+        return ("login", f"{'':4}  expired {clock:<12}  re-login needed")
+    return ("login", f"{'':4}  expires {clock:<12}  in {oauth.format_countdown(left)}")
 
 
 # Human notes for sentinel usage states (fallback: the raw sentinel string).
@@ -297,30 +338,46 @@ def _plan_marker(record: dict | None, now: float) -> str:
     return marker
 
 
-def _usage_entry_lines(entry: UsageEntry) -> list[str]:
+def _usage_entry_lines(
+    entry: UsageEntry, login_expires_at: float | None = None
+) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
     line when an older measurement exists. Measurements render as usual, age-
     annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served); an account
     with no measurement at all shows "usage unavailable" plus the last fetch
-    error, so a failing endpoint is visible instead of a silent blank.
+    error, so a failing endpoint is visible instead of a silent blank. A
+    "login" row (``_login_row``) ends the block while the slot's stored login
+    is due for renewal, whichever branch, so it shows under a sentinel or a
+    missing measurement too.
     """
+    login_row = _login_row(login_expires_at, entry.sentinel == USAGE_RELOGIN_REQUIRED)
+    login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1)) if login_row else None
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
+        children = []
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
-            out.append(f"{dimmed('└')} {muted(last_seen)}")
+            children.append(muted(last_seen))
+        if login_line is not None:
+            children.append(login_line)
+        out.extend(
+            f"{dimmed('└' if j == len(children) - 1 else '├')} {line}"
+            for j, line in enumerate(children)
+        )
         return out
     if entry.last_good is not None:
-        lines = _format_usage_lines(entry.last_good, entry.fetched_at)
+        extra = (login_row,) if login_row is not None else ()
+        lines = _format_usage_lines(entry.last_good, entry.fetched_at, extra_rows=extra)
+        usage_count = len(lines) - len(extra)
         if (
-            lines
+            usage_count
             and entry.age_s is not None
             and entry.age_s > _USAGE_AGE_NOTE_S
             and entry.fetched_at is not None
         ):
-            lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+            lines[usage_count - 1] += f" · {format_age(int(entry.fetched_at * 1000))}"
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
@@ -328,7 +385,10 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     detail = "usage unavailable"
     if entry.last_error:
         detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"
-    return [dimmed(detail)]
+    out = [dimmed(detail)]
+    if login_line is not None:
+        out.append(f"{dimmed('└')} {login_line}")
+    return out
 
 
 def _label_token_status(source: str, credentials: str) -> str | None:
@@ -1977,7 +2037,7 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
-        for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             n = str(num)
             if is_active:
                 active_number = n
@@ -1993,6 +2053,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    login_expires_at=oauth.login_expires_at_epoch(creds),
                     policy=self._policy_from_data(seq_data, n),
                     subscription_plan=plans.get(n),
                 )
@@ -7029,7 +7090,7 @@ class ClaudeAccountSwitcher:
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
+        for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
@@ -7039,7 +7100,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {muted('(disabled)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
-            for line in _usage_entry_lines(entries[str(num)]):
+            login_expires_at = oauth.login_expires_at_epoch(creds)
+            for line in _usage_entry_lines(entries[str(num)], login_expires_at):
                 print(f"     {line}")
 
             if show_token_status:
@@ -7096,8 +7158,8 @@ class ClaudeAccountSwitcher:
 
     def _active_account_usage(
         self, account_num: str, current_email: str, org_uuid: str
-    ) -> UsageEntry:
-        """Store-backed usage entry for just the active account.
+    ) -> tuple[UsageEntry, float | None]:
+        """Store-backed usage entry (+ login expiry) for just the active account.
 
         Builds a single-account info row instead of the full accounts list
         (``--status`` touches one slot) and runs it through the shared
@@ -7111,7 +7173,8 @@ class ClaudeAccountSwitcher:
         # A one-slot pass has no roster to compare against, so a `slot_creds`
         # map built from just this slot would make arms B/C keep rows a full
         # pass drops, flickering the kept-set warning: never sweep here.
-        return self._collect_usage_entries([info], sweep_stash=False)[str(account_num)]
+        entry = self._collect_usage_entries([info], sweep_stash=False)[str(account_num)]
+        return entry, oauth.login_expires_at_epoch(creds)
 
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
@@ -7138,7 +7201,9 @@ class ClaudeAccountSwitcher:
         org_name = acct.get("organizationName", "") or ""
         org_uuid = acct.get("organizationUuid", "") or ""
         alias = acct.get("alias", "") or ""
-        entry = self._active_account_usage(account_num, current_email, org_uuid)
+        entry, _login_expires_at = self._active_account_usage(
+            account_num, current_email, org_uuid
+        )
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
@@ -7202,10 +7267,10 @@ class ClaudeAccountSwitcher:
                 f"({current_email} {muted(f'[{tag}]')})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
-            entry = self._active_account_usage(
+            entry, login_expires_at = self._active_account_usage(
                 account_num, current_email, current_org_uuid
             )
-            for line in _usage_entry_lines(entry):
+            for line in _usage_entry_lines(entry, login_expires_at):
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
