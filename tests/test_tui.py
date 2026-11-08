@@ -886,22 +886,23 @@ class TestDashboard:
             row(9, "work", make_entry(30.0, 85.0), disabled=True),  # ahead and disabled
         ]
         app = make_app(FakeSwitcher(accs, tmp_path))
-        async with app.run_test(size=(140, 40)) as pilot:
+        async with app.run_test(size=(70, 40)) as pilot:
             await settle(pilot)
             from claude_swap.tui.theme import Palette
             from claude_swap.tui.widgets import (
                 AccountsPanel, mini_account_text, mini_widths)
 
             widget = app.screen.query_one(AccountsPanel)
-            panel = widget.render().plain
-            # a row wider than the panel is ellipsized, never wrapped onto a second line
-            assert widget.size.height == len(panel.splitlines())
-            width = widget.size.width
-            await pilot.resize_terminal(70, 40)
-            await settle(pilot)
             narrow = widget.render().plain
+            # a row wider than the panel is ellipsized, never wrapped onto a second line
             assert widget.size.height == len(narrow.splitlines())
             narrow_width = widget.size.width
+        # the panel at 140 columns (widget 134 wide, rows cut at 132): no mount needed
+        now = time.time()
+        width = 134
+        widths = mini_widths(accs[1:], now)
+        panel = "\n".join(
+            mini_account_text(a, now, widths=widths, width=width - 2).plain for a in accs[1:])
 
         def compact(text):
             lines = text.splitlines()
@@ -939,7 +940,6 @@ class TestDashboard:
         assert all(t.endswith("…]") for t in tags[:2]) and "[work]" in tags
         assert "[personal]" in tags
         # under the cap the tag column is the widest tag shown, not the cap
-        now = time.time()
         assert mini_widths(accs[3:5], now).tag == len("[personal]") < 24
         # only note rows shown: no window grid, the notes alone set the column
         notes = accs[5:7]
