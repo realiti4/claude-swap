@@ -229,7 +229,9 @@ class TestDashboardMiniRowAlignment:
         # Seven accounts at 80x24: the 14-column login token pushed the minis
         # past the panel's 74 columns, the rows wrapped and the menu was
         # scrolled out of view. The token now steps down (full, short, none)
-        # rather than wrap, and usage figures are never cut.
+        # rather than wrap, and usage figures are never cut. The minis' chips
+        # carry their reset countdown (`5h(⟳1h59m):25%`), 16 columns wider than
+        # at 80x24's 74, so the screen is 16 wider to hold the same row.
         from textual.widgets import ListView
 
         from claude_swap.tui.widgets import AccountsPanel, MenuItem
@@ -241,20 +243,20 @@ class TestDashboardMiniRowAlignment:
                     n,
                     active=n == 1,
                     email=f"developer{n}@example.com",
-                    alias="work" if n in (1, 2) else "",
+                    alias={1: "work-account-name", 2: "work"}.get(n, ""),
                 ),
                 expires,
             )
             for n in range(1, 8)
         ]
-        # The plan marker fills the active header: it has no room for the
-        # token, and that must not take the minis' token with it.
+        # The plan marker (and a long alias) fills the active header: it has no
+        # room for the token, and that must not take the minis' token with it.
         accounts[0] = dataclasses.replace(
             accounts[0], subscription_plan=TestPlanMarkerAndLoginTogether.PLAN
         )
 
         app = make_app(FakeSwitcher(accounts, tmp_path))
-        async with app.run_test(size=(80, 24)) as pilot:
+        async with app.run_test(size=(97, 24)) as pilot:
             await _workers_done(pilot)
             await pilot.pause()
             panel = app.screen.query_one(AccountsPanel)
@@ -272,7 +274,7 @@ class TestDashboardMiniRowAlignment:
             assert size.height == len(lines)  # nothing wrapped
             minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
             assert len(minis) == 6 and "login" not in lines[0]
-            assert all("5h 25%" in line and "7d 10%" in line for line in minis)
+            assert all("5h(" in line and "25%" in line and "10%" in line for line in minis)
             # The middle form: "login 23d" fits at 74 columns, the full one does not.
             assert all("login 23d  " in line and "23d04h" not in line for line in minis)
 
@@ -381,14 +383,14 @@ async def test_next_best_login_column_alignment(tmp_path, fake_engine):
 
 @pytest.mark.asyncio
 async def test_next_best_rows_never_wrap_on_a_narrow_screen(tmp_path, fake_engine):
-    """A 44-column email pushes the full `login 23d04h` token past the 76-column
-    row; the token steps down to its short form so the usage figure stays on
-    the line."""
+    """A 25-column email pushes the full `login 23d04h` token past the 76-column
+    row (the chips carry their reset countdown); the token steps down to its
+    short form so the usage figure stays on the line."""
     from claude_swap.tui.autoview import AutoScreen
 
     expires = time.time() + 23 * 86400 + 4 * 3600
     accounts = [make_account(1, active=True, email="active@example.com")] + [
-        _replace_login(make_account(n, email=f"{'x' * 31}{n}@example.com"), expires)
+        _replace_login(make_account(n, email=f"{'x' * 12}{n}@example.com"), expires)
         for n in (2, 3)
     ]
     app = make_app(FakeSwitcher(accounts, tmp_path))
@@ -402,7 +404,7 @@ async def test_next_best_rows_never_wrap_on_a_narrow_screen(tmp_path, fake_engin
         rows = [line for line in candidates.render().plain.splitlines() if "login" in line]
         assert len(rows) == 2
         assert all(cell_len(row) <= candidates.size.width for row in rows)
-        assert all("used" in row and "login 23d" in row and "23d04h" not in row for row in rows)
+        assert all("10%" in row and "login 23d" in row and "23d04h" not in row for row in rows)
 
 
 @pytest.mark.asyncio

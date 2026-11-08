@@ -2824,6 +2824,8 @@ class TestUnswitchableRowsAreListed:
         # A real policy: the panel reads `policy.threshold` as a number or None,
         # and a MagicMock attribute is neither.
         a.policy = AccountPolicy()
+        # Likewise a real stamp: the login column formats it as a number or None.
+        a.login_expires_at = None
         if usage is not None:
             a.usage = usage
         else:
@@ -2850,7 +2852,13 @@ class TestUnswitchableRowsAreListed:
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
-        with patch.object(AutoScreen, "app", property(lambda s: app)):
+        # The login column fits the panel box, which a screen built with
+        # `__new__` has no layout for: a box wide enough for every form.
+        box = MagicMock()
+        box.size.width = 200
+        with patch.object(AutoScreen, "app", property(lambda s: app)), patch.object(
+            AutoScreen, "query_one", lambda s, *a: box
+        ):
             return str(v._candidates_text(snap, active_number=active))
 
     def test_a_credential_less_slot_is_shown_with_what_to_do(self):

@@ -729,12 +729,7 @@ class AutoScreen(Screen):
         budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
         for row in fit_login(
             lambda login: [
-                Text.assemble(
-                    head,
-                    # A slot with no stored login has no expiry to show.
-                    Text(login_segment(acc, login) if acc.switchable else "", style=palette.muted),
-                    tail,
-                )
+                Text.assemble(head, Text(login_segment(acc, login), style=palette.muted), tail)
                 for acc, head, tail in order
             ],
             budget,
