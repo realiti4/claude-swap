@@ -3325,7 +3325,7 @@ class TestNextBestRowSlots:
 
         chip_rows = self._note_rows()
         sentinel = CandidateRow(
-            Text("6"), chip_rows[0].email, Text("x" * 150), note=True
+            Text("6"), chip_rows[0].email, Text("x" * 250), note=True
         )
         for width in (200, 80, 70, 69, 50):
             assert self._render(chip_rows + [sentinel], width)[:-1] == (
@@ -3364,11 +3364,33 @@ class TestNextBestRowSlots:
         """A note row wider than the panel even without its login is left out of
         the fit as before: the chip rows keep the form they would have alone."""
         chip_rows = [self._login_row(n) for n in (1, 2)]
-        hopeless = self._login_row(3, "x" * 150)
+        hopeless = self._login_row(3, "x" * 250)
         for width in (200, 55, 40):
             assert self._render(chip_rows + [hopeless], width)[:-1] == (
                 self._render(chip_rows, width)
             ), width
+
+    def test_a_note_row_that_never_fits_carries_no_login(self):
+        """Left out of the fit, a row cannot be helped by its login: it gives the
+        login up, the chip rows' login form stays."""
+        rows = [self._login_row(1), self._login_row(2, "x" * 150)]
+        for width in (55, 40):
+            lines = self._render(rows, width)
+            assert "re-login" not in lines[1], (width, lines)
+
+    @pytest.mark.parametrize(
+        "usages, width", [(("usage unknown",) * 2, 45), (("chip", "chip", "sentinel"), 55)]
+    )
+    def test_a_note_row_that_fits_only_with_a_cut_email_is_counted_in_the_fit(self, usages, width):
+        """The loop cuts the email down to its floor, so a note row is left out
+        only if even that does not fit; one that fits there is counted, and the
+        block gives up its login (and cuts the email) for it."""
+        from rich.cells import cell_len
+
+        email = "someone.long.name{}@example.com"  # 30 columns
+        rows = [self._login_row(n, u, email.format(n)) for n, u in enumerate(usages, 1)]
+        lines = self._render(rows, width)
+        assert all(cell_len(line) <= width for line in lines), (width, lines)
 
     def test_dropping_the_login_alone_keeps_the_email_it_leaves_room_for(self):
         """Short login, email at its floor and short statuses all overflow at

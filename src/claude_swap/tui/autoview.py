@@ -156,7 +156,8 @@ def render_candidate_rows(
     their short ones; the login, the email taking back the room it frees;
     last, the note itself, cut to the room left. The usage slot is never cut.
     A free-text note row counts in the fit unless it overflows even with no
-    login and the email uncut: that one never fits, so it is left out."""
+    login and the email at its floor: that one never fits, so it is left out
+    and carries no login."""
     sep = Text(" \u00b7 ", style=palette.muted)
 
     def note(row: CandidateRow, short: bool) -> Text:
@@ -189,8 +190,9 @@ def render_candidate_rows(
         """Every row at an email slot of at most `email` columns, its login in
         the `login` form; with `room`, a note is cut to end by that column."""
         grid = [
-            [row.number, _cut(row.email, email), row.usage, note(row, short), login_in(row, login)]
-            for row in rows
+            [row.number, _cut(row.email, email), row.usage, note(row, short),
+             login_in(row, login if ok else None)]
+            for row, ok in zip(rows, fits)
         ]
         usage, notes = 2, 3
         widths = [2, 0, 0, 0, 0]  # the number is right-aligned, two wide at least
@@ -227,11 +229,12 @@ def render_candidate_rows(
     limit = 10**9 if width is None else width
 
     widest = max((row.email.cell_len for row in rows), default=0)
-    # A free-text note row that overflows without its login is left out of the
-    # fit: its text is never cut, so only its login is the fit's to give up.
-    fits = [
+    # A free-text note row that overflows without its login, even at the email
+    # floor, is left out of the fit: its text is never cut, and it gives up its login.
+    fits = [True] * len(rows)  # `lines` reads it; the probe below carries no login
+    fits[:] = [
         not row.note or line.cell_len <= limit
-        for row, line in zip(rows, lines(widest, True))
+        for row, line in zip(rows, lines(EMAIL_FLOOR, True))
     ]
 
     def over(block: list[Text]) -> int:
