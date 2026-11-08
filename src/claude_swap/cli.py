@@ -1340,6 +1340,12 @@ def _menubar_service(args) -> int:
         print(f"  plist: {result['plist']}")
         print(f"  logs:  {result['stderr_log']}")
         _print_menubar_auto_switch(suggest_flag=True)
+        for key, old, new in result["profile_changes"]:
+            warning(
+                f"  now follows {key}={new or '(unset)'} (was {old or '(unset)'}); "
+                "the service manages that profile from now on",
+                file=sys.stderr,
+            )
         print(
             dimmed(
                 "It starts at login from now on; plain `cswap menubar` is enough "
@@ -1384,6 +1390,14 @@ def _menubar_service(args) -> int:
     print(f"  starts at login: {'yes' if result['start_at_login'] else 'no'}")
     plist = result["plist"] if result["start_at_login"] else result["session_plist"]
     print(f"  plist: {plist or result['plist']}")
+    if result["running_build"]:
+        print(f"  build: {result['running_build']}")
+    if result["stale_build"]:
+        warning(
+            f"  installed build is {result['installed_build']}; plain "
+            "`cswap menubar` restarts it onto that",
+            file=sys.stderr,
+        )
     _print_menubar_auto_switch(suggest_flag=False)
     if result["switched_off"]:
         warning(

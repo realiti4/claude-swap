@@ -46,11 +46,13 @@ from tests.test_tui import (
 # clock date and would rot daily.  Their invariance is asserted structurally
 # instead (see ``test_the_card_bar_rows_are_untouched``).  The two mini rows were
 # re-captured on this branch, whose chips read ``5h:25%`` where the unmodified
-# engine printed ``5h 25%`` (see ``golden_form``).
-GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h:25% · 7d:10%"
-GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h:25% · 7d:10%"
+# engine printed ``5h 25%`` (see ``golden_form``).  The ``login ?``
+# segment comes from the login-expiry column, which every account view now
+# carries: it ends the card header and follows the name in a mini row.
+GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active   login ?"
+GOLDEN_MINI = " 2  dev (user2@example.com)  login ?       [personal]   5h:25% · 7d:10%"
+GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)   login ?"
+GOLDEN_MINI_DISABLED = " 3  user3@example.com  login ?       [personal]  (disabled)   5h:25% · 7d:10%"
 
 NOW = 1000.0
 

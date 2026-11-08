@@ -2594,6 +2594,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.policy = AccountPolicy()
+        a.login_expires_at = None  # the login column reads it; a MagicMock is not a time
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
         return a
@@ -2764,9 +2765,11 @@ class TestUnswitchableRowsAreListed:
             }),
             self._acct("4", "new@x.com", switchable=False),
         ), active="9")
-        rows = [line for line in out.split("\n") if re.match(r"\s+\d+\s+\S+\s+", line)]
+        # The login token is a slot of its own (a note row has none): content starts after it.
+        lead = r"\s+\d+\s+\S+\s+(?:login \S+\s+)?"
+        rows = [line for line in out.split("\n") if re.match(lead, line)]
         assert len(rows) == 3, rows
-        columns = [re.match(r"\s+\d+\s+\S+\s+", line).end() for line in rows]
+        columns = [re.match(lead, line).end() for line in rows]
         assert columns[0] == columns[1] == columns[2], (
             f"content does not share a column: {columns} in {rows!r}"
         )
@@ -2846,7 +2849,7 @@ class TestUnswitchableRowsAreListed:
         ), active="9", settings=settings)
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
         assert len(rows) == 3, rows
-        assert re.search(r"cccc@x\.com\s+7d:", rows["cccc@x.com"]), rows  # no leading dot
+        assert re.search(r"cccc@x\.com\s+(?:login \S+\s+)?7d:", rows["cccc@x.com"]), rows  # no leading dot
         assert "7d(⟳" in rows["aaaa@x.com"] and "7d:" in rows["bbbb@x.com"], rows  # widths differ
         for window in ("5h", "7d", "Fable"):
             hits = [

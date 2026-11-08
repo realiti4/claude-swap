@@ -43,7 +43,7 @@ from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel, spend_row, usage_rows
+from claude_swap.tui.widgets import AccountsPanel, login_segment, spend_row, usage_rows
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -110,6 +110,8 @@ class CandidateRow:
     email: Text
     usage: Text  # the chip block, the spend text, or the sentinel note
     login: Text = field(default_factory=Text)
+    # The login in its short form, for a narrow panel; a row without one keeps the long form.
+    login_short: Text = field(default_factory=Text)
     status: dict[str, Text] = field(default_factory=dict)  # keys of STATUS_ORDER
     # The short form of a status piece, for a narrow panel; a key without one
     # keeps its long text.
@@ -122,7 +124,7 @@ class CandidateRow:
             if unknown := pieces.keys() - set(STATUS_ORDER):
                 raise ValueError(f"status key not in STATUS_ORDER: {sorted(unknown)}")
         # A marker never pads itself; usage is exempt, its chip blanks pad on purpose.
-        for cell in (self.login, self.where, *self.status.values(), *self.short.values()):
+        for cell in (self.login, self.login_short, self.where, *self.status.values(), *self.short.values()):
             if cell.plain != cell.plain.strip():
                 raise ValueError(
                     f"marker has leading or trailing whitespace: {cell.plain!r}"
@@ -148,9 +150,10 @@ def render_candidate_rows(
     are one trailing note cell, joined by a dot, `where` last.
 
     Over `width`, the block takes ONE form so its columns stay aligned. In
-    this order it gives up: the email slot, cut to a shared width no narrower
-    than EMAIL_FLOOR; the long status texts for their short ones; last, the
-    note itself, cut to the room left. The usage slot is never cut."""
+    this order it gives up: the login, to its short form; the email slot, cut
+    to a shared width no narrower than EMAIL_FLOOR; the long status texts for
+    their short ones; the login; last, the note itself, cut to the room left.
+    The usage slot is never cut."""
     sep = Text(" \u00b7 ", style=palette.muted)
 
     def note(row: CandidateRow, short: bool) -> Text:
@@ -171,11 +174,19 @@ def render_candidate_rows(
             out.append_text(piece)
         return out
 
-    def lines(email: int, short: bool, room: int | None = None) -> list[Text]:
-        """Every row at an email slot of at most `email` columns; with `room`,
-        a note is cut to end by that column."""
+    def login_in(row: CandidateRow, login: str | None) -> Text:
+        """The row's login in the `login` form: `"full"`, `"short"`, or none."""
+        if login == "full":
+            return row.login
+        return (row.login_short or row.login) if login else Text()
+
+    def lines(
+        email: int, short: bool, login: str | None = None, room: int | None = None
+    ) -> list[Text]:
+        """Every row at an email slot of at most `email` columns, its login in
+        the `login` form; with `room`, a note is cut to end by that column."""
         grid = [
-            [row.number, _cut(row.email, email), row.login, row.usage, note(row, short)]
+            [row.number, _cut(row.email, email), login_in(row, login), row.usage, note(row, short)]
             for row in rows
         ]
         usage = 3
@@ -220,11 +231,16 @@ def render_candidate_rows(
         ) - limit
 
     widest = max((row.email.cell_len for row in rows), default=0)
-    for short in (False, True):
-        shown = lines(widest, short)
-        if over(shown) <= 0:
-            break
-        shown = lines(max(EMAIL_FLOOR, widest - over(shown)), short)
+    # (login form, short status texts, email cut): each step keeps what the one before gave up.
+    for login, short, cut in (
+        ("full", False, False),
+        ("short", False, False),
+        ("short", False, True),
+        ("short", True, True),
+    ):
+        shown = lines(widest, short, login)
+        if cut and over(shown) > 0:
+            shown = lines(max(EMAIL_FLOOR, widest - over(shown)), short, login)
         if over(shown) <= 0:
             break
     else:
@@ -779,6 +795,8 @@ class AutoScreen(Screen):
                 Text(acc.number, style=palette.foreground),
                 Text(acc.email, style=palette.foreground),
                 usage,
+                login=Text(login_segment(acc, "full", gap="").strip(), style=palette.muted),
+                login_short=Text(login_segment(acc, "short", gap="").strip(), style=palette.muted),
                 status=status,
                 short=short,
                 note=free_text,
