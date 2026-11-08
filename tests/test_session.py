@@ -6747,9 +6747,10 @@ def _unscanned_exec_sites(root: Path, scanned: set[Path]) -> list[str]:
         str(p.relative_to(root))
         for p in root.rglob("*.py")
         if p not in scanned
+        and "exec_default" in (src := p.read_text(encoding="utf-8"))
         and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                 and n.func.attr == "exec_default"
-                for n in ast.walk(ast.parse(p.read_text(encoding="utf-8"))))
+                for n in ast.walk(ast.parse(src)))
     )
 
 
