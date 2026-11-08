@@ -47,19 +47,19 @@ NOW = 1000.0
 # and would rot daily.  Their invariance is asserted structurally instead (see
 # ``test_the_card_bar_rows_are_untouched``).  The mini row's window chips carry
 # a reset countdown, so its goldens were re-rendered through ``NO_RESET``, an
-# entry that reports no reset (``⟳?``), and stay fixed.  The ``login ?``
-# segment comes from the login-expiry column, which every account view now
-# carries: it ends the card header and follows the name in a mini row.
+# entry that reports no reset (``⟳?``), and stay fixed.  The re-login note
+# (tests/test_login_expiry.py) only joins a row while its login is due, so
+# these fixtures, which carry no expiry, render without it.
 NO_RESET = UsageEntry(
     last_good={"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}},
     fetched_at=NOW - 5.0,
     age_s=5.0,
 )
-GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active   login ?"
-GOLDEN_MINI = " 2  dev (user2@example.com)  login ?       [personal]   5h(⟳?):25% · 7d(⟳?):10%"
-GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)   login ?"
+GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
+GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h(⟳?):25% · 7d(⟳?):10%"
+GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
 GOLDEN_MINI_DISABLED = (
-    " 3  user3@example.com  login ?       [personal]  (disabled)   5h(⟳?):25% · 7d(⟳?):10%"
+    " 3  user3@example.com  [personal]  (disabled)   5h(⟳?):25% · 7d(⟳?):10%"
 )
 
 def with_policy(acc, **kwargs):

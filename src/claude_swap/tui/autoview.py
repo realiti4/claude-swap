@@ -453,7 +453,7 @@ class AutoScreen(Screen):
             else:
                 rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
-        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, up to the login, after it)
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
         # Padded to the widest email among the rows THIS block renders, so
         # every row's chips start in the same column — computed from exactly
         # the accounts the loop below iterates (all but the active one).
@@ -729,7 +729,7 @@ class AutoScreen(Screen):
         budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
         for row in fit_login(
             lambda login: [
-                Text.assemble(head, Text(login_segment(acc, login), style=palette.muted), tail)
+                Text.assemble(head, tail, Text(login_segment(acc, login), style=palette.muted))
                 for acc, head, tail in order
             ],
             budget,
