@@ -318,14 +318,14 @@ def _random_fleet(seed: int, now: float, n: int = 5) -> dict:
 
 
 def _run_trace(home, strategy: str, model: str, seed: int) -> list:
-    """One fresh ``home`` per call — a shared root across combos leaves the
+    """One fresh ``home`` per call: a shared root across combos leaves the
     prior combo's switched-to account and backups behind, aliasing the next
     one's decisions onto stale state (measured: reusing one ``temp_home``
     across the four combos below moved a digest that a fresh root does not).
 
     ``Path.home()`` stays patched for the whole call, not only construction:
     ``make_live()`` and ``tick()`` both resolve the active account through
-    ``paths.*``, which reads ``Path.home()`` live — patched only around
+    ``paths.*``, which reads ``Path.home()`` live: patched only around
     ``EngineHarness.__init__`` (as the conftest ``temp_home`` fixture does
     NOT do here) reads every tick's active account off the real ambient
     home instead, and every tick reads `no-active-account` (measured).
