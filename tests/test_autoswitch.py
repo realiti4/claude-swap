@@ -7683,7 +7683,7 @@ class TestWarmthAndAlternation375:
         self._seed_last_active_at(h, {"1": now - chunk - 1.0})
         usage = {
             "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),
-            "2": _usage7(0.0, 95.0, _iso_at(now + 6.5 * 3600)),
+            "2": _usage7(0.0, 95.0, _iso_at(now + 2 * 86400)),  # perishing, past the day `expiring-window` takes
         }
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED and h.active_number() == 2, (
@@ -17655,6 +17655,14 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert h.active_number() == 2
         assert _xw_switch(h).trigger == "expiring-window"
 
+    def test_a_window_resetting_in_hours_pulls_the_switch_whatever_the_burn_rate(self, temp_home):
+        """2 resets in 6 h with 6 points of room on a fleet burning 4 pts/h: the old
+        just-in-time start was 2 h before the reset. Within a day it is expiring."""
+        h = _xw_harness(temp_home)
+        usage = self._fleet(h, **{"2": _xw(h, 10.0, 91.0, 6 * _H)})
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "expiring-window")
+
     def test_the_pin_reads_the_pull_while_every_gate_keeps_alternation(self, temp_home):
         """cswap-pin's session-affinity keep yields to `expiring-window`, which
         only the decisions log named; `leftTrigger` stays the gate trigger."""
@@ -17731,13 +17739,13 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert "spending its expiring window first" in _xw_hold(h).detail
 
     def test_a_far_reset_window_does_not_pull_and_the_hold_says_when_it_will(self, temp_home):
-        """7d at 40/80/20/100 %, resets 6 d / 20 h / 5 d / 6.9 d out: 55.6 h of mean
-        elapsed time for 240 points is 4.3 pts/h. 2's 17 points of room take 17 x 1.5 /
-        4.3 = 5.9 h, so it is due at its reset (09:46Z) less that, 03:52Z: 14.1 h out."""
+        """7d at 40/80/20/100 %, resets 6 d / 30 h / 5 d / 6.9 d out: 2's 17 points of
+        room expire at 19:46Z the next day, so it is expiring from a day before that,
+        19:46Z today, 6 h out. 240 points over 53.1 h of mean elapsed time is 4.5 pts/h."""
         h = _xw_harness(temp_home)
         usage = self._fleet(h, **{
             "1": _xw(h, 10.0, 40.0, 6 * _D),
-            "2": _xw(h, 10.0, 80.0, 20 * _H),
+            "2": _xw(h, 10.0, 80.0, 30 * _H),
             "3": _xw(h, 10.0, 20.0, 5 * _D),
         })
         assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
@@ -17745,53 +17753,52 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert _xw_hold(h).reason == "below-threshold"
         assert _xw_hold(h).detail == (
             "active account is healthy (60% headroom, not about to wall); "
-            "the alternation step is not reached; nothing expiring yet; next at 03:52Z: "
-            "switch to #2 (needs 17 pts through #2 by its 09:46Z reset, 5.9 h at 4.3 pts/h)"
+            "the alternation step is not reached; nothing expiring yet; next at 19:46Z: "
+            "switch to #2 (spends #2's 17 pts before its Tue 19:46Z reset, at 4.5 pts/h)"
         )
         assert _xw_hold(h).human() == f"no switch: below-threshold ({_xw_hold(h).detail})"
 
     def test_the_hold_names_the_account_the_tick_then_switches_to(self, temp_home):
-        """Active 1; 2 resets in 20 h with 5 pts of room, 3 in 21 h with 25 more. 264
-        points over 80.35 h of mean elapsed time is 3.29 pts/h: 3's 30 pts through it take
-        30 x 1.5 / 3.29 = 13.7 h, due 7.3 h out, and 2's 5 pts 2.3 h, due 17.7 h out. At
-        3's due time the walk is [2, 3] and the tick takes its first row, 2, not 3."""
+        """Active 1; 2 resets in 26 h with 5 pts of room, 3 in 27 h with 25 more. 264
+        points over 77.35 h of mean elapsed time is 3.4 pts/h. 2 is expiring from 24 h
+        before its reset, 2 h out, and the tick then takes it: the soonest, not 3."""
         h = _xw_harness(temp_home)
         fleet = {
-            "1": (40.0, 6 * _D), "2": (92.0, 20 * _H), "3": (72.0, 21 * _H), "4": (60.0, 6.9 * _D),
+            "1": (40.0, 6 * _D), "2": (92.0, 26 * _H), "3": (72.0, 27 * _H), "4": (60.0, 6.9 * _D),
         }
-        rate = 264 / 80.35
+        rate = 264 / 77.35
         reading = (
-            "nothing expiring yet; next at 21:04Z: switch to #2 "
-            "(needs 30 pts through #3 by its 10:46Z reset, 13.7 h at 3.3 pts/h)"
+            "nothing expiring yet; next at 15:46Z: switch to #2 "
+            "(spends #2's 5 pts before its Tue 15:46Z reset, at 3.4 pts/h)"
         )
         t0 = h.clock.now
         assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 0.0)) is TickOutcome.NO_ACTION
         assert _xw_hold(h).detail.endswith("; " + reading)
         # Just before it, the same reading; just after, the tick does what the line said.
-        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 7.2)) is TickOutcome.NO_ACTION
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 1.9)) is TickOutcome.NO_ACTION
         assert _xw_hold(h).detail.endswith("; " + reading)
-        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 7.4)) is TickOutcome.SWITCHED
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 2.1)) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (2, "expiring-window")
 
     def test_the_hold_says_the_active_spends_its_own_window_when_it_resets_first(self, temp_home):
-        """Active 1 resets first, in 20 h, with 17 pts of room: 190 points over 58.6 h
-        is 3.24 pts/h, so its 17 pts take 7.9 h, due 12.1 h out. Nothing switches then:
-        the active is the first row, and the hold says it spends the window first."""
+        """Active 1 resets first, in 26 h, with 17 pts of room: 190 points over 57.1 h
+        is 3.3 pts/h. It is expiring 2 h out, and nothing switches then: the active is
+        the first row, and the hold says it spends the window first."""
         h = _xw_harness(temp_home)
         fleet = {
-            "1": (80.0, 20 * _H), "2": (20.0, 5 * _D), "3": (30.0, 5.5 * _D), "4": (60.0, 6.9 * _D),
+            "1": (80.0, 26 * _H), "2": (20.0, 5 * _D), "3": (30.0, 5.5 * _D), "4": (60.0, 6.9 * _D),
         }
-        rate = 190 / 58.6
+        rate = 190 / 57.1
         reading = (
-            "nothing expiring yet; next at 01:54Z: the active (#1) starts spending its expiring "
-            "window (needs 17 pts through #1 by its 09:46Z reset, 7.9 h at 3.2 pts/h)"
+            "nothing expiring yet; next at 15:46Z: the active (#1) starts spending its expiring "
+            "window (spends #1's 17 pts before its Tue 15:46Z reset, at 3.3 pts/h)"
         )
         t0 = h.clock.now
         assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 0.0)) is TickOutcome.NO_ACTION
         assert _xw_hold(h).detail.endswith("; " + reading)
-        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 12.0)) is TickOutcome.NO_ACTION
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 1.9)) is TickOutcome.NO_ACTION
         assert _xw_hold(h).detail.endswith("; " + reading)
-        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 12.2)) is TickOutcome.NO_ACTION
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 2.1)) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert _xw_hold(h).detail.endswith("; spending its expiring window first")
 
@@ -17935,7 +17942,7 @@ class TestAnExpiringWindowPullsTheSwitch:
         h = _xw_harness(temp_home)
         usage = {
             "1": _xw(h, 97.0, 10.0, 6 * _D),  # headroom 3: at its own switch point
-            "2": _xw(h, 10.0, 40.0, 6 * _D if far else 30 * _H),  # 57 points, 30 h
+            "2": _xw(h, 10.0, 40.0, 6 * _D if far else 20 * _H),  # 57 points, 20 h
             "3": _xw(h, 10.0, 2.0, 6 * _D),  # 98 points, far
             "4": _xw(h, 100.0, 1.0, 6 * _D),
         }
@@ -17944,11 +17951,12 @@ class TestAnExpiringWindowPullsTheSwitch:
 
     def test_with_nothing_expiring_a_walled_active_leaves_for_the_perishing_peer(self, temp_home):
         """`_perish_then_room_key` decides here: 2 resets inside a day with less
-        headroom, 3 has more; the fleet burns fast enough that neither is due."""
+        headroom, 3 has more; 2's 5h cannot absorb a cold landing, so the walk
+        leaves it out and nothing is expiring."""
         h = _xw_harness(temp_home)
         usage = {
             "1": _xw(h, 98.0, 10.0, 6 * _D),  # headroom 2: at the wall
-            "2": _xw(h, 10.0, 75.0, 20 * _H),  # 25 points, resets inside a day
+            "2": _xw(h, 78.0, 75.0, 20 * _H),  # 22 points, resets inside a day
             "3": _xw(h, 10.0, 20.0, 4 * _D),  # 80 points, resets later
             "4": _xw(h, 100.0, 100.0, 6.9 * _D),
         }
@@ -17979,6 +17987,16 @@ def _xw_unit(now: float, **accounts: tuple[float, float]) -> dict:
     }
 
 
+def _xw_room(usage: dict, headroom: dict, caps: dict | None = None, plans: dict | None = None) -> float:
+    """Account 2's walked room (Ultra points), `_expiring_walk`'s row for it."""
+    from claude_swap.autoswitch import _expiring_walk
+
+    rows = _expiring_walk(
+        ["1", "2"], usage, headroom, {}, caps or {}, plans or {}, lambda n: 0.0, 1_000_000.0
+    )[1]
+    return next(room for n, room, _ in rows if n == "2")
+
+
 def test_hosts_sharing_accounts_pick_the_same_expiring_target():
     from claude_swap.autoswitch import expiring_order
 
@@ -18002,20 +18020,36 @@ def test_hosts_sharing_accounts_pick_the_same_expiring_target():
 
 
 def test_a_max_5x_candidates_room_counts_a_quarter():
-    from claude_swap.autoswitch import expiring_order
-
     now = 1_000_000.0
     usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (87.0, 10 * _H)})
     headroom = {"1": 0.0, "2": 13.0}  # the active is not walked: only 2's room is queued
 
-    def order(plans: dict) -> list[str]:
-        return expiring_order(["1", "2"], usage, headroom, {}, {}, plans, lambda n: 0.0, now)
-
-    assert order({}) == ["2"]  # ten points at 1.3 pts/h, doubled, reach the reset
-    assert order({"2": "Max 5x"}) == []  # a quarter of them do not
+    assert _xw_room(usage, headroom) == 10.0
+    assert _xw_room(usage, headroom, plans={"2": "Max 5x"}) == 2.5
 
 
-def test_it_names_nothing_without_a_measurable_rate():
+@pytest.mark.parametrize(
+    ("active_left", "left", "headroom", "expect"),
+    [
+        (6 * _D, 6 * _H, 13.0, ["2"]),
+        (3 * _H, 6 * _H, 13.0, ["1", "2"]),  # the active resets sooner: first, so the tick keeps it
+        (6 * _D, 30 * _H, 13.0, []),
+        (6 * _D, 6 * _H, 0.0, []),  # walled
+    ],
+    ids=["soon", "active-sooner", "past-a-day", "walled"],
+)
+def test_a_7d_window_resetting_within_a_day_is_expiring(active_left, left, headroom, expect):
+    from claude_swap.autoswitch import expiring_order
+
+    now = 1_000_000.0
+    usage = _xw_unit(now, **{"1": (70.0, active_left), "2": (91.0, left)})
+    order = expiring_order(
+        ["1", "2"], usage, {"1": 30.0, "2": headroom}, {}, {}, {}, lambda n: 0.0, now
+    )
+    assert order == expect
+
+
+def test_it_names_nothing_without_a_readable_reset_and_needs_no_burn_rate():
     from claude_swap.autoswitch import expiring_order
 
     now = 1_000_000.0
@@ -18026,32 +18060,19 @@ def test_it_names_nothing_without_a_measurable_rate():
 
     assert order({}) == []
     assert order({"1": {"seven_day": {"pct": 32.0}}, "2": "token expired"}) == []  # no resets
-    assert order(_xw_unit(now, **{"1": (0.0, 6 * _D), "2": (0.0, 2 * _H)})) == []  # nothing spent
-
-
-@pytest.mark.parametrize("left, expect", [(36 * _H, ["2"]), (48 * _H, [])])
-def test_the_start_is_early_by_a_factor_of_the_room_not_by_a_fixed_slack(left, expect):
-    from claude_swap.autoswitch import expiring_order
-
-    now = 1_000_000.0
-    # About 1.1 pts/h; 2's 30 points of room take 27 h: 1.5 x is due at 36 h out, not at
-    # 48 h (2 x would be: the margin is 1.49 x measured, 6.9 against 4.64 pts/h).
-    usage = _xw_unit(now, **{"1": (20.0, 6 * _D), "2": (67.0, left)})
-    headroom = {"1": 0.0, "2": 33.0}  # the active is at its wall: not walked, still read
-    assert expiring_order(["1", "2"], usage, headroom, {}, {}, {}, lambda n: 0.0, now) == expect
+    assert order(_xw_unit(now, **{"1": (0.0, 6 * _D), "2": (0.0, 2 * _H)})) == ["2"]  # nothing spent
 
 
 @pytest.mark.parametrize(
-    "left_3, expect", [(50 * _H, ["2", "4", "3"]), (100 * _H, ["2"])]
+    "left_3, expect", [(23 * _H, ["2", "4", "3"]), (25 * _H, ["2", "4"])]
 )
-def test_the_walk_is_cut_after_the_last_due_account(left_3, expect):
+def test_the_walk_is_cut_at_the_first_reset_past_a_day(left_3, expect):
     from claude_swap.autoswitch import expiring_order
 
     now = 1_000_000.0
-    # 2 is due; 4 (7 points) is not on its own but sits before 3; 3's 67 points are due at
-    # 50 h out (95 h of spending at 1.9 pts/h) and not at 100 h (83 h at 2.2).
+    # 2 and 4 reset inside the day; 3 does at 23 h out and does not at 25 h.
     usage = _xw_unit(
-        now, **{"1": (20.0, 6.5 * _D), "2": (50.0, 20 * _H), "4": (90.0, 2 * _D), "3": (30.0, left_3)}
+        now, **{"1": (20.0, 6.5 * _D), "2": (50.0, 10 * _H), "4": (90.0, 20 * _H), "3": (30.0, left_3)}
     )
     headroom = {"1": 0.0, "2": 50.0, "4": 10.0, "3": 70.0}
     order = expiring_order(["1", "2", "4", "3"], usage, headroom, {}, {}, {}, lambda n: 0.0, now)
@@ -18067,62 +18088,51 @@ def test_the_nothing_expiring_reading_says_when_no_account_will_come_due():
         rate, rows = _expiring_walk(["1", "2"], usage, headroom, {}, {}, {}, lambda n: 0.0, now)
         return _nothing_expiring_detail(rate, rows, now, "1")
 
-    walled = {"1": 0.0, "2": 0.0}  # both at their wall: read for the rate, never walked
+    walled = {"1": 0.0, "2": 0.0}  # both at their wall: never walked
     assert reading(_xw_unit(now, **{"1": (32.0, 6 * _D), "2": (87.0, 2 * _H)}), walled) == (
         "nothing expiring; no account has 7d room it can spend now"
     )
-    assert reading({}, walled) == "nothing expiring; no fleet burn rate to time a deadline"
 
 
 def test_a_due_time_a_day_or_more_out_names_its_weekday():
     from claude_swap.autoswitch import _expiring_walk, _nothing_expiring_detail
 
     now = 1_000_000.0  # Mon 1970-01-12 13:46:40Z
-    # 62 points over 36 h mean elapsed is 1.7 pts/h; 2's 67 points take 58.4 h, so it is due
-    # at its reset (Sat 13:46Z) less that: Thu 03:25Z, 61.6 h out, not a bare "03:25Z".
+    # 62 points over 36 h mean elapsed is 1.7 pts/h. 2 is expiring from a day before its
+    # reset (Sat 13:46Z): Fri 13:46Z, 4 d out, not a bare "13:46Z".
     usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (30.0, 5 * _D)})
     rate, rows = _expiring_walk(
         ["1", "2"], usage, {"1": 0.0, "2": 70.0}, {}, {}, {}, lambda n: 0.0, now
     )
     assert _nothing_expiring_detail(rate, rows, now, "1") == (
-        "nothing expiring yet; next at Thu 03:25Z: switch to #2 "
-        "(needs 67 pts through #2 by its Sat 13:46Z reset, 58.4 h at 1.7 pts/h)"
+        "nothing expiring yet; next at Fri 13:46Z: switch to #2 "
+        "(spends #2's 67 pts before its Sat 13:46Z reset, at 1.7 pts/h)"
     )
 
 
 def test_a_weekly_cap_leaves_room_to_the_fullest_weekly_window():
-    from claude_swap.autoswitch import expiring_order
-
     now = 1_000_000.0
     usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (60.0, 8 * _H)})
     scoped = {"name": "Fable", "pct": 79.0, "resets_at": _iso_at(now + 8 * _H)}
     headroom = {"1": 0.0, "2": 40.0}
 
-    def order(cap_usage: dict) -> list[str]:
-        usage["2"] = cap_usage
-        return expiring_order(["1", "2"], usage, headroom, {}, {"2": 80.0}, {}, lambda n: 0.0, now)
-
-    plain = dict(usage["2"])
-    assert order(plain) == ["2"]  # cap 80, 7d 60: 20 points, due at 1 pt/h
-    assert order({**plain, "scoped": [scoped]}) == []  # cap 80, scoped 79: 1 point, not due
+    assert _xw_room(usage, headroom, {"2": 80.0}) == 20.0  # cap 80, 7d 60
+    usage["2"] = {**usage["2"], "scoped": [scoped]}
+    assert _xw_room(usage, headroom, {"2": 80.0}) == 1.0  # cap 80, scoped 79
 
 
 def test_a_header_probe_reading_under_a_weekly_cap_keeps_its_seven_day_room():
-    from claude_swap.autoswitch import expiring_order
-
     now = 1_000_000.0
     usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (60.0, 8 * _H)})
     usage["2"].update(source="headers", five_hour={"pct": 10.0})  # `all` is never complete
     headroom = {"1": 0.0, "2": 40.0}
-    assert expiring_order(["1", "2"], usage, headroom, {}, {"2": 80.0}, {}, lambda n: 0.0, now) == ["2"]
+    assert _xw_room(usage, headroom, {"2": 80.0}) == 20.0  # cap 80 less 7d 60
 
 
 def test_a_weekly_cap_of_one_hundred_is_no_cap():
-    from claude_swap.autoswitch import expiring_order
-
     now = 1_000_000.0
     usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (60.0, 8 * _H)})
     usage["2"]["scoped"] = [{"name": "Fable", "pct": 100.0, "resets_at": _iso_at(now + 8 * _H)}]
     headroom = {"1": 0.0, "2": 40.0}
     # The room is 7d's 37 points (a cap of 100 is none, as models.py reads it), not 100 - 100.
-    assert expiring_order(["1", "2"], usage, headroom, {}, {"2": 100.0}, {}, lambda n: 0.0, now) == ["2"]
+    assert _xw_room(usage, headroom, {"2": 100.0}) == 37.0
