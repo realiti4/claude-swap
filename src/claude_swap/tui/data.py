@@ -30,12 +30,13 @@ from claude_swap.autoswitch import (
     _binding_at,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
+    _expiring_due,
     _headroom_by_account,
     _model_window_binds_everywhere,
     _seven_day_reset_ts,
     _wall_headroom,
     dynamic_candidate_order,
-    dynamic_expiring,
+    dynamic_expiring_walk,
     rank_candidates_pass,
     rank_priority_candidates,
 )
@@ -357,10 +358,10 @@ def rank_switch_candidates(
             # The active reads as the engine passes it: widened on the model axis,
             # its own unmodeled headroom on the retry.
             active_headroom=active_headroom if axis else headroom.get(active_number),
-            expiring=dynamic_expiring(
+            expiring=_expiring_due(*dynamic_expiring_walk(
                 active_number, oauth_candidates, usage, model_headroom, bars, policies,
                 entries, last, settings, now,
-            ),
+            ), now),
             trigger=trigger, model_window_dropped=dropped, reasons=reasons,
             raw_active_headroom=model_headroom.get(active_number), models=models,
         )

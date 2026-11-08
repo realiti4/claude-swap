@@ -38,6 +38,7 @@ from tests.test_tui import (
     make_account,
     make_app,
     make_entry,
+    quick_pilot,  # noqa: F401 - Textual's idle check polled at 1 ms, used by name
     settle,
 )
 
@@ -47,7 +48,9 @@ from tests.test_tui import (
 # through the same ``make_account`` fixture used below.  Only the header row and
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
-# instead (see ``test_the_card_bar_rows_are_untouched``).
+# instead (see ``test_the_card_bar_rows_are_untouched``).  The re-login note
+# (tests/test_login_expiry.py) only joins a row while its login is due, so
+# these fixtures, which carry no expiry, render without it.
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
 GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h:25% · 7d:10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
@@ -195,9 +198,12 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
     """
 
     async def _open(self, pilot):
+        from claude_swap.tui.autoview import AutoScreen
+
         await settle(pilot)
-        await pilot.press("g")
-        await pilot.pause()
+        # Awaiting the push is the `g` binding's own effect without the idle
+        # waits of a key press; the binding itself is TestAutoScreen's to prove.
+        await pilot.app.push_screen(AutoScreen())
 
     def _fleet(self, tmp_path):
         (tmp_path / "settings.json").write_text(json.dumps({
@@ -235,6 +241,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
             assert "(line" not in self._row(plain, "user3@example.com")
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_a_capped_candidate_is_marked_and_ranked_last(
         self, tmp_path, fake_engine
     ):
@@ -248,7 +255,6 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
         app = make_app(fleet)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
-            await settle(pilot)
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
@@ -275,6 +281,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             )
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
         self, tmp_path, fake_engine
     ):

@@ -37,7 +37,7 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.lines import weekly_capped
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
@@ -47,7 +47,7 @@ from claude_swap.settings import (
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel, spend_row, usage_rows
+from claude_swap.tui.widgets import AccountsPanel, fit_login, login_segment, spend_row, usage_rows
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -430,7 +430,7 @@ class AutoScreen(Screen):
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
         bars = data.switch_bars(snap)
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
-        lines: dict[str, Text] = {}
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
         now = time.time()
         # THE engine's own admission and order -- `ordered_accounts` (data.py)
         # reads off this exact same call for every other listing screen.
@@ -463,9 +463,9 @@ class AutoScreen(Screen):
             # showed two accounts here and five in the engine's own log. A row
             # that says why it cannot be picked beats a row that isn't there.
             if not acc.switchable:
-                entry = Text()
-                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(acc.email, style=palette.muted)
+                head, entry = Text(), Text()
+                head.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                head.append(acc.email, style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -480,7 +480,7 @@ class AutoScreen(Screen):
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
                 entry.append(f"  {note}", style=palette.sev_warn)
-                lines[acc.number] = entry
+                lines[acc.number] = (acc, head, entry)
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
             no_plan = data.is_no_plan(acc)
@@ -491,20 +491,20 @@ class AutoScreen(Screen):
                 # RANKED one (`decision_value()` serves `last_good` for a
                 # while after polls fail) is the engine's pick and keeps its
                 # place below, the reason a marker after the chips.
-                entry = Text()
-                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(acc.email, style=palette.muted)
+                head, entry = Text(), Text()
+                head.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                head.append(acc.email, style=palette.muted)
                 entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
-                lines[acc.number] = entry
+                lines[acc.number] = (acc, head, entry)
                 ranked.append(((1001.0,), acc.number))
                 continue
             # THIS row's bar: its own threshold when it has one, as the engine
             # lands on it (`_rank_candidates_pass`), else the strategy's.
             row_bar = bars.get(acc.number, bar)
             binding = _binding_at(acc.usage.last_good, settings, models, row_bar)
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            head, entry = Text(), Text()
+            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            head.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -652,7 +652,7 @@ class AutoScreen(Screen):
                         style=palette.sev_warn,
                     )
                 ranked.append((key_of(acc), acc.number))
-            lines[acc.number] = entry
+            lines[acc.number] = (acc, head, entry)
 
         text = Text()
         # `rank_axis`: the engine's own report, never re-derived here.
@@ -678,6 +678,15 @@ class AutoScreen(Screen):
                 # switch to, and ranking one anyway would name a top row the
                 # engine could never pick.
                 text.append("\n  no candidate qualifies", style=palette.muted)
-        for _key, number in sorted(ranked):
-            text.append(lines[number])
+        order = [lines[number] for _key, number in sorted(ranked)]
+        # The box has no width before its first layout; its CSS padding is 2 a side.
+        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
+        for row in fit_login(
+            lambda login: [
+                Text.assemble(head, tail, Text(login_segment(acc, login), style=palette.muted))
+                for acc, head, tail in order
+            ],
+            budget,
+        ):
+            text.append(row)
         return text
