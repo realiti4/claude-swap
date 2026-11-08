@@ -1708,6 +1708,9 @@ class _ContendedFakeEngine:
         self.stopped = False
         self._stop = threading.Event()
         self._promote_requested = threading.Event()
+        # set once the UI has handled the promotion event (`call_from_thread`
+        # returns after the callback ran), so a test waits on it, not a pause
+        self.promotion_delivered = threading.Event()
         _ContendedFakeEngine.instances.append(self)
 
     def run_loop(self) -> int:
@@ -1729,6 +1732,7 @@ class _ContendedFakeEngine:
                                 "engine is now LIVE"
                     )
                 )
+                self.promotion_delivered.set()
         return 0
 
     def stop(self, reason: str = "stopped") -> None:
@@ -1743,15 +1747,6 @@ class _ContendedFakeEngine:
 
     def promote(self) -> None:
         self._promote_requested.set()
-
-    def wait_promoted(self, timeout: float = 1.0) -> bool:
-        """Block until `run_loop`'s worker thread has flipped `dry_run`."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not self.dry_run:
-                return True
-            time.sleep(0.01)
-        return not self.dry_run
 
 
 @pytest.fixture
@@ -1843,8 +1838,9 @@ class TestAutoScreen:
             )
 
             engine.promote()
-            assert engine.wait_promoted(), "premise: the engine never promoted"
-            await settle(pilot)
+            assert await asyncio.to_thread(
+                engine.promotion_delivered.wait, 1.0
+            ), "premise: the engine never promoted"
 
             assert badge.has_class("live"), (
                 "the badge still reads DRY-RUN over an engine that is now "
@@ -1878,7 +1874,7 @@ class TestAutoScreen:
             FakeSwitcher([make_account(1, active=True)], tmp_path), start="auto"
         )
         async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
+            await pilot.pause(0)
             badge = app.screen.query_one("#mode-badge", Static)
             assert badge.has_class("live"), "premise: --auto starts LIVE"
 
@@ -1986,7 +1982,9 @@ class TestAutoScreen:
             # not dynamic (the default is consume-first): the key is inert
             assert screen.check_action("toggle_cache_aware", ()) is False
             assert "c" not in screen.active_bindings
-            await pilot.press("c")
+            # the action, not the key (`press` idles about 0.1 s; c_flips and
+            # c_follows press `c`); run_action honours check_action as the key does
+            await screen.run_action("toggle_cache_aware")
             assert not (tmp_path / "settings.json").exists()
             assert "cache-aware" not in summary.render().plain
 
@@ -1998,11 +1996,11 @@ class TestAutoScreen:
             screen._update_summary()
             assert "c" in screen.active_bindings
             assert "cache-aware off" in summary.render().plain
-            await pilot.press("c")
+            await screen.run_action("toggle_cache_aware")
             assert load_settings(tmp_path).cache_aware is True  # the file, not the session
             assert "cache-aware on" in summary.render().plain
             assert any("cache-aware on" in line.text for line in log.lines)
-            await pilot.press("c")
+            await screen.run_action("toggle_cache_aware")
             assert load_settings(tmp_path).cache_aware is False
             assert "cache-aware off" in summary.render().plain
 
@@ -2052,7 +2050,18 @@ class TestAutoScreen:
             screen.refresh_bindings()
             assert screen._settings.cache_aware is False  # the mount-time value
             set_setting(tmp_path, "autoswitch.cacheAware", "true")  # edited elsewhere
-            await pilot.press("c")
+            # The real binding, awaited on its action: `press` idles about
+            # 0.1 s; c_follows still presses `c` for the inert case.
+            ran = asyncio.Event()
+            toggle = screen.action_toggle_cache_aware
+
+            def toggled():
+                toggle()
+                ran.set()
+
+            screen.action_toggle_cache_aware = toggled
+            app.simulate_key("c")
+            await asyncio.wait_for(ran.wait(), 2)
             assert load_settings(tmp_path).cache_aware is False
             assert "cache-aware off" in screen.query_one("#auto-summary", Static).render().plain
 
@@ -2618,7 +2627,7 @@ class TestTheAutoFlagIsTheOnlyRouteToLive:
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = CswapApp(fake, start="auto")
         async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
+            await pilot.pause(0)  # `pause()` waits for cpu idle, about 0.1 s
             assert isinstance(app.screen, AutoScreen)
             assert fake_engine.instances, "no engine was constructed"
             assert fake_engine.instances[-1].dry_run is False, (
@@ -2827,10 +2836,10 @@ class TestNeedsLoginIsReported:
         app = make_app(fake)
         seen: list[tuple[str, dict]] = []
         async with app.run_test() as pilot:
-            await settle(pilot)
+            await _wait_workers(app)
             app.notify = lambda msg, **kw: seen.append((str(msg), kw))
             app.do_switch("2")
-            await settle(pilot)
+            await _wait_workers(app)  # call_from_thread has run the notify
 
         assert seen, "the switch produced no notification at all"
         body = " ".join(m for m, _ in seen)
