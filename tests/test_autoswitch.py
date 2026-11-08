@@ -3033,7 +3033,23 @@ def _base_jobs(base_sha: str) -> list[str]:
 
 
 def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
-    """`_base_jobs(base_sha)` through `base_sha`'s engine in one child."""
+    """`_base_jobs(base_sha)` through the `base_sha` `AutoSwitchEngine` in one
+    fresh subprocess against ITS OWN `claude_swap` package: a different
+    `usage_store`/`switcher`/`settings`/`autoswitch`, not merely a fresh module
+    namespace sharing this process's `sys.modules`. Same technique as
+    `test_dynamic_isolation.py`'s `_digests_at_base_rev`: guard-and-skip,
+    `git archive` + `tarfile`, a driver subprocess, a positive control on
+    where `claude_swap` resolved from. The child imports only
+    `tests/_digest_harness.py`, never this module: HEAD's 18k-line test module
+    names things the base does not define, and compiling it cost most of the
+    child.
+
+    SKIPPED, not failed, when `base_sha` is not in the object database --
+    CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
+    branch's own pre-PR base is never in that checkout, and a bare
+    `git show` there would redden every job today and every run forever
+    once the branch is deleted post-merge.
+    """
     repo_root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
@@ -3067,8 +3083,6 @@ def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
         "print(json.dumps({'_claude_swap_file': claude_swap.__file__, "
         "'results': results}))\n"
     )
-    homes_dir = root / "homes"
-    homes_dir.mkdir()
     jobs = _base_jobs(base_sha)
     # Dead proxy, as in test_dynamic_isolation.py: the base tree's code must
     # not reach the network (that test measured 7 lookups without it).
@@ -3079,11 +3093,13 @@ def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
         "HTTP_PROXY": dead_proxy, "HTTPS_PROXY": dead_proxy,
         "no_proxy": "", "NO_PROXY": "",
     }
-    digest = TestOutcomeDigestAgainstBase
     result = subprocess.run(
         [
-            sys.executable, str(driver), str(homes_dir),
-            json.dumps([jobs, digest._DIGEST_SEED, digest._N_FLEETS]),
+            sys.executable, str(driver), str(root / "homes"),
+            json.dumps([
+                jobs, TestOutcomeDigestAgainstBase._DIGEST_SEED,
+                TestOutcomeDigestAgainstBase._N_FLEETS,
+            ]),
         ],
         capture_output=True, text=True, env=child_env,
     )
@@ -3113,24 +3129,10 @@ def _base_engine_results(
     *, base_sha: str = _PR_321_BASE_SHA, custom_fleets: list[dict] | None = None,
     settings_kwargs: dict | None = None,
 ):
-    """The fleets of `TestOutcomeDigestAgainstBase` (fixed seed) at
-    `settings_kwargs`, or `custom_fleets` verbatim (raw `{account: usage}`
-    maps), run through the `base_sha` `AutoSwitchEngine` in a fresh subprocess
-    against ITS OWN `claude_swap` package: a different `usage_store`/
-    `switcher`/`settings`/`autoswitch`, not merely a fresh module namespace
-    sharing this process's `sys.modules`. Same technique as
-    `test_dynamic_isolation.py`'s `_digests_at_base_rev`: guard-and-skip,
-    `git archive` + `tarfile`, a driver subprocess, a positive control on
-    where `claude_swap` resolved from. The child imports only
-    `tests/_digest_harness.py`, never this module: HEAD's 18k-line test module
-    names things the base does not define, and compiling it cost most of the
-    child. A job `_base_jobs` does not list is a KeyError, add it there.
-
-    SKIPPED, not failed, when `base_sha` is not in the object database --
-    CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
-    branch's own pre-PR base is never in that checkout, and a bare
-    `git show` there would redden every job today and every run forever
-    once the branch is deleted post-merge.
+    """One job's results from the cached base child: the fixed-seed fleets of
+    `TestOutcomeDigestAgainstBase` at `settings_kwargs`, or `custom_fleets`
+    verbatim (raw `{account: usage}` maps). A job `_base_jobs` does not list
+    is a KeyError, add it there.
     """
     if base_sha not in _BASE_RESULTS:
         _BASE_RESULTS[base_sha] = _run_base_child(tmp_path, base_sha)
