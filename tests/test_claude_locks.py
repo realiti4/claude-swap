@@ -50,6 +50,16 @@ def _wait_for(predicate):
         time.sleep(0.01)
 
 
+def _prime_the_pin_probe(monkeypatch, directory: Path) -> None:
+    """Seed the pin probe for `directory`'s device, so a case whose budget is
+    tens of ms does not spend it on the probe's first-call gaps (~30ms).
+    True is a local filesystem's answer and is never consulted where a
+    directory cannot be opened. Undone on teardown."""
+    monkeypatch.setitem(
+        claude_locks._PIN_PROBE, os.stat(directory).st_dev, True
+    )
+
+
 class TestProperLockfile:
     def test_acquire_creates_and_release_removes(self, lock_dir):
         with proper_lockfile(lock_dir):
@@ -72,6 +82,7 @@ class TestProperLockfile:
         spin until the sweeper stops.
         """
         real_mkdir = os.mkdir
+        _prime_the_pin_probe(monkeypatch, lock_dir.parent)
         started = time.monotonic()
 
         # THE BOUND IS ASSERTED WHERE IT IS REACHABLE. Both assertions below
@@ -95,10 +106,10 @@ class TestProperLockfile:
 
         monkeypatch.setattr(claude_locks.os, "mkdir", swept)
         with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.3):
+            with proper_lockfile(lock_dir, timeout=0.04):
                 pass
         elapsed = time.monotonic() - started
-        assert elapsed < 1.5, f"a 0.3s budget took {elapsed:.2f}s"
+        assert elapsed < 1.5, f"a 0.04s budget took {elapsed:.2f}s"
 
     def test_a_swept_name_does_not_pin_a_core_for_the_whole_budget(
         self, lock_dir, monkeypatch
@@ -116,6 +127,7 @@ class TestProperLockfile:
         """
         real_mkdir = os.mkdir
         attempts: list[int] = []
+        _prime_the_pin_probe(monkeypatch, lock_dir.parent)
         started = time.monotonic()
 
         def swept(path, *args, **kwargs):
@@ -137,13 +149,14 @@ class TestProperLockfile:
 
         monkeypatch.setattr(claude_locks.os, "mkdir", swept)
         with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.3):
+            with proper_lockfile(lock_dir, timeout=0.04):
                 pass
         assert attempts, "premise: the swept arm was never entered"
-        # A back-off of any sane size keeps a 0.3s budget in single digits;
-        # the unbounded spin was four orders of magnitude above this.
-        assert len(attempts) <= 30, (
-            f"{len(attempts)} attempts in a 0.3s budget — the swept arm is "
+        # A nap clamped to what is left of a 0.04s budget makes one attempt,
+        # two at most; the unbounded spin makes hundreds in the same time
+        # (25,184 a second where it was measured).
+        assert len(attempts) <= 8, (
+            f"{len(attempts)} attempts in a 0.04s budget: the swept arm is "
             "spinning, not waiting"
         )
 
@@ -206,7 +219,18 @@ class TestProperLockfile:
 
     def test_release_leaves_a_lock_a_running_toucher_saw(self, lock_dir, monkeypatch):
         # A live toucher must not adopt the successor's stamp as its own.
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
+        me, ticks, real_stat = threading.current_thread(), [], os.stat
+
+        def watching(path, *a, **k):
+            # THE TOUCHER'S READ OF THE NAME, the first thing every tick does.
+            if (not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock_dir)
+                    and threading.current_thread() is not me):
+                ticks.append(threading.current_thread())
+            return real_stat(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "stat", watching)
         with proper_lockfile(lock_dir):
             os.rmdir(lock_dir)
             os.mkdir(lock_dir)
@@ -222,7 +246,15 @@ class TestProperLockfile:
             # (measured here: 200 rmdir+mkdir cycles, inode reused 200 times).
             fresh = float(int(time.time()) + 1)
             os.utime(lock_dir, (fresh, fresh))
-            time.sleep(0.25)  # at least one toucher tick
+            # A TICK THAT SAW THE SUCCESSOR, not a guessed sleep. One that
+            # declines ends the heartbeat, so a dead toucher is the answer;
+            # one that adopts keeps beating, so a second read of the name
+            # means the first tick has finished whatever it was going to write.
+            seen = len(ticks)
+            assert _wait_for(
+                lambda: len(ticks) >= seen + 2
+                or (ticks and not ticks[0].is_alive())
+            ), "premise: no toucher tick followed the takeover"
 
         assert lock_dir.is_dir()
         assert lock_dir.stat().st_mtime == fresh  # nor did we refresh theirs
@@ -973,8 +1005,8 @@ class TestTheAcquireAndReleaseAreBounded:
         already unlocked and raises in the daemon thread.
         """
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
-        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.02)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         caplog.set_level(logging.WARNING, logger="claude-swap")
 
         lock = tmp_path / "target.lock"
@@ -1646,8 +1678,25 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             cl, "_fd_pins_an_inode", lambda parent: probes.append(parent) or False
         )
 
-        with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(held, timeout=0.2):
+        # THREE LOST ATTEMPTS, then stop. The retry nap is 0.25-0.5s, so naps
+        # are skipped and the third one ends the loop instead of the budget:
+        # a probe placed after the nap is still reached. Other threads' naps
+        # are left alone.
+        class Enough(Exception):
+            pass
+
+        real_sleep, me, naps = time.sleep, threading.current_thread(), []
+
+        def nap(seconds):
+            if threading.current_thread() is not me:
+                return real_sleep(seconds)
+            naps.append(seconds)
+            if len(naps) == 3:
+                raise Enough
+
+        monkeypatch.setattr(cl.time, "sleep", nap)
+        with pytest.raises(Enough):
+            with proper_lockfile(held, timeout=2.0):
                 pass
         assert probes == [], (
             f"{len(probes)} probe(s) on a contended acquire -- the gaps ran "
@@ -1952,16 +2001,16 @@ class TestATransientErrnoIsNotFatalToTheHold:
         """The release is not joined to the heartbeat, so a probe running
         outside the stamp mutex leaves `.mtime-probe-*` in the parent after
         the `with` ends (win32, where `test_takeover_leaves_no_takeover_dir`
-        saw it). A probe that holds its file open for 0.3s makes it visible."""
+        saw it). A probe that holds its file open for 30ms makes it visible."""
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         started = threading.Event()
 
         def slow_probe(directory):
             fd, name = tempfile.mkstemp(dir=directory, prefix=".mtime-probe-")
             os.close(fd)
             started.set()
-            time.sleep(0.3)
+            time.sleep(0.03)
             os.unlink(name)
             return 1
 
@@ -2243,21 +2292,27 @@ class TestATransientErrnoIsNotFatalToTheHold:
         abandoned, and a fresh orphan appears for every hold.
         """
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         lock = tmp_path / "target.lock"
         real_utime = os.utime
         quantum = 1_000_000_000  # a one-second mount
+        stamps: list[int] = []
 
         def coarse_utime(path, *a, **k):
             ns = k.get("ns")
             if isinstance(ns, tuple) and len(ns) == 2:
                 k["ns"] = tuple((int(v) // quantum) * quantum for v in ns)
-            return real_utime(path, *a, **k)
+            real_utime(path, *a, **k)
+            if not isinstance(path, int) and os.fspath(path) == os.fspath(lock):
+                stamps.append(1)
 
         monkeypatch.setattr(claude_locks.os, "utime", coarse_utime)
 
         with proper_lockfile(lock, timeout=2.0):
-            time.sleep(0.2)  # several ticks at the interval above
+            # SEVERAL TICKS at the interval above, counted and not slept for.
+            assert _wait_for(lambda: len(stamps) >= 3), (
+                f"premise: {len(stamps)} tick(s) stamped the lock"
+            )
 
         assert not lock.exists(), (
             "the release left an undisturbed lock behind: the read-back never "
