@@ -1,6 +1,6 @@
-"""Tests for the "login <countdown>" token: the formatter and its alignment
-across every view that lists accounts (CLI list/status, TUI dashboard mini
-rows, TUI auto-view Next-best rows)."""
+"""Tests for the ``re-login in …`` note: when it shows, how it reads, and
+how it fits in every view that lists accounts (CLI list/status, TUI dashboard
+card and mini rows, TUI auto-view Next-best rows, the menu bar label)."""
 
 from __future__ import annotations
 
@@ -15,86 +15,97 @@ import pytest
 from rich.cells import cell_len
 
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_NO_CREDENTIALS
+from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS, USAGE_RELOGIN_REQUIRED
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher, _usage_entry_lines
 from claude_swap.tui import widgets
-from claude_swap.tui.theme import Palette
 from claude_swap.usage_store import UsageEntry
 
-from tests.test_tui import FakeSwitcher, fake_engine, make_account, make_app, settle
+from tests.test_tui import FakeSwitcher, fake_engine, make_account, make_app, make_entry
+
+NOW = 1_000_000.0
+DAY = 86400
+DUE = 5 * DAY + 12 * 3600 + 30  # "5d 12h" (with 30 s for the render to happen in)
+FAR = 23 * DAY  # a fresh login: nothing to say for weeks
+
+
+def _replace_login(acc: AccountSnapshot, login_expires_at: float | None) -> AccountSnapshot:
+    return dataclasses.replace(acc, login_expires_at=login_expires_at)
+
+
+async def _workers_done(pilot) -> None:
+    """Wait for the thread workers only (the engine worker runs until its screen
+    stops it); the caller then pushes its screen, or pauses once."""
+    app = pilot.app
+    pending = [w for w in app.workers if w.group != "engine"]
+    if pending:
+        await app.workers.wait_for_complete(pending)
 
 
 # ---------------------------------------------------------------------------
-# format_login_expiry
+# The rule: oauth.login_time_left / format_login_expiry
 # ---------------------------------------------------------------------------
 
 
-class TestFormatLoginExpiry:
-    def test_days_and_hours(self):
-        now = 1_000_000.0
-        expires_at = now + 23 * 86400 + 4 * 3600
-        assert oauth.format_login_expiry(expires_at, False, now) == "23d04h"
+class TestLoginTimeLeft:
+    def test_nothing_to_say_without_a_stamp(self):
+        assert oauth.login_time_left(None, False, NOW) is None
 
-    def test_hours_and_minutes(self):
-        now = 1_000_000.0
-        expires_at = now + 5 * 3600 + 7 * 60
-        assert oauth.format_login_expiry(expires_at, False, now) == "5h07m "
+    def test_nothing_to_say_further_out_than_a_week(self):
+        assert oauth.login_time_left(NOW + 7 * DAY + 1, False, NOW) is None
+        assert oauth.login_time_left(NOW + FAR, False, NOW) is None
 
-    def test_under_an_hour(self):
-        now = 1_000_000.0
-        expires_at = now + 45 * 60
-        assert oauth.format_login_expiry(expires_at, False, now) == "0h45m "
+    def test_due_inside_a_week(self):
+        assert oauth.login_time_left(NOW + 7 * DAY, False, NOW) == 7 * DAY
+        assert oauth.login_time_left(NOW + 3600, False, NOW) == 3600
 
-    def test_expired(self):
-        now = 1_000_000.0
-        assert oauth.format_login_expiry(now - 10, False, now) == "needed"
-        assert oauth.format_login_expiry(now, False, now) == "needed"
+    def test_past_reads_as_zero(self):
+        assert oauth.login_time_left(NOW - 10, False, NOW) == 0.0
+        assert oauth.login_time_left(NOW, False, NOW) == 0.0
 
-    def test_quarantined_wins_over_a_future_expiry(self):
-        now = 1_000_000.0
-        assert oauth.format_login_expiry(now + 999_999, True, now) == "needed"
-
-    def test_unknown(self):
-        assert oauth.format_login_expiry(None, False) == "?     "
+    def test_quarantined_says_nothing_even_when_past(self):
+        # The usage sentinel already puts "re-login needed" on that row.
+        assert oauth.login_time_left(NOW - 10, True, NOW) is None
+        assert oauth.login_time_left(NOW + 3600, True, NOW) is None
 
     @pytest.mark.parametrize("stamp", [float("nan"), float("inf"), float("-inf")])
     def test_a_non_finite_stamp_reads_as_unknown(self, stamp):
-        """A NaN/Infinity ``refreshTokenExpiresAt`` reads "?", not a crash at
-        ``int(remaining)`` inside the formatter."""
         creds = json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": stamp}})
         expires_at = oauth.login_expires_at_epoch(creds)
-        assert oauth.format_login_expiry(expires_at, False) == "?     "
+        assert expires_at is None
+        assert oauth.format_login_expiry(expires_at, False, NOW) is None
 
-    def test_every_shape_is_the_same_width(self):
-        now = 1_000_000.0
-        shapes = [
-            oauth.format_login_expiry(None, False),
-            oauth.format_login_expiry(now - 1, False, now),
-            oauth.format_login_expiry(now + 999_999, True, now),
-            oauth.format_login_expiry(now + 23 * 86400 + 4 * 3600, False, now),
-            oauth.format_login_expiry(now + 5 * 3600 + 7 * 60, False, now),
-            oauth.format_login_expiry(now + 45 * 60, False, now),
-        ]
-        widths = {len(s) for s in shapes}
-        assert widths == {6}
 
-    def test_short_form_is_three_columns_for_every_shape(self):
-        now = 1_000_000.0
-        cases = {
-            (None, False): "?  ",
-            (now - 1, False): "now",
-            (now + 999_999, True): "now",
-            (now + 23 * 86400 + 4 * 3600, False): "23d",
-            (now + 5 * 3600 + 7 * 60, False): "5h ",
-            (now + 45 * 60, False): "0h ",
-        }
-        for (expires_at, quarantined), want in cases.items():
-            assert oauth.format_login_expiry(expires_at, quarantined, now, short=True) == want
+class TestFormatLoginExpiry:
+    def test_reads_in_the_reset_counters_grammar(self):
+        assert oauth.format_login_expiry(NOW + DUE, False, NOW) == "re-login in 5d 12h"
+        assert oauth.format_login_expiry(NOW + 3600 + 59 * 60, False, NOW) == "re-login in 1h 59m"
+        assert oauth.format_login_expiry(NOW + 45 * 60, False, NOW) == "re-login in 45m"
+
+    def test_same_countdown_as_a_reset(self):
+        # One formatter behind both: a window resetting in 5d 12h and a login
+        # expiring in 5d 12h show the same figure.
+        assert oauth.format_countdown(DUE) == "5d 12h"
+        future = datetime.now(timezone.utc) + timedelta(seconds=DUE + 30)
+        assert oauth.format_reset(future.isoformat())[0] == "5d 12h"
+
+    def test_short_keeps_the_first_unit(self):
+        assert oauth.format_login_expiry(NOW + DUE, False, NOW, short=True) == "re-login in 5d"
+        assert oauth.format_login_expiry(NOW + 3600 + 59 * 60, False, NOW, short=True) == "re-login in 1h"
+        assert oauth.format_login_expiry(NOW + 45 * 60, False, NOW, short=True) == "re-login in 45m"
+
+    def test_past(self):
+        assert oauth.format_login_expiry(NOW - 10, False, NOW) == "re-login needed"
+        assert oauth.format_login_expiry(NOW, False, NOW, short=True) == "re-login needed"
+
+    def test_silent_when_there_is_nothing_to_say(self):
+        assert oauth.format_login_expiry(None, False, NOW) is None
+        assert oauth.format_login_expiry(NOW + FAR, False, NOW) is None
+        assert oauth.format_login_expiry(NOW - 10, True, NOW) is None
 
 
 # ---------------------------------------------------------------------------
-# CLI list block: `switcher._usage_entry_lines`, via `list_accounts`
+# CLI list block: `switcher._usage_entry_lines`, and via `list_accounts`
 # ---------------------------------------------------------------------------
 
 
@@ -106,29 +117,33 @@ def _iso_in(seconds: float) -> str:
     )
 
 
-class TestCliListAlignment:
-    def test_login_column_starts_where_in_countdown_starts(
+_MEASURED = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 50.0}}
+
+
+class TestCliList:
+    def test_no_row_while_the_login_is_not_due(self):
+        now = time.time()
+        entry = UsageEntry(last_good=_MEASURED, fetched_at=now)
+        fresh = _usage_entry_lines(entry, now + FAR)
+        assert fresh == _usage_entry_lines(entry, None)  # exactly the block without a stamp
+        assert not any("login" in line for line in fresh)
+        assert any("5h:  10%" in line for line in fresh)  # label column unwidened
+
+    def test_due_row_shares_the_reset_columns(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
         # `list_accounts` sources the non-active slot's creds through
-        # `_read_account_credentials` (patched below) -- that account is the
-        # one that gets real 5h/7d rows to compare against, so its login
-        # expiry is the one under test.
-        expires_ms = int((time.time() + 23 * 86400 + 4 * 3600) * 1000)
+        # `_read_account_credentials` (patched below): that is the slot whose
+        # 5h/7d rows the login row is compared against.
+        expires_ms = int((time.time() + DUE) * 1000)
         backup_creds = json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "sk-backup",
-                    "refreshTokenExpiresAt": expires_ms,
-                }
-            }
+            {"claudeAiOauth": {"accessToken": "sk-backup", "refreshTokenExpiresAt": expires_ms}}
         )
-
         usage_response = {
             "five_hour": {"utilization": 10.0, "resets_at": _iso_in(7200)},
-            "seven_day": {"utilization": 50.0, "resets_at": _iso_in(3 * 86400)},
+            "seven_day": {"utilization": 50.0, "resets_at": _iso_in(3 * DAY)},
         }
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps(usage_response).encode()
@@ -138,297 +153,263 @@ class TestCliListAlignment:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
-
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
-        output = capsys.readouterr().out
-        lines = output.splitlines()
-        line_7d = next(line for line in lines if "7d:" in line)
-        # The active slot's creds carry no refreshTokenExpiresAt (its login
-        # line reads "?"); pick the row with the real value under test.
-        line_login = next(line for line in lines if "login:" in line and "?" not in line)
-
-        in_at = line_7d.index("in ") + len("in ")
-        # The login row's value is left-padded with spaces up to the same
-        # column, then the countdown text itself — find the first non-space
-        # character after the "login:" label.
-        after_label = line_login.index("login:") + len("login:")
-        value_at = after_label + len(line_login[after_label:]) - len(
-            line_login[after_label:].lstrip(" ")
-        )
-        assert value_at == in_at
-        assert line_login[value_at:].strip().endswith("h")  # "23d0Nh" shape
-
-    def test_login_column_aligns_for_a_no_credentials_slot(self):
-        """A sentinel row (no stored credentials) must get the same `└ `
-        glyph a measured row's login line gets, or its value starts two
-        columns earlier than the column every other row's countdown lines
-        up on."""
-        now = time.time()
-        login_expires_at = now + 23 * 86400 + 4 * 3600
-        measured = _usage_entry_lines(
-            UsageEntry(
-                last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 50.0}},
-                fetched_at=now,
-            ),
-            login_expires_at,
-        )
-        no_creds = _usage_entry_lines(
-            UsageEntry(sentinel=USAGE_NO_CREDENTIALS), login_expires_at
-        )
-
-        measured_login = next(line for line in measured if "login:" in line)
-        no_creds_login = next(line for line in no_creds if "login:" in line)
-        assert measured_login.index("login:") == no_creds_login.index("login:")
-        assert measured_login.startswith("└ ") and no_creds_login.startswith("└ ")
-
-
-# ---------------------------------------------------------------------------
-# TUI dashboard inactive rows: `tui.widgets.mini_account_text`
-# ---------------------------------------------------------------------------
-
-
-class TestDashboardMiniRowAlignment:
-    @pytest.mark.asyncio
-    async def test_login_column_starts_at_the_same_offset(self, tmp_path):
-        # Rendered through the real `AccountsPanel` (not a hand-computed
-        # `email_width`), so this fails if the panel ever stops passing the
-        # width it measures to `mini_account_text`. Includes an aliased slot:
-        # its displayed name is `alias (email)`, wider than the raw email
-        # `email_width` used to be measured over.
-        now = time.time()
-        accounts = [
-            _replace_login(make_account(1, email="a@example.com"), now + 23 * 86400 + 4 * 3600),
-            _replace_login(
-                make_account(2, email="a-much-longer-email@example.com"), None
-            ),
-            _replace_login(
-                make_account(3, email="mid@example.com", alias="dev"),
-                now + 5 * 3600 + 7 * 60,
-            ),
-        ]
-        fake = FakeSwitcher(accounts, tmp_path)
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            from claude_swap.tui.widgets import AccountsPanel
-
-            panel = app.screen.query_one(AccountsPanel).render().plain
-            lines = [line for line in panel.splitlines() if "login" in line]
-            assert len(lines) == 3
-            offsets = {line.index("login") for line in lines}
-            assert len(offsets) == 1
-
-    @pytest.mark.asyncio
-    async def test_80x24_dashboard_with_seven_accounts_keeps_usage_and_menu(
-        self, tmp_path, monkeypatch
-    ):
-        # Seven accounts at 80x24: the 14-column login token pushed the minis
-        # past the panel's 74 columns, the rows wrapped and the menu was
-        # scrolled out of view. The token now steps down (full, short, none)
-        # rather than wrap, and usage figures are never cut.
-        from textual.widgets import ListView
-
-        from claude_swap.tui.widgets import AccountsPanel, MenuItem
-
-        expires = time.time() + 23 * 86400 + 4 * 3600
-        # No reset times: this branch's chips carry a countdown (`5h(⟳1h59m):25%`)
-        # that alone passes the panel's 74 columns, so the chips here read `5h:25%`.
-        entry = UsageEntry(
-            last_good={"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}},
-            fetched_at=time.time() - 5.0,
-            age_s=5.0,
-        )
-        accounts = [
-            _replace_login(
-                make_account(
-                    n,
-                    active=n == 1,
-                    email=f"developer{n}@example.com",
-                    alias="work" if n in (1, 2) else "",
-                    entry=entry,
-                ),
-                expires,
-            )
-            for n in range(1, 8)
-        ]
-        # The plan marker fills the active header: it has no room for the
-        # token, and that must not take the minis' token with it.
-        accounts[0] = dataclasses.replace(
-            accounts[0], subscription_plan=TestPlanMarkerAndLoginTogether.PLAN
-        )
-
-        app = make_app(FakeSwitcher(accounts, tmp_path))
-        async with app.run_test(size=(80, 24)) as pilot:
-            await _workers_done(pilot)
-            await pilot.pause()
-            panel = app.screen.query_one(AccountsPanel)
-            menu = app.screen.query_one("#menu", ListView)
-
-            def dashboard():
-                shown = [
-                    item for item in menu.query(MenuItem)
-                    if menu.region.contains_region(item.region)
-                ]
-                return panel.render().plain.splitlines(), panel.size, len(shown)
-
-            lines, size, shown = dashboard()
-            assert all(cell_len(line) <= size.width for line in lines)
-            assert size.height == len(lines)  # nothing wrapped
-            minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
-            assert len(minis) == 6 and "login" not in lines[0]
-            assert all("5h:25%" in line and "7d:10%" in line for line in minis)
-            # The middle form: "login 23d" fits at 74 columns, the full one does not.
-            assert all("login 23d  " in line and "23d04h" not in line for line in minis)
-
-            # The same dashboard with no login token at all, as the menu was.
-            monkeypatch.setattr(widgets, "LOGIN_FORMS", (None,))
-            panel.refresh(layout=True)
-            await pilot.pause()
-            bare_lines, _size, bare_shown = dashboard()
-            assert len(lines) == len(bare_lines)  # the card's login row is gone too
-            assert shown == bare_shown > 0
-
-
-class TestPlanMarkerAndLoginTogether:
-    """A slot carrying both a subscription plan and a login expiry shows both."""
-
-    PLAN = {"plan": {"tier": "default_claude_max_20x"}, "fetchedAt": time.time()}
-
-    def _account(self) -> AccountSnapshot:
-        acc = make_account(2, email="a@example.com")
-        return dataclasses.replace(
-            acc, login_expires_at=time.time() + 5 * 3600 + 7 * 60, subscription_plan=self.PLAN
-        )
-
-    def test_dashboard_card_and_mini_row(self):
-        acc = self._account()
-        card = widgets.account_card_text(acc, 100).plain
-        mini = widgets.mini_account_text(acc, time.time()).plain
-        header = card.splitlines()[0]
-        assert "· Max 20x" in header and "login 5h" in header
-        assert "login" in mini and "· Max 20x" in mini
-
-    def test_cli_header_and_login_row(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
-    ):
-        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
-        creds = json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "sk-x",
-                    "refreshTokenExpiresAt": int((time.time() + 5 * 3600) * 1000),
-                }
-            }
-        )
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(switcher.sequence_file, sample_sequence_data)
-        plans = {str(n): self.PLAN for n in (1, 2)}
-
-        with patch.object(switcher, "_read_credentials", return_value=creds), \
-             patch.object(switcher, "_read_account_credentials", return_value=creds), \
-             patch.object(switcher, "_plans_for_pass", return_value=plans), \
-             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=OSError):
-            switcher.list_accounts()
-
         lines = capsys.readouterr().out.splitlines()
-        assert any("· Max 20x" in line for line in lines if line.startswith("  1:"))
-        assert any("login:" in line and "?" not in line for line in lines)
+        line_7d = next(line for line in lines if "7d:" in line)
+        (line_login,) = [line for line in lines if "login:" in line]
+        assert line_login.lstrip().startswith("└ login:")
+        assert line_login.endswith("in 5d 12h")
+        # Clock under clock, countdown under countdown.
+        assert line_login.index("expires ") + len("expires ") == line_7d.index("resets ") + len("resets ")
+        assert line_login.index("  in ") == line_7d.index("  in ")
+
+    def test_past_row(self):
+        now = time.time()
+        lines = _usage_entry_lines(UsageEntry(last_good=_MEASURED, fetched_at=now), now - 60)
+        (line,) = [line for line in lines if "login:" in line]
+        assert line.startswith("└ ") and "expired " in line and line.endswith("re-login needed")
+
+    def test_under_a_sentinel_and_a_missing_measurement(self):
+        now = time.time()
+        no_creds = _usage_entry_lines(UsageEntry(sentinel=USAGE_NO_CREDENTIALS), now + DUE)
+        assert no_creds[1].startswith("└ login:") and no_creds[1].endswith("in 5d 12h")
+        unavailable = _usage_entry_lines(UsageEntry(last_error="timeout"), now + DUE)
+        assert unavailable[0].startswith("usage unavailable")
+        assert unavailable[1].startswith("└ login:")
+
+    def test_quarantined_block_says_it_once(self):
+        now = time.time()
+        lines = _usage_entry_lines(UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED), now - 60)
+        assert lines[0].startswith("re-login may be needed")
+        assert len(lines) == 1
+
+    def test_age_note_stays_on_the_last_usage_row(self):
+        now = time.time()
+        entry = UsageEntry(last_good=_MEASURED, fetched_at=now - 3 * 3600, age_s=3 * 3600)
+        with_note = _usage_entry_lines(entry, now + DUE)
+        assert "ago" in with_note[-2] and "7d:" in with_note[-2]
+        assert "login:" in with_note[-1] and "ago" not in with_note[-1]
 
 
 # ---------------------------------------------------------------------------
-# TUI auto-view Next-best rows: `AutoScreen._candidates_text`
+# TUI dashboard: card header, mini rows, and the fit at narrow widths
 # ---------------------------------------------------------------------------
 
 
-def _replace_login(acc: AccountSnapshot, login_expires_at: float | None) -> AccountSnapshot:
-    return dataclasses.replace(acc, login_expires_at=login_expires_at)
+PLAN = {"plan": {"tier": "default_claude_max_20x"}, "fetchedAt": time.time()}
+
+# No reset times: this branch's chips carry a countdown (`5h(⟳1h59m):25%`),
+# which would pass the dashboard's 74 columns and rot a literal row, so the
+# cases that fit a width or pin a row read `5h:25%`.
+_CHIPS = UsageEntry(
+    last_good={"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}},
+    fetched_at=time.time() - 5.0,
+    age_s=5.0,
+)
 
 
-async def _workers_done(pilot) -> None:
-    """Wait for the thread workers only (the engine worker runs until its screen
-    stops it). A caller then pushes its screen and pauses once, which skips the
-    idle waits `settle()` and a key press each add."""
-    app = pilot.app
-    pending = [w for w in app.workers if w.group != "engine"]
-    if pending:
-        await app.workers.wait_for_complete(pending)
+class TestCardAndMiniRow:
+    def test_nothing_while_the_login_is_not_due(self):
+        acc = make_account(2, email="a@example.com", alias="dev")
+        fresh = _replace_login(acc, time.time() + FAR)
+        assert widgets.account_card_text(fresh, 100).plain == widgets.account_card_text(acc, 100).plain
+        assert widgets.mini_account_text(fresh, time.time()).plain == widgets.mini_account_text(acc, time.time()).plain
+
+    def test_note_ends_the_header_and_the_mini_row(self):
+        now = time.time()
+        acc = _replace_login(
+            dataclasses.replace(
+                make_account(2, email="a@example.com", alias="dev", entry=_CHIPS), subscription_plan=PLAN
+            ),
+            now + 5 * 3600 + 7 * 60,
+        )
+        header = widgets.account_card_text(acc, 100, now=now).plain.splitlines()[0]
+        assert header.endswith("· Max 20x   re-login in 5h 7m")
+        mini = widgets.mini_account_text(acc, now).plain
+        assert mini == " 2  dev (a@example.com)  [personal]  · Max 20x   5h:25% · 7d:10% · re-login in 5h 7m"
+
+    def test_quarantined_card_says_it_once(self):
+        now = time.time()
+        acc = _replace_login(
+            make_account(1, active=True, entry=make_entry(sentinel=USAGE_RELOGIN_REQUIRED)), now - 60
+        )
+        lines = widgets.account_card_text(acc, 100, now=now).plain.splitlines()
+        assert "re-login" not in lines[0]
+        assert lines[1].lstrip().startswith("⚠ re-login may be needed")
+        mini = widgets.mini_account_text(acc, now).plain
+        assert mini.count("re-login") == 1
+
+    def test_api_key_slot_shows_nothing(self):
+        acc = make_account(3, kind="api_key", entry=make_entry(sentinel=USAGE_API_KEY))
+        assert "re-login" not in widgets.mini_account_text(acc, time.time()).plain
+        assert "re-login" not in widgets.account_card_text(acc, 100).plain
+
+    def test_past_stamp_without_the_sentinel_yet(self):
+        now = time.time()
+        acc = _replace_login(make_account(2), now - 60)
+        assert widgets.mini_account_text(acc, now).plain.endswith(" · re-login needed")
 
 
-@pytest.mark.asyncio
-async def test_next_best_login_column_alignment(tmp_path, fake_engine):
-    from claude_swap.tui.autoview import AutoScreen
-
-    now = time.time()
+def _seven(expires_at: float | None) -> list[AccountSnapshot]:
+    """Seven `developerN@example.com` slots, the active one on a plan."""
     accounts = [
-        make_account(1, active=True, email="active@example.com"),
-        _replace_login(make_account(2, email="a@example.com"), now + 23 * 86400 + 4 * 3600),
         _replace_login(
-            make_account(3, email="a-much-longer-email@example.com"), None
-        ),
-        _replace_login(make_account(4, email="mid@example.com"), now + 5 * 3600 + 7 * 60),
+            make_account(
+                n, active=n == 1, email=f"developer{n}@example.com",
+                alias="work" if n in (1, 2) else "", entry=_CHIPS,
+            ),
+            expires_at,
+        )
+        for n in range(1, 8)
     ]
-    fake = FakeSwitcher(accounts, tmp_path)
-    app = make_app(fake)
-    async with app.run_test(size=(100, 40)) as pilot:
+    accounts[0] = dataclasses.replace(accounts[0], subscription_plan=PLAN)
+    return accounts
+
+
+def _mixed(expires_at: float | None) -> list[AccountSnapshot]:
+    """One long address and five short ones under a long organisation tag."""
+    accounts = [
+        make_account(1, active=True, email="developer1@example.com", entry=_CHIPS),
+        make_account(2, email="developer-with-long-name2@example.com", entry=_CHIPS),
+    ] + [
+        dataclasses.replace(
+            make_account(n, email=f"a{n}@example.com", entry=_CHIPS), org_name="Example Engineering Team"
+        )
+        for n in range(3, 8)
+    ]
+    return [_replace_login(acc, expires_at) for acc in accounts]
+
+
+async def _dashboard(tmp_path, accounts, size):
+    """(panel lines, panel content size, fully visible menu items) at ``size``."""
+    from textual.widgets import ListView
+
+    from claude_swap.tui.widgets import AccountsPanel, MenuItem
+
+    app = make_app(FakeSwitcher(accounts, tmp_path))
+    async with app.run_test(size=size) as pilot:
         await _workers_done(pilot)
-        await app.push_screen(AutoScreen())
         await pilot.pause()
-        from textual.widgets import Static
-
-        plain = app.screen.query_one("#candidates", Static).render().plain
-        lines = [line for line in plain.splitlines() if "login" in line]
-        assert len(lines) == 3
-        offsets = {line.index("login") for line in lines}
-        assert len(offsets) == 1
+        panel = app.screen.query_one(AccountsPanel)
+        menu = app.screen.query_one("#menu", ListView)
+        shown = sum(1 for item in menu.query(MenuItem) if menu.region.contains_region(item.region))
+        return panel.render().plain.splitlines(), panel.size, shown
 
 
-@pytest.mark.asyncio
-async def test_next_best_rows_never_wrap_on_a_narrow_screen(tmp_path, fake_engine):
-    """A 44-column email pushes the full `login 23d04h` token past the 76-column
-    row; the token steps down to its short form so the usage figure stays on
-    the line."""
+class TestDashboardFit:
+    @pytest.mark.asyncio
+    async def test_fresh_logins_render_exactly_as_without_the_field(self, tmp_path):
+        # The mixed case that once wrapped: the rows must be the ones a
+        # snapshot without any expiry renders, column for column.
+        fresh, size, shown = await _dashboard(tmp_path, _mixed(time.time() + FAR), (80, 24))
+        bare, _size, bare_shown = await _dashboard(tmp_path, _mixed(None), (80, 24))
+        assert fresh == bare
+        assert size.height == len(fresh)  # nothing wrapped
+        assert shown == bare_shown > 0
+
+    @pytest.mark.asyncio
+    async def test_due_note_steps_down_to_fit_the_row(self, tmp_path):
+        # 88 columns: the full note overflows the minis, the short one fits.
+        lines, size, _shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (88, 24))
+        assert all(cell_len(line) <= size.width for line in lines)
+        assert size.height == len(lines)
+        minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
+        assert len(minis) == 6
+        assert all(line.endswith("5h:25% · 7d:10% · re-login in 5d") for line in minis)
+
+    @pytest.mark.asyncio
+    async def test_due_note_goes_before_usage_does(self, tmp_path):
+        # 80 columns: not even the short note fits, so the rows read as
+        # before and keep their usage figures and the menu its rows.
+        lines, size, shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (80, 24))
+        bare, _size, bare_shown = await _dashboard(tmp_path, _seven(None), (80, 24))
+        assert lines == bare
+        assert size.height == len(lines)
+        assert shown == bare_shown > 0
+
+    @pytest.mark.asyncio
+    async def test_wide_enough_shows_the_full_note(self, tmp_path):
+        lines, size, _shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (120, 40))
+        assert all(cell_len(line) <= size.width for line in lines)
+        minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
+        assert all(line.endswith(" · re-login in 5d 12h") for line in minis)
+        assert lines[0].endswith("re-login in 5d 12h")
+
+
+# ---------------------------------------------------------------------------
+# TUI auto view: Next-best rows
+# ---------------------------------------------------------------------------
+
+
+async def _candidates(tmp_path, accounts, size):
+    from textual.widgets import Static
+
     from claude_swap.tui.autoview import AutoScreen
 
-    expires = time.time() + 23 * 86400 + 4 * 3600
-    accounts = [make_account(1, active=True, email="active@example.com")] + [
-        _replace_login(make_account(n, email=f"{'x' * 31}{n}@example.com"), expires)
-        for n in (2, 3)
-    ]
     app = make_app(FakeSwitcher(accounts, tmp_path))
-    async with app.run_test(size=(80, 24)) as pilot:
+    async with app.run_test(size=size) as pilot:
         await _workers_done(pilot)
         await app.push_screen(AutoScreen())
         await pilot.pause()
-        from textual.widgets import Static
+        box = app.screen.query_one("#candidates", Static)
+        return box.render().plain, box.size.width
 
-        candidates = app.screen.query_one("#candidates", Static)
-        rows = [line for line in candidates.render().plain.splitlines() if "login" in line]
+
+class TestNextBest:
+    @pytest.mark.asyncio
+    async def test_fresh_logins_leave_the_rows_alone(self, tmp_path, fake_engine):
+        now = time.time()
+        accounts = [
+            make_account(1, active=True, email="active@example.com"),
+            _replace_login(make_account(2, email="a@example.com"), now + FAR),
+            _replace_login(make_account(3, email="a-much-longer-email@example.com"), None),
+        ]
+        plain, _width = await _candidates(tmp_path, accounts, (100, 40))
+        assert "re-login" not in plain
+        bare, _width = await _candidates(tmp_path, [_replace_login(acc, None) for acc in accounts], (100, 40))
+        assert plain == bare  # the rows a snapshot without any expiry renders
+
+    @pytest.mark.asyncio
+    async def test_due_note_ends_the_row_and_steps_down_when_narrow(self, tmp_path, fake_engine):
+        # 40-column addresses at 80 columns: the full note overflows the
+        # 76-column row, the short one fits, and the usage figure stays. (This
+        # branch's chips are wider, so the address is cut as well.)
+        expires = time.time() + DUE
+        accounts = [make_account(1, active=True, email="active@example.com")] + [
+            _replace_login(make_account(n, email=f"{'x' * 27}{n}@example.com"), expires) for n in (2, 3)
+        ]
+        plain, width = await _candidates(tmp_path, accounts, (80, 24))
+        rows = [line for line in plain.splitlines() if "re-login" in line]
         assert len(rows) == 2
-        assert all(cell_len(row) <= candidates.size.width for row in rows)
-        # the usage figure stays on the line; this branch's chips carry no "used" wording
-        assert all("10%" in row and "login 23d" in row and "23d04h" not in row for row in rows)
+        assert all(cell_len(row) <= width for row in rows)
+        assert all(row.endswith("10%  re-login in 5d") for row in rows)
+
+
+# ---------------------------------------------------------------------------
+# TUI switch screen: the account cards
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_switch_screen_card_header_keeps_login_within_the_width(tmp_path):
+async def test_switch_screen_card_header_keeps_the_note_within_the_width(tmp_path):
     from claude_swap.tui.dashboard import SwitchScreen
     from claude_swap.tui.widgets import AccountCard
 
     acc = _replace_login(
-        make_account(1, active=True, email="dev-account-1@a.io", alias="work"),
-        time.time() + 23 * 86400 + 4 * 3600,
+        make_account(1, active=True, email="dev-account-1@a.io", alias="work"), time.time() + DUE
     )
-    app = make_app(FakeSwitcher([acc, make_account(2)], tmp_path))
-    async with app.run_test(size=(70, 24)) as pilot:
-        await _workers_done(pilot)
-        await app.push_screen(SwitchScreen())
-        await pilot.pause()
-        card = app.screen.query(AccountCard).first()
-        header = card.render().plain.splitlines()[0]
-        assert cell_len(header) <= card.size.width
-        assert "login 23d" in header
+    # 76 columns: the full note overflows the header, the short one fits.
+    for size, expect in (((100, 24), "re-login in 5d 12h"), ((76, 24), "re-login in 5d")):
+        app = make_app(FakeSwitcher([acc, make_account(2)], tmp_path))
+        async with app.run_test(size=size) as pilot:
+            await _workers_done(pilot)
+            await app.push_screen(SwitchScreen())
+            await pilot.pause()
+            card = app.screen.query(AccountCard).first()
+            header = card.render().plain.splitlines()[0]
+            assert cell_len(header) <= card.size.width
+            assert header.endswith(expect)

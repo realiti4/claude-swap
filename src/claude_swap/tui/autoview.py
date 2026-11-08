@@ -109,14 +109,15 @@ class CandidateRow:
     number: Text
     email: Text
     usage: Text  # the chip block, the spend text, or the sentinel note
-    login: Text = field(default_factory=Text)
-    # The login in its short form, for a narrow panel; a row without one keeps the long form.
-    login_short: Text = field(default_factory=Text)
     status: dict[str, Text] = field(default_factory=dict)  # keys of STATUS_ORDER
     # The short form of a status piece, for a narrow panel; a key without one
     # keeps its long text.
     short: dict[str, Text] = field(default_factory=dict)
     where: Text = field(default_factory=Text)  # where-in-use markers, joined by " · "
+    # The `re-login in 5d 12h` note that ends the row, empty unless the login is
+    # due, and its short form for a narrow panel (a row without one keeps the long).
+    login: Text = field(default_factory=Text)
+    login_short: Text = field(default_factory=Text)
     note: bool = False  # usage is free text (a sentinel note): it sizes no column
 
     def __post_init__(self) -> None:
@@ -147,7 +148,7 @@ def render_candidate_rows(
     display column on all of them. A slot is as wide as its widest cell over
     every row that fills it; a free-text usage note sizes nothing, and a slot
     empty on every row takes no column at all. The status pieces and `where`
-    are one trailing note cell, joined by a dot, `where` last.
+    are one note cell, joined by a dot, `where` last; the login note ends the row.
 
     Over `width`, the block takes ONE form so its columns stay aligned. In
     this order it gives up: the login, to its short form; the email slot, cut
@@ -186,10 +187,10 @@ def render_candidate_rows(
         """Every row at an email slot of at most `email` columns, its login in
         the `login` form; with `room`, a note is cut to end by that column."""
         grid = [
-            [row.number, _cut(row.email, email), login_in(row, login), row.usage, note(row, short)]
+            [row.number, _cut(row.email, email), row.usage, note(row, short), login_in(row, login)]
             for row in rows
         ]
-        usage = 3
+        usage, notes = 2, 3
         widths = [2, 0, 0, 0, 0]  # the number is right-aligned, two wide at least
         used = [False] * len(widths)
         for row, cells in zip(rows, grid):
@@ -203,7 +204,7 @@ def render_candidate_rows(
             for i, cell in enumerate(cells):
                 if i and not used[i]:
                     continue
-                if room is not None and i == len(cells) - 1:
+                if room is not None and i == notes:
                     if (left := room - line.cell_len - 2) < 2:
                         continue
                     cell = _cut(cell, left)
@@ -795,10 +796,10 @@ class AutoScreen(Screen):
                 Text(acc.number, style=palette.foreground),
                 Text(acc.email, style=palette.foreground),
                 usage,
-                login=Text(login_segment(acc, "full", gap="").strip(), style=palette.muted),
-                login_short=Text(login_segment(acc, "short", gap="").strip(), style=palette.muted),
                 status=status,
                 short=short,
+                login=Text(login_segment(acc, "full", gap=""), style=palette.muted),
+                login_short=Text(login_segment(acc, "short", gap=""), style=palette.muted),
                 note=free_text,
             )
 

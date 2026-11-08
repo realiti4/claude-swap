@@ -254,46 +254,64 @@ def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
 
 def test_format_account_label():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
 def test_format_account_label_with_alias():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
-    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
 
 
 def test_format_account_label_disabled_marker():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
-    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
-def test_format_account_label_login_expiry():
+def test_format_account_label_login_due():
     now = 1_000_000.0
     label = menubar.format_account_label(
-        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 23 * 86400 + 4 * 3600
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 5 * 86400 + 12 * 3600
     )
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login 23d04h"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · re-login in 5d 12h"
 
 
-def test_format_account_label_login_expiry_unknown():
+def test_format_account_label_login_not_due_yet_says_nothing():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 23 * 86400
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_login_unknown_says_nothing():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, login_expires_at=None)
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
-def test_format_account_label_login_expiry_quarantined():
+def test_format_account_label_login_past():
     now = 1_000_000.0
     label = menubar.format_account_label(
-        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 999_999, quarantined=True
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now - 60
     )
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login needed"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · re-login needed"
 
 
-def test_format_account_label_usage_unavailable_still_carries_login_token():
+def test_format_account_label_quarantined_row_already_says_it():
+    # The sentinel text is the row's usage summary; no second "re-login".
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED],
+        now=now, login_expires_at=now - 60, quarantined=True,
+    )
+    assert label == "2  loc@papaya.asia  re-login may be needed"
+
+
+def test_format_account_label_usage_unavailable_still_carries_the_note():
     now = 1_000_000.0
     label = menubar.format_account_label(
         2, "loc@papaya.asia", None, now=now, login_expires_at=now + 5 * 3600 + 7 * 60
     )
-    assert label == "2  loc@papaya.asia  usage unavailable · login 5h07m"
+    assert label == "2  loc@papaya.asia  usage unavailable · re-login in 5h 7m"
 
 
 # --- usage logging -------------------------------------------------------------
@@ -877,7 +895,7 @@ def test_account_row_shows_the_sentinel_state_not_the_remedy():
     label = menubar.format_account_label(
         2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
     )
-    assert label.endswith("re-login may be needed · login ?")
+    assert label.endswith("re-login may be needed")
     assert "cswap add" not in label
 
 

@@ -2594,7 +2594,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.policy = AccountPolicy()
-        a.login_expires_at = None  # the login column reads it; a MagicMock is not a time
+        a.login_expires_at = None  # the re-login note reads it; a MagicMock is not a time
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
         return a
@@ -2765,11 +2765,9 @@ class TestUnswitchableRowsAreListed:
             }),
             self._acct("4", "new@x.com", switchable=False),
         ), active="9")
-        # The login token is a slot of its own (a note row has none): content starts after it.
-        lead = r"\s+\d+\s+\S+\s+(?:login \S+\s+)?"
-        rows = [line for line in out.split("\n") if re.match(lead, line)]
+        rows = [line for line in out.split("\n") if re.match(r"\s+\d+\s+\S+\s+", line)]
         assert len(rows) == 3, rows
-        columns = [re.match(lead, line).end() for line in rows]
+        columns = [re.match(r"\s+\d+\s+\S+\s+", line).end() for line in rows]
         assert columns[0] == columns[1] == columns[2], (
             f"content does not share a column: {columns} in {rows!r}"
         )
@@ -2849,7 +2847,7 @@ class TestUnswitchableRowsAreListed:
         ), active="9", settings=settings)
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
         assert len(rows) == 3, rows
-        assert re.search(r"cccc@x\.com\s+(?:login \S+\s+)?7d:", rows["cccc@x.com"]), rows  # no leading dot
+        assert re.search(r"cccc@x\.com\s+7d:", rows["cccc@x.com"]), rows  # no leading dot
         assert "7d(⟳" in rows["aaaa@x.com"] and "7d:" in rows["bbbb@x.com"], rows  # widths differ
         for window in ("5h", "7d", "Fable"):
             hits = [
@@ -3115,7 +3113,7 @@ _SLOT_USAGE_TEXT = {
 
 class TestNextBestRowSlots:
     """`render_candidate_rows` is the one place a Next best row is padded:
-    every marker is a named slot (number | email | login | usage | note), the
+    every marker is a named slot (number | email | usage | note | login), the
     note being the status pieces then `where` in one cell, and a slot starts
     in the SAME display column on every row of the block. Each PR that added a
     marker used to pad it itself, and the integration build stitched the
@@ -3133,7 +3131,7 @@ class TestNextBestRowSlots:
             email=Text(f"李{number}@例え.jp" if wide
                        else f"u{number}@x.com"),
             usage=Text(_SLOT_USAGE_TEXT.get(usage, usage)),
-            login=Text("login 6d" if login else ""),
+            login=Text("re-login in 6d" if login else ""),
             status={k: Text(_SLOT_STATUS_TEXT[k]) for k in on},
             where=Text("○ cloud" if where else ""),
             note=usage not in ("chip", "spend"),
@@ -3147,7 +3145,7 @@ class TestNextBestRowSlots:
             rows, Palette.from_theme(CSWAP_DARK), width
         ).plain.split("\n")[1:]
 
-    _SLOTS = ("number", "email", "login", "usage", "note")
+    _SLOTS = ("number", "email", "usage", "note", "login")
 
     def _aligned(self, rows):
         """Render `rows` and assert every slot starts in one display column on
@@ -3170,8 +3168,8 @@ class TestNextBestRowSlots:
             )
             pos = 0
             for slot, text in zip(self._SLOTS, (
-                row.number.plain, row.email.plain, row.login.plain,
-                row.usage.plain, note,
+                row.number.plain, row.email.plain, row.usage.plain,
+                note, row.login.plain,
             )):
                 if not text:
                     continue
