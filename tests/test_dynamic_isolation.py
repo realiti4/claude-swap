@@ -176,6 +176,8 @@ def base_rev_digests(tmp_path_factory):
     )
 
 
+# One xdist worker runs the group, so `base_rev_digests` is built once.
+@pytest.mark.xdist_group("base-rev-digests")
 class TestDynamicLeavesTheBaseRevisionAlone:
     """The actual adr/0009 measurement: golden values above pin FUTURE
     drift on this branch, which is not the same claim as "this round left

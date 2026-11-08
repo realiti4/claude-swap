@@ -3277,6 +3277,9 @@ def _base_engine_results(
     return _BASE_ENGINE_RUNS[run_key]
 
 
+# One xdist worker runs both digest classes, so the memoised head and base
+# runs (`_head_digests`, `_BASE_ENGINE_RUNS`) are built once, not per worker.
+@pytest.mark.xdist_group("outcome-digests")
 class TestOutcomeDigestAgainstBase:
     """The #321 invariant: `best`'s ranking/admission must stay identical to
     the PR's base commit except the one exclusion this PR adds. Proven by
@@ -3577,6 +3580,7 @@ class TestOutcomeDigestAgainstBase:
 _ROUND_375_BASE_SHA = "a32a34d779ac5cb2838afe49df1cc41ec801be27"
 
 
+@pytest.mark.xdist_group("outcome-digests")
 class TestOutcomeDigest375:
     """F5 (#375): the motivating window, reconstructed as a named fixture
     from the coordinator/analyzer evidence (10:01:32Z Account-3 at 5h 78% /
