@@ -42,6 +42,17 @@ async def _workers_done(pilot) -> None:
         await app.workers.wait_for_complete(pending)
 
 
+async def _laid_out(pilot, query):
+    """The first widget matching ``query`` once it has a width. One pause is not
+    a layout: a slow runner (Windows CI) reads the widget at 0x0."""
+    for _ in range(100):
+        await pilot.pause(0.05)
+        widget = next(iter(pilot.app.screen.query(query)), None)
+        if widget is not None and widget.size.width:
+            return widget
+    pytest.fail(f"{query!r} was never laid out")
+
+
 # ---------------------------------------------------------------------------
 # The rule: oauth.login_time_left / format_login_expiry
 # ---------------------------------------------------------------------------
@@ -287,8 +298,7 @@ async def _dashboard(tmp_path, accounts, size):
     app = make_app(FakeSwitcher(accounts, tmp_path))
     async with app.run_test(size=size) as pilot:
         await _workers_done(pilot)
-        await pilot.pause()
-        panel = app.screen.query_one(AccountsPanel)
+        panel = await _laid_out(pilot, AccountsPanel)
         menu = app.screen.query_one("#menu", ListView)
         shown = sum(1 for item in menu.query(MenuItem) if menu.region.contains_region(item.region))
         return panel.render().plain.splitlines(), panel.size, shown
@@ -340,16 +350,13 @@ class TestDashboardFit:
 
 
 async def _candidates(tmp_path, accounts, size):
-    from textual.widgets import Static
-
     from claude_swap.tui.autoview import AutoScreen
 
     app = make_app(FakeSwitcher(accounts, tmp_path))
     async with app.run_test(size=size) as pilot:
         await _workers_done(pilot)
         await app.push_screen(AutoScreen())
-        await pilot.pause()
-        box = app.screen.query_one("#candidates", Static)
+        box = await _laid_out(pilot, "#candidates")
         return box.render().plain, box.size.width
 
 
@@ -401,14 +408,7 @@ async def test_switch_screen_card_header_keeps_the_note_within_the_width(tmp_pat
         async with app.run_test(size=size) as pilot:
             await _workers_done(pilot)
             await app.push_screen(SwitchScreen())
-            # One pause is not a layout: a slow runner reads the card at 0x0.
-            for _ in range(100):
-                await pilot.pause(0.05)
-                card = next(iter(app.screen.query(AccountCard)), None)
-                if card is not None and card.size.width:
-                    break
-            else:
-                pytest.fail("the account card was never laid out")
+            card = await _laid_out(pilot, AccountCard)
             header = card.render().plain.splitlines()[0]
             assert cell_len(header) <= card.size.width
             assert header.endswith(expect)
