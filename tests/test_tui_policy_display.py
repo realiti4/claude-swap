@@ -19,10 +19,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from claude_swap.models import AccountPolicy, UsageEntry
+from claude_swap.settings import load_settings
+from claude_swap.tui.autoview import AutoScreen
+from claude_swap.tui.theme import CSWAP_DARK
 from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
@@ -231,7 +235,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
 
     async def test_the_model_gate_and_label_follow_each_accounts_own_line(
-        self, tmp_path, fake_engine
+        self, tmp_path
     ):
         # Dynamic, model Fable, global 90. Account 2 sits at Fable 92% under a
         # 95% line of its own: open, so the engine's model-gated pass ranks on
@@ -260,15 +264,16 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             ],
             tmp_path,
         )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user2@example.com") < plain.index(
-                "user3@example.com"
-            )
-            assert "Fable-only" not in self._row(plain, "user2@example.com")
-            assert "Fable-only" in self._row(plain, "user3@example.com")
+        # Rendered straight off the screen: the ranking needs no engine and no
+        # pilot (the sibling tests cover the mount wiring).
+        v = AutoScreen.__new__(AutoScreen)
+        v._settings = load_settings(tmp_path)
+        v._engine = None
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK
+        with patch.object(AutoScreen, "app", property(lambda s: app)):
+            snap = fake.accounts_snapshot()
+            plain = str(v._candidates_text(snap, active_number=snap.active_number))
+        assert plain.index("user2@example.com") < plain.index("user3@example.com")
+        assert "Fable-only" not in self._row(plain, "user2@example.com")
+        assert "Fable-only" in self._row(plain, "user3@example.com")
