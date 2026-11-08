@@ -831,6 +831,13 @@ def test_engine_error_is_surfaced_the_first_time():
     assert should_surface_engine_error(ev, {}, now=1000.0) is True
 
 
+def test_engine_stop_error_is_left_to_the_engine_stopped_notice():
+    # run_loop's final non-transient error and the menu bar's own
+    # EngineStoppedEvent describe one stop; only the second is surfaced.
+    ev = ErrorEvent(message="engine stopped: unhandled error", transient=False)
+    assert should_surface_engine_error(ev, {}, now=1000.0) is False
+
+
 def test_engine_error_repeating_every_tick_is_not_a_notification_storm():
     ev = ErrorEvent(message="Current account credential is empty")
     seen: dict = {}
@@ -949,6 +956,17 @@ def test_health_label_running():
         auto_enabled=True, engine_running=True, usage_age=30, refresh_interval=60
     )
     assert label == "Auto-switch running · usage read just now"
+    assert attention is False
+
+
+def test_health_label_demoted_engine_is_dry_run_not_running():
+    # An engine that lost the live lock stays hosted but only dry-runs; the
+    # auto-switch item already says so, and "stopped" would offer a restart
+    # that returns early while an engine is hosted.
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=True, dry_run=True, usage_age=30, refresh_interval=60
+    )
+    assert label == "Auto-switch dry run · usage read just now"
     assert attention is False
 
 

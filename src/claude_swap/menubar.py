@@ -304,21 +304,22 @@ def health_label(
     engine_running: bool,
     usage_age: float | None,
     refresh_interval: int,
+    dry_run: bool = False,
 ) -> tuple[str, bool]:
     """The menu's first row: ``(label, attention)``.
 
     Four states hide behind "the icon is there": auto-switch off in settings,
-    enabled with the engine running, enabled with no engine (it failed to
-    start or its thread died), and usage that stopped being read. The row
-    names the first three and dates the fourth from the active account's last
-    reading (:func:`active_usage_age`); ``attention`` is True for the state
-    that needs a click, so the caller can wire a restart to the row and flag
-    the title.
+    enabled with the engine running (or only dry-running, when it lost the live
+    lock: ``dry_run``), enabled with no engine (it failed to start or its
+    thread died), and usage that stopped being read. The row names the first
+    three and dates the fourth from the active account's last reading
+    (:func:`active_usage_age`); ``attention`` is True for the state that needs
+    a click, so the caller can wire a restart to the row and flag the title.
     """
     if not auto_enabled:
         status, attention = "Auto-switch off", False
     elif engine_running:
-        status, attention = "Auto-switch running", False
+        status, attention = f"Auto-switch {'dry run' if dry_run else 'running'}", False
     else:
         status, attention = "⚠ Auto-switch stopped, click to restart", True
     stale_after = max(STALE_REFRESH_INTERVALS * refresh_interval, STALE_USAGE_FLOOR_S)
@@ -560,7 +561,9 @@ def should_surface_engine_error(event, surfaced: dict, now: float) -> bool:
     message, so two errors alternating tick by tick can't defeat the limit.
     """
     message = getattr(event, "message", None)
-    if not message:
+    # A non-transient error is run_loop's own "engine stopped"; the menu bar's
+    # EngineStoppedEvent follows it with the cause, so one stop is one notice.
+    if not message or not getattr(event, "transient", True):
         return False
     # Digits stripped so a message carrying a changing id, count or time is
     # still one error, and stale entries pruned so the table stays bounded.
@@ -937,6 +940,7 @@ def run(switcher) -> int:
             return health_label(
                 auto_enabled=self.settings.auto_switch_enabled,
                 engine_running=self._engine is not None,
+                dry_run=getattr(self._engine, "demoted_from_live", False),
                 usage_age=active_usage_age(self.snapshot),
                 refresh_interval=self.settings.refresh_interval,
             )
