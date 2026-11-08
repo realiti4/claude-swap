@@ -153,8 +153,10 @@ def render_candidate_rows(
     Over `width`, the block takes ONE form so its columns stay aligned. In
     this order it gives up: the login, to its short form; the email slot, cut
     to a shared width no narrower than EMAIL_FLOOR; the long status texts for
-    their short ones; the login, the email taking back the room it frees;
-    last, the note itself, cut to the room left. The usage slot is never cut.
+    their short ones; the login; last, the note itself, cut to the room left.
+    A form given up stays given up at every narrower width: the email slot
+    keeps the width its cut left it and takes back no room a later step frees.
+    The usage slot is never cut.
     A free-text note row counts in the fit unless it overflows even with no
     login and the email at its floor: that one never fits, so it is left out
     and carries no login."""
@@ -240,7 +242,9 @@ def render_candidate_rows(
     def over(block: list[Text]) -> int:
         return max((line.cell_len for ok, line in zip(fits, block) if ok), default=0) - limit
 
-    # (login form, short status texts, email cut): each step keeps what the one before gave up.
+    # (login form, short status texts, email cut): each step keeps what the one
+    # before gave up, the email slot at the width the last cut left it.
+    email = widest
     for login, short, cut in (
         ("full", False, False),
         ("short", False, False),
@@ -248,9 +252,10 @@ def render_candidate_rows(
         ("short", True, True),
         (None, True, True),
     ):
-        shown = lines(widest, short, login)
+        shown = lines(email, short, login)
         if cut and over(shown) > 0:
-            shown = lines(max(EMAIL_FLOOR, widest - over(shown)), short, login)
+            email = max(EMAIL_FLOOR, email - over(shown))
+            shown = lines(email, short, login)
         if over(shown) <= 0:
             break
     else:

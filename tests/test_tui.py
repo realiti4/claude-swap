@@ -3311,10 +3311,29 @@ class TestNextBestRowSlots:
         _lines, slot = self._fit(70, self._NOTES)  # 25 + 12 + 33
         assert slot == EMAIL_FLOOR
         # One column fewer: every row gives its long form up at once, and the
-        # email takes back what the short forms free (a piece without a short
-        # form keeps its long one).
+        # email, already cut, stays at its floor (a piece without a short form
+        # keeps its long one).
         _lines, slot = self._fit(69, self._SHORT_NOTES)
-        assert slot == 69 - 25 - 23
+        assert slot == EMAIL_FLOOR
+
+    def test_the_email_slot_never_takes_room_back_as_the_width_falls(self):
+        """A form given up stays given up: from 120 columns down to 60 the
+        email slot is never wider than at the width before. That covers the
+        whole email returning beside short words after it was cut, and the
+        email growing again when the login is dropped."""
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        rows = [CandidateRow(
+            number=Text(str(n)), email=Text(f"someone.long.name{n}@example.com"),
+            usage=Text(_SLOT_USAGE_TEXT["chip"]),
+            status={"capped": Text("limit 97% reached"), "disabled": Text("auto-swap off")},
+            short={"capped": Text("97%"), "disabled": Text("off")},
+            login=Text("re-login in 5d 12h"), login_short=Text("re-login in 5d"),
+        ) for n in (1, 2)]
+        slots = [self._render(rows, w)[0].index("5h:") - 8 for w in range(120, 59, -1)]
+        assert slots == sorted(slots, reverse=True), slots
 
     def test_a_sentinel_row_wider_than_the_panel_does_not_move_the_chip_rows(self):
         """A free-text note never fits and is never cut, so it is left out of
@@ -3392,15 +3411,15 @@ class TestNextBestRowSlots:
         lines = self._render(rows, width)
         assert all(cell_len(line) <= width for line in lines), (width, lines)
 
-    def test_dropping_the_login_alone_keeps_the_email_it_leaves_room_for(self):
-        """Short login, email at its floor and short statuses all overflow at
-        50 columns, but the row fits with no login and a 27-column email: the
-        email is not cut down to the floor as well."""
+    def test_dropping_the_login_leaves_the_cut_email_at_its_floor(self):
+        """Short login and the email at its floor overflow at 50 columns, so the
+        login goes; the email, already cut, does not take back the room it frees
+        (a 27-column email would fit)."""
         emails = [f"someone.long.name{n}@example.com" for n in (1, 2)]  # 30 columns
         rows = [self._login_row(n, email=email) for n, email in enumerate(emails, 1)]
         lines = self._render(rows, 50)
         assert lines == [
-            f"   {n}  {email[:26]}…  5h:25% · 7d:10%" for n, email in enumerate(emails, 1)
+            f"   {n}  {email[:11]}…  5h:25% · 7d:10%" for n, email in enumerate(emails, 1)
         ]
 
     def test_a_note_with_one_column_of_room_is_dropped_not_cut_to_a_lone_ellipsis(self):
