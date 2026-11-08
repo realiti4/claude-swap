@@ -104,7 +104,7 @@ EMAIL_FLOOR = 12  # display columns the email slot is cut to, at the least
 class CandidateRow:
     """One Next best row as named slots. A producer fills a slot and never
     pads it: `render_candidate_rows` owns every column. `status` and `where`
-    render as ONE trailing note, `where` last."""
+    render as ONE trailing note, `where` last; the `login` note is the last slot."""
 
     number: Text
     email: Text
@@ -153,8 +153,10 @@ def render_candidate_rows(
     Over `width`, the block takes ONE form so its columns stay aligned. In
     this order it gives up: the login, to its short form; the email slot, cut
     to a shared width no narrower than EMAIL_FLOOR; the long status texts for
-    their short ones; the login; last, the note itself, cut to the room left.
-    The usage slot is never cut."""
+    their short ones; the login, the email taking back the room it frees;
+    last, the note itself, cut to the room left. The usage slot is never cut.
+    A free-text note row counts in the fit unless it overflows even with no
+    login and the email uncut: that one never fits, so it is left out."""
     sep = Text(" \u00b7 ", style=palette.muted)
 
     def note(row: CandidateRow, short: bool) -> Text:
@@ -224,20 +226,24 @@ def render_candidate_rows(
 
     limit = 10**9 if width is None else width
 
-    def over(block: list[Text]) -> int:
-        # A free-text note row is left out: it never fits and is never cut.
-        return max(
-            (line.cell_len for row, line in zip(rows, block) if not row.note),
-            default=0,
-        ) - limit
-
     widest = max((row.email.cell_len for row in rows), default=0)
+    # A free-text note row that overflows without its login is left out of the
+    # fit: its text is never cut, so only its login is the fit's to give up.
+    fits = [
+        not row.note or line.cell_len <= limit
+        for row, line in zip(rows, lines(widest, True))
+    ]
+
+    def over(block: list[Text]) -> int:
+        return max((line.cell_len for ok, line in zip(fits, block) if ok), default=0) - limit
+
     # (login form, short status texts, email cut): each step keeps what the one before gave up.
     for login, short, cut in (
         ("full", False, False),
         ("short", False, False),
         ("short", False, True),
         ("short", True, True),
+        (None, True, True),
     ):
         shown = lines(widest, short, login)
         if cut and over(shown) > 0:

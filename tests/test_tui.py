@@ -3332,6 +3332,55 @@ class TestNextBestRowSlots:
                 self._render(chip_rows, width)
             ), width
 
+    def _login_row(self, number, usage="chip", email=None):
+        """A row whose login is due, in both forms; `sentinel` is a free-text note row."""
+        from rich.text import Text
+
+        from claude_swap.tui.autoview import CandidateRow
+
+        return CandidateRow(
+            Text(str(number)), Text(email or f"u{number}@x.com"),
+            Text(_SLOT_USAGE_TEXT.get(usage, usage)),
+            login=Text("re-login in 5d 12h"), login_short=Text("re-login in 5d"),
+            note=usage not in ("chip", "spend"),
+        )
+
+    @pytest.mark.parametrize("usages", [("sentinel", "sentinel"), ("chip", "sentinel")])
+    def test_a_note_rows_login_steps_down_with_the_block_and_is_dropped_to_fit(self, usages):
+        """A sentinel or `usage unknown` row ends in the login too, so the fit
+        counts it: the chip rows alone fit at 55 columns with the full login,
+        the note row (20 columns of usage) does not, and when nothing is left
+        to give but the login it goes from every row."""
+        from rich.cells import cell_len
+
+        rows = [self._login_row(n, u) for n, u in enumerate(usages, 1)]
+        for width, login in ((200, "re-login in 5d 12h"), (55, "re-login in 5d"), (40, "")):
+            lines = self._render(rows, width)
+            assert all(cell_len(line) <= width for line in lines), (width, lines)
+            assert all(line.endswith(login) for line in lines), (width, lines)
+            assert ("re-login" in "\n".join(lines)) == bool(login), (width, lines)
+
+    def test_a_note_row_that_never_fits_does_not_move_the_chip_rows_login(self):
+        """A note row wider than the panel even without its login is left out of
+        the fit as before: the chip rows keep the form they would have alone."""
+        chip_rows = [self._login_row(n) for n in (1, 2)]
+        hopeless = self._login_row(3, "x" * 150)
+        for width in (200, 55, 40):
+            assert self._render(chip_rows + [hopeless], width)[:-1] == (
+                self._render(chip_rows, width)
+            ), width
+
+    def test_dropping_the_login_alone_keeps_the_email_it_leaves_room_for(self):
+        """Short login, email at its floor and short statuses all overflow at
+        50 columns, but the row fits with no login and a 27-column email: the
+        email is not cut down to the floor as well."""
+        emails = [f"someone.long.name{n}@example.com" for n in (1, 2)]  # 30 columns
+        rows = [self._login_row(n, email=email) for n, email in enumerate(emails, 1)]
+        lines = self._render(rows, 50)
+        assert lines == [
+            f"   {n}  {email[:26]}…  5h:25% · 7d:10%" for n, email in enumerate(emails, 1)
+        ]
+
     def test_a_note_with_one_column_of_room_is_dropped_not_cut_to_a_lone_ellipsis(self):
         lines = self._render(self._note_rows(), 38)  # the note column would start at 37
         assert all(line.endswith("5h:25% · 7d:10%") for line in lines), lines
@@ -3381,7 +3430,7 @@ class TestNextBestRowSlots:
                 short={"mystery": Text("m")},
             )
 
-    @pytest.mark.parametrize("cell", ["login", "where", "status", "short"])
+    @pytest.mark.parametrize("cell", ["login", "login_short", "where", "status", "short"])
     @pytest.mark.parametrize("text", [" pad", "pad ", " "])
     def test_a_marker_that_pads_itself_is_refused(self, cell, text):
         """The renderer owns every column: a producer's own blanks would
