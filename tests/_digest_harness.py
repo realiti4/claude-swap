@@ -289,3 +289,63 @@ def run_jobs(engine_cls, root: Path, jobs: list[dict], seed: int, n_fleets: int)
             )
         )
     return out
+
+
+def _iso_at(epoch: float) -> str:
+    """An absolute epoch as the ISO-Z string a window's ``resets_at`` carries."""
+    from datetime import datetime, timezone
+
+    return (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _random_fleet(seed: int, now: float, n: int = 5) -> dict:
+    rng = random.Random(seed)
+    fleet = {}
+    for i in range(1, n + 1):
+        fleet[str(i)] = {
+            "five_hour": {"pct": rng.uniform(0, 100)},
+            "seven_day": {
+                "pct": rng.uniform(0, 100),
+                "resets_at": _iso_at(now + rng.uniform(3600, 30 * 86400)),
+            },
+            "scoped": [{"name": "Fable", "pct": rng.uniform(0, 100)}],
+        }
+    return fleet
+
+
+def _run_trace(home, strategy: str, model: str, seed: int) -> list:
+    """One fresh ``home`` per call — a shared root across combos leaves the
+    prior combo's switched-to account and backups behind, aliasing the next
+    one's decisions onto stale state (measured: reusing one ``temp_home``
+    across the four combos below moved a digest that a fresh root does not).
+
+    ``Path.home()`` stays patched for the whole call, not only construction:
+    ``make_live()`` and ``tick()`` both resolve the active account through
+    ``paths.*``, which reads ``Path.home()`` live — patched only around
+    ``EngineHarness.__init__`` (as the conftest ``temp_home`` fixture does
+    NOT do here) reads every tick's active account off the real ambient
+    home instead, and every tick reads `no-active-account` (measured).
+    """
+    home.mkdir()
+    (home / ".claude").mkdir()
+    with (
+        patch("pathlib.Path.home", return_value=home),
+        patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+    ):
+        h = EngineHarness(home, model=model, threshold=90.0, strategy=strategy)
+        fleet = _random_fleet(seed, h.clock.now)
+        for num in fleet:
+            h.seed(int(num), f"acc{num}@example.com")
+        h.make_live("acc1@example.com", 1)
+        trace = []
+        for _ in range(8):
+            n0 = len(h.events)
+            outcome = h.tick_with_usage(fleet)
+            events = [(e.kind, getattr(e, "reason", None)) for e in h.events[n0:]]
+            trace.append([outcome.name, h.active_number(), events])
+            h.clock.advance(300.0)
+    return trace

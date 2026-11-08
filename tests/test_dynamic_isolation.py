@@ -12,16 +12,14 @@ import hashlib
 import io
 import json
 import os
-import random
 import subprocess
 import sys
 import tarfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
-from tests.test_autoswitch import EngineHarness, _iso_at
+from tests._digest_harness import _run_trace
 
 # This PR's own base — before DRAIN STATE — for the cross-revision check
 # below. Not "integration"/trunk; this branch's history.
@@ -48,55 +46,6 @@ _GOLDEN = {
 # control vacuous. Found by sweeping seeds 1-59 for one whose dynamic/Fable
 # trace actually differs.
 _DYNAMIC_SEED = 5
-
-
-def _random_fleet(seed: int, now: float, n: int = 5) -> dict:
-    rng = random.Random(seed)
-    fleet = {}
-    for i in range(1, n + 1):
-        fleet[str(i)] = {
-            "five_hour": {"pct": rng.uniform(0, 100)},
-            "seven_day": {
-                "pct": rng.uniform(0, 100),
-                "resets_at": _iso_at(now + rng.uniform(3600, 30 * 86400)),
-            },
-            "scoped": [{"name": "Fable", "pct": rng.uniform(0, 100)}],
-        }
-    return fleet
-
-
-def _run_trace(home, strategy: str, model: str, seed: int) -> list:
-    """One fresh ``home`` per call — a shared root across combos leaves the
-    prior combo's switched-to account and backups behind, aliasing the next
-    one's decisions onto stale state (measured: reusing one ``temp_home``
-    across the four combos below moved a digest that a fresh root does not).
-
-    ``Path.home()`` stays patched for the whole call, not only construction:
-    ``make_live()`` and ``tick()`` both resolve the active account through
-    ``paths.*``, which reads ``Path.home()`` live — patched only around
-    ``EngineHarness.__init__`` (as the conftest ``temp_home`` fixture does
-    NOT do here) reads every tick's active account off the real ambient
-    home instead, and every tick reads `no-active-account` (measured).
-    """
-    home.mkdir()
-    (home / ".claude").mkdir()
-    with (
-        patch("pathlib.Path.home", return_value=home),
-        patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
-    ):
-        h = EngineHarness(home, model=model, threshold=90.0, strategy=strategy)
-        fleet = _random_fleet(seed, h.clock.now)
-        for num in fleet:
-            h.seed(int(num), f"acc{num}@example.com")
-        h.make_live("acc1@example.com", 1)
-        trace = []
-        for _ in range(8):
-            n0 = len(h.events)
-            outcome = h.tick_with_usage(fleet)
-            events = [(e.kind, getattr(e, "reason", None)) for e in h.events[n0:]]
-            trace.append([outcome.name, h.active_number(), events])
-            h.clock.advance(300.0)
-    return trace
 
 
 def _digest(home, strategy: str, model: str, seed: int) -> str:
@@ -158,8 +107,8 @@ class TestDynamicNeverMovesBestOrConsumeFirst:
 
 
 # Every (strategy, model, seed) the cross-revision tests below read. One
-# driver run answers them all: measured, 0.43 s of its 0.66 s is importing
-# `_BASE_REV`'s own test module, a cost each separate run paid again.
+# driver run answers them all: the child's fixed cost (interpreter and the
+# base's `claude_swap` import, 0.13 s) is paid once, not once per test.
 _BASE_REV_JOBS = (
     *((strategy, model, _SEED) for strategy, model in _GOLDEN),
     ("dynamic", "Fable", _DYNAMIC_SEED),
@@ -183,10 +132,11 @@ class TestDynamicLeavesTheBaseRevisionAlone:
     drift on this branch, which is not the same claim as "this round left
     `best`/`consume-first` alone". That claim needs a SECOND revision to
     compare against — `_BASE_REV`, this PR's own base before DRAIN STATE.
-    `tests/test_autoswitch.py` (the `EngineHarness` this module imports)
-    and `src/claude_swap` are archived from that revision into a scratch
-    tree and run there, unchanged, in a subprocess (a different
-    `claude_swap` package must not share `sys.modules` with this process).
+    `src/claude_swap` is archived from that revision into a scratch tree and
+    HEAD's `tests/_digest_harness.py` (stdlib and `claude_swap` only: that
+    revision's own 12.7k-line test module cost 0.43 s of the 0.66 s child to
+    compile) drives it in a subprocess (a different `claude_swap` package must
+    not share `sys.modules` with this process).
 
     SKIPPED, not failed, when `_BASE_REV` is not in the object database —
     CI checks out at `refs/pull/N/merge` with `fetch-depth: 1` (no history,
@@ -216,30 +166,28 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         old_root = tmp_path / "base"
         old_root.mkdir()
         archive = subprocess.run(
-            ["git", "-C", str(repo_root), "archive", "--format=tar", _BASE_REV, "src", "tests"],
+            ["git", "-C", str(repo_root), "archive", "--format=tar", _BASE_REV, "src"],
             capture_output=True, check=True,
         )
         with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
             tf.extractall(old_root, filter="data")  # trusted: our own repo's history
         jobs_literal = json.dumps(list(jobs))
         driver = (
-            "import sys, json\n"
-            f"sys.path.insert(0, {str(old_root)!r})\n"
-            f"sys.path.insert(0, {str(old_root / 'src')!r})\n"
-            f"sys.path.insert(0, {str(tmp_path)!r})\n"  # this module's own dir, for _run_trace
-            "from test_dynamic_isolation import _run_trace\n"
+            "import hashlib, json, os, sys\n"
             "from pathlib import Path\n"
-            "import hashlib, json as _json\n"
-            "import claude_swap\n"
+            f"sys.path.insert(0, {str(old_root / 'src')!r})\n"
+            f"sys.path.insert(1, {str(repo_root)!r})\n"  # HEAD's tests/_digest_harness.py
+            "import claude_swap, claude_swap.oauth\n"
+            # conftest's hermetic stubs do not reach this interpreter.
+            "claude_swap.oauth.fetch_oauth_profile = lambda token: None\n"
+            "os.fsync = lambda fd: None\n"
+            "from tests._digest_harness import _run_trace\n"
             "out = {'_claude_swap_file': claude_swap.__file__}\n"
             f"for i, (strategy, model, seed) in enumerate({jobs_literal}):\n"
             "    trace = _run_trace(Path(sys.argv[1]) / f'b{i}', strategy, model, seed)\n"
             "    out[f'{strategy}|{model}|{seed}'] = hashlib.sha256("
-            "_json.dumps(trace, sort_keys=True).encode()).hexdigest()\n"
-            "print(_json.dumps(out))\n"
-        )
-        (tmp_path / "test_dynamic_isolation.py").write_text(
-            Path(__file__).read_text(encoding="utf-8"), encoding="utf-8"
+            "json.dumps(trace, sort_keys=True).encode()).hexdigest()\n"
+            "print(json.dumps(out))\n"
         )
         driver_path = tmp_path / "_zz_cross_rev_driver.py"
         driver_path.write_text(driver)

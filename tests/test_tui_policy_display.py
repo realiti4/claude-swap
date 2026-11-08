@@ -250,7 +250,6 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
         app = make_app(fleet)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
-            await settle(pilot)
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain

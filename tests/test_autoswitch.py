@@ -5,15 +5,14 @@ from __future__ import annotations
 import copy
 import functools
 import hashlib
-import io
 import json
 import logging
 import os
 import random
 import subprocess
 import sys
-import tarfile
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -55,21 +54,11 @@ from tests._digest_harness import (
     _R_SOON,
     EngineHarness,
     _entry_for,
+    _iso_at,
     _usage7,
     fleet,
     run_fleets,
 )
-
-
-def _iso_at(epoch: float) -> str:
-    """An absolute epoch as the ISO-Z string a window's ``resets_at`` carries."""
-    from datetime import datetime, timezone
-
-    return (
-        datetime.fromtimestamp(epoch, tz=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
 
 
 def _usage(pct: float, resets_at: str | None = None) -> dict:
@@ -3010,6 +2999,8 @@ _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 # Per worker, `{base sha: {job: results}}`: one child per sha answers every job
 # the digest cases read (measured: 0.32 s for two jobs, 0.47 s for five).
 _BASE_RESULTS: dict[str, dict[str, list]] = {}
+# The children `_base_children_started` launched that no case has read yet.
+_BASE_PENDING: dict[str, Callable[[], dict[str, list]]] = {}
 
 
 def _digest_job(strategy: str, settings=None, fleets=None) -> str:
@@ -3032,9 +3023,11 @@ def _base_jobs(base_sha: str) -> list[str]:
     return jobs
 
 
-def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
-    """`_base_jobs(base_sha)` through the `base_sha` `AutoSwitchEngine` in one
-    fresh subprocess against ITS OWN `claude_swap` package: a different
+def _start_base_child(
+    tmp_path: Path, base_sha: str
+) -> Callable[[], dict[str, list]]:
+    """Start `_base_jobs(base_sha)` through the `base_sha` `AutoSwitchEngine` in
+    one fresh subprocess against ITS OWN `claude_swap` package: a different
     `usage_store`/`switcher`/`settings`/`autoswitch`, not merely a fresh module
     namespace sharing this process's `sys.modules`. Same technique as
     `test_dynamic_isolation.py`'s `_digests_at_base_rev`: guard-and-skip,
@@ -3042,32 +3035,39 @@ def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
     where `claude_swap` resolved from. The child imports only
     `tests/_digest_harness.py`, never this module: HEAD's 18k-line test module
     names things the base does not define, and compiling it cost most of the
-    child.
+    child. The child archives the base itself, so starting costs the caller a
+    spawn, and the caller works while it runs.
 
-    SKIPPED, not failed, when `base_sha` is not in the object database --
+    Returns `finish`: it waits for the child and returns `{job: results}`.
+
+    `finish` SKIPS, not fails, when `base_sha` is not in the object database --
     CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
     branch's own pre-PR base is never in that checkout, and a bare
     `git show` there would redden every job today and every run forever
-    once the branch is deleted post-merge.
+    once the branch is deleted post-merge. The reader skips, not the starter:
+    the cases that need no base still run.
     """
     repo_root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
     )
     if probe.returncode != 0:
-        pytest.skip(f"{base_sha} is not in this checkout's object database")
+        return lambda: pytest.skip(
+            f"{base_sha} is not in this checkout's object database"
+        )
     root = tmp_path / "base"
     root.mkdir()
-    archive = subprocess.run(
-        ["git", "-C", str(repo_root), "archive", "--format=tar", base_sha, "src"],
-        capture_output=True, check=True,
-    )
-    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
-        tf.extractall(root, filter="data")  # trusted: our own repo's history
     driver = root / "driver.py"
     driver.write_text(
-        "import sys, json, os\n"
+        "import io, json, os, subprocess, sys, tarfile\n"
         "from pathlib import Path\n"
+        "archive = subprocess.run(\n"
+        f"    ['git', '-C', {str(repo_root)!r}, 'archive', '--format=tar', "
+        f"{base_sha!r}, 'src'],\n"
+        "    capture_output=True, check=True)\n"
+        # trusted: our own repo's history
+        f"tarfile.open(fileobj=io.BytesIO(archive.stdout)).extractall("
+        f"{str(root)!r}, filter='data')\n"
         f"sys.path.insert(0, {str(root / 'src')!r})\n"
         f"sys.path.insert(1, {str(repo_root)!r})\n"
         "import claude_swap, claude_swap.oauth\n"
@@ -3093,7 +3093,7 @@ def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
         "HTTP_PROXY": dead_proxy, "HTTPS_PROXY": dead_proxy,
         "no_proxy": "", "NO_PROXY": "",
     }
-    result = subprocess.run(
+    child = subprocess.Popen(
         [
             sys.executable, str(driver), str(root / "homes"),
             json.dumps([
@@ -3101,27 +3101,32 @@ def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
                 TestOutcomeDigestAgainstBase._N_FLEETS,
             ]),
         ],
-        capture_output=True, text=True, env=child_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env,
     )
-    assert result.returncode == 0, (
-        f"base-engine driver failed: rc={result.returncode}\n"
-        f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
-    )
-    out = json.loads(result.stdout.strip().splitlines()[-1])
-    # POSITIVE CONTROL, per test_dynamic_isolation.py: an editable install
-    # could resolve `claude_swap` to the working tree regardless of
-    # `sys.path` order, which would compare HEAD against itself.
-    assert out["_claude_swap_file"].startswith(str(root / "src")), (
-        f"the subprocess imported claude_swap from outside {root / 'src'}: "
-        f"this compared HEAD against itself, not against {base_sha}"
-    )
-    return {
-        job: [
-            (name, active, tuple(tuple(e) for e in events))
-            for name, active, events in results
-        ]
-        for job, results in zip(jobs, out["results"])
-    }
+
+    def finish() -> dict[str, list]:
+        stdout, stderr = child.communicate()
+        assert child.returncode == 0, (
+            f"base-engine driver failed: rc={child.returncode}\n"
+            f"STDOUT={stdout}\nSTDERR={stderr}"
+        )
+        out = json.loads(stdout.strip().splitlines()[-1])
+        # POSITIVE CONTROL, per test_dynamic_isolation.py: an editable install
+        # could resolve `claude_swap` to the working tree regardless of
+        # `sys.path` order, which would compare HEAD against itself.
+        assert out["_claude_swap_file"].startswith(str(root / "src")), (
+            f"the subprocess imported claude_swap from outside {root / 'src'}: "
+            f"this compared HEAD against itself, not against {base_sha}"
+        )
+        return {
+            job: [
+                (name, active, tuple(tuple(e) for e in events))
+                for name, active, events in results
+            ]
+            for job, results in zip(jobs, out["results"])
+        }
+
+    return finish
 
 
 def _base_engine_results(
@@ -3135,15 +3140,32 @@ def _base_engine_results(
     is a KeyError, add it there.
     """
     if base_sha not in _BASE_RESULTS:
-        _BASE_RESULTS[base_sha] = _run_base_child(tmp_path, base_sha)
+        finish = _BASE_PENDING.pop(base_sha, None) or _start_base_child(
+            tmp_path, base_sha
+        )
+        _BASE_RESULTS[base_sha] = finish()
     return _BASE_RESULTS[base_sha][
         _digest_job(strategy, settings_kwargs, custom_fleets)
     ]
 
 
+@pytest.fixture
+def _base_children_started(tmp_path_factory):
+    """Launch both base children at the first digest case, so they run beside
+    the cases that need no base (the mutant ones) instead of in front of the
+    first that does. Per test, not per class: a class fixture would copy the
+    child's environment before conftest's per-test HOME isolation is in force."""
+    for sha in (_PR_321_BASE_SHA, _ROUND_375_BASE_SHA):
+        if sha not in _BASE_RESULTS and sha not in _BASE_PENDING:
+            _BASE_PENDING[sha] = _start_base_child(
+                tmp_path_factory.mktemp("base"), sha
+            )
+
+
 # One xdist worker runs both digest classes, so `_head_digests` and
 # `_BASE_RESULTS` are each built once per worker.
 @pytest.mark.xdist_group("outcome-digests")
+@pytest.mark.usefixtures("_base_children_started")
 class TestOutcomeDigestAgainstBase:
     """The #321 invariant: `best`'s ranking/admission must stay identical to
     the PR's base commit except the one exclusion this PR adds. Proven by
