@@ -12845,7 +12845,7 @@ class TestDegradedReadProvenance:
             s, "_read_active_credentials",
             lambda: ActiveCredentials(old_gen, False, True),  # degraded, stale
         )
-        entry = s._active_account_usage("2", "b@example.com", "")
+        entry, _login_expires_at = s._active_account_usage("2", "b@example.com", "")
         assert entry.sentinel != USAGE_RELOGIN_REQUIRED, (
             "C1 (round 11) regression on the --status path: an already-"
             f"healed slot was condemned on a degraded read, sentinel={entry.sentinel!r}"
