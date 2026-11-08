@@ -864,7 +864,8 @@ class TestListMarker:
 class TestSnapshotField:
     def test_appended_after_policy(self):
         names = [f.name for f in dataclasses.fields(AccountSnapshot)]
-        assert names[-1] == "subscription_plan"
+        # Immediately after `policy`; fields added since are appended after it,
+        # so "last" is no longer the right proxy (same as the policy test).
         assert names[names.index("subscription_plan") - 1] == "policy"
 
     def test_defaults_to_none(self):
