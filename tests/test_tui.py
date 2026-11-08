@@ -268,11 +268,14 @@ async def settle(pilot) -> None:
     The (fake) auto engine worker deliberately runs until its screen stops
     it, so waiting on it would block; wait on everything else.
     """
-    app = pilot.app
+    await _wait_workers(pilot.app)
+    await pilot.pause()
+
+
+async def _wait_workers(app) -> None:
     pending = [w for w in app.workers if w.group != "engine"]
     if pending:
         await app.workers.wait_for_complete(pending)
-    await pilot.pause()
 
 
 async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
@@ -1763,9 +1766,14 @@ def contended_fake_engine(monkeypatch):
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
-        await settle(pilot)
-        await pilot.press("g")
+        """What `g` does (`action_open_auto`), without the key press: Textual's
+        `press` idles twice and waits on the animator, about 0.1 s a case.
+        `test_opens_in_dry_run_and_store_only` still drives the real key."""
+        from claude_swap.tui.autoview import AutoScreen
 
+        await _wait_workers(pilot.app)
+        await pilot.app.push_screen(AutoScreen())
+        await _wait_workers(pilot.app)  # the store worker on_mount starts
 
     async def test_opens_in_dry_run_and_store_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1773,7 +1781,8 @@ class TestAutoScreen:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("g")
             from claude_swap.tui.autoview import AutoScreen
 
             assert isinstance(app.screen, AutoScreen)
@@ -1797,14 +1806,12 @@ class TestAutoScreen:
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
-            await settle(pilot)  # on_mount starts a store worker
             summary = app.screen.query_one("#auto-summary", Static)
             assert "snapshot" not in summary.render().plain
             app.snapshot = dataclasses.replace(
                 app.snapshot, taken_at=time.time() - app.SNAPSHOT_AGE_NOTE_S - 1.0
             )
             app._update_refresh_status()
-            await pilot.pause()
             # leading: the title row is one line and clips the end of the text
             assert summary.render().plain.startswith("snapshot 1m ago · auto-switch")
 
@@ -1879,7 +1886,6 @@ class TestAutoScreen:
             await app.workers.wait_for_complete(
                 [w for w in app.workers if w.group == "engine"]
             )
-            await pilot.pause()
 
             assert badge.has_class("dry"), (
                 "the engine is dead and the badge still reads LIVE"
@@ -1990,7 +1996,6 @@ class TestAutoScreen:
             screen._configured_strategy = "dynamic"
             screen.refresh_bindings()
             screen._update_summary()
-            await pilot.pause()
             assert "c" in screen.active_bindings
             assert "cache-aware off" in summary.render().plain
             await pilot.press("c")
@@ -2020,7 +2025,6 @@ class TestAutoScreen:
             screen._settings = replace(screen._settings, strategy="dynamic")
             screen.refresh_bindings()
             screen._update_summary()
-            await pilot.pause()
             assert screen.check_action("toggle_cache_aware", ()) is False
             assert "c" not in screen.active_bindings
             assert "cache-aware" not in screen.query_one("#auto-summary", Static).render().plain
@@ -2296,7 +2300,6 @@ class TestAutoScreen:
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
-            await settle(pilot)
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
@@ -2362,7 +2365,6 @@ class TestAutoScreen:
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
-            await settle(pilot)
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
