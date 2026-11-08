@@ -401,8 +401,14 @@ async def test_switch_screen_card_header_keeps_the_note_within_the_width(tmp_pat
         async with app.run_test(size=size) as pilot:
             await _workers_done(pilot)
             await app.push_screen(SwitchScreen())
-            await pilot.pause()
-            card = app.screen.query(AccountCard).first()
+            # One pause is not a layout: a slow runner reads the card at 0x0.
+            for _ in range(100):
+                await pilot.pause(0.05)
+                card = next(iter(app.screen.query(AccountCard)), None)
+                if card is not None and card.size.width:
+                    break
+            else:
+                pytest.fail("the account card was never laid out")
             header = card.render().plain.splitlines()[0]
             assert cell_len(header) <= card.size.width
             assert header.endswith(expect)
