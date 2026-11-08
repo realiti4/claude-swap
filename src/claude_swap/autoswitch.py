@@ -455,9 +455,6 @@ def _perish_then_room_key(usage: dict | str | None, headroom: float, now: float)
     return (1, 0.0, -headroom)
 
 
-# The window-read rate overstates the real one on a fill-then-idle fleet: 6.9 against
-# 4.64 pts/h over 7 d of usage.jsonl, 1.49x (2026-11-06). Start that much early.
-EXPIRING_RATE_MARGIN = 1.5
 _SEVEN_DAYS_S = 7 * 24 * 3600.0
 
 
@@ -471,33 +468,25 @@ def expiring_order(
     landing_cost: Callable[[str], float],
     now: float,
 ) -> list[str]:
-    """The accounts whose 7d room must be spent now to be spent at all (T3310):
-    soonest reset first, up to and including the last account whose deadline has
-    come (one after it is not expiring); ``[]`` when every deadline can be met
-    or no burn rate is measurable.
+    """The accounts whose 7d room must be spent now to be spent at all (T3310,
+    T3398): those whose 7d window resets within ``PERISH_SOON_S``, soonest reset
+    first (the Next best list's own rule, ``_perish_then_room_key``). Nothing
+    is timed against a burn rate: whatever the active spends before that reset
+    is room the expiring account may lose.
 
     ``accounts[0]`` is the active, the rest the admissible OAuth candidates (an
     equal reset keeps the active ahead). Room is what is left under the
     account's own bar and the weekly cap on its fullest weekly window. An
-    account is not walked now when it cannot serve (``headroom`` at its wall),
+    account is not walked when it cannot serve (``headroom`` at its wall),
     when its 5h window cannot absorb ``landing_cost`` (5h points, 0 for the
     active or a warm one: it lands once that window rolls), or when its room
-    does not exceed that cost in 7d points. Rooms add up in reset order, in
-    Ultra points (``_PLAN_COST_SCALE``), and are spent at the fleet's rate: an
-    account is due once ``need * EXPIRING_RATE_MARGIN / rate`` reaches its
-    reset. The rate is every readable account's 7d level over their mean
-    elapsed time: account-global and stateless, so a restart, a dry run and the
-    panel read one number.
-
-    shortcut: the rate is read off the current windows, not sampled; upgrade to a
-    rolling sample if a burst makes it misjudge a deadline. Checked against the
-    live 6.9 pts/h: 6.17 (24 h) and 4.64 (7 d) measured from usage.jsonl, 2026-11-06.
+    does not exceed that cost in 7d points.
     """
-    rate, rows = _expiring_walk(accounts, usage, headroom, bars, caps, plans, landing_cost, now)
-    return _expiring_due(rate, rows, now)
+    _, rows = _expiring_walk(accounts, usage, headroom, bars, caps, plans, landing_cost, now)
+    return _expiring_due(rows, now)
 
 
-_WalkRows = list[tuple[str, float, float]]  # (account, need, reset), in reset order
+_WalkRows = list[tuple[str, float, float]]  # (account, room, reset), in reset order
 
 
 def _expiring_walk(
@@ -510,10 +499,9 @@ def _expiring_walk(
     landing_cost: Callable[[str], float],
     now: float,
 ) -> tuple[float, _WalkRows]:
-    """``expiring_order``'s walk: the fleet's burn rate (7d points per second;
-    0.0 and no rows when none is measurable) and one ``(account, need, reset)``
-    row per walked account in reset order, ``need`` the Ultra points of room to
-    spend through that account."""
+    """``expiring_order``'s walk: the fleet's burn rate (7d points per second, 0.0
+    when none is measurable; it only words the hold) and one ``(account, room,
+    reset)`` row per walked account in reset order, ``room`` its Ultra points."""
     def weight(n: str) -> float:
         return 1.0 / _PLAN_COST_SCALE.get(plans.get(n), 1.0)
 
@@ -527,11 +515,8 @@ def _expiring_walk(
         return 0.0, []
     elapsed = sum(max(_SEVEN_DAYS_S - (r - now), 0.0) for _, r in seen.values()) / len(seen)
     spent = sum(pct * weight(n) for n, (pct, _) in seen.items())
-    if spent <= 0 or elapsed <= 0:
-        return 0.0, []
-    rate = spent / elapsed
+    rate = spent / elapsed if spent > 0 and elapsed > 0 else 0.0
     rows: _WalkRows = []
-    need = 0.0
     for n in sorted((n for n in accounts if n in seen), key=lambda n: seen[n][1]):
         pct, reset = seen[n]
         wall = _wall_headroom(bars.get(n))
@@ -550,26 +535,14 @@ def _expiring_walk(
             or (five is not None and 100.0 - five - cost <= wall)
         ):
             continue
-        need += room * weight(n)
-        rows.append((n, need, reset))
+        rows.append((n, room * weight(n), reset))
     return rate, rows
 
 
-def _spend_lead_s(rate: float, need: float) -> float:
-    """Seconds before its reset an account's room must start to be spent: the
-    ``need`` points at the fleet's rate, started ``EXPIRING_RATE_MARGIN`` early."""
-    return need * EXPIRING_RATE_MARGIN / rate
-
-
-def _expiring_due(rate: float, rows: _WalkRows, now: float) -> list[str]:
-    """The walk's rows up to and including the last whose deadline has come: an
-    account is due once ``_spend_lead_s`` reaches its reset."""
-    last_due = max(
-        (i for i, (_, need, reset) in enumerate(rows, 1)
-         if _spend_lead_s(rate, need) >= reset - now),
-        default=0,
-    )
-    return [n for n, _, _ in rows[:last_due]]
+def _expiring_due(rows: _WalkRows, now: float) -> list[str]:
+    """The walk's rows whose reset is within ``PERISH_SOON_S``: the prefix, as
+    the rows are in reset order."""
+    return [n for n, _, reset in rows if reset - now <= PERISH_SOON_S]
 
 
 def _hhmm_z(ts: float, now: float) -> str:
@@ -579,28 +552,31 @@ def _hhmm_z(ts: float, now: float) -> str:
     )
 
 
-def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float, current: str) -> str:
-    """What `dynamic` decided when no row is due: at the first deadline
-    (``reset - _spend_lead_s``) the rows up to that account are due, and the tick
-    then acts on the first row (`_tick_inner`'s ``ahead``): it takes the switch,
-    or, when it is the active, the active spends its window. ``need`` is the
-    room through the deadline's row, in Ultra points, not that row's own."""
-    if not rows:
-        return "nothing expiring; " + (
-            "no account has 7d room it can spend now" if rate else "no fleet burn rate to time a deadline"
-        )
-    due, n, need, reset = min(
-        (reset - _spend_lead_s(rate, need), n, need, reset) for n, need, reset in rows
+def _spend_note(rate: float, row: tuple[str, float, float], now: float) -> str:
+    """What an expiring window has to spend, for the holds: the room and its reset,
+    and the fleet's rate when one is measurable."""
+    n, room, reset = row
+    return (
+        f"#{n}'s {room:.0f} pts before its {_hhmm_z(reset, now)} reset"
+        + (f", at {rate * 3600:.1f} pts/h" if rate else "")
     )
-    first = rows[0][0]
+
+
+def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float, current: str) -> str:
+    """What `dynamic` decided when no row is within ``PERISH_SOON_S`` of its
+    reset: the soonest row becomes expiring a day before that reset, and the
+    tick then acts on it (`_tick_inner`'s ``ahead``): it takes the switch, or,
+    when it is the active, the active spends its own window."""
+    if not rows:
+        return "nothing expiring; no account has 7d room it can spend now"
+    n, _, reset = rows[0]
     act = (
-        f"the active (#{current}) starts spending its expiring window" if first == current
-        else f"switch to #{first}"
+        f"the active (#{n}) starts spending its expiring window" if n == current
+        else f"switch to #{n}"
     )
     return (
-        f"nothing expiring yet; next at {_hhmm_z(due, now)}: {act} (needs {need:.0f} pts through "
-        f"#{n} by its {_hhmm_z(reset, now)} reset, {(reset - due) / 3600:.1f} h at "
-        f"{rate * 3600:.1f} pts/h)"
+        f"nothing expiring yet; next at {_hhmm_z(reset - PERISH_SOON_S, now)}: {act} "
+        f"(spends {_spend_note(rate, rows[0], now)})"
     )
 
 
@@ -3231,7 +3207,7 @@ class AutoSwitchEngine:
                 current, oauth_candidates, usage, headroom, self._bars, policies,
                 entries, last_active_at, settings, now,
             )
-            expiring = _expiring_due(*walk, now)
+            expiring = _expiring_due(walk[1], now)
 
         # On a healthy active, the expiring accounts ahead of its own window pull the
         # switch. An active walled on its own model-gated axis leaves by the walled
@@ -3565,10 +3541,12 @@ class AutoSwitchEngine:
                     "% headroom, not about to wall)"
                 )
                 # The hold says what `dynamic` decided: its own expiring window,
-                # or, with nothing expiring, what the next due account does and
-                # when (`_expiring_walk`'s reading), after the cause that holds.
+                # or, with nothing expiring, what the soonest-resetting account does
+                # and when (`_expiring_walk`'s reading), after the cause that holds.
                 if spend_first and not alternation_admissible:
-                    detail = healthy + "; spending its expiring window first"
+                    detail = healthy + "; spending its expiring window first: " + _spend_note(
+                        walk[0], walk[1][0], now
+                    )
                 else:
                     detail = healthy + (
                         "; the alternation step is not reached" if step_holds else ""
