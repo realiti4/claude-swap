@@ -326,6 +326,18 @@ async def menu_select(pilot, action_id: str) -> None:
     await pilot.press("enter")
 
 
+async def menu_dispatch(pilot, action_id: str) -> None:
+    """`menu_select` without the key press: the entry must be listed, then
+    the screen's own handler for it runs awaited."""
+    from textual.widgets import ListView
+
+    from claude_swap.tui.widgets import MenuItem
+
+    menu = pilot.app.screen.query_one("#menu", ListView)
+    assert action_id in [item.action_id for item in menu.query(MenuItem)]
+    await pilot.app.screen._dispatch(action_id)
+
+
 # ---------------------------------------------------------------------------
 # Data service units (sync)
 # ---------------------------------------------------------------------------
@@ -1328,14 +1340,14 @@ class TestDashboard:
                     for item in menu.query(MenuItem)
                 ]
 
-            await menu_select(pilot, "cap-menu")
+            await menu_dispatch(pilot, "cap-menu")
             rows = labels()
             assert any("2" in r and "85%" in r for r in rows), rows
             assert any("1" in r and "none" in r for r in rows), rows
-            await menu_select(pilot, "cap:1")
+            await menu_dispatch(pilot, "cap:1")
             assert "100%" in labels()  # 100 is "use to exhaustion"
-            await menu_select(pilot, "set-cap:1:80")
-            await settle(pilot)
+            await menu_dispatch(pilot, "set-cap:1:80")
+            await app.workers.wait_for_complete()
             assert ("set_cap", "1", 80.0) in fake.calls
             # A cap hands the 5h window to the global line: the old own line goes.
             assert ("set_threshold", "1", None) in fake.calls
@@ -1343,10 +1355,10 @@ class TestDashboard:
             menu = app.screen.query_one("#menu", ListView)
             assert [i.action_id for i in menu.query(MenuItem)][0] == "switch"
 
-            await menu_select(pilot, "cap-menu")
-            await menu_select(pilot, "cap:2")
-            await menu_select(pilot, "set-cap:2:default")
-            await settle(pilot)
+            await menu_dispatch(pilot, "cap-menu")
+            await menu_dispatch(pilot, "cap:2")
+            await menu_dispatch(pilot, "set-cap:2:default")
+            await app.workers.wait_for_complete()
             assert ("set_cap", "2", None) in fake.calls
             assert ("set_threshold", "2", None) in fake.calls
 
@@ -1362,10 +1374,10 @@ class TestDashboard:
         app = make_app(Rejecting([make_account(1, active=True)], tmp_path))
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
-            await menu_select(pilot, "cap-menu")
-            await menu_select(pilot, "cap:1")
-            await menu_select(pilot, "set-cap:1:80")
-            await settle(pilot)
+            await menu_dispatch(pilot, "cap-menu")
+            await menu_dispatch(pilot, "cap:1")
+            await menu_dispatch(pilot, "set-cap:1:80")
+            await app.workers.wait_for_complete()
             from claude_swap.tui.modals import OutputModal
 
             assert isinstance(app.screen, OutputModal)
@@ -1784,6 +1796,12 @@ class TestAutoScreen:
         await pilot.press("g")
         await pilot.pause()
 
+    async def _push_auto(self, pilot):
+        """`_open` without the `g` key press, which `_open`'s own cases prove."""
+        from claude_swap.tui.autoview import AutoScreen
+
+        await settle(pilot)
+        await pilot.app.push_screen(AutoScreen())
 
     async def test_opens_in_dry_run_and_store_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1921,6 +1939,8 @@ class TestAutoScreen:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
+            from textual import events
+
             from claude_swap.tui.autoview import AutoScreen
 
             await app.push_screen(AutoScreen())
@@ -1934,10 +1954,15 @@ class TestAutoScreen:
             # threshold — without this, the dynamic-strategy assertion below
             # would pass even if "threshold " never printed at all.
             assert "threshold 90%" in summary.render().plain
-            # the one real key press: it proves the `s` binding reaches the
-            # action; the rest of the cycle calls the action directly.
-            await pilot.press("s")
-            await pilot.pause()
+            # the one real key: it proves the `s` binding reaches the action,
+            # posted as the driver posts it (pilot.press and pilot.pause wait
+            # for CPU idle); the action is synchronous, so wait for its effect
+            # and call the rest of the cycle directly.
+            app.post_message(events.Key("s", "s"))
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if screen._settings.strategy == "dynamic":
+                    break
             assert screen._settings.strategy == "dynamic"
             engine = fake_engine.instances[0]
             assert engine.applied_strategies == ["dynamic"]
@@ -2004,6 +2029,7 @@ class TestAutoScreen:
     async def test_strategy_cycle_refreshes_a_strategy_gated_footer(
         self, tmp_path, fake_engine
     ):
+        from textual import events
         from textual.binding import Binding
         from textual.widgets import Footer
         from textual.widgets._footer import FooterKey
@@ -2044,14 +2070,14 @@ class TestAutoScreen:
                 return False
 
             assert await footer_shows_c(False), footer_keys()  # consume-first
-            await pilot.press("s")  # -> dynamic
-            await settle(pilot)
-            assert app.screen._settings.strategy == "dynamic"
+            # Keys posted as the driver posts them: the action is synchronous
+            # and the footer poll is the wait, so no idle waits.
+            app.post_message(events.Key("s", "s"))  # -> dynamic
             assert await footer_shows_c(True), footer_keys()
-            await pilot.press("s")  # -> best
-            await settle(pilot)
-            assert app.screen._settings.strategy == "best"
+            assert app.screen._settings.strategy == "dynamic"
+            app.post_message(events.Key("s", "s"))  # -> best
             assert await footer_shows_c(False), footer_keys()
+            assert app.screen._settings.strategy == "best"
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
@@ -2299,7 +2325,7 @@ class TestAutoScreen:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
+            await self._push_auto(pilot)
             await settle(pilot)
             from textual.widgets import Static
 
@@ -2345,7 +2371,7 @@ class TestAutoScreen:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
+            await self._push_auto(pilot)
             await settle(pilot)
             from textual.widgets import Static
 

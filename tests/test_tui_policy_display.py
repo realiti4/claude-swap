@@ -193,9 +193,12 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
     """
 
     async def _open(self, pilot):
+        from claude_swap.tui.autoview import AutoScreen
+
         await settle(pilot)
-        await pilot.press("g")
-        await pilot.pause()
+        # Awaiting the push is the `g` binding's own effect without the idle
+        # waits of a key press; the binding itself is TestAutoScreen's to prove.
+        await pilot.app.push_screen(AutoScreen())
 
     def _fleet(self, tmp_path):
         (tmp_path / "settings.json").write_text(json.dumps({
