@@ -253,32 +253,36 @@ class TestDashboardMiniRowAlignment:
             accounts[0], subscription_plan=TestPlanMarkerAndLoginTogether.PLAN
         )
 
-        async def dashboard():
-            app = make_app(FakeSwitcher(accounts, tmp_path))
-            async with app.run_test(size=(80, 24)) as pilot:
-                await settle(pilot)
-                panel = app.screen.query_one(AccountsPanel)
-                menu = app.screen.query_one("#menu", ListView)
+        app = make_app(FakeSwitcher(accounts, tmp_path))
+        async with app.run_test(size=(80, 24)) as pilot:
+            await _workers_done(pilot)
+            await pilot.pause()
+            panel = app.screen.query_one(AccountsPanel)
+            menu = app.screen.query_one("#menu", ListView)
+
+            def dashboard():
                 shown = [
                     item for item in menu.query(MenuItem)
                     if menu.region.contains_region(item.region)
                 ]
                 return panel.render().plain.splitlines(), panel.size, len(shown)
 
-        lines, size, shown = await dashboard()
-        assert all(cell_len(line) <= size.width for line in lines)
-        assert size.height == len(lines)  # nothing wrapped
-        minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
-        assert len(minis) == 6 and "login" not in lines[0]
-        assert all("5h 25%" in line and "7d 10%" in line for line in minis)
-        # The middle form: "login 23d" fits at 74 columns, the full one does not.
-        assert all("login 23d  " in line and "23d04h" not in line for line in minis)
+            lines, size, shown = dashboard()
+            assert all(cell_len(line) <= size.width for line in lines)
+            assert size.height == len(lines)  # nothing wrapped
+            minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
+            assert len(minis) == 6 and "login" not in lines[0]
+            assert all("5h 25%" in line and "7d 10%" in line for line in minis)
+            # The middle form: "login 23d" fits at 74 columns, the full one does not.
+            assert all("login 23d  " in line and "23d04h" not in line for line in minis)
 
-        # The same dashboard with no login token at all, as the menu was.
-        monkeypatch.setattr(widgets, "LOGIN_FORMS", (None,))
-        bare_lines, _size, bare_shown = await dashboard()
-        assert len(lines) == len(bare_lines)  # the card's login row is gone too
-        assert shown == bare_shown > 0
+            # The same dashboard with no login token at all, as the menu was.
+            monkeypatch.setattr(widgets, "LOGIN_FORMS", (None,))
+            panel.refresh(layout=True)
+            await pilot.pause()
+            bare_lines, _size, bare_shown = dashboard()
+            assert len(lines) == len(bare_lines)  # the card's login row is gone too
+            assert shown == bare_shown > 0
 
 
 class TestPlanMarkerAndLoginTogether:
@@ -337,8 +341,20 @@ def _replace_login(acc: AccountSnapshot, login_expires_at: float | None) -> Acco
     return dataclasses.replace(acc, login_expires_at=login_expires_at)
 
 
+async def _workers_done(pilot) -> None:
+    """Wait for the thread workers only (the engine worker runs until its screen
+    stops it). A caller then pushes its screen and pauses once, which skips the
+    idle waits `settle()` and a key press each add."""
+    app = pilot.app
+    pending = [w for w in app.workers if w.group != "engine"]
+    if pending:
+        await app.workers.wait_for_complete(pending)
+
+
 @pytest.mark.asyncio
 async def test_next_best_login_column_alignment(tmp_path, fake_engine):
+    from claude_swap.tui.autoview import AutoScreen
+
     now = time.time()
     accounts = [
         make_account(1, active=True, email="active@example.com"),
@@ -351,8 +367,8 @@ async def test_next_best_login_column_alignment(tmp_path, fake_engine):
     fake = FakeSwitcher(accounts, tmp_path)
     app = make_app(fake)
     async with app.run_test(size=(100, 40)) as pilot:
-        await settle(pilot)
-        await pilot.press("g")
+        await _workers_done(pilot)
+        await app.push_screen(AutoScreen())
         await pilot.pause()
         from textual.widgets import Static
 
@@ -368,6 +384,8 @@ async def test_next_best_rows_never_wrap_on_a_narrow_screen(tmp_path, fake_engin
     """A 44-column email pushes the full `login 23d04h` token past the 76-column
     row; the token steps down to its short form so the usage figure stays on
     the line."""
+    from claude_swap.tui.autoview import AutoScreen
+
     expires = time.time() + 23 * 86400 + 4 * 3600
     accounts = [make_account(1, active=True, email="active@example.com")] + [
         _replace_login(make_account(n, email=f"{'x' * 31}{n}@example.com"), expires)
@@ -375,8 +393,8 @@ async def test_next_best_rows_never_wrap_on_a_narrow_screen(tmp_path, fake_engin
     ]
     app = make_app(FakeSwitcher(accounts, tmp_path))
     async with app.run_test(size=(80, 24)) as pilot:
-        await settle(pilot)
-        await pilot.press("g")
+        await _workers_done(pilot)
+        await app.push_screen(AutoScreen())
         await pilot.pause()
         from textual.widgets import Static
 
@@ -389,6 +407,7 @@ async def test_next_best_rows_never_wrap_on_a_narrow_screen(tmp_path, fake_engin
 
 @pytest.mark.asyncio
 async def test_switch_screen_card_header_keeps_login_within_the_width(tmp_path):
+    from claude_swap.tui.dashboard import SwitchScreen
     from claude_swap.tui.widgets import AccountCard
 
     acc = _replace_login(
@@ -397,8 +416,8 @@ async def test_switch_screen_card_header_keeps_login_within_the_width(tmp_path):
     )
     app = make_app(FakeSwitcher([acc, make_account(2)], tmp_path))
     async with app.run_test(size=(70, 24)) as pilot:
-        await settle(pilot)
-        await pilot.press("s")
+        await _workers_done(pilot)
+        await app.push_screen(SwitchScreen())
         await pilot.pause()
         card = app.screen.query(AccountCard).first()
         header = card.render().plain.splitlines()[0]
