@@ -2662,7 +2662,7 @@ class TestUnswitchableRowsAreListed:
         a.login_expires_at = None
         return a
 
-    def _render(self, snap, active):
+    def _render(self, snap, active, width=200):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
@@ -2670,8 +2670,8 @@ class TestUnswitchableRowsAreListed:
         v = AutoScreen.__new__(AutoScreen)
         v._settings = AutoSwitchSettings()
         # The login column fits the "#candidates" box; an unmounted screen has
-        # none, so give the rows room for every login form.
-        v.query_one = lambda *_a, **_k: MagicMock(size=MagicMock(width=200))
+        # none, so the default leaves room for every login form.
+        v.query_one = lambda *_a, **_k: MagicMock(size=MagicMock(width=width))
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
@@ -2695,7 +2695,7 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
             self._acct("2", "b@x.com", switchable=True),
             self._acct("4", "new@x.com", switchable=False),
-        ), active="1")
+        ), active="1", width=76)  # the unswitchable note alone is wider than this
         rows = {row.split()[1]: row for row in out.splitlines() if "@x.com" in row}
         assert "login ?" in rows["b@x.com"]
         assert "login ?" not in rows["new@x.com"]  # its note says "no stored login"

@@ -534,16 +534,20 @@ class AutoScreen(Screen):
         order = [lines[number] for _key, number in sorted(ranked)]
         # The box has no width before its first layout; its CSS padding is 2 a side.
         budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
-        for row in fit_login(
-            lambda login: [
-                Text.assemble(
-                    head,
-                    Text(login_segment(acc, login) if acc else "", style=palette.muted),
-                    tail,
-                )
-                for acc, head, tail in order
-            ],
-            budget,
-        ):
-            text.append(row)
+        # Only the rows with a login column are fitted: an unswitchable row's
+        # long note would otherwise fail every form and drop the column from all.
+        fitted = iter(
+            fit_login(
+                lambda login: [
+                    Text.assemble(
+                        head, Text(login_segment(acc, login), style=palette.muted), tail
+                    )
+                    for acc, head, tail in order
+                    if acc
+                ],
+                budget,
+            )
+        )
+        for acc, head, tail in order:
+            text.append(next(fitted) if acc else Text.assemble(head, tail))
         return text
