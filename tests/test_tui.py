@@ -282,15 +282,15 @@ def make_app(fake: FakeSwitcher):
 
 @pytest.fixture
 def quick_pilot(monkeypatch):
-    """Poll Textual's idle check every 2 ms instead of every 20 ms.
+    """Poll Textual's idle check every 1 ms instead of every 20 ms.
 
     ``pilot.pause()`` waits on ``wait_for_idle`` once and ``pilot.press()``
     twice, and each wait sleeps at least one ``SLEEP_GRANULARITY`` (20 ms) per
     look at the process CPU. The rule it applies (CPU under 5% of wall clock
-    means settled) is unchanged; only the look is ten times as frequent.
+    means settled) is unchanged; only the look is twenty times as frequent.
     """
-    monkeypatch.setattr("textual._wait.SLEEP_GRANULARITY", 0.002)
-    monkeypatch.setattr("textual._wait.SLEEP_IDLE", 0.002 / 20.0)
+    monkeypatch.setattr("textual._wait.SLEEP_GRANULARITY", 0.001)
+    monkeypatch.setattr("textual._wait.SLEEP_IDLE", 0.001 / 20.0)
 
 
 async def settle(pilot) -> None:
@@ -322,9 +322,8 @@ async def menu_select(pilot, action_id: str) -> None:
     menu.index = next(
         i for i, item in enumerate(items) if item.action_id == action_id
     )
-    await pilot.pause()
+    # `press` already waits for the key to be handled and the app to go idle.
     await pilot.press("enter")
-    await pilot.pause()
 
 
 # ---------------------------------------------------------------------------
@@ -2027,8 +2026,7 @@ class TestAutoScreen:
             [make_account(1, active=True), make_account(2)], tmp_path
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
+        async with app.run_test(size=(100, 24)) as pilot:
             await app.push_screen(GatedScreen())
             await settle(pilot)
 

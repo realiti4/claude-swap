@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import hashlib
 import io
@@ -3130,12 +3131,10 @@ class TestFailoverSkipsAStaleTopCandidate:
 
 _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 
-# One worker's base-engine runs, so a later case asks the base once, not
-# again: the archive, the subprocess and the import of this module against
-# the base cost about 0.5 s (measured). A run is a pure function of its
-# arguments; whether this module can be imported against a base is a
-# property of the base alone.
-_BASE_ENGINE_RUNS: dict = {}
+# Whether this module can be imported against a base is a property of the
+# base alone, so one failed driver (about 0.5 s measured: the archive, the
+# subprocess, `claude_swap` and `pytest` imported, then the ImportError)
+# answers every later case on this worker.
 _BASE_ENGINE_SKIPS: dict[str, str] = {}
 
 
@@ -3161,14 +3160,8 @@ def _base_engine_results(
     `git show` there would redden every job today and every run forever
     once the branch is deleted post-merge.
     """
-    run_key = (
-        base_sha, strategy, seed, n_fleets,
-        json.dumps(custom_fleets), json.dumps(settings_kwargs, sort_keys=True),
-    )
     if base_sha in _BASE_ENGINE_SKIPS:
         pytest.skip(_BASE_ENGINE_SKIPS[base_sha])
-    if run_key in _BASE_ENGINE_RUNS:
-        return _BASE_ENGINE_RUNS[run_key]
     repo_root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
@@ -3270,15 +3263,14 @@ def _base_engine_results(
         f"the subprocess imported claude_swap from outside {old_root} — "
         f"this compared HEAD against itself, not against {base_sha}"
     )
-    _BASE_ENGINE_RUNS[run_key] = [
+    return [
         (name, active, tuple(tuple(e) for e in events))
         for name, active, events in out["results"]
     ]
-    return _BASE_ENGINE_RUNS[run_key]
 
 
-# One xdist worker runs both digest classes, so the memoised head and base
-# runs (`_head_digests`, `_BASE_ENGINE_RUNS`) are built once, not per worker.
+# One xdist worker runs both digest classes, so `_head_digests` and
+# `_BASE_ENGINE_SKIPS` are built once, not per worker.
 @pytest.mark.xdist_group("outcome-digests")
 class TestOutcomeDigestAgainstBase:
     """The #321 invariant: `best`'s ranking/admission must stay identical to
@@ -3439,7 +3431,8 @@ class TestOutcomeDigestAgainstBase:
         # fleets. `trigger == "proactive"` is reachable under ANY strategy
         # setting (utilization over threshold with real headroom, regardless
         # of `settings.strategy`), so its own predicate needs neutralizing
-        # too, not only the consume-first-literal HOLD's.
+        # too, not only the consume-first-literal HOLD's. A copy: the fleets
+        # come from `_head_digests`, shared by every case on this worker.
         with (
             patch(
                 "claude_swap.autoswitch.candidate_usage_is_stale",
@@ -3451,7 +3444,8 @@ class TestOutcomeDigestAgainstBase:
             ),
         ):
             return self._run(
-                AutoSwitchEngine, tmp_path, "mutant", fleets, strategy, **settings_kwargs
+                AutoSwitchEngine, tmp_path, "mutant", copy.deepcopy(fleets),
+                strategy, **settings_kwargs,
             )
 
     @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
