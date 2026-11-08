@@ -318,6 +318,22 @@ async def push_auto(app) -> None:
     await app.push_screen(AutoScreen())
 
 
+async def wait_for(pilot, read, expected) -> None:
+    """Pause until ``read()`` equals ``expected``, bounded, else fail saying what it read.
+
+    A list rebuild runs in an awaited watcher that one ``pilot.pause()`` under
+    ``quick_pilot`` can outrun: the idle check compares CPU time over 1 ms, and
+    Windows' CPU clock ticks every 15.6 ms, so it reads idle while work is queued.
+    """
+    got = read()
+    for _ in range(200):
+        if got == expected:
+            return
+        await pilot.pause()
+        got = read()
+    pytest.fail(f"still {got!r}, expected {expected!r}")
+
+
 async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
     assert await asyncio.to_thread(event.wait, timeout)
 
@@ -2708,11 +2724,15 @@ class TestSharedAccountOrder:
         async with app.run_test(size=(100, 40)) as pilot:
             await app.workers.wait_for_complete()
             await app.push_screen(SwitchScreen())
-            await pilot.pause()
             listview = app.screen.query_one("#accounts", ListView)
-            before = [item.number for item in listview.query(AccountItem)]
-            assert before == ["1", "3", "2"]  # "3" (5%) ranks ahead of "2" (30%)
-            listview.index = before.index("2")  # cursor on the worse one
+
+            def numbers() -> list[str]:
+                return [item.number for item in listview.query(AccountItem)]
+
+            # "3" (5%) ranks ahead of "2" (30%); _numbers is set once the build,
+            # cursor included, is done
+            await wait_for(pilot, lambda: app.screen._numbers, ["1", "3", "2"])
+            listview.index = 2  # cursor on the worse one, "2"
 
             swapped = [  # invert the ranking: "2" becomes the better candidate
                 dataclasses.replace(a, usage=make_entry(5.0, 5.0))
@@ -2725,11 +2745,8 @@ class TestSharedAccountOrder:
             app.snapshot = AccountsSnapshot(
                 active_number="1", accounts=tuple(swapped), taken_at=time.time()
             )
-            await pilot.pause()
-
-            after = [item.number for item in listview.query(AccountItem)]
-            assert after == ["1", "2", "3"]  # the row order really flipped
-            assert listview.index == after.index("2")  # cursor followed "2"
+            # the row order really flipped, and the cursor followed "2"
+            await wait_for(pilot, lambda: (numbers(), listview.index), (["1", "2", "3"], 1))
 
 
 def fake_calls(app) -> list[tuple]:
