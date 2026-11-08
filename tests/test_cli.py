@@ -525,6 +525,7 @@ class TestCLI:
                     "program": ["/tmp/cswap", "menubar"],
                     "stdout_log": "/tmp/o.log",
                     "stderr_log": "/tmp/e.log",
+                    "profile_changes": [],
                 },
             ),
         )
@@ -557,6 +558,9 @@ class TestCLI:
                     "pid": 4242,
                     "plist": "/tmp/p.plist",
                     "switched_off": False,
+                    "running_build": None,
+                    "installed_build": "1.0.0",
+                    "stale_build": False,
                 },
             ),
         )
@@ -577,6 +581,7 @@ class TestCLI:
                     "stderr_log": "/tmp/e.log",
                     "pid": 4242,
                     "switched_off": False,
+                    "stale_build": False,
                 },
             ),
         )
@@ -684,7 +689,12 @@ class TestCLI:
         def fake_install():
             at_install["enabled"] = json.loads(path.read_text())["auto_switch_enabled"]
             seen["called"] = "install"
-            return {"label": "com.cswap.menubar", "plist": "/tmp/p.plist", "stderr_log": "/tmp/e.log"}
+            return {
+                "label": "com.cswap.menubar",
+                "plist": "/tmp/p.plist",
+                "stderr_log": "/tmp/e.log",
+                "profile_changes": [],
+            }
 
         monkeypatch.setattr("claude_swap.launch_agent.install", fake_install)
 
@@ -785,6 +795,7 @@ class TestCLI:
             "stderr_log": "/tmp/e.log",
             "pid": 4242,
             "switched_off": False,
+            "stale_build": False,
         }
         payload.update(overrides)
         return payload
@@ -867,6 +878,7 @@ class TestCLI:
             "label": "com.cswap.menubar", "installed": True, "start_at_login": True,
             "session_plist": None, "configured": True, "loaded": True,
             "state": "running", "pid": 4242, "plist": "/tmp/p.plist", "switched_off": True,
+            "running_build": None, "installed_build": "1.0.0", "stale_build": False,
         }
         monkeypatch.setattr("claude_swap.launch_agent.status", lambda *a, **k: status)
 
@@ -1083,6 +1095,42 @@ class TestCLI:
 
         assert calls["purged"] is True
         assert "uninstall" not in calls
+
+    def test_install_service_says_when_the_profile_moved(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.install",
+            lambda **k: {
+                "label": "com.cswap.menubar", "plist": "/tmp/p.plist",
+                "program": ["/tmp/cswap", "menubar", "--foreground"],
+                "stdout_log": "/tmp/o.log", "stderr_log": "/tmp/e.log",
+                "profile_changes": [("CLAUDE_CONFIG_DIR", None, "/new/profile")],
+            },
+        )
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        err = capsys.readouterr().err
+        assert "now follows CLAUDE_CONFIG_DIR=/new/profile (was (unset))" in err
+
+    def test_service_status_shows_the_running_build_and_a_stale_one(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+        status = {
+            "label": "com.cswap.menubar", "installed": True, "start_at_login": True,
+            "session_plist": None, "configured": True, "loaded": True,
+            "state": "running", "pid": 4242, "plist": "/tmp/p.plist", "switched_off": False,
+            "running_build": "1.0.0b1 (3fec656)", "installed_build": "1.0.0b1 (6a2a182)",
+            "stale_build": True,
+        }
+        monkeypatch.setattr("claude_swap.launch_agent.status", lambda *a, **k: status)
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert "build: 1.0.0b1 (3fec656)" in captured.out
+        assert "installed build is 1.0.0b1 (6a2a182)" in captured.err
 
     def test_service_status_reports_the_login_state(self, monkeypatch, capsys):
         self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])

@@ -20,7 +20,7 @@ from claude_swap import menubar, oauth
 from claude_swap.autoswitch import ErrorEvent
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.menubar import ENGINE_ERROR_REPEAT_S, should_surface_engine_error
-from claude_swap.switcher import USAGE_API_KEY
+from claude_swap.switcher import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
 
 
 # --- notification identity -----------------------------------------------------
@@ -254,17 +254,46 @@ def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
 
 def test_format_account_label():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login ?"
 
 
 def test_format_account_label_with_alias():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
-    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30% · login ?"
 
 
 def test_format_account_label_disabled_marker():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
-    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
+    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30% · login ?"
+
+
+def test_format_account_label_login_expiry():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 23 * 86400 + 4 * 3600
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login 23d04h"
+
+
+def test_format_account_label_login_expiry_unknown():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, login_expires_at=None)
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login ?"
+
+
+def test_format_account_label_login_expiry_quarantined():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 999_999, quarantined=True
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login needed"
+
+
+def test_format_account_label_usage_unavailable_still_carries_login_token():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", None, now=now, login_expires_at=now + 5 * 3600 + 7 * 60
+    )
+    assert label == "2  loc@papaya.asia  usage unavailable · login 5h07m"
 
 
 def test_auto_switch_item_shows_a_demoted_engine_as_dry_run():
@@ -509,13 +538,16 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
+    def __init__(
+        self, number, email, is_active, usage, alias="", disabled=False, login_expires_at=None
+    ):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
         self.alias = alias
         self.disabled = disabled
+        self.login_expires_at = login_expires_at
 
 
 class _FakeSnap:
@@ -537,19 +569,28 @@ def test_adapt_snapshot_shape_and_active_selection():
     # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
-        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0)),
-        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
+        _FakeAcct(
+            "1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0), login_expires_at=456.0
+        ),
+        _FakeAcct(
+            "2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True
+        ),
+        _FakeAcct(
+            "3", "c@x.com", False, _FakeEntry(sentinel=USAGE_RELOGIN_REQUIRED)
+        ),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
+    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, login_expires_at, quarantined)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0, 456.0, False)
     # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None, None, False,
     )
+    # the re-login sentinel is the one that marks the account quarantined
+    assert snap["accounts"][2][9] is True
 
 
 def test_adapt_snapshot_empty():
@@ -853,7 +894,7 @@ def test_account_row_shows_the_sentinel_state_not_the_remedy():
     label = menubar.format_account_label(
         2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
     )
-    assert label.endswith("re-login may be needed")
+    assert label.endswith("re-login may be needed · login ?")
     assert "cswap add" not in label
 
 
@@ -872,3 +913,108 @@ def test_set_tooltip_reaches_the_native_item_and_tolerates_its_absence():
     menubar._set_tooltip(item, "re-login needed — the full remedy")
     assert item._menuitem.tip == "re-login needed — the full remedy"
     menubar._set_tooltip(object(), "ignored")  # no native item behind it: no error
+
+
+# --- health row: auto-switch state + refresh age -------------------------------
+
+
+def test_health_label_off():
+    label, attention = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=90, refresh_interval=60
+    )
+    assert label == "Auto-switch off · usage read 1m ago"
+    assert attention is False
+
+
+def test_health_label_running():
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=30, refresh_interval=60
+    )
+    assert label == "Auto-switch running · usage read just now"
+    assert attention is False
+
+
+def test_health_label_enabled_but_not_running_needs_attention():
+    # The state that used to look healthy: the toggle on, no engine behind it.
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=False, usage_age=30, refresh_interval=60
+    )
+    assert label.startswith("⚠ Auto-switch stopped, click to restart")
+    assert attention is True
+
+
+def test_health_label_dates_a_stale_reading_and_a_missing_one():
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=2 * 3600, refresh_interval=60
+    )
+    assert "usage stale, read 2h 0m ago" in label
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=None, refresh_interval=60
+    )
+    assert label.endswith("no usage reading yet")
+
+
+def test_health_label_stale_threshold_has_a_floor():
+    # Three 30 s display intervals is not stale while the engine polls the
+    # active account every few minutes; the floor is fifteen minutes.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=600, refresh_interval=30
+    )
+    assert "stale" not in label
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=16 * 60, refresh_interval=30
+    )
+    assert "stale" in label
+    # With a long interval the multiple wins: 3 x 600 s = 30 min.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=20 * 60, refresh_interval=600
+    )
+    assert "stale" not in label
+
+
+def _row(num, is_active, fetched_at):
+    return (num, f"a{num}@x.com", is_active, {}, {}, None, False, fetched_at)
+
+
+def test_active_usage_age_dates_the_active_accounts_reading_not_the_snapshot():
+    # A store-only refresh is new; the reading it serves can be hours old.
+    snapshot = {"accounts": [_row(1, False, 1000.0), _row(2, True, 1000.0 - 2.5 * 3600)]}
+    assert menubar.active_usage_age(snapshot, now=1000.0) == 2.5 * 3600
+
+
+def test_active_usage_age_is_none_without_an_active_reading():
+    assert menubar.active_usage_age({"accounts": [_row(1, False, 10.0)]}, now=20.0) is None
+    assert menubar.active_usage_age({"accounts": [_row(1, True, None)]}, now=20.0) is None
+    assert menubar.active_usage_age(dict(menubar.EMPTY_SNAPSHOT), now=20.0) is None
+
+
+@pytest.mark.parametrize(
+    "seconds, text",
+    [(5, "just now"), (120, "2m ago"), (3900, "1h 5m ago"), (90000, "1d 1h ago")],
+)
+def test_age_text(seconds, text):
+    assert menubar._age_text(seconds) == text
+
+
+def test_engine_exit_applies_only_to_the_hosted_engine():
+    old, new = object(), object()
+    assert menubar.engine_exit_applies(old, old) is True
+    # Restart race: the predecessor's thread finishes after the replacement
+    # started; its exit must not clear the replacement.
+    assert menubar.engine_exit_applies(new, old) is False
+    # Already let go through the app's own stop.
+    assert menubar.engine_exit_applies(None, old) is False
+
+
+def test_engine_stopped_event_names_the_error_or_the_plain_end():
+    engine = object()
+    assert menubar.EngineStoppedEvent(engine, "RuntimeError: boom").human() == "RuntimeError: boom"
+    assert menubar.EngineStoppedEvent(engine).human() == "the engine loop ended on its own"
+    assert menubar.EngineStoppedEvent.kind == "engine-stopped"
+
+
+def test_format_title_attention_prefix():
+    settings = menubar.MenuBarSettings()
+    assert menubar.format_title(None, None, settings, attention=True) == "⚠ ⇄"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, settings, attention=True).startswith("⚠ ⇄ ")
+    assert not menubar.format_title("loc@papaya.asia", _USAGE, settings).startswith("⚠")

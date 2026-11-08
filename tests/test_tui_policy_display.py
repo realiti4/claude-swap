@@ -40,12 +40,17 @@ from tests.test_tui import (
 # through the same ``make_account`` fixture used below.  Only the header row and
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
-# instead (see ``test_the_card_bar_rows_are_untouched``).
-GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h(⟳1h59m):25% · 7d(⟳2d23h):10%"
-GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
+# instead (see ``test_the_card_bar_rows_are_untouched``).  The ``login ?``
+# segment comes from the login-expiry column, which every account view now
+# carries: it ends the card header and follows the name in a mini row.
+GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active   login ?"
+GOLDEN_MINI = (
+    " 2  dev (user2@example.com)  login ?       [personal]   5h(⟳1h59m):25% · 7d(⟳2d23h):10%"
+)
+GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)   login ?"
 GOLDEN_MINI_DISABLED = (
-    " 3  user3@example.com  [personal]  (disabled)   5h(⟳1h59m):25% · 7d(⟳2d23h):10%"
+    " 3  user3@example.com  login ?       [personal]  (disabled)"
+    "   5h(⟳1h59m):25% · 7d(⟳2d23h):10%"
 )
 
 NOW = 1000.0

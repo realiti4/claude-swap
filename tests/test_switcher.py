@@ -1627,7 +1627,8 @@ class TestListAccountsUsage:
         assert "test@example.com [personal] (active)" in output
         assert "account2@example.com" in output
         assert "├ 5h:" in output
-        assert "└ 7d:" in output
+        assert "├ 7d:" in output
+        assert "└ login:" in output
         assert "10%" in output
         assert "50%" in output
 
@@ -1686,7 +1687,8 @@ class TestListAccountsUsage:
 
         output = capsys.readouterr().out
         assert "5h:" not in output
-        assert "7d: 100%" in output
+        # Label column widened to fit "login:" (added alongside 7d/$$).
+        assert "7d:    100%" in output
         assert "usage unavailable" not in output
 
     def test_list_no_credentials(
@@ -15050,7 +15052,7 @@ class TestDegradedReadProvenance:
             s, "_read_active_credentials",
             lambda: ActiveCredentials(old_gen, False, True),  # degraded, stale
         )
-        entry = s._active_account_usage("2", "b@example.com", "")
+        entry, _login_expires_at = s._active_account_usage("2", "b@example.com", "")
         assert entry.sentinel != USAGE_RELOGIN_REQUIRED, (
             "C1 (round 11) regression on the --status path: an already-"
             f"healed slot was condemned on a degraded read, sentinel={entry.sentinel!r}"

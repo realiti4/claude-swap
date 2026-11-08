@@ -2659,6 +2659,7 @@ class TestUnswitchableRowsAreListed:
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
         a.policy.threshold = None
+        a.login_expires_at = None
         return a
 
     def _render(self, snap, active):
@@ -2668,6 +2669,9 @@ class TestUnswitchableRowsAreListed:
 
         v = AutoScreen.__new__(AutoScreen)
         v._settings = AutoSwitchSettings()
+        # The login column fits the "#candidates" box; an unmounted screen has
+        # none, so give the rows room for every login form.
+        v.query_one = lambda *_a, **_k: MagicMock(size=MagicMock(width=200))
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
@@ -2685,6 +2689,16 @@ class TestUnswitchableRowsAreListed:
         # the login to whatever slot is active instead of this one.
         assert "switch here" in out
         assert "log in" in out
+
+    def test_only_a_switchable_slot_carries_the_login_countdown(self):
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True),
+            self._acct("4", "new@x.com", switchable=False),
+        ), active="1")
+        rows = {row.split()[1]: row for row in out.splitlines() if "@x.com" in row}
+        assert "login ?" in rows["b@x.com"]
+        assert "login" not in rows["new@x.com"]
 
     def test_an_api_key_slot_says_api_key_not_re_login(self):
         out = self._render(self._snap(

@@ -34,7 +34,7 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.lines import binding_window
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
     load_settings,
@@ -44,7 +44,13 @@ from claude_swap.settings import (
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel, spend_row, usage_rows
+from claude_swap.tui.widgets import (
+    AccountsPanel,
+    fit_login,
+    login_segment,
+    spend_row,
+    usage_rows,
+)
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -393,8 +399,19 @@ class AutoScreen(Screen):
             self._settings
             and self._settings.strategy in ("consume-first", "weekly-first")
         )
+        # Widest email among the switchable candidates, so every row's login
+        # column starts at the same offset regardless of which email is longest.
+        email_width = max(
+            (
+                len(acc.email)
+                for acc in snap.accounts
+                if acc.number != active_number and acc.switchable
+            ),
+            default=0,
+        )
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
-        lines: dict[str, Text] = {}
+        # (acc while the row carries a login column, up to the login, after it)
+        lines: dict[str, tuple[AccountSnapshot | None, Text, Text]] = {}
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -404,9 +421,9 @@ class AutoScreen(Screen):
             # showed two accounts here and five in the engine's own log. A row
             # that says why it cannot be picked beats a row that isn't there.
             if not acc.switchable:
-                entry = Text()
-                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(acc.email, style=palette.muted)
+                head, entry = Text(), Text()
+                head.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                head.append(acc.email, style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -421,7 +438,7 @@ class AutoScreen(Screen):
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
                 entry.append(f"  {note}", style=palette.sev_warn)
-                lines[acc.number] = entry
+                lines[acc.number] = (None, head, entry)  # no stored login to count down
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
             line = (
@@ -433,9 +450,9 @@ class AutoScreen(Screen):
                 weekly,
                 scale=threshold,
             )
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            head, entry = Text(), Text()
+            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            head.append(f"{acc.email:<{email_width}}", style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -504,7 +521,7 @@ class AutoScreen(Screen):
                     else (-binding.line_headroom,)
                 )
                 ranked.append((key, acc.number))
-            lines[acc.number] = entry
+            lines[acc.number] = (acc, head, entry)
 
         text = Text()
         text.append("Next best", style=palette.muted)
@@ -514,6 +531,19 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
-        for _key, number in sorted(ranked):
-            text.append(lines[number])
+        order = [lines[number] for _key, number in sorted(ranked)]
+        # The box has no width before its first layout; its CSS padding is 2 a side.
+        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
+        for row in fit_login(
+            lambda login: [
+                Text.assemble(
+                    head,
+                    Text(login_segment(acc, login) if acc else "", style=palette.muted),
+                    tail,
+                )
+                for acc, head, tail in order
+            ],
+            budget,
+        ):
+            text.append(row)
         return text
