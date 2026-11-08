@@ -13,6 +13,10 @@ import sys
 
 import pytest
 
+# Imported at collection so no single case pays for Textual (and the TUI
+# modules it loads) inside its own timing; the import-safety case below runs
+# the TUI seam modules in this process.
+import claude_swap.tui.app  # noqa: F401
 from claude_swap.exceptions import ClaudeSwitchError
 from tests.conftest import source_text, source_tree
 
@@ -219,9 +223,10 @@ class TestImportSafeWithoutTheExtra:
 
     def test_nothing_imports_cswap_pin_at_module_scope(self):
         """Behavioural tests pass right up until someone adds a top-level
-        import; assert the seam itself. Walks the whole tree, not just
-        module-level statements, so a conditional import at module scope
-        (`if sys.platform != "win32": import cswap_pin`) is caught too."""
+        import; assert the seam itself. Walks everything outside a function
+        body, not just module-level statements, so a conditional import at
+        module scope (`if sys.platform != "win32": import cswap_pin`) is
+        caught too."""
         import ast
         from pathlib import Path
 
@@ -230,14 +235,12 @@ class TestImportSafeWithoutTheExtra:
         for path in root.rglob("*.py"):
             if "cswap_pin" not in source_text(path):
                 continue
-            tree = source_tree(path)
-            nested = set()
-            for fn in ast.walk(tree):
-                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    nested.update(id(c) for c in ast.walk(fn))
-            for node in ast.walk(tree):
-                if id(node) in nested:
-                    continue
+            todo = [source_tree(path)]
+            while todo:
+                node = todo.pop()
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue  # runs at call time, not at import
+                todo.extend(ast.iter_child_nodes(node))
                 names = []
                 if isinstance(node, ast.Import):
                     names = [a.name for a in node.names]
@@ -247,13 +250,22 @@ class TestImportSafeWithoutTheExtra:
                     offenders.append(f"{path.name}:{node.lineno}")
         assert not offenders, f"module-scope import of cswap_pin: {offenders}"
 
-    def test_the_whole_package_imports_without_it(self):
-        """Runs in a subprocess with cswap_pin blocked at sys.meta_path —
-        importlib.import_module does not go through builtins.__import__, so a
-        __import__ patch would miss that form."""
+    def test_the_whole_package_imports_without_it(self, monkeypatch):
+        """Runs each seam module with cswap_pin blocked at sys.meta_path and
+        hidden from sys.modules -- importlib.import_module does not go through
+        builtins.__import__, so a __import__ patch would miss that form.
+
+        In this process, not a subprocess: a fresh interpreter paid ~0.35s to
+        re-import Textual for five modules. Each is executed again under its
+        own name WITHOUT being registered, so sys.modules is left as found
+        (asserted below). What the subprocess caught and this does not is a
+        module that reaches cswap_pin only through a dependency this process
+        has already imported; the two static scans around this case cover
+        that, since only a module that spells `cswap_pin` can do it.
+        """
         import ast
-        import subprocess
-        import textwrap
+        import importlib
+        import importlib.util
         from pathlib import Path
 
         src = Path(__file__).resolve().parent.parent / "src"
@@ -282,29 +294,32 @@ class TestImportSafeWithoutTheExtra:
         # module that builds the name at runtime, or reaches the seam only
         # through a function-scope import, is invisible here, and to the two
         # static scans around this case.
-        mods = [
-            ".".join(p.relative_to(src).with_suffix("").parts).removesuffix(".__init__")
+        mods = {
+            ".".join(p.relative_to(src).with_suffix("").parts).removesuffix(".__init__"): p
             for p in sorted((src / "claude_swap").rglob("*.py"))
             if "cswap_pin" in source_text(p) or binds_the_seam(p)
-        ]
+        }
         assert mods, "no module names cswap_pin: the walk found nothing to import"
-        code = textwrap.dedent(
-            f"""
-            import sys
-            sys.path.insert(0, {str(src)!r})
-            class Block:
-                def find_spec(self, name, path=None, target=None):
-                    if name.split(".")[0] == "cswap_pin":
-                        raise ImportError("blocked", name=name)
-                    return None
-            sys.meta_path.insert(0, Block())
-            import claude_swap
-            for name in {mods!r}:
-                __import__(name)
-            """
-        )
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr[-900:]
+        for name in mods:
+            importlib.import_module(name)  # so the runs below load nothing new
+        before = set(sys.modules)
+
+        class Block:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] == "cswap_pin":
+                    raise ImportError("blocked", name=name)
+                return None
+
+        monkeypatch.setattr(sys, "meta_path", [Block(), *sys.meta_path])
+        hidden = {m for m in sys.modules if m.split(".")[0] == "cswap_pin"}
+        for m in hidden:
+            monkeypatch.delitem(sys.modules, m)
+        with pytest.raises(ImportError):  # the control: the block took
+            importlib.import_module("cswap_pin")
+        for name, path in mods.items():
+            spec = importlib.util.spec_from_file_location(name, path)
+            spec.loader.exec_module(importlib.util.module_from_spec(spec))
+        assert set(sys.modules) == before - hidden, "a run registered or dropped a module"
 
     def test_only_pin_py_names_cswap_pin_at_all(self):
         """The sibling of the module-scope test above, one step further in.
@@ -1687,6 +1702,16 @@ class TestTheWiringCanAlwaysBeRemoved:
         # Shrink the DEFAULT this function resolves internally when no
         # timeout is passed, so both held locks time out in under a second.
         monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.4)
+        # A DRIVEN CLOCK for the lock's wait: its sleep advances the clock
+        # instead of napping, so each held lock times out without waiting.
+        # Only the wait is simulated; both locks stay really held below.
+        import time
+        import types
+
+        now = [0.0]
+        monkeypatch.setattr(claude_locks, "time", types.SimpleNamespace(
+            monotonic=lambda: now[0], time=time.time,
+            sleep=lambda s: now.__setitem__(0, now[0] + s)))
 
         real_proper_lockfile = claude_locks.proper_lockfile
         shares = []
@@ -9817,14 +9842,24 @@ class TestNoNameIsDefinedTwiceInThisModule:
     def test_no_duplicate_top_level_definitions(self):
         import ast
         import collections
+        import re
         from pathlib import Path
 
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
-        checked = 0
+        # A name repeats at module level only if its `def`/`class` line repeats
+        # at column 0, so only a file where one does is parsed (the AST stays
+        # the judge, since a column-0 line inside a string matches too). The
+        # rest cost a text scan instead of a parse of every module.
+        defn = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+(\w+)", re.M)
+        checked = defined = 0
         problems = []
         for path in sorted(root.rglob("*.py")):
-            tree = source_tree(path)
             checked += 1
+            heads = collections.Counter(defn.findall(source_text(path)))
+            defined += len(heads)
+            if max(heads.values(), default=0) < 2:
+                continue
+            tree = source_tree(path)
             names = collections.Counter(
                 n.name for n in tree.body
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -9835,6 +9870,7 @@ class TestNoNameIsDefinedTwiceInThisModule:
         # THE CONTROL: an empty walk would pass vacuously, and this guard's
         # whole value is that it fires on a file nobody thought to look at.
         assert checked > 5, f"the walk found only {checked} modules"
+        assert defined > 50, f"the prefilter matched only {defined} definitions"
         assert not problems, (
             "a name is defined more than once at module level; the LAST one "
             f"wins and the earlier is dead code nothing will report: {problems}"
@@ -11309,6 +11345,27 @@ class TestASourceFileIsReadAsUTF8:
     `__file__`, `getsourcefile`, `getsource`, or a `.py` path.
     """
 
+    @staticmethod
+    def _nodes_spanning(tree, hit_lines):
+        """Every node of ``tree`` whose line span holds a line in ``hit_lines``
+        (sorted), which is every node that can be a `read_text` call: the
+        attribute sits on such a line, inside the call and each ancestor.
+        Skips the subtrees `ast.walk` would visit for nothing; a node with no
+        position (`arguments`, `comprehension`) is passed through."""
+        import ast
+        import bisect
+
+        todo = [tree]
+        while todo:
+            node = todo.pop()
+            lo = getattr(node, "lineno", None)
+            if lo is not None:
+                k = bisect.bisect_left(hit_lines, lo)
+                if k == len(hit_lines) or hit_lines[k] > node.end_lineno:
+                    continue
+            todo.extend(ast.iter_child_nodes(node))
+            yield node
+
     def test_no_test_reads_a_source_file_with_the_platform_default(self):
         import ast
         import pathlib
@@ -11328,13 +11385,12 @@ class TestASourceFileIsReadAsUTF8:
             # `(p.read_text)()`. The ceiling is a call whose receiver or
             # arguments run past 10 lines with the marker only out there; the
             # AST below is still the judge of every file this lets through.
+            hit_lines = [i for i, ln in enumerate(lines, 1) if "read_text" in ln]
             if not any(
-                    "read_text" in ln and any(
-                        s in "\n".join(lines[max(0, i - 10):i + 11]) for s in srcish)
-                    for i, ln in enumerate(lines)):
+                    any(s in w for s in srcish) for w in (
+                        "\n".join(lines[max(0, i - 11):i + 10]) for i in hit_lines)):
                 continue
-            tree = source_tree(path)
-            for node in ast.walk(tree):
+            for node in self._nodes_spanning(source_tree(path), hit_lines):
                 if not (isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Attribute)
                         and node.func.attr == "read_text"):
@@ -11364,14 +11420,18 @@ class TestASourceFileIsReadAsUTF8:
         the failure mode every lint in this file has had at least once."""
         import ast
 
-        planted = 'src = pathlib.Path(__file__).read_text()\n'
-        tree = ast.parse(planted)
-        found = [n for n in ast.walk(tree)
-                 if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Attribute)
-                 and n.func.attr == "read_text"
-                 and not any(k.arg == "encoding" for k in n.keywords)]
-        assert len(found) == 1, "the walk cannot see an offender at all"
+        # The lint's own traversal, on a one-line and on a multi-line call.
+        for planted, hits in (
+            ('src = pathlib.Path(__file__).read_text()\n', [1]),
+            ('src = (\n    pathlib.Path(__file__)\n    .read_text()\n)\n', [3]),
+        ):
+            tree = ast.parse(planted)
+            found = [n for n in self._nodes_spanning(tree, hits)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "read_text"
+                     and not any(k.arg == "encoding" for k in n.keywords)]
+            assert len(found) == 1, "the walk cannot see an offender at all"
 
     def test_CONTROL_an_explicit_encoding_is_not_flagged(self):
         import ast

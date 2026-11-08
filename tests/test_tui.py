@@ -24,6 +24,8 @@ from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
+# Loads Textual at collection, so no single case pays for it inside its timing.
+from claude_swap.tui.autoview import AutoScreen
 from claude_swap.usage_store import UsageEntry
 
 
@@ -1420,12 +1422,21 @@ PIN_TOGGLES = [
 ]
 
 
+@pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
+def test_the_auto_view_binds_each_pin_key_to_its_toggle(key, json_key, field, text):
+    """The keystroke half of the flip case below, read off the bindings."""
+    bound = {b.key: b.action for b in AutoScreen.BINDINGS}
+    assert bound[key] == f"toggle_{field}"
+
+
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
-        await settle(pilot)
-        await pilot.press("g")
-        await pilot.pause()
+        # What the `g` binding's action pushes. One real `g` press is
+        # test_opens_in_dry_run_and_store_only, so the rest skip the keystroke
+        # and the settle in front of it, and await the mount itself rather
+        # than an idle tick.
+        await pilot.app.push_screen(AutoScreen())
 
     async def test_opens_in_dry_run_and_store_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1433,7 +1444,9 @@ class TestAutoScreen:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
             from claude_swap.tui.autoview import AutoScreen
 
             assert isinstance(app.screen, AutoScreen)
@@ -1592,23 +1605,23 @@ class TestAutoScreen:
             await self._open(pilot)
             screen = app.screen
             summary = screen.query_one("#auto-summary", Static)
+            toggle = getattr(screen, f"action_toggle_{field}")
             assert f"{text} on" in summary.render().plain
-            await pilot.press(key)
-            await pilot.pause()
+            toggle()
             assert getattr(load_pin_settings(tmp_path), field) is False
             assert f"{text} off" in summary.render().plain
-            await pilot.press(key)
-            await pilot.pause()
+            toggle()
             assert getattr(load_pin_settings(tmp_path), field) is True
             # `cswap pin --desktop off` ran meanwhile: the next press flips THAT.
             path.write_text(_json.dumps({"schemaVersion": 1, "pin": {json_key: False}}))
-            await pilot.press(key)
-            await pilot.pause()
+            toggle()
             assert getattr(load_pin_settings(tmp_path), field) is True
             log = screen.query_one("#event-log", RichLog)
             assert any(f"{text} on" in ln.text for ln in log.lines)
 
-    @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
+    # One key: both toggles share `_toggle_pin_switch`, so the failed-save
+    # branch is the same code for `o`; the `o` mapping is the binding test above.
+    @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES[:1])
     async def test_pin_toggle_reports_a_failed_save_and_keeps_the_old_state(
         self, tmp_path, fake_engine, monkeypatch, key, json_key, field, text
     ):
@@ -1633,8 +1646,7 @@ class TestAutoScreen:
             monkeypatch.setattr(
                 app.screen, "notify", lambda msg, **kw: notes.append(msg)
             )
-            await pilot.press(key)
-            await pilot.pause()
+            getattr(app.screen, f"action_toggle_{field}")()
             assert len(notes) == 1 and "read-only" in notes[0]
             summary = app.screen.query_one("#auto-summary", Static)
             assert f"{text} on" in summary.render().plain

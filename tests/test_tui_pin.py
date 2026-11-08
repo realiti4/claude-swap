@@ -16,16 +16,44 @@ import io
 import types
 
 import pytest
+from cswap_pin import proxy
+from textual.widgets import ListView, Static
 
+# Textual and the package load here, at collection, so whichever case runs
+# first on a worker does not pay for them inside its own timing.
+import claude_swap.tui.app  # noqa: F401
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_KEYCHAIN_UNAVAILABLE, USAGE_NO_CREDENTIALS
 from tests.conftest import source_tree
-from tests.test_tui import FakeSwitcher, make_account, make_app, menu_select, settle
+from tests.test_tui import FakeSwitcher, make_account, make_app, settle
+
+
+async def workers_done(pilot) -> None:
+    """Await every worker, then one pause for the UI updates they queued.
+
+    `settle` without its second pause: a case that starts a real worker waits
+    on that worker, and one pause is what applies what it posted.
+    """
+    await pilot.app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+async def open_switch(pilot) -> None:
+    """Open the switch screen without moving the cursor and pressing Enter.
+
+    `_dispatch` is what `on_list_view_selected` awaits for that Enter, so a
+    case about the screen itself starts from the same state. `push_screen` is
+    not awaited there, so the one pause is what mounts it.
+    """
+    await pilot.app.screen._dispatch("switch")
+    await pilot.pause()
 
 
 @pytest.mark.asyncio
 class TestThePinTuiSurface:
-    async def test_the_root_menu_cursor_survives_a_poll_and_a_rebuild(self, tmp_path):
+    async def test_the_root_menu_cursor_survives_a_poll_and_a_rebuild(
+        self, tmp_path, monkeypatch
+    ):
         """A poll must not steal the cursor, and a rebuild follows the action.
 
         POLL. The root menu is rebuilt on every snapshot so the pin row can
@@ -40,21 +68,20 @@ class TestThePinTuiSurface:
         a remembered integer lands on a different action than the one the user
         was pointing at. The identity to preserve is the action id.
         """
+        from claude_swap import pin
+
+        # Off the real resolution, which imports the package on every call.
+        monkeypatch.setattr(pin, "is_available", lambda: False)
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
-            from textual.widgets import ListView
-
             from claude_swap.tui.widgets import MenuItem
 
             menu = app.screen.query_one("#menu", ListView)
-            await pilot.press("down", "down")
-            await pilot.pause()
+            menu.index = 2
             assert menu.index == 2
 
             await app.screen.refresh_root_menu()
-            await pilot.pause()
             assert menu.index == 2, "a poll moved the cursor"
 
             items = list(menu.query(MenuItem))
@@ -62,21 +89,13 @@ class TestThePinTuiSurface:
                 i for i, it in enumerate(items) if it.action_id == "remove-menu"
             )
             menu.index = target
-            await pilot.pause()
 
             # The extra becomes available: a row is inserted ABOVE the cursor.
-            from claude_swap import pin
-
-            monkey = pin.is_available
-            pin.is_available = lambda: True
-            try:
-                await app.screen.refresh_root_menu()
-                await pilot.pause()
-                items = list(menu.query(MenuItem))
-                assert "pin-menu" in [it.action_id for it in items]
-                assert items[menu.index].action_id == "remove-menu"
-            finally:
-                pin.is_available = monkey
+            monkeypatch.setattr(pin, "is_available", lambda: True)
+            await app.screen.refresh_root_menu()
+            items = list(menu.query(MenuItem))
+            assert "pin-menu" in [it.action_id for it in items]
+            assert items[menu.index].action_id == "remove-menu"
 
     async def test_a_failing_pin_does_not_kill_the_dashboard(
         self, tmp_path, monkeypatch
@@ -89,8 +108,6 @@ class TestThePinTuiSurface:
         needs no injection: a plain FILE where <backup>/pin-proxy should be a
         directory makes ensure_proxy's mkdir raise FileExistsError.
         """
-        import cswap_pin.proxy as proxy
-
         from claude_swap import pin
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
@@ -114,7 +131,7 @@ class TestThePinTuiSurface:
         pin.is_available = lambda: True
         try:
             async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
+                await app.workers.wait_for_complete()
                 # `pin:1`, NOT `pin:clear`. This said "apply_pin failing"
                 # and dispatched the ONE action that never calls it: the
                 # clear branch skips `_impl()` on purpose ("CLEAR does not
@@ -123,18 +140,18 @@ class TestThePinTuiSurface:
                 # injection was inert and the assertion held for a reason
                 # unrelated to its name.
                 #
-                # `settle`, not a bare pause: this goes through
+                # `workers_done`, not a bare pause: this goes through
                 # `_start_action`, so the failure runs on a WORKER and one
                 # pause does not wait for it. The sibling below caught that
                 # half the loud way — Windows CI, `assert 'clear_wiring' in []`.
                 await app.screen._dispatch("pin:1")
-                await settle(pilot)
+                await workers_done(pilot)
                 assert fired, "the injected fault never fired"
                 assert app.is_running, "a failing pin killed the dashboard"
         finally:
             pin.is_available = real_avail
 
-    async def test_only_the_actionless_row_is_inert(self, tmp_path):
+    async def test_only_the_actionless_row_is_inert(self, tmp_path, monkeypatch):
         """A row with no action does nothing; an unknown id is still loud.
 
         INFORMATIONAL. `_pin_entries` returns [(str(exc), ""), _BACK] when the
@@ -151,12 +168,14 @@ class TestThePinTuiSurface:
         the KeyError it removed is the only thing that surfaces the typo. An id
         that is SUPPOSED to resolve must still be loud when it does not.
         """
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "is_available", lambda: False)
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
+            await app.workers.wait_for_complete()
             await app.screen._dispatch("")
-            await pilot.pause()
             assert app.is_running, "an actionless row killed the dashboard"
             with pytest.raises(KeyError):
                 await app.screen._dispatch("no-such-action-id")
@@ -189,16 +208,16 @@ class TestThePinTuiSurface:
         pin.pinned_email = lambda _sw: None
         try:
             async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
+                await app.workers.wait_for_complete()
                 await app.screen._dispatch("pin:clear")
-                # `settle` WAITS FOR THE WORKER; one pause only yields the
+                # `workers_done` WAITS FOR THE WORKER; one pause only yields the
                 # loop. `pin:clear` is dispatched through `_start_action`
                 # (clear_wiring takes a 9s lock and would freeze the
                 # dashboard inline), so this asserted a thread's side effect
                 # without waiting for the thread. Green on linux, and on
                 # Windows CI it failed with `assert 'clear_wiring' in []` —
                 # the scheduler, not the product.
-                await settle(pilot)
+                await workers_done(pilot)
                 assert "clear_wiring" in called, (
                     "the TUI cleared the pin but left the wiring behind"
                 )
@@ -325,14 +344,12 @@ class TestThePinTuiSurface:
         pin.pinned_email = lambda _sw: "cloud@example.com"
         try:
             async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
+                await app.workers.wait_for_complete()
                 app._start_action = lambda label, fn, **k: started.append(label)
                 await app.screen._dispatch("pin:clear")
-                await pilot.pause()
                 assert started, "pin:clear ran on the event loop"
                 started.clear()
                 await app.screen._dispatch("pin:1")
-                await pilot.pause()
                 assert started, "pin:<n> ran on the event loop"
         finally:
             pin.is_available, pin._impl, pin.pinned_email = real
@@ -505,9 +522,8 @@ class TestTheSwitchScreenBadgeIsResolvedOncePerSnapshot:
 
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
-            await menu_select(pilot, "switch")
-            await settle(pilot)
+            await app.workers.wait_for_complete()
+            await open_switch(pilot)
 
             cards = {
                 item.email: item.query_one(AccountCard)
@@ -697,7 +713,9 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
         finally:
             pin._impl, pin.clear_pin = real
 
-    async def test_a_snapshot_actually_rebuilds_the_root_menu(self, tmp_path):
+    async def test_a_snapshot_actually_rebuilds_the_root_menu(
+        self, tmp_path, monkeypatch
+    ):
         """The SUBSCRIPTION, not just the method it calls.
 
         `refresh_root_menu` had a direct-call test, so its logic was covered —
@@ -710,10 +728,13 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
 
         So drive a snapshot through the app and assert the rebuild happened.
         """
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "is_available", lambda: False)
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
+            await workers_done(pilot)
             calls = []
             original = app.screen.refresh_root_menu
 
@@ -725,8 +746,7 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
             # A poll publishes a new snapshot; that is the app's own mechanism,
             # not a helper invented here.
             app.snapshot = types.SimpleNamespace(accounts=[make_account(1, active=True)])
-            await pilot.pause()
-            await settle(pilot)
+            await workers_done(pilot)
             assert calls, (
                 "a snapshot did not rebuild the root menu — the pin row cannot "
                 "appear on a mid-session install"
@@ -807,9 +827,8 @@ class TestAnOrphanedRecordDoesNotHideItsOwnRemoval:
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
-            await menu_select(pilot, "pin-menu")
-            await settle(pilot)
+            await app.workers.wait_for_complete()
+            await app.screen._dispatch("pin-menu")  # awaits the submenu render
             actions = [i.action_id for i in app.screen.query(MenuItem)]
             assert "pin:clear" in actions, (
                 f"the broken-package submenu dead-ends on the error string "
@@ -824,15 +843,13 @@ class TestAnOrphanedRecordDoesNotHideItsOwnRemoval:
         reason states that reason in the title, not just the label.
         """
         from claude_swap.tui import dashboard as _dash
-        from textual.widgets import Static
 
         monkeypatch.setattr(_dash.pin, "is_available", lambda: True)
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
-            await menu_select(pilot, "pin-menu")
-            await settle(pilot)
+            await app.workers.wait_for_complete()
+            await app.screen._dispatch("pin-menu")  # awaits the submenu render
             title = app.screen.query_one("#menu-title", Static).render().plain
             assert "slot order" in title
             assert "numbers stay put" in title  # states the reason, not just the label
@@ -919,7 +936,7 @@ class TestTwoSlotsAtOneAddressLightOneBadge:
 
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
+            await app.workers.wait_for_complete()
             panel = app.screen.query_one(_w.AccountsPanel)
             panel._resolve_and_refresh()
             text = panel.render().plain
@@ -929,8 +946,7 @@ class TestTwoSlotsAtOneAddressLightOneBadge:
                 "lights both"
             )
 
-            await menu_select(pilot, "switch")
-            await settle(pilot)
+            await open_switch(pilot)
 
             cards = [(item.number, item.query_one(AccountCard))
                      for item in app.screen.query(AccountItem)]
