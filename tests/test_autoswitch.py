@@ -3178,9 +3178,8 @@ def _base_engine_results(
         tf.extractall(old_root, filter="data")  # trusted: our own repo's history
     module_dir = tmp_path / "base_driver"
     module_dir.mkdir()
-    # HEAD's test module runs against BASE's package: a name this file imports
-    # from `claude_swap` that post-dates the base sha reddens the driver
-    # (ImportError) instead of skipping.
+    # HEAD's test module runs against BASE's package: the driver stubs a name
+    # this file imports from `claude_swap` that post-dates the base sha.
     (module_dir / "test_autoswitch.py").write_text(
         Path(__file__).read_text(encoding="utf-8"), encoding="utf-8"
     )
@@ -3216,8 +3215,24 @@ def _base_engine_results(
         "from pathlib import Path\n"
         f"sys.path.insert(0, {str(old_root / 'src')!r})\n"
         f"sys.path.insert(0, {str(module_dir)!r})\n"
-        "import claude_swap\n"
-        "import test_autoswitch as ta\n"
+        "import claude_swap, claude_swap.oauth, os\n"
+        # conftest's hermetic stubs do not reach this interpreter: without
+        # them a base switch opens a live oauth-profile request (2.7 of 3.5 s).
+        "claude_swap.oauth.fetch_oauth_profile = lambda token: None\n"
+        "os.fsync = lambda fd: None\n"
+        "import importlib, re\n"
+        "while True:\n"
+        # A name HEAD's test module imports that post-dates the base is
+        # stubbed: the digest jobs never call it, and one that did would
+        # fail loudly (None is not callable) instead of skipping.
+        "    try:\n"
+        "        import test_autoswitch as ta\n"
+        "        break\n"
+        "    except ImportError as e:\n"
+        "        m = re.match(r\"cannot import name '(\\w+)' from '(claude_swap[\\w.]*)'\", str(e))\n"
+        "        if not m:\n"
+        "            raise\n"
+        "        setattr(importlib.import_module(m[2]), m[1], None)\n"
         f"{fleets_setup}"
         "results = ta.TestOutcomeDigestAgainstBase._run(\n"
         f"    None, ta.AutoSwitchEngine, Path(sys.argv[1]), 'base', fleets, {strategy!r},\n"
@@ -3232,12 +3247,13 @@ def _base_engine_results(
     )
     if result.returncode != 0:
         # The digest is a PR-branch invariant (base vs THIS PR's head), not
-        # an integration one: where a later PR's merge has added a symbol
-        # to `claude_swap.autoswitch` that this test module now imports,
-        # base's own package (frozen at `base_sha`) cannot satisfy it and
-        # the comparison is undefined — SKIP, exactly as this function
-        # already skips when the base object itself is absent. Any OTHER
-        # subprocess failure (a real digest-run crash) still reds.
+        # an integration one: where a later PR's merge has added a module
+        # to `claude_swap` that this test module now imports (a mere new
+        # name is stubbed in the driver), base's own package (frozen at
+        # `base_sha`) cannot satisfy it and the comparison is undefined —
+        # SKIP, exactly as this function already skips when the base
+        # object itself is absent. Any OTHER subprocess failure (a real
+        # digest-run crash) still reds.
         import_line = next(
             (
                 line for line in result.stderr.splitlines()
@@ -3676,7 +3692,7 @@ class TestOutcomeDigest375:
 
         old_classify = autoswitch._classify_dynamic_trigger
 
-        def always_proactive(active_headroom):
+        def always_proactive(active_headroom, wall=None):
             # #375 replaced the bare below-threshold trigger with TWO new
             # guards, not one: `about_to_wall` deciding whether `proactive`
             # fires at all, and `cold_switch_cost_pct` (below) deciding
