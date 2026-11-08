@@ -2729,7 +2729,10 @@ class TestNextBestMarksStaleUsage:
         v._settings = settings or AutoSwitchSettings(strategy="best")
         app = MagicMock()
         app.current_theme = CSWAP_DARK
-        with patch.object(AutoScreen, "app", property(lambda s: app)):
+        # The rows are fitted to the box's width, which an unmounted screen has no query for.
+        box = MagicMock(size=MagicMock(width=200))
+        with patch.object(AutoScreen, "app", property(lambda s: app)), \
+                patch.object(AutoScreen, "query_one", return_value=box):
             return str(v._candidates_text(snap, active_number=active))
 
     @pytest.mark.parametrize(
@@ -2818,6 +2821,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
+        a.login_expires_at = None
         a.policy = AccountPolicy()
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
@@ -2833,7 +2837,10 @@ class TestUnswitchableRowsAreListed:
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
-        with patch.object(AutoScreen, "app", property(lambda s: app)):
+        # The rows are fitted to the box's width, which an unmounted screen has no query for.
+        box = MagicMock(size=MagicMock(width=200))
+        with patch.object(AutoScreen, "app", property(lambda s: app)), \
+                patch.object(AutoScreen, "query_one", return_value=box):
             return str(v._candidates_text(snap, active_number=active))
 
     def test_a_credential_less_slot_is_shown_with_what_to_do(self):
