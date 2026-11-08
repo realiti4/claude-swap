@@ -577,7 +577,7 @@ class TestProperLockfile:
             assert not takeover.is_symlink() and not takeover.exists()
         else:
             with pytest.raises(ClaudeCodeLockTimeout):
-                with proper_lockfile(lock_dir, timeout=0.5):
+                with proper_lockfile(lock_dir, timeout=0.05):
                     pass
             assert takeover.is_symlink() or takeover.exists()
 
