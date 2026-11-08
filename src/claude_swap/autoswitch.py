@@ -422,6 +422,27 @@ def expiring_order(
     rolling sample if a burst makes it misjudge a deadline. Checked against the
     live 6.9 pts/h: 6.17 (24 h) and 4.64 (7 d) measured from usage.jsonl, 2026-11-06.
     """
+    rate, rows = _expiring_walk(accounts, usage, headroom, bars, caps, plans, landing_cost, now)
+    return _expiring_due(rate, rows, now)
+
+
+_WalkRows = list[tuple[str, float, float]]  # (account, need, reset), in reset order
+
+
+def _expiring_walk(
+    accounts: Sequence[str],
+    usage: Mapping[str, dict | str | None],
+    headroom: Mapping[str, float | None],
+    bars: Mapping[str, float],
+    caps: Mapping[str, float | None],
+    plans: Mapping[str, str | None],
+    landing_cost: Callable[[str], float],
+    now: float,
+) -> tuple[float, _WalkRows]:
+    """``expiring_order``'s walk: the fleet's burn rate (7d points per second;
+    0.0 and no rows when none is measurable) and one ``(account, need, reset)``
+    row per walked account in reset order, ``need`` the Ultra points of room to
+    spend through that account. The one place the deadline arithmetic lives."""
     def weight(n: str) -> float:
         return 1.0 / _PLAN_COST_SCALE.get(plans.get(n), 1.0)
 
@@ -432,15 +453,14 @@ def expiring_order(
         if pct is not None and reset is not None:
             seen[n] = (pct, reset)
     if not seen:
-        return []
+        return 0.0, []
     elapsed = sum(max(_SEVEN_DAYS_S - (r - now), 0.0) for _, r in seen.values()) / len(seen)
     spent = sum(pct * weight(n) for n, (pct, _) in seen.items())
     if spent <= 0 or elapsed <= 0:
-        return []
+        return 0.0, []
     rate = spent / elapsed
-    walked: list[str] = []
+    rows: _WalkRows = []
     need = 0.0
-    last_due = 0
     for n in sorted((n for n in accounts if n in seen), key=lambda n: seen[n][1]):
         pct, reset = seen[n]
         wall = _wall_headroom(bars.get(n))
@@ -459,11 +479,43 @@ def expiring_order(
             or (five is not None and 100.0 - five - cost <= wall)
         ):
             continue
-        walked.append(n)
         need += room * weight(n)
-        if need * EXPIRING_RATE_MARGIN / rate >= reset - now:
-            last_due = len(walked)
-    return walked[:last_due]
+        rows.append((n, need, reset))
+    return rate, rows
+
+
+def _expiring_due(rate: float, rows: _WalkRows, now: float) -> list[str]:
+    """The walk's rows up to and including the last whose deadline has come: an
+    account is due once ``need * EXPIRING_RATE_MARGIN / rate`` reaches its reset."""
+    last_due = max(
+        (i for i, (_, need, reset) in enumerate(rows, 1)
+         if need * EXPIRING_RATE_MARGIN / rate >= reset - now),
+        default=0,
+    )
+    return [n for n, _, _ in rows[:last_due]]
+
+
+def _hhmm_z(ts: float, now: float) -> str:
+    """UTC with a Z, as the log's own times; a day or more out it names the weekday."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime(
+        "%H:%MZ" if abs(ts - now) < 24 * 3600 else "%a %H:%MZ"
+    )
+
+
+def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float) -> str:
+    """What `dynamic` decided when no row is due: the walked account whose
+    deadline (``reset - need * EXPIRING_RATE_MARGIN / rate``) comes first, and when."""
+    if not rows:
+        return "nothing expiring; " + (
+            "no account has 7d room it can spend now" if rate else "no fleet burn rate to time a deadline"
+        )
+    due, n, need, reset = min(
+        (reset - need * EXPIRING_RATE_MARGIN / rate, n, need, reset) for n, need, reset in rows
+    )
+    return (
+        f"nothing expiring yet; next: #{n} due at {_hhmm_z(due, now)} ({need:.0f} pts room, "
+        f"{(reset - due) / 3600:.1f} h at {rate * 3600:.1f} pts/h, resets {_hhmm_z(reset, now)})"
+    )
 
 
 def _stay_progress(
@@ -2858,9 +2910,10 @@ class AutoSwitchEngine:
             return warm, cold, bar_active
 
         # T3310: an account whose 7d window expires with room left pulls the
-        # switch (`expiring_order`); its logged trigger is `expiring-window`,
+        # switch (`expiring_order`'s walk); its logged trigger is `expiring-window`,
         # while every gate downstream keeps reading `alternation`.
         expiring: list[str] = []
+        walk = (0.0, [])
         logged_trigger: str | None = None
         if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
             now = self.clock()
@@ -2873,12 +2926,13 @@ class AutoSwitchEngine:
                     None, settings.cold_switch_cost_pct, getattr(entries.get(n), "plan", None)
                 )
 
-            expiring = expiring_order(
+            walk = _expiring_walk(
                 [current, *oauth_candidates], usage, headroom, self._bars,
                 {n: p.weekly_cap for n, p in policies.items()},
                 {n: getattr(e, "plan", None) for n, e in entries.items()},
                 _landing_cost, now,
             )
+            expiring = _expiring_due(*walk, now)
 
         # On a healthy active, the expiring accounts ahead of its own window pull the
         # switch. An active walled on its own model-gated axis leaves by the walled
@@ -3333,22 +3387,22 @@ class AutoSwitchEngine:
                 # m1: the active is healthy (not about to wall) here on
                 # EITHER side of `settings.threshold` -- no `< threshold`
                 # comparison, which can print a false "95% < 90%".
-                self._emit(
-                    NoSwitchEvent(
-                        reason=reason,
-                        detail=(
-                            f"active account is healthy ({pct_label(active_headroom)}"
-                            "% headroom, not about to wall)"
-                            + (
-                                "; spending its expiring window first"
-                                if spend_first and not alternation_admissible
-                                else "; the alternation step is not reached"
-                                if step_holds
-                                else ""
-                            )
-                        ),
-                    )
+                healthy = (
+                    f"active account is healthy ({pct_label(active_headroom)}"
+                    "% headroom, not about to wall)"
                 )
+                # The hold names what `dynamic` decided, not the threshold or
+                # the step it did not need: its own expiring window, or when
+                # the next account comes due (`_expiring_walk`'s reading).
+                if not expiring:
+                    detail = _nothing_expiring_detail(*walk, now)
+                elif spend_first and not alternation_admissible:
+                    detail = healthy + "; spending its expiring window first"
+                else:
+                    detail = healthy + (
+                        "; the alternation step is not reached" if step_holds else ""
+                    )
+                self._emit(NoSwitchEvent(reason=reason, detail=detail))
                 return TickOutcome.NO_ACTION
             else:
                 if self._in_cooldown(state):

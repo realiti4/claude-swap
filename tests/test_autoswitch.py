@@ -7037,7 +7037,7 @@ class TestWarmthAndAlternation375:
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         )
         assert "<" not in detail, detail
-        assert "healthy" in detail, detail
+        assert "nothing expiring" in detail, detail
 
     def test_f2_walled_active_admits_the_cold_candidate_above_floor(
         self, temp_home
@@ -17928,13 +17928,30 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert _xw_hold(h).reason == "below-threshold"
         assert "spending its expiring window first" in _xw_hold(h).detail
 
-    def test_a_far_reset_window_does_not_pull_and_the_step_holds(self, temp_home):
+    def test_a_far_reset_window_does_not_pull_and_the_hold_says_when_it_will(self, temp_home):
+        """7d at 40/80/20/100 %, resets 6 d / 20 h / 5 d / 6.9 d out: 55.6 h of mean
+        elapsed time for 240 points is 4.3 pts/h. 2's 17 points of room take 17 x 1.5 /
+        4.3 = 5.9 h, so it is due at its reset (09:46Z) less that, 03:52Z: 14.1 h out."""
         h = _xw_harness(temp_home)
-        usage = self._fleet(h, **{"2": _xw(h, 10.0, 87.0, 5 * _D)})
+        usage = self._fleet(h, **{
+            "1": _xw(h, 10.0, 40.0, 6 * _D),
+            "2": _xw(h, 10.0, 80.0, 20 * _H),
+            "3": _xw(h, 10.0, 20.0, 5 * _D),
+        })
         assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert _xw_hold(h).reason == "below-threshold"
-        assert "the alternation step is not reached" in _xw_hold(h).detail
+        assert _xw_hold(h).detail == (
+            "nothing expiring yet; next: #2 due at 03:52Z "
+            "(17 pts room, 5.9 h at 4.3 pts/h, resets 09:46Z)"
+        )
+        assert _xw_hold(h).human() == f"no switch: below-threshold ({_xw_hold(h).detail})"
+
+    def test_another_strategy_keeps_the_threshold_wording(self, temp_home):
+        h = _xw_harness(temp_home)
+        h.settings = replace(h.settings, strategy="best")
+        assert _xw_tick(h, self._fleet(h)) is TickOutcome.NO_ACTION
+        assert (_xw_hold(h).reason, _xw_hold(h).detail) == ("below-threshold", "7d 32% < 90%")
 
     @pytest.mark.parametrize("how", ["own-bar", "weekly-cap", "disabled", "five-hour-bound"])
     def test_a_candidate_that_cannot_serve_does_not_pull(self, temp_home, how):
@@ -18191,6 +18208,38 @@ def test_the_walk_is_cut_after_the_last_due_account(left_3, expect):
     headroom = {"1": 0.0, "2": 50.0, "4": 10.0, "3": 70.0}
     order = expiring_order(["1", "2", "4", "3"], usage, headroom, {}, {}, {}, lambda n: 0.0, now)
     assert order == expect
+
+
+def test_the_nothing_expiring_reading_says_when_no_account_will_come_due():
+    from claude_swap.autoswitch import _expiring_walk, _nothing_expiring_detail
+
+    now = 1_000_000.0
+
+    def reading(usage: dict, headroom: dict) -> str:
+        rate, rows = _expiring_walk(["1", "2"], usage, headroom, {}, {}, {}, lambda n: 0.0, now)
+        return _nothing_expiring_detail(rate, rows, now)
+
+    walled = {"1": 0.0, "2": 0.0}  # both at their wall: read for the rate, never walked
+    assert reading(_xw_unit(now, **{"1": (32.0, 6 * _D), "2": (87.0, 2 * _H)}), walled) == (
+        "nothing expiring; no account has 7d room it can spend now"
+    )
+    assert reading({}, walled) == "nothing expiring; no fleet burn rate to time a deadline"
+
+
+def test_a_due_time_a_day_or_more_out_names_its_weekday():
+    from claude_swap.autoswitch import _expiring_walk, _nothing_expiring_detail
+
+    now = 1_000_000.0  # Mon 1970-01-12 13:46:40Z
+    # 62 points over 36 h mean elapsed is 1.7 pts/h; 2's 67 points take 58.4 h, so it is due
+    # at its reset (Sat 13:46Z) less that: Thu 03:25Z, 61.6 h out, not a bare "03:25Z".
+    usage = _xw_unit(now, **{"1": (32.0, 6 * _D), "2": (30.0, 5 * _D)})
+    rate, rows = _expiring_walk(
+        ["1", "2"], usage, {"1": 0.0, "2": 70.0}, {}, {}, {}, lambda n: 0.0, now
+    )
+    assert _nothing_expiring_detail(rate, rows, now) == (
+        "nothing expiring yet; next: #2 due at Thu 03:25Z "
+        "(67 pts room, 58.4 h at 1.7 pts/h, resets Sat 13:46Z)"
+    )
 
 
 def test_a_weekly_cap_leaves_room_to_the_fullest_weekly_window():
