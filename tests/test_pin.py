@@ -1702,16 +1702,19 @@ class TestTheWiringCanAlwaysBeRemoved:
         # Shrink the DEFAULT this function resolves internally when no
         # timeout is passed, so both held locks time out in under a second.
         monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.4)
-        # A DRIVEN CLOCK for the lock's wait: its sleep advances the clock
-        # instead of napping, so each held lock times out without waiting.
-        # Only the wait is simulated; both locks stay really held below.
+        # A SKIPPED-SLEEP CLOCK for the lock's wait: the real clock plus every
+        # sleep not slept, so each held lock times out without waiting. Real
+        # time keeps passing between reads, as a wait clamped to its remaining
+        # budget needs to end; every other `time` name stays the real one.
+        # Both locks stay really held below.
         import time
         import types
 
-        now = [0.0]
-        monkeypatch.setattr(claude_locks, "time", types.SimpleNamespace(
-            monotonic=lambda: now[0], time=time.time,
-            sleep=lambda s: now.__setitem__(0, now[0] + s)))
+        skipped = [0.0]
+        monkeypatch.setattr(claude_locks, "time", types.SimpleNamespace(**{
+            **vars(time),
+            "monotonic": lambda: time.monotonic() + skipped[0],
+            "sleep": lambda s: skipped.__setitem__(0, skipped[0] + s)}))
 
         real_proper_lockfile = claude_locks.proper_lockfile
         shares = []
