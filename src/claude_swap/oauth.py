@@ -135,11 +135,30 @@ def login_expires_at_epoch(credentials: str) -> float | None:
     return value / 1000 if value is not None else None
 
 
-# Widest shape `format_login_expiry` can produce: "needed" (6) ties "23d04h"
-# / "99d23h" (6) under the ~30-day refresh window (2-digit days is the
-# practical ceiling). ljust below pads every shorter shape to this so a
-# column of them starts at the same offset.
-_LOGIN_VALUE_WIDTH = 6
+# How far ahead a stored login's expiry is worth showing. Claude Code's own
+# notice fires inside the last three days; a week leaves time to plan the
+# re-logins of several accounts without every view nagging for a month.
+LOGIN_DUE_WITHIN_S = 7 * 86400
+
+
+def login_time_left(
+    expires_at: float | None, quarantined: bool, now: float | None = None
+) -> float | None:
+    """Seconds until a stored login must be redone, when that is worth saying.
+
+    ``None`` means "nothing to say": the stamp is unknown (logins older than
+    the field, API-key slots), the expiry is further out than
+    ``LOGIN_DUE_WITHIN_S``, or the slot is quarantined, whose usage sentinel
+    already reads "re-login needed". Otherwise the seconds left, ``0.0`` once
+    the stamp is past.
+    """
+    if quarantined or expires_at is None:
+        return None
+    now = now if now is not None else datetime.now(timezone.utc).timestamp()
+    remaining = expires_at - now
+    if remaining > LOGIN_DUE_WITHIN_S:
+        return None
+    return max(0.0, remaining)
 
 
 def format_login_expiry(
@@ -147,36 +166,29 @@ def format_login_expiry(
     quarantined: bool,
     now: float | None = None,
     short: bool = False,
-) -> str:
-    """Fixed-width countdown to a stored login's refresh-token expiry.
-
-    ``"23d04h"`` at a day or more out (days, zero-padded hours), ``"5h07m"``
-    / ``"0h45m"`` under a day (zero-padded minutes), ``"needed"`` once the
-    expiry is at or before now or the account is quarantined (dead
-    refresh-token lineage — the same fact either signals), ``"?"`` when the
-    stamp is missing or unreadable. Right-padded to the widest shape
-    (``_LOGIN_VALUE_WIDTH``) so a column of these lines up.
-
-    ``short`` is the three-column form for rows too narrow for the full one:
-    ``"23d"``, ``"5h"``, ``"now"`` (login needed), ``"?"``.
+) -> str | None:
+    """``"re-login in 5d 12h"`` while a stored login is due (see
+    :func:`login_time_left`), ``"re-login needed"`` once its stamp is past,
+    ``None`` when there is nothing to say. The countdown is the reset
+    counters' (:func:`format_countdown`); ``short`` keeps its first unit
+    (``"re-login in 5d"``) for rows with little room.
     """
-    needed = "now" if short else "needed"
-    if quarantined:
-        text = needed
-    elif expires_at is None:
-        text = "?"
-    else:
-        now = now if now is not None else datetime.now(timezone.utc).timestamp()
-        remaining = expires_at - now
-        if remaining <= 0:
-            text = needed
-        elif remaining >= 86400:
-            days, rem = divmod(int(remaining), 86400)
-            text = f"{days}d" if short else f"{days}d{rem // 3600:02d}h"
-        else:
-            rem = int(remaining)
-            text = f"{rem // 3600}h" if short else f"{rem // 3600}h{(rem % 3600) // 60:02d}m"
-    return text.ljust(3 if short else _LOGIN_VALUE_WIDTH)
+    left = login_time_left(expires_at, quarantined, now)
+    if left is None:
+        return None
+    if left <= 0:
+        return "re-login needed"
+    countdown = format_countdown(left)
+    return f"re-login in {countdown.split(' ')[0] if short else countdown}"
+
+
+def login_expiry_clock(expires_at: float, now: float | None = None) -> str:
+    """The stamp as the local clock string the reset columns use."""
+    now_utc = (
+        datetime.fromtimestamp(now, tz=timezone.utc) if now is not None
+        else datetime.now(timezone.utc)
+    )
+    return reset_clock_string(datetime.fromtimestamp(expires_at, tz=timezone.utc), now_utc)
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
@@ -458,20 +470,20 @@ def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
     now = datetime.now(timezone.utc)
-    remaining = reset_utc - now
-    total_seconds = max(0, int(remaining.total_seconds()))
-    days, remainder = divmod(total_seconds, 86400)
+    return format_countdown((reset_utc - now).total_seconds()), reset_clock_string(reset_utc, now)
+
+
+def format_countdown(seconds: float) -> str:
+    """``"5d 12h"`` / ``"1h 59m"`` / ``"45m"``: the grammar of every countdown shown."""
+    total = max(0, int(seconds))
+    days, remainder = divmod(total, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
-
     if days > 0:
-        countdown = f"{days}d {hours}h"
-    elif hours > 0:
-        countdown = f"{hours}h {minutes}m"
-    else:
-        countdown = f"{minutes}m"
-
-    return countdown, reset_clock_string(reset_utc, now)
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def reset_clock_string(reset_utc: datetime, now_utc: datetime) -> str:

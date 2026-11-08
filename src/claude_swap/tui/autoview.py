@@ -359,11 +359,8 @@ class AutoScreen(Screen):
             acc for acc in snap.accounts
             if acc.number != active_number and acc.switchable
         ]
-        # Widest email among the candidates, so every row's login column
-        # starts at the same offset regardless of which email is longest.
-        email_width = max((len(acc.email) for acc in candidates), default=0)
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
-        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, up to the login, after it)
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
         # The badge rides on that account's own row rather than the summary
         # line: naming the pin separately makes you match an email against the
         # list directly below it instead of just reading the list.
@@ -385,7 +382,7 @@ class AutoScreen(Screen):
             )
             head, entry = Text(), Text()
             head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            head.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+            head.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -436,7 +433,7 @@ class AutoScreen(Screen):
         budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
         for row in fit_login(
             lambda login: [
-                Text.assemble(head, Text(login_segment(acc, login), style=palette.muted), tail)
+                Text.assemble(head, tail, Text(login_segment(acc, login), style=palette.muted))
                 for acc, head, tail in order
             ],
             budget,

@@ -207,24 +207,24 @@ def pin_is_broken(acc: AccountSnapshot) -> bool:
     )
 
 
-_LOGIN_LABEL = "login"
-
-
-# Login-countdown forms, fullest first: "login 23d04h", "login 23d", nothing.
+# Login-note forms, fullest first: "re-login in 5d 12h", "re-login in 5d",
+# nothing. A row carries one only while its login is due
+# (``oauth.login_time_left``), so most rows read as if there were no note.
 LOGIN_FORMS = ("full", "short", None)
 
 
 def login_segment(
     acc: AccountSnapshot, form: str | None, now: float | None = None, gap: str = "  "
 ) -> str:
-    """The ``login <countdown>`` text of a row, led by ``gap`` ("" when ``form`` is None)."""
+    """The row's ``re-login in …`` note led by ``gap``, or ``""`` when
+    ``form`` is None or the slot's login is not due."""
     if form is None:
         return ""
     quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
-    value = oauth.format_login_expiry(
+    note = oauth.format_login_expiry(
         acc.login_expires_at, quarantined, now, short=form == "short"
     )
-    return f"{gap}{_LOGIN_LABEL} {value}"
+    return f"{gap}{note}" if note else ""
 
 
 def fit_login(build: Callable[[str | None], list[Text]], budget: int) -> list[Text]:
@@ -289,8 +289,8 @@ def account_card_text(
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
     5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
-    per-model rows, which reset weekly. ``login`` is the form of the login
-    countdown that ends the header (see ``LOGIN_FORMS``).
+    per-model rows, which reset weekly. ``login`` is the form of the re-login
+    note that ends the header while the login is due (see ``LOGIN_FORMS``).
 
     ``cloud_pinned`` marks the account that owns the claude.ai-side assets
     (Remote Control sessions, Artifacts). It is independent of ``is_active``
@@ -330,7 +330,7 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
-    text.append(login_segment(acc, login, now, "   ").rstrip(), style=palette.muted)
+    text.append(login_segment(acc, login, now, "   "), style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
@@ -392,25 +392,26 @@ def account_card_text(
 
 
 def fitted_card_text(acc: AccountSnapshot, width: int, budget: int, **kwargs) -> Text:
-    """``account_card_text`` with the login form its header has room for in ``budget`` columns."""
+    """``account_card_text`` with the login-note form its header has room for in ``budget`` columns."""
     (card,) = fit_login(
         lambda login: [account_card_text(acc, width, login=login, **kwargs)], budget
     )
     return card
 
 
-def mini_row_display_name(acc: AccountSnapshot) -> str:
-    """The name shown in a mini row: ``alias (email)`` when aliased, else the
-    plain email — what ``email_width`` below must be measured over, so an
-    aliased slot's login column lines up with the rest."""
-    return f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+def _end_mini(text: Text, acc: AccountSnapshot, form: str | None, now: float, palette: Palette) -> Text:
+    """Close a mini row with its ``re-login in …`` note, while the login is due."""
+    note = login_segment(acc, form, now, gap="")
+    if note:
+        text.append(" · ", style=palette.track)
+        text.append(note, style=palette.muted)
+    return text
 
 
 def mini_account_text(
     acc: AccountSnapshot,
     now: float,
     *,
-    email_width: int = 0,
     palette: Palette = Palette.DARK,
     login: str | None = "full",
     cloud_pinned: bool = False,
@@ -420,7 +421,8 @@ def mini_account_text(
     ``2  work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
     colored; a window at/over 100% brings its reset countdown along, and a
     maxed per-model window shows as ``Fable (!)``. Sentinel states show
-    their label instead.
+    their label instead. ``login`` is the form of the ``· re-login in …``
+    note that ends the row while the login is due (see ``LOGIN_FORMS``).
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
@@ -429,8 +431,6 @@ def mini_account_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(" " * max(0, email_width - len(mini_row_display_name(acc))))
-    text.append(login_segment(acc, login, now), style=palette.muted)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if cloud_pinned:
         # Labelled, like the full card: a bare glyph sitting between the
@@ -449,7 +449,7 @@ def mini_account_text(
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)
-        return text
+        return _end_mini(text, acc, login, now, palette)
 
     last_good = acc.usage.last_good
     fetched_at = acc.usage.fetched_at
@@ -494,7 +494,7 @@ def mini_account_text(
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)
-    return text
+    return _end_mini(text, acc, login, now, palette)
 
 
 class AccountsPanel(Static):
@@ -542,25 +542,18 @@ class AccountsPanel(Static):
         now = time.time()
         panel_width = self.size.width or 80
         width = panel_width - 2
-        # Widest displayed name (alias included) among the mini rows, so
-        # their login columns start at the same offset regardless of which
-        # account's name is longest.
-        email_width = max(
-            (len(mini_row_display_name(acc)) for acc in snap.accounts if not acc.is_active),
-            default=0,
-        )
-
         def is_pinned(acc: AccountSnapshot) -> bool:
             return pin.account_is_pinned(self._pinned_identity, acc.email, acc.org_uuid)
 
-        # One login form for all the minis so their columns line up; the
-        # card's header also carries the plan and age, so it fits its own.
+        # One login-note form for all the minis, so the rows that carry one
+        # read alike; the card's header also carries the plan and age, so it
+        # fits its own.
         inactive = [acc for acc in snap.accounts if not acc.is_active and self._show_minis]
         minis = iter(
             fit_login(
                 lambda login: [
                     mini_account_text(
-                        acc, now, email_width=email_width, palette=palette, login=login,
+                        acc, now, palette=palette, login=login,
                         cloud_pinned=is_pinned(acc),
                     )
                     for acc in inactive

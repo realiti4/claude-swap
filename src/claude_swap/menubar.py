@@ -431,15 +431,16 @@ def format_account_label(
 ) -> str:
     """Build one account row's menu label.
 
-    Ends with a "login <countdown>" segment (:func:`oauth.format_login_expiry`,
-    the same judgement the CLI/TUI views use), stripped of its column padding:
-    an NSMenu row is proportional-font, so alignment there is meaningless and
-    the segment's *position* (last, after usage) is what stays constant.
+    Ends with ``· re-login in 5d 12h`` while the slot's stored login is due
+    (:func:`oauth.format_login_expiry`, the same judgement the CLI/TUI views
+    use), last so its position is what stays constant in a proportional-font
+    NSMenu row.
     """
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    login = oauth.format_login_expiry(login_expires_at, quarantined, now).strip()
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)} · login {login}"
+    row = f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    note = oauth.format_login_expiry(login_expires_at, quarantined, now)
+    return f"{row} · {note}" if note else row
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -600,8 +601,8 @@ def _adapt_snapshot(snap) -> dict:
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
-    ``login_expires_at``/``quarantined`` are the same fields the TUI's login
-    row reads (``AccountSnapshot.login_expires_at``, sentinel ==
+    ``login_expires_at``/``quarantined`` are the same fields the TUI's re-login
+    note reads (``AccountSnapshot.login_expires_at``, sentinel ==
     ``USAGE_RELOGIN_REQUIRED``) — no extra credential read.
     """
     accounts = []
