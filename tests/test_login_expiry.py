@@ -362,7 +362,11 @@ class TestNextBest:
         # 21-column addresses at 80 columns: the full note overflows the
         # 76-column row, the short one fits, and the usage figure stays.
         expires = time.time() + DUE
-        accounts = [make_account(1, active=True, email="active@example.com")] + [
+        # The active's weekly window resets after the peers', so the engine lists
+        # them as candidates and the rows carry only the usage figures.
+        active = make_entry()
+        active.last_good["seven_day"]["resets_at"] = _iso_in(5 * DAY)
+        accounts = [make_account(1, active=True, email="active@example.com", entry=active)] + [
             _replace_login(make_account(n, email=f"{'x' * 8}{n}@example.com"), expires) for n in (2, 3)
         ]
         plain, width = await _candidates(tmp_path, accounts, (80, 24))
