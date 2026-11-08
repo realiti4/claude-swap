@@ -281,6 +281,19 @@ def make_app(fake: FakeSwitcher):
     return CswapApp(fake)
 
 
+@pytest.fixture
+def quick_pilot(monkeypatch):
+    """Poll Textual's idle check every 1 ms instead of every 20 ms.
+
+    ``pilot.pause()`` waits on ``wait_for_idle`` once and ``pilot.press()``
+    twice, and each wait sleeps at least one ``SLEEP_GRANULARITY`` (20 ms) per
+    look at the process CPU. The rule it applies (CPU under 5% of wall clock
+    means settled) is unchanged; only the look is twenty times as frequent.
+    """
+    monkeypatch.setattr("textual._wait.SLEEP_GRANULARITY", 0.001)
+    monkeypatch.setattr("textual._wait.SLEEP_IDLE", 0.001 / 20.0)
+
+
 async def settle(pilot) -> None:
     """Let thread workers finish and their UI updates apply.
 
@@ -310,9 +323,8 @@ async def menu_select(pilot, action_id: str) -> None:
     menu.index = next(
         i for i, item in enumerate(items) if item.action_id == action_id
     )
-    await pilot.pause()
+    # `press` already waits for the key to be handled and the app to go idle.
     await pilot.press("enter")
-    await pilot.pause()
 
 
 # ---------------------------------------------------------------------------
@@ -2572,6 +2584,7 @@ class TestPanelOrderIsTheEnginesOrder:
 class TestSharedAccountOrder:
     """Dashboard/Switch/Watch render `ordered_accounts`; Remove/Disable keep slot order."""
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_opening_the_auto_view_resyncs_auto_settings(self, tmp_path, fake_engine):
         app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
         (tmp_path / "settings.json").write_text(
@@ -2584,6 +2597,7 @@ class TestSharedAccountOrder:
             await pilot.pause()
             assert app.auto_settings.strategy == "best"
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_every_listing_screen_follows_the_shared_order(self, tmp_path):
         """A state file on disk, so the reference order below actually
         depends on `last_active_at` (`dynamic`, the warm-partner fixture)
@@ -2622,6 +2636,7 @@ class TestSharedAccountOrder:
                 numbers = [item.number for item in listview.query(AccountItem)]
                 assert numbers == order
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_remove_and_disable_menus_keep_slot_order_and_say_so(
         self, tmp_path
     ):
@@ -2647,6 +2662,7 @@ class TestSharedAccountOrder:
                 assert ids == [f"{prefix}{n}" for n in ("3", "5", "2", "4", "12")]
                 await menu_select(pilot, "back")
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_switch_cursor_follows_the_account_when_order_changes(
         self, tmp_path
     ):
@@ -3390,6 +3406,7 @@ class TestAutoScreen:
                 f"5h axis `best` never uses: {plain!r}"
             )
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_candidates_rank_unconditionally_under_a_disabled_active(
         self, tmp_path, fake_engine
     ):
@@ -3425,6 +3442,7 @@ class TestAutoScreen:
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert "no candidate qualifies" not in plain, plain
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_candidates_dynamic_retry_ranks_once_the_model_gate_drops(
         self, tmp_path, fake_engine
     ):
