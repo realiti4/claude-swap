@@ -308,6 +308,16 @@ async def settle(pilot) -> None:
     await pilot.pause()
 
 
+async def push_auto(app) -> None:
+    """Open the auto view over a ready app: awaiting the push is its mount, so
+    neither a `g` press nor a settle is owed. The first refresh worker only
+    ends once its snapshot is applied, so waiting on it is waiting on that."""
+    from claude_swap.tui.autoview import AutoScreen
+
+    await app.workers.wait_for_complete()
+    await app.push_screen(AutoScreen())
+
+
 async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
     assert await asyncio.to_thread(event.wait, timeout)
 
@@ -2590,11 +2600,9 @@ class TestSharedAccountOrder:
         (tmp_path / "settings.json").write_text(
             json.dumps({"schemaVersion": 1, "autoswitch": {"strategy": "best"}})
         )
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
+        async with app.run_test(size=(100, 40)):
             assert app.auto_settings.strategy == "consume-first"  # stale copy
-            await pilot.press("g")
-            await pilot.pause()
+            await push_auto(app)
             assert app.auto_settings.strategy == "best"
 
     @pytest.mark.usefixtures("quick_pilot")
@@ -2619,7 +2627,7 @@ class TestSharedAccountOrder:
         fake = FakeSwitcher(_warm_fixture_accounts(), tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
+            await app.workers.wait_for_complete()
             last_active_at = tui_data.read_last_active_at(tmp_path)
             order = tui_data.ordered_accounts(
                 fake.accounts_snapshot(), app.auto_settings, time.time(),
@@ -2646,21 +2654,22 @@ class TestSharedAccountOrder:
 
         fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
         app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
+        async with app.run_test(size=(100, 40)):
+            await app.workers.wait_for_complete()
+            screen = app.screen
+            menu = screen.query_one("#menu", ListView)
             for menu_id, prefix in (("remove-menu", "remove:"), ("disable-menu", "disable:")):
-                await menu_select(pilot, menu_id)
-                await settle(pilot)
-                title = app.screen.query_one("#menu-title", Static).render().plain
+                assert menu_id in [i.action_id for i in menu.query(MenuItem)]  # listed at the root
+                await screen._dispatch(menu_id)  # awaited: the sub-menu is rendered on return
+                title = screen.query_one("#menu-title", Static).render().plain
                 assert "slot order" in title
                 assert "numbers stay put" in title  # states the reason, not just the label
-                menu = app.screen.query_one("#menu", ListView)
                 ids = [
                     item.action_id for item in menu.query(MenuItem)
                     if item.action_id.startswith(prefix)
                 ]
                 assert ids == [f"{prefix}{n}" for n in ("3", "5", "2", "4", "12")]
-                await menu_select(pilot, "back")
+                await screen._dispatch("back")
 
     @pytest.mark.usefixtures("quick_pilot")
     async def test_switch_cursor_follows_the_account_when_order_changes(
@@ -2668,6 +2677,7 @@ class TestSharedAccountOrder:
     ):
         from textual.widgets import ListView
 
+        from claude_swap.tui.dashboard import SwitchScreen
         from claude_swap.tui.widgets import AccountItem
 
         fake = FakeSwitcher(
@@ -2680,9 +2690,9 @@ class TestSharedAccountOrder:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            await menu_select(pilot, "switch")
-            await settle(pilot)
+            await app.workers.wait_for_complete()
+            await app.push_screen(SwitchScreen())
+            await pilot.pause()
             listview = app.screen.query_one("#accounts", ListView)
             before = [item.number for item in listview.query(AccountItem)]
             assert before == ["1", "3", "2"]  # "3" (5%) ranks ahead of "2" (30%)
@@ -3434,9 +3444,8 @@ class TestAutoScreen:
             tmp_path,
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
+        async with app.run_test(size=(100, 40)):
+            await push_auto(app)
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
@@ -3478,9 +3487,8 @@ class TestAutoScreen:
             tmp_path,
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
+        async with app.run_test(size=(100, 40)):
+            await push_auto(app)
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
