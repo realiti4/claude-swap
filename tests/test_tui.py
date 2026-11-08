@@ -2698,7 +2698,7 @@ class TestUnswitchableRowsAreListed:
         ), active="1")
         rows = {row.split()[1]: row for row in out.splitlines() if "@x.com" in row}
         assert "login ?" in rows["b@x.com"]
-        assert "login" not in rows["new@x.com"]
+        assert "login ?" not in rows["new@x.com"]  # its note says "no stored login"
 
     def test_an_api_key_slot_says_api_key_not_re_login(self):
         out = self._render(self._snap(
