@@ -1982,8 +1982,8 @@ class TestAutoScreen:
             # not dynamic (the default is consume-first): the key is inert
             assert screen.check_action("toggle_cache_aware", ()) is False
             assert "c" not in screen.active_bindings
-            # the action, not the key (`press` idles about 0.1 s; c_flips and
-            # c_follows press `c`); run_action honours check_action as the key does
+            # the action, not the key (`press` idles about 0.1 s; c_flips sends
+            # `c`, c_follows presses it); run_action honours check_action as the key does
             await screen.run_action("toggle_cache_aware")
             assert not (tmp_path / "settings.json").exists()
             assert "cache-aware" not in summary.render().plain
