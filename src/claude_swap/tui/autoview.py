@@ -39,12 +39,18 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.lines import BindingWindow, binding_window
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel, spend_row, usage_rows
+from claude_swap.tui.widgets import (
+    AccountsPanel,
+    fit_login,
+    login_segment,
+    spend_row,
+    usage_rows,
+)
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -447,7 +453,7 @@ class AutoScreen(Screen):
             else:
                 rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
-        lines: dict[str, Text] = {}
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, up to the login, after it)
         # Padded to the widest email among the rows THIS block renders, so
         # every row's chips start in the same column — computed from exactly
         # the accounts the loop below iterates (all but the active one).
@@ -547,9 +553,9 @@ class AutoScreen(Screen):
             # showed two accounts here and five in the engine's own log. A row
             # that says why it cannot be picked beats a row that isn't there.
             if not acc.switchable:
-                entry = Text()
-                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
+                head, entry = Text(), Text()
+                head.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                head.append(f"{acc.email:<{email_width}}", style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -564,7 +570,7 @@ class AutoScreen(Screen):
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
                 entry.append(f"  {note}", style=palette.sev_warn)
-                lines[acc.number] = entry
+                lines[acc.number] = (acc, head, entry)
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
             line = thresholds[acc.number]
@@ -574,9 +580,9 @@ class AutoScreen(Screen):
                 weekly,
                 scale=threshold,
             )
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+            head, entry = Text(), Text()
+            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            head.append(f"{acc.email:<{email_width}}", style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -708,7 +714,7 @@ class AutoScreen(Screen):
                     else (-rank_binding.line_headroom,)
                 )
                 ranked.append((key, acc.number))
-            lines[acc.number] = entry
+            lines[acc.number] = (acc, head, entry)
 
         text = Text()
         text.append("Next best", style=palette.muted)
@@ -718,6 +724,20 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
-        for _key, number in sorted(ranked):
-            text.append(lines[number])
+        order = [lines[number] for _key, number in sorted(ranked)]
+        # The box has no width before its first layout; its CSS padding is 2 a side.
+        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
+        for row in fit_login(
+            lambda login: [
+                Text.assemble(
+                    head,
+                    # A slot with no stored login has no expiry to show.
+                    Text(login_segment(acc, login) if acc.switchable else "", style=palette.muted),
+                    tail,
+                )
+                for acc, head, tail in order
+            ],
+            budget,
+        ):
+            text.append(row)
         return text

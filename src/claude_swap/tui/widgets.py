@@ -9,13 +9,14 @@ auto-switch trigger line), and stale-measurement dimming.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace, subscription
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap import oauth, pace, subscription
+from claude_swap.json_output import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.printer import format_age
@@ -204,6 +205,37 @@ def usage_rows(
     return rows
 
 
+_LOGIN_LABEL = "login"
+
+
+# Login-countdown forms, fullest first: "login 23d04h", "login 23d", nothing.
+LOGIN_FORMS = ("full", "short", None)
+
+
+def login_segment(
+    acc: AccountSnapshot, form: str | None, now: float | None = None, gap: str = "  "
+) -> str:
+    """The ``login <countdown>`` text of a row, led by ``gap`` ("" when ``form`` is None)."""
+    if form is None:
+        return ""
+    quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+    value = oauth.format_login_expiry(
+        acc.login_expires_at, quarantined, now, short=form == "short"
+    )
+    return f"{gap}{_LOGIN_LABEL} {value}"
+
+
+def fit_login(build: Callable[[str | None], list[Text]], budget: int) -> list[Text]:
+    """``build(form)`` for the fullest login form in which every row's first
+    line fits ``budget`` columns; usage figures are never cut, so with no
+    fitting form the login goes."""
+    for form in LOGIN_FORMS:
+        rows = build(form)
+        if all(cell_len(row.plain.strip("\n").partition("\n")[0]) <= budget for row in rows):
+            break
+    return rows
+
+
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
     """``· Ultra`` after the header — the same marker ``cswap list`` prints:
     a lapsed subscription is a highlighted ``Free`` rather than an appended
@@ -249,11 +281,13 @@ def account_card_text(
     weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    login: str | None = "full",
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
     5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
-    per-model rows, which reset weekly."""
+    per-model rows, which reset weekly. ``login`` is the form of the login
+    countdown that ends the header (see ``LOGIN_FORMS``)."""
     now = now if now is not None else time.time()
 
     text = Text()
@@ -274,6 +308,7 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
+    text.append(login_segment(acc, login, now, "   ").rstrip(), style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
@@ -347,8 +382,28 @@ def spend_row(rows: list[tuple]) -> tuple | None:
     return next((r for r in rows if r[0] == SPEND_LABEL), None)
 
 
+def fitted_card_text(acc: AccountSnapshot, width: int, budget: int, **kwargs) -> Text:
+    """``account_card_text`` with the login form its header has room for in ``budget`` columns."""
+    (card,) = fit_login(
+        lambda login: [account_card_text(acc, width, login=login, **kwargs)], budget
+    )
+    return card
+
+
+def mini_row_display_name(acc: AccountSnapshot) -> str:
+    """The name shown in a mini row: ``alias (email)`` when aliased, else the
+    plain email — what ``email_width`` below must be measured over, so an
+    aliased slot's login column lines up with the rest."""
+    return f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+
+
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    email_width: int = 0,
+    palette: Palette = Palette.DARK,
+    login: str | None = "full",
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -364,6 +419,8 @@ def mini_account_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
+    text.append(" " * max(0, email_width - len(mini_row_display_name(acc))))
+    text.append(login_segment(acc, login, now), style=palette.muted)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
@@ -487,19 +544,41 @@ class AccountsPanel(Static):
                 style=palette.muted,
             )
         now = time.time()
-        width = (self.size.width or 80) - 2
+        panel_width = self.size.width or 80
+        width = panel_width - 2
+        # Widest displayed name (alias included) among the mini rows, so
+        # their login columns start at the same offset regardless of which
+        # account's name is longest.
+        email_width = max(
+            (len(mini_row_display_name(acc)) for acc in snap.accounts if not acc.is_active),
+            default=0,
+        )
+        # One login form for all the minis so their columns line up; the
+        # card's header also carries the plan and age, so it fits its own.
+        inactive = [acc for acc in snap.accounts if not acc.is_active and self._show_minis]
+        minis = iter(
+            fit_login(
+                lambda login: [
+                    mini_account_text(
+                        acc, now, email_width=email_width, palette=palette, login=login
+                    )
+                    for acc in inactive
+                ],
+                panel_width,
+            )
+        )
         blocks: list[Text] = []
         for acc in snap.accounts:
             if acc.is_active:
                 blocks.append(
-                    account_card_text(
-                        acc, width, threshold=app.threshold_pct,
+                    fitted_card_text(
+                        acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette,
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(next(minis))
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
@@ -527,8 +606,9 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        return account_card_text(
-            self._acc, self.size.width or 80, threshold=self._threshold,
+        width = self.size.width or 80
+        return fitted_card_text(
+            self._acc, width, width, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
         )
 
