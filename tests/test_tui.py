@@ -1749,7 +1749,10 @@ def _autoview_text(snap, active, settings, last_active_at=None):
     v._settings = settings
     v._last_active_at = last_active_at or {}
     app = MagicMock(current_theme=CSWAP_DARK)
-    with patch.object(AutoScreen, "app", property(lambda s: app)):
+    # The rows are fitted to the box's width, which an unmounted screen has no query for.
+    box = MagicMock(size=MagicMock(width=200))
+    with patch.object(AutoScreen, "app", property(lambda s: app)), \
+            patch.object(AutoScreen, "query_one", return_value=box):
         return str(v._candidates_text(snap, active_number=active))
 
 
