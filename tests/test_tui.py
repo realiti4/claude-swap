@@ -906,16 +906,19 @@ class TestDashboard:
         everywhere = {"orgA", "orgB", "solo"}
         menus = everywhere if show else {"orgA", "orgB"}
         async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
+            # Menus entered by action, not keys: one pause instead of five.
+            await app.workers.wait_for_complete(
+                [w for w in app.workers if w.group != "engine"]
+            )
             panel = app.screen.query_one(AccountsPanel).render().plain
             assert tags(panel) == (everywhere if show else set())
-            await menu_select(pilot, "remove-menu")
+            await app.screen._dispatch("remove-menu")
             menu = app.screen.query_one("#menu", ListView)
             labels = " ".join(
                 item.query_one(Static).render().plain for item in menu.query(MenuItem)
             )
             assert tags(labels) == menus
-            await pilot.press("escape", "s")
+            app.screen.action_open_switch()
             await pilot.pause()
             cards = " ".join(c.render().plain for c in app.screen.query(AccountCard))
             assert tags(cards) == menus
