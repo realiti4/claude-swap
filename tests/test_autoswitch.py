@@ -17800,7 +17800,9 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert _xw_hold(h).detail.endswith("; " + reading)
         assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 2.1)) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
-        assert _xw_hold(h).detail.endswith("; spending its expiring window first")
+        assert _xw_hold(h).detail.endswith(
+            "; spending its expiring window first: #1's 17 pts before its 15:46Z reset, at 3.3 pts/h"
+        )
 
     def test_another_strategy_keeps_the_threshold_wording(self, temp_home):
         h = _xw_harness(temp_home)

@@ -481,6 +481,16 @@ def _hhmm_z(ts: float, now: float) -> str:
     )
 
 
+def _spend_note(rate: float, row: tuple[str, float, float], now: float) -> str:
+    """What an expiring window has to spend, for the holds: the room and its reset,
+    and the fleet's rate when one is measurable."""
+    n, room, reset = row
+    return (
+        f"#{n}'s {room:.0f} pts before its {_hhmm_z(reset, now)} reset"
+        + (f", at {rate * 3600:.1f} pts/h" if rate else "")
+    )
+
+
 def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float, current: str) -> str:
     """What `dynamic` decided when no row is within ``PERISH_SOON_S`` of its
     reset: the soonest row becomes expiring a day before that reset, and the
@@ -488,15 +498,14 @@ def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float, current: 
     when it is the active, the active spends its own window."""
     if not rows:
         return "nothing expiring; no account has 7d room it can spend now"
-    n, room, reset = rows[0]
+    n, _, reset = rows[0]
     act = (
         f"the active (#{n}) starts spending its expiring window" if n == current
         else f"switch to #{n}"
     )
     return (
         f"nothing expiring yet; next at {_hhmm_z(reset - PERISH_SOON_S, now)}: {act} "
-        f"(spends #{n}'s {room:.0f} pts before its {_hhmm_z(reset, now)} reset"
-        + (f", at {rate * 3600:.1f} pts/h)" if rate else ")")
+        f"(spends {_spend_note(rate, rows[0], now)})"
     )
 
 
@@ -3374,10 +3383,12 @@ class AutoSwitchEngine:
                     "% headroom, not about to wall)"
                 )
                 # The hold says what `dynamic` decided: its own expiring window,
-                # or, with nothing expiring, what the next due account does and
-                # when (`_expiring_walk`'s reading), after the cause that holds.
+                # or, with nothing expiring, what the soonest-resetting account does
+                # and when (`_expiring_walk`'s reading), after the cause that holds.
                 if spend_first and not alternation_admissible:
-                    detail = healthy + "; spending its expiring window first"
+                    detail = healthy + "; spending its expiring window first: " + _spend_note(
+                        walk[0], walk[1][0], now
+                    )
                 else:
                     detail = healthy + (
                         "; the alternation step is not reached" if step_holds else ""
