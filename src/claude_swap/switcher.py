@@ -255,20 +255,21 @@ def _format_usage_lines(
     return [_pad_row(label, body, width) for label, body in rows]
 
 
-# Column where a window row's reset countdown value starts, counted from
-# right after its "label: " prefix: pct (3, right-aligned) + "%   resets "
-# (11) + clock (12, left-aligned) + "  in " (5) -- mirrors the body format
-# `_usage_rows` builds for 5h/7d/scoped rows above, and is constant
-# regardless of the real pct/clock values (both are fixed-width fields). The
-# login row's countdown lands in this same column, so it and a window row's
-# "in <countdown>" are easy to compare at a glance.
-_COUNTDOWN_COLUMN = len(f"{0:>3.0f}%   resets {'':<12}  in ")
+def _login_row(login_expires_at: float | None, quarantined: bool) -> tuple[str, str] | None:
+    """(label, body) for the login-expiry row, or None while there is nothing
+    to say (``oauth.login_time_left``). Shaped like a window row, with the
+    stamp where their reset clock is and the countdown in the same column::
 
-
-def _login_row(login_expires_at: float | None, quarantined: bool) -> tuple[str, str]:
-    """(label, body) for the login-expiry row, shaped like a ``_usage_rows`` row."""
-    value = oauth.format_login_expiry(login_expires_at, quarantined)
-    return ("login", " " * _COUNTDOWN_COLUMN + value)
+        ├ 7d:     18%   resets Nov 10 16:26  in 2d 23h
+        └ login:        expires Nov 14 03:00  in 5d 12h
+    """
+    left = oauth.login_time_left(login_expires_at, quarantined)
+    if left is None:
+        return None
+    clock = oauth.login_expiry_clock(login_expires_at)
+    if left <= 0:
+        return ("login", f"{'':4}  expired {clock:<12}  re-login needed")
+    return ("login", f"{'':4}  expires {clock:<12}  in {oauth.format_countdown(left)}")
 
 
 # Human notes for sentinel usage states (fallback: the raw sentinel string).
@@ -405,34 +406,37 @@ def _usage_entry_lines(
     line when an older measurement exists. Measurements render as usual, age-
     annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served); an account
     with no measurement at all shows "usage unavailable" plus the last fetch
-    error, so a failing endpoint is visible instead of a silent blank. Every
-    branch also carries a trailing "login" row (the refresh-token countdown),
-    so it survives a sentinel or a missing measurement too.
+    error, so a failing endpoint is visible instead of a silent blank. A
+    "login" row (``_login_row``) ends the block while the slot's stored login
+    is due for renewal, whichever branch, so it shows under a sentinel or a
+    missing measurement too.
     """
-    login_row = _login_row(
-        login_expires_at, entry.sentinel == USAGE_RELOGIN_REQUIRED
-    )
+    login_row = _login_row(login_expires_at, entry.sentinel == USAGE_RELOGIN_REQUIRED)
+    login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1)) if login_row else None
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
         children = []
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
             children.append(muted(last_seen))
-        children.append(muted(_pad_row(*login_row, len(login_row[0]) + 1)))
+        if login_line is not None:
+            children.append(login_line)
         out.extend(
             f"{dimmed('└' if j == len(children) - 1 else '├')} {line}"
             for j, line in enumerate(children)
         )
         return out
     if entry.last_good is not None:
-        lines = _format_usage_lines(entry.last_good, entry.fetched_at, extra_rows=(login_row,))
+        extra = (login_row,) if login_row is not None else ()
+        lines = _format_usage_lines(entry.last_good, entry.fetched_at, extra_rows=extra)
+        usage_count = len(lines) - len(extra)
         if (
-            len(lines) > 1
+            usage_count
             and entry.age_s is not None
             and entry.age_s > _USAGE_AGE_NOTE_S
             and entry.fetched_at is not None
         ):
-            lines[-2] += f" · {format_age(int(entry.fetched_at * 1000))}"
+            lines[usage_count - 1] += f" · {format_age(int(entry.fetched_at * 1000))}"
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
@@ -440,8 +444,10 @@ def _usage_entry_lines(
     detail = "usage unavailable"
     if entry.last_error:
         detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"
-    login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1))
-    return [dimmed(detail), f"{dimmed('└')} {login_line}"]
+    out = [dimmed(detail)]
+    if login_line is not None:
+        out.append(f"{dimmed('└')} {login_line}")
+    return out
 
 
 def _label_token_status(source: str, credentials: str) -> str | None:

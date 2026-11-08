@@ -399,18 +399,8 @@ class AutoScreen(Screen):
             self._settings
             and self._settings.strategy in ("consume-first", "weekly-first")
         )
-        # Widest email among the switchable candidates, so every row's login
-        # column starts at the same offset regardless of which email is longest.
-        email_width = max(
-            (
-                len(acc.email)
-                for acc in snap.accounts
-                if acc.number != active_number and acc.switchable
-            ),
-            default=0,
-        )
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
-        # (acc while the row carries a login column, up to the login, after it)
+        # (acc while the row can carry a re-login note, name, the rest)
         lines: dict[str, tuple[AccountSnapshot | None, Text, Text]] = {}
         for acc in snap.accounts:
             if acc.number == active_number:
@@ -438,7 +428,7 @@ class AutoScreen(Screen):
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
                 entry.append(f"  {note}", style=palette.sev_warn)
-                lines[acc.number] = (None, head, entry)  # no stored login to count down
+                lines[acc.number] = (None, head, entry)  # no stored login, no re-login note
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
             line = (
@@ -452,7 +442,7 @@ class AutoScreen(Screen):
             )
             head, entry = Text(), Text()
             head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            head.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+            head.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -534,13 +524,14 @@ class AutoScreen(Screen):
         order = [lines[number] for _key, number in sorted(ranked)]
         # The box has no width before its first layout; its CSS padding is 2 a side.
         budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
-        # Only the rows with a login column are fitted: an unswitchable row's
-        # long note would otherwise fail every form and drop the column from all.
+        # Only the rows that can carry a re-login note are fitted: an
+        # unswitchable row's long note would otherwise fail every form and
+        # drop the note from the rows that have one.
         fitted = iter(
             fit_login(
                 lambda login: [
                     Text.assemble(
-                        head, Text(login_segment(acc, login), style=palette.muted), tail
+                        head, tail, Text(login_segment(acc, login), style=palette.muted)
                     )
                     for acc, head, tail in order
                     if acc

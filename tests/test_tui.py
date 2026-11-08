@@ -2652,14 +2652,14 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None):
+              sentinel=None, login_expires_at=None):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
         a.policy.threshold = None
-        a.login_expires_at = None
+        a.login_expires_at = login_expires_at
         return a
 
     def _render(self, snap, active, width=200):
@@ -2669,8 +2669,8 @@ class TestUnswitchableRowsAreListed:
 
         v = AutoScreen.__new__(AutoScreen)
         v._settings = AutoSwitchSettings()
-        # The login column fits the "#candidates" box; an unmounted screen has
-        # none, so the default leaves room for every login form.
+        # The re-login note fits the "#candidates" box; an unmounted screen has
+        # none, so the default leaves room for every note form.
         v.query_one = lambda *_a, **_k: MagicMock(size=MagicMock(width=width))
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
@@ -2690,15 +2690,17 @@ class TestUnswitchableRowsAreListed:
         assert "switch here" in out
         assert "log in" in out
 
-    def test_only_a_switchable_slot_carries_the_login_countdown(self):
+    def test_only_a_switchable_slot_carries_the_relogin_note(self):
+        due = time.time() + 3 * 86400 + 12 * 3600 + 600
         out = self._render(self._snap(
-            self._acct("1", "a@x.com", switchable=True),
-            self._acct("2", "b@x.com", switchable=True),
-            self._acct("4", "new@x.com", switchable=False),
+            self._acct("1", "a@x.com", switchable=True, login_expires_at=due),
+            self._acct("2", "b@x.com", switchable=True, login_expires_at=due),
+            self._acct("4", "new@x.com", switchable=False, login_expires_at=due),
         ), active="1", width=76)  # the unswitchable note alone is wider than this
         rows = {row.split()[1]: row for row in out.splitlines() if "@x.com" in row}
-        assert "login ?" in rows["b@x.com"]
-        assert "login ?" not in rows["new@x.com"]  # its note says "no stored login"
+        # Its long row must not take the note's full form from the others.
+        assert rows["b@x.com"].endswith("re-login in 3d 12h")
+        assert "re-login in" not in rows["new@x.com"]
 
     def test_an_api_key_slot_says_api_key_not_re_login(self):
         out = self._render(self._snap(
