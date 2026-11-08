@@ -2256,6 +2256,12 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             ),
             raising=False,
         )
+        # The candidates box is what the login column is fitted to.
+        monkeypatch.setattr(
+            autoview.AutoScreen,
+            "query_one",
+            lambda self, *_a, **_k: types.SimpleNamespace(size=types.SimpleNamespace(width=80)),
+        )
 
         monkeypatch.setattr(autoview.pin, "pinned_identity", lambda sw: (pinned, ""))
         with_pin = screen._candidates_text(snap, accounts[0].number).plain

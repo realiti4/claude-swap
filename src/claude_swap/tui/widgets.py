@@ -549,10 +549,10 @@ class AccountsPanel(Static):
             (len(mini_row_display_name(acc)) for acc in snap.accounts if not acc.is_active),
             default=0,
         )
-        pinned = {
-            acc.number: pin.account_is_pinned(self._pinned_identity, acc.email, acc.org_uuid)
-            for acc in snap.accounts
-        }
+
+        def is_pinned(acc: AccountSnapshot) -> bool:
+            return pin.account_is_pinned(self._pinned_identity, acc.email, acc.org_uuid)
+
         # One login form for all the minis so their columns line up; the
         # card's header also carries the plan and age, so it fits its own.
         inactive = [acc for acc in snap.accounts if not acc.is_active and self._show_minis]
@@ -561,7 +561,7 @@ class AccountsPanel(Static):
                 lambda login: [
                     mini_account_text(
                         acc, now, email_width=email_width, palette=palette, login=login,
-                        cloud_pinned=pinned[acc.number],
+                        cloud_pinned=is_pinned(acc),
                     )
                     for acc in inactive
                 ],
@@ -575,7 +575,7 @@ class AccountsPanel(Static):
                     fitted_card_text(
                         acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
-                        palette=palette, cloud_pinned=pinned[acc.number],
+                        palette=palette, cloud_pinned=is_pinned(acc),
                     )
                 )
             elif self._show_minis:
