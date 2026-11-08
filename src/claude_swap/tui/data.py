@@ -358,10 +358,10 @@ def rank_switch_candidates(
             # The active reads as the engine passes it: widened on the model axis,
             # its own unmodeled headroom on the retry.
             active_headroom=active_headroom if axis else headroom.get(active_number),
-            expiring=_expiring_due(*dynamic_expiring_walk(
+            expiring=_expiring_due(dynamic_expiring_walk(
                 active_number, oauth_candidates, usage, model_headroom, bars, policies,
                 entries, last, settings, now,
-            ), now),
+            )[1], now),
             trigger=trigger, model_window_dropped=dropped, reasons=reasons,
             raw_active_headroom=model_headroom.get(active_number), models=models,
         )

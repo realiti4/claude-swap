@@ -2442,11 +2442,10 @@ class TestPanelOrderIsTheEnginesOrder:
     def test_dynamic_lists_the_account_the_tick_lands_on_first_and_names_its_key(
         self, temp_home, five, soon, pick, header
     ):
-        """Account 2 (7d 40%, a reset 30 h out) is spent at the fleet's rate
-        before it resets, so `expiring_order` pulls it ahead of 3 (98 points of
-        room), which the perish-then-room key alone ranks first. The tick lands
-        on 2, and the panel's order and header are the tick's, never
-        "(soonest reset)"."""
+        """Account 2 (7d 40%, a reset 20 h out) is inside the 24 h expiring
+        window, so `expiring_order` pulls it ahead of 3 (98 points of room),
+        which the most-room key alone ranks first. The tick lands on 2, and the
+        panel's order and header are the tick's, never "(soonest reset)"."""
         def w(five_pct, seven_pct, secs):
             return {
                 "five_hour": {"pct": five_pct},
@@ -2455,7 +2454,7 @@ class TestPanelOrderIsTheEnginesOrder:
 
         fleet = {
             "1": w(five, 10.0, 6 * 86400),
-            "2": w(10.0, 40.0, 30 * 3600 if soon else 6 * 86400),
+            "2": w(10.0, 40.0, 20 * 3600 if soon else 6 * 86400),
             "3": w(10.0, 2.0, 6 * 86400),
             "4": w(100.0, 1.0, 6 * 86400),
         }
