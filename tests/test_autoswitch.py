@@ -3241,18 +3241,28 @@ def _base_engine_results(
         "print(json.dumps({'_claude_swap_file': claude_swap.__file__, "
         "'results': results}))\n"
     )
+    # Dead proxy, as in test_dynamic_isolation.py: the base tree's code must
+    # not reach the network (that test measured 7 lookups without it).
+    dead_proxy = "http://127.0.0.1:1"
+    child_env = {
+        **os.environ,
+        "http_proxy": dead_proxy, "https_proxy": dead_proxy,
+        "HTTP_PROXY": dead_proxy, "HTTPS_PROXY": dead_proxy,
+        "no_proxy": "", "NO_PROXY": "",
+    }
     result = subprocess.run(
         [sys.executable, str(driver), str(homes_dir)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=child_env,
     )
     if result.returncode != 0:
         # The digest is a PR-branch invariant (base vs THIS PR's head), not
-        # an integration one: where a later PR's merge has added a module
-        # to `claude_swap` that this test module now imports (a mere new
-        # name is stubbed in the driver), base's own package (frozen at
-        # `base_sha`) cannot satisfy it and the comparison is undefined —
-        # SKIP, exactly as this function already skips when the base
-        # object itself is absent. Any OTHER subprocess failure (a real
+        # an integration one. The driver stubs as None a name that `from
+        # claude_swap[.mod] import name` or `from claude_swap import newmod`
+        # cannot find; `from claude_swap.newmod import X` raises
+        # ModuleNotFoundError, which it does not stub. Base's package (frozen
+        # at `base_sha`) then cannot satisfy this module and the comparison
+        # is undefined, so SKIP, as this function already skips when the
+        # base object itself is absent. Any OTHER subprocess failure (a real
         # digest-run crash) still reds.
         import_line = next(
             (
