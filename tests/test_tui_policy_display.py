@@ -32,7 +32,7 @@ from tests.test_tui import (
     make_account,
     make_app,
     make_entry,
-    quick_pilot,  # noqa: F401 - Textual's idle check at 2 ms, used by name
+    quick_pilot,  # noqa: F401 - Textual's idle check polled at 1 ms, used by name
     settle,
 )
 
