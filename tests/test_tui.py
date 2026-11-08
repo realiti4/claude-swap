@@ -2034,15 +2034,24 @@ class TestAutoScreen:
                 footer = app.screen.query_one(Footer)
                 return [k.key for k in footer.query(FooterKey)]
 
-            assert "c" not in footer_keys()  # consume-first: gated off
+            async def footer_shows_c(shown: bool) -> bool:
+                # The footer recomposes after the next refresh, which
+                # settle() does not wait for; poll it, bounded.
+                for _ in range(200):
+                    if ("c" in footer_keys()) is shown:
+                        return True
+                    await pilot.pause()
+                return False
+
+            assert await footer_shows_c(False), footer_keys()  # consume-first
             await pilot.press("s")  # -> dynamic
             await settle(pilot)
             assert app.screen._settings.strategy == "dynamic"
-            assert "c" in footer_keys()
+            assert await footer_shows_c(True), footer_keys()
             await pilot.press("s")  # -> best
             await settle(pilot)
             assert app.screen._settings.strategy == "best"
-            assert "c" not in footer_keys()
+            assert await footer_shows_c(False), footer_keys()
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
