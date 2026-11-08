@@ -27,6 +27,7 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
 )
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
@@ -1683,6 +1684,39 @@ def contended_fake_engine(monkeypatch):
     return _ContendedFakeEngine
 
 
+def _autoview_text(snap, active, settings, width=None):
+    """The "Next best" panel's rendered text, with no app and no pilot.
+
+    `width` is the panel box (the screen's less 4); None leaves the rows
+    unfitted, as before the panel's first layout. A pilot render of the same
+    fleet costs about 0.4 s, this about 2 ms."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from claude_swap.tui.autoview import AutoScreen
+    from claude_swap.tui.theme import CSWAP_DARK
+
+    def query_one(*_args):
+        if width is None:
+            raise AttributeError("the panel has no layout yet")
+        return SimpleNamespace(size=SimpleNamespace(width=width))
+
+    v = AutoScreen.__new__(AutoScreen)
+    v._settings = settings
+    app = MagicMock(current_theme=CSWAP_DARK)
+    with patch.object(AutoScreen, "app", property(lambda s: app)), patch.object(
+        AutoScreen, "query_one", query_one
+    ):
+        return str(v._candidates_text(snap, active_number=active))
+
+
+def _autoview_order(snap, active, settings):
+    """The account numbers "Next best" renders, in its own displayed order."""
+    rendered = _autoview_text(snap, active, settings)
+    others = [acc.number for acc in snap.accounts if acc.number != active]
+    return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
+
+
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
@@ -1991,6 +2025,13 @@ class TestAutoScreen:
             )
             assert re.search(r"7d\S*:\s*93%", row2) and row2.endswith("limit 97%"), plain
             assert re.search(r"5h\S*:\s*95%", row3) and row3.endswith("limit 85%"), plain
+            # The note is the row's last cell, outside every chip column, and
+            # the block label reads the same lines the chips are judged on:
+            # 7d 93% under a 97 line is no block, 5h 95% over an 85 line is.
+            rows = [ln for ln in plain.splitlines() if "@example.com" in ln]
+            assert len(rows) == 2 and "full" not in plain, plain
+            assert len({ln.index("7d(") for ln in rows}) == 1, plain
+            assert "5h limit reached" in row3 and "7d limit reached" not in plain, plain
             summary = app.screen.query_one("#auto-summary", Static).render().plain
             assert "threshold 85%" in summary and "weekly 97%" in summary
             assert app.weekly_threshold_pct == 97.0
@@ -2061,86 +2102,40 @@ class TestAutoScreen:
             assert "weekly" not in summary
             assert app.weekly_threshold_pct is None
 
-    async def test_the_line_note_keeps_the_chip_columns_and_the_block_label_on_one_line_set(
-        self, tmp_path, fake_engine
-    ):
-        """The `limit N%` note is the row's last cell, outside every chip
-        column, so the chips start where the other rows' do, and the block label
-        reads the same lines the chips are judged against: 7d 93% under a 97
-        line is no block, 5h 95% over an 85 line is."""
-        import json as _json
-
-        (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1,
-            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
-        }))
-        fake = FakeSwitcher(
-            [
-                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
-                make_account(2, entry=make_entry(5.0, 93.0)),
-                make_account(3, entry=make_entry(95.0, 47.0)),
-            ],
-            tmp_path,
-        )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            rows = [ln for ln in plain.splitlines() if "@example.com" in ln]
-            assert len(rows) == 2
-            assert len({ln.index("7d(") for ln in rows}) == 1, plain
-            assert rows[0].endswith("limit 97%"), plain
-            assert rows[1].endswith("limit 85%"), plain
-            assert "5h limit reached" in rows[1] and "7d limit reached" not in plain, plain
-
-    async def test_candidates_are_fitted_to_the_panel_width(
-        self, tmp_path, fake_engine
-    ):
+    async def test_candidates_are_fitted_to_the_panel_width(self):
         """The rows are laid out at the width the panel has: the emails give
         way first, then the notes take their short forms, and no row is wider
-        than the panel (a wider one wraps, and the wrapped pct reads wrong)."""
-        import json as _json
-
+        than the panel (a wider one wraps, and the wrapped pct reads wrong).
+        The widths are the panel box of a 100 and a 75 column screen."""
         from rich.cells import cell_len
 
-        (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1,
-            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
-        }))
-        fake = FakeSwitcher(
-            [
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
                 make_account(1, active=True, entry=make_entry(91.0, 20.0)),
                 make_account(2, entry=make_entry(5.0, 93.0),
                              email="a.very.long.address.indeed@example-company.com"),
                 make_account(3, entry=make_entry(95.0, 47.0)),
                 # Its sentinel row is wider than the panel and sizes nothing.
                 make_account(4, switchable=False),
-            ],
-            tmp_path,
+            ),
+            taken_at=0.0,
         )
+        settings = AutoSwitchSettings(threshold=85, weekly_threshold=97)
         seen = {}
-        for width in (100, 75):
-            app = make_app(fake)
-            async with app.run_test(size=(width, 40)) as pilot:
-                await self._open(pilot)
-                await settle(pilot)
-                from textual.widgets import Static
-
-                plain = app.screen.query_one("#candidates", Static).render().plain
-                seen[width] = [
-                    ln for ln in plain.splitlines() if re.match(r"\s+[23]  ", ln)
-                ]
-            assert len(seen[width]) == 2, plain
-            assert all(cell_len(ln) <= width - 4 for ln in seen[width]), seen[width]
-            assert all(re.search(r"(5h|7d)\S*:\s*\d+%", ln) for ln in seen[width])
-        assert seen[100][1].endswith("5h limit reached \u00b7 limit 85%"), seen[100]
-        assert seen[75][1].endswith("5h full \u00b7 lim 85%"), seen[75]
+        for box in (96, 71):
+            plain = _autoview_text(snap, "1", settings, width=box)
+            seen[box] = [
+                ln for ln in plain.splitlines() if re.match(r"\s+[23]  ", ln)
+            ]
+            assert len(seen[box]) == 2, plain
+            assert all(cell_len(ln) <= box for ln in seen[box]), seen[box]
+            assert all(re.search(r"(5h|7d)\S*:\s*\d+%", ln) for ln in seen[box])
+        assert seen[96][1].endswith("5h limit reached \u00b7 limit 85%"), seen[96]
+        assert seen[71][1].endswith("5h full \u00b7 lim 85%"), seen[71]
         # The long address is cut at both widths; the short one only at the narrow.
-        assert "user3@example.com" in seen[100][1], seen[100]
-        assert "user3@example.com" not in seen[75][1], seen[75]
+        assert "user3@example.com" in seen[96][1], seen[96]
+        assert "user3@example.com" not in seen[71][1], seen[71]
 
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine

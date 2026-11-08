@@ -23,11 +23,14 @@ import re
 
 import pytest
 
-from claude_swap.models import AccountPolicy
+from claude_swap.models import AccountPolicy, AccountsSnapshot
+from claude_swap.settings import AutoSwitchSettings
 from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
     FakeSwitcher,
+    _autoview_order,
+    _autoview_text,
     _iso_in,
     fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
     make_account,
@@ -235,19 +238,14 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert "5h:50%" in row2 and row2.endswith("limit 60%"), row2
 
 
-    async def test_the_threshold_note_ends_the_row_and_moves_no_column(
-        self, tmp_path, fake_engine
-    ):
+    async def test_the_threshold_note_ends_the_row_and_moves_no_column(self):
         """The per-account threshold is the row's LAST cell, so it never sits
         between two window columns: the 7d and Fable chips of a row with one
         start where a row without one starts them, and a row without one gains
         no trailing padding for it."""
-        (tmp_path / "settings.json").write_text(json.dumps({
-            "schemaVersion": 1,
-            "autoswitch": {"threshold": 90, "strategy": "best", "model": "Fable"},
-        }))
-        fake = FakeSwitcher(
-            [
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
                 make_account(1, active=True, entry=make_entry(91.0, 20.0)),
                 with_policy(
                     make_account(
@@ -258,26 +256,22 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 make_account(
                     3, entry=make_entry(60.0, 87.0, scoped=[("Fable", 0.0)])
                 ),
-            ],
-            tmp_path,
+            ),
+            taken_at=0.0,
         )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            with_note = self._row(plain, "user2@example.com")
-            without = self._row(plain, "user3@example.com")
-            assert with_note.endswith("  limit 70%"), with_note
-            assert "(line" not in plain
-            assert "limit" not in without
-            assert without == without.rstrip(), repr(without)
-            chips = with_note[: with_note.index("  limit")]
-            for column in ("7d", "Fable"):
-                assert chips.index(column) == without.index(column), plain
-            assert chips.count("%") == without.count("%") == 3, plain
+        settings = AutoSwitchSettings(threshold=90, strategy="best", model="Fable")
+        # The panel box of a 100 column screen.
+        plain = _autoview_text(snap, "1", settings, width=96)
+        with_note = self._row(plain, "user2@example.com")
+        without = self._row(plain, "user3@example.com")
+        assert with_note.endswith("  limit 70%"), with_note
+        assert "(line" not in plain
+        assert "limit" not in without
+        assert without == without.rstrip(), repr(without)
+        chips = with_note[: with_note.index("  limit")]
+        for column in ("7d", "Fable"):
+            assert chips.index(column) == without.index(column), plain
+        assert chips.count("%") == without.count("%") == 3, plain
 
 
 @pytest.mark.asyncio
@@ -287,33 +281,19 @@ class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
     line of its own with the sooner weekly reset; on the global 90 it read as
     over and fell behind account 3."""
 
-    async def test_an_account_under_its_own_line_keeps_the_soonest_reset(
-        self, tmp_path, fake_engine
-    ):
-        (tmp_path / "settings.json").write_text(json.dumps({
-            "schemaVersion": 1,
-            "autoswitch": {"threshold": 90, "strategy": "consume-first"},
-        }))
+    async def test_an_account_under_its_own_line_keeps_the_soonest_reset(self):
         later = make_entry(50.0, 10.0)
         later.last_good["seven_day"]["resets_at"] = _iso_in(86400 * 5)
-        app = make_app(FakeSwitcher(
-            [
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
                 make_account(1, active=True, entry=make_entry(99.0, 20.0)),
                 with_policy(
                     make_account(2, entry=make_entry(92.0, 10.0)), threshold=95.0
                 ),
                 make_account(3, entry=later),
-            ],
-            tmp_path,
-        ))
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            await pilot.press("g")
-            await pilot.pause()
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user2@example.com") < plain.index(
-                "user3@example.com"
-            )
+            ),
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(threshold=90, strategy="consume-first")
+        assert _autoview_order(snap, "1", settings) == ["2", "3"]
