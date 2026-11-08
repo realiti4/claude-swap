@@ -1688,7 +1688,7 @@ def contended_fake_engine(monkeypatch):
     return _ContendedFakeEngine
 
 
-def _autoview_text(snap, active, settings, width=None):
+def _next_best_text(snap, active, settings, width=None):
     """The "Next best" panel's rendered text, with no app and no pilot.
 
     `width` is the panel box (the screen's less 4); None leaves the rows
@@ -1708,9 +1708,9 @@ def _autoview_text(snap, active, settings, width=None):
         return str(v._candidates_text(snap, active_number=active))
 
 
-def _autoview_order(snap, active, settings):
+def _next_best_order(snap, active, settings):
     """The account numbers "Next best" renders, in its own displayed order."""
-    rendered = _autoview_text(snap, active, settings)
+    rendered = _next_best_text(snap, active, settings)
     others = [acc.number for acc in snap.accounts if acc.number != active]
     return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
 
@@ -2122,7 +2122,7 @@ class TestAutoScreen:
         settings = AutoSwitchSettings(threshold=85, weekly_threshold=97)
         seen = {}
         for box in (96, 71):
-            plain = _autoview_text(snap, "1", settings, width=box)
+            plain = _next_best_text(snap, "1", settings, width=box)
             seen[box] = [
                 ln for ln in plain.splitlines() if re.match(r"\s+[23]  ", ln)
             ]

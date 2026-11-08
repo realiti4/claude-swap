@@ -29,9 +29,9 @@ from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
     FakeSwitcher,
-    _autoview_order,
-    _autoview_text,
     _iso_in,
+    _next_best_order,
+    _next_best_text,
     fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
     make_account,
     make_app,
@@ -261,7 +261,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
         )
         settings = AutoSwitchSettings(threshold=90, strategy="best", model="Fable")
         # The panel box of a 100 column screen.
-        plain = _autoview_text(snap, "1", settings, width=96)
+        plain = _next_best_text(snap, "1", settings, width=96)
         with_note = self._row(plain, "user2@example.com")
         without = self._row(plain, "user3@example.com")
         assert with_note.endswith("  limit 70%"), with_note
@@ -296,4 +296,4 @@ class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
             taken_at=0.0,
         )
         settings = AutoSwitchSettings(threshold=90, strategy="consume-first")
-        assert _autoview_order(snap, "1", settings) == ["2", "3"]
+        assert _next_best_order(snap, "1", settings) == ["2", "3"]
