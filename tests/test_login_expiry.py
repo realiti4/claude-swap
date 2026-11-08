@@ -184,7 +184,7 @@ class TestCliList:
     def test_quarantined_block_says_it_once(self):
         now = time.time()
         lines = _usage_entry_lines(UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED), now - 60)
-        assert lines[0].startswith("re-login needed")
+        assert lines[0].startswith("re-login may be needed")
         assert len(lines) == 1
 
     def test_age_note_stays_on_the_last_usage_row(self):
@@ -219,7 +219,9 @@ class TestCardAndMiniRow:
         header = widgets.account_card_text(acc, 100, now=now).plain.splitlines()[0]
         assert header.endswith("· Max 20x   re-login in 5h 7m")
         mini = widgets.mini_account_text(acc, now).plain
-        assert mini == " 2  dev (a@example.com)  [personal]  · Max 20x   5h 25% · 7d 10% · re-login in 5h 7m"
+        # The mini row's chips carry their reset countdown (`5h(⟳1h59m):25%`).
+        assert mini.startswith(" 2  dev (a@example.com)  [personal]  · Max 20x   5h(")
+        assert mini.endswith("10% · re-login in 5h 7m")
 
     def test_quarantined_card_says_it_once(self):
         now = time.time()
@@ -228,7 +230,7 @@ class TestCardAndMiniRow:
         )
         lines = widgets.account_card_text(acc, 100, now=now).plain.splitlines()
         assert "re-login" not in lines[0]
-        assert lines[1].lstrip().startswith("⚠ re-login needed")
+        assert lines[1].lstrip().startswith("⚠ re-login may be needed")
         mini = widgets.mini_account_text(acc, now).plain
         assert mini.count("re-login") == 1
 
@@ -288,29 +290,33 @@ class TestDashboardFit:
     @pytest.mark.asyncio
     async def test_fresh_logins_render_exactly_as_without_the_field(self, tmp_path):
         # The mixed case that once wrapped: the rows must be the ones a
-        # snapshot without any expiry renders, column for column.
-        fresh, size, shown = await _dashboard(tmp_path, _mixed(time.time() + FAR), (80, 24))
-        bare, _size, bare_shown = await _dashboard(tmp_path, _mixed(None), (80, 24))
+        # snapshot without any expiry renders, column for column. The minis'
+        # chips carry their reset countdown, so the screen is wide enough for
+        # the long address's row (87 columns) without the note.
+        fresh, size, shown = await _dashboard(tmp_path, _mixed(time.time() + FAR), (100, 24))
+        bare, _size, bare_shown = await _dashboard(tmp_path, _mixed(None), (100, 24))
         assert fresh == bare
         assert size.height == len(fresh)  # nothing wrapped
         assert shown == bare_shown > 0
 
     @pytest.mark.asyncio
     async def test_due_note_steps_down_to_fit_the_row(self, tmp_path):
-        # 88 columns: the full note overflows the minis, the short one fits.
-        lines, size, _shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (88, 24))
+        # 104 columns (the minis' chips carry their reset countdown): the full
+        # note overflows the minis, the short one fits.
+        lines, size, _shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (104, 24))
         assert all(cell_len(line) <= size.width for line in lines)
         assert size.height == len(lines)
         minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
         assert len(minis) == 6
-        assert all(line.endswith("5h 25% · 7d 10% · re-login in 5d") for line in minis)
+        assert all(line.endswith("10% · re-login in 5d") for line in minis)
 
     @pytest.mark.asyncio
     async def test_due_note_goes_before_usage_does(self, tmp_path):
-        # 80 columns: not even the short note fits, so the rows read as
-        # before and keep their usage figures and the menu its rows.
-        lines, size, shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (80, 24))
-        bare, _size, bare_shown = await _dashboard(tmp_path, _seven(None), (80, 24))
+        # 88 columns: the rows fit without a note (79 wide) but not even the
+        # short one, so they read as before and keep their usage figures and
+        # the menu its rows.
+        lines, size, shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (88, 24))
+        bare, _size, bare_shown = await _dashboard(tmp_path, _seven(None), (88, 24))
         assert lines == bare
         assert size.height == len(lines)
         assert shown == bare_shown > 0
@@ -354,21 +360,23 @@ class TestNextBest:
         ]
         plain, _width = await _candidates(tmp_path, accounts, (100, 40))
         assert "re-login" not in plain
-        assert "   2  a@example.com  5h " in plain  # the name is not padded
+        # The name is padded to the widest one so the chips share a column.
+        assert "   2  a@example.com" + " " * 20 + "5h(" in plain
 
     @pytest.mark.asyncio
     async def test_due_note_ends_the_row_and_steps_down_when_narrow(self, tmp_path, fake_engine):
-        # 40-column addresses at 80 columns: the full note overflows the
-        # 76-column row, the short one fits, and the usage figure stays.
+        # 20-column addresses at 80 columns: the chips carry their reset
+        # countdown, so the full note overflows the 76-column row, the short
+        # one fits, and the usage figure stays.
         expires = time.time() + DUE
         accounts = [make_account(1, active=True, email="active@example.com")] + [
-            _replace_login(make_account(n, email=f"{'x' * 27}{n}@example.com"), expires) for n in (2, 3)
+            _replace_login(make_account(n, email=f"{'x' * 7}{n}@example.com"), expires) for n in (2, 3)
         ]
         plain, width = await _candidates(tmp_path, accounts, (80, 24))
         rows = [line for line in plain.splitlines() if "re-login" in line]
         assert len(rows) == 2
         assert all(cell_len(row) <= width for row in rows)
-        assert all(row.endswith("% used  re-login in 5d") for row in rows)
+        assert all(row.endswith("%  re-login in 5d") for row in rows)
 
 
 # ---------------------------------------------------------------------------

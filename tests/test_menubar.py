@@ -303,7 +303,7 @@ def test_format_account_label_quarantined_row_already_says_it():
         2, "loc@papaya.asia", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED],
         now=now, login_expires_at=now - 60, quarantined=True,
     )
-    assert label == "2  loc@papaya.asia  re-login needed"
+    assert label == "2  loc@papaya.asia  re-login may be needed"
 
 
 def test_format_account_label_usage_unavailable_still_carries_the_note():
