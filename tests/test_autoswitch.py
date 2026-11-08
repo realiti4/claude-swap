@@ -10356,7 +10356,7 @@ class TestLiveLock:
         )
 
         # Let the worker reach its emit only AFTER stop() is already waiting.
-        threading.Timer(0.3, release_worker.set).start()
+        threading.Timer(0.05, release_worker.set).start()
 
         t0 = time.monotonic()
         engine.stop()
@@ -10652,10 +10652,7 @@ class TestLiveLock:
 
             stopper = threading.Thread(target=do_stop)
             stopper.start()
-            import time
-
-            time.sleep(0.2)
-            assert not stopped.is_set(), (
+            assert not stopped.wait(0.05), (
                 "stop() returned while a freshen was in flight — it freed the "
                 "LIVE lock and the predecessor went on to POST a one-time "
                 "refresh grant for an account the successor now owns"
@@ -10715,8 +10712,6 @@ class TestLiveLock:
         worker.start()
         assert entered.wait(5), "premise: a switch is in flight"
 
-        import time
-
         stopped = threading.Event()
 
         def do_stop():
@@ -10725,8 +10720,7 @@ class TestLiveLock:
 
         stopper = threading.Thread(target=do_stop)
         stopper.start()
-        time.sleep(0.2)
-        assert not stopped.is_set(), (
+        assert not stopped.wait(0.05), (
             "stop() returned while a switch was in flight — it freed the LIVE "
             "lock without waiting for the state lock the switch holds"
         )

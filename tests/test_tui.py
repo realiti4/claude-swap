@@ -273,7 +273,6 @@ async def settle(pilot) -> None:
     if pending:
         await app.workers.wait_for_complete(pending)
     await pilot.pause()
-    await pilot.pause()
 
 
 async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
@@ -1766,7 +1765,6 @@ class TestAutoScreen:
     async def _open(self, pilot):
         await settle(pilot)
         await pilot.press("g")
-        await pilot.pause()
 
 
     async def test_opens_in_dry_run_and_store_only(self, tmp_path, fake_engine):
@@ -1983,7 +1981,6 @@ class TestAutoScreen:
             assert screen.check_action("toggle_cache_aware", ()) is False
             assert "c" not in screen.active_bindings
             await pilot.press("c")
-            await pilot.pause()
             assert not (tmp_path / "settings.json").exists()
             assert "cache-aware" not in summary.render().plain
 
@@ -1997,12 +1994,10 @@ class TestAutoScreen:
             assert "c" in screen.active_bindings
             assert "cache-aware off" in summary.render().plain
             await pilot.press("c")
-            await pilot.pause()
             assert load_settings(tmp_path).cache_aware is True  # the file, not the session
             assert "cache-aware on" in summary.render().plain
             assert any("cache-aware on" in line.text for line in log.lines)
             await pilot.press("c")
-            await pilot.pause()
             assert load_settings(tmp_path).cache_aware is False
             assert "cache-aware off" in summary.render().plain
 
@@ -2030,7 +2025,6 @@ class TestAutoScreen:
             assert "c" not in screen.active_bindings
             assert "cache-aware" not in screen.query_one("#auto-summary", Static).render().plain
             await pilot.press("c")
-            await pilot.pause()
             assert not (tmp_path / "settings.json").exists()
 
     async def test_c_flips_the_files_current_value_not_the_mount_time_one(
@@ -2055,7 +2049,6 @@ class TestAutoScreen:
             assert screen._settings.cache_aware is False  # the mount-time value
             set_setting(tmp_path, "autoswitch.cacheAware", "true")  # edited elsewhere
             await pilot.press("c")
-            await pilot.pause()
             assert load_settings(tmp_path).cache_aware is False
             assert "cache-aware off" in screen.query_one("#auto-summary", Static).render().plain
 

@@ -33,6 +33,25 @@ def _repeatable(node: ast.AST) -> bool:
     return False
 
 
+def _classes(node: ast.AST):
+    """Every ClassDef under `node`, at any depth.
+
+    Descends statement lists only (`body`, `orelse`, `finalbody`, `handlers`,
+    `cases`). A class is a statement, so no expression can hold one, and
+    skipping the expression subtrees is what makes this cheaper than
+    `ast.walk` over every node of the package. The `isinstance` check skips
+    `Lambda.body` and `IfExp.body`, which are single expressions.
+    """
+    for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+        children = getattr(node, field, None)
+        if not isinstance(children, list):
+            continue
+        for child in children:
+            if isinstance(child, ast.ClassDef):
+                yield child
+            yield from _classes(child)
+
+
 def duplicate_names(source: str, where: str = "") -> list[str]:
     """Names defined twice in one module body, or twice in one class body.
 
@@ -52,9 +71,7 @@ def duplicate_names(source: str, where: str = "") -> list[str]:
     )
     offenders += [f"{prefix}{n} x{c}" for n, c in counts.items() if c > 1]
 
-    for cls in ast.walk(tree):
-        if not isinstance(cls, ast.ClassDef):
-            continue
+    for cls in _classes(tree):
         counts = collections.Counter(
             m.name for m in cls.body
             if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -173,6 +190,62 @@ class C:
     def heal(self): ...
 """
 
+    NESTED_DUPLICATES = """
+def make():
+    class InFunction:
+        def a(self): ...
+        def a(self): ...
+    return InFunction
+
+if True:
+    class InIf:
+        def b(self): ...
+        def b(self): ...
+else:
+    class InElse:
+        def c(self): ...
+        def c(self): ...
+
+try:
+    class InTry:
+        def d(self): ...
+        def d(self): ...
+except Exception:
+    class InExcept:
+        def e(self): ...
+        def e(self): ...
+finally:
+    class InFinally:
+        def f(self): ...
+        def f(self): ...
+
+with open("x") as fh:
+    class InWith:
+        def g(self): ...
+        def g(self): ...
+
+for _ in ():
+    class InFor:
+        def h(self): ...
+        def h(self): ...
+
+while False:
+    class InWhile:
+        def i(self): ...
+        def i(self): ...
+
+match 1:
+    case 1:
+        class InMatch:
+            def j(self): ...
+            def j(self): ...
+
+class Outer:
+    class InClass:
+        def k(self): ...
+        def k(self): ...
+"""
+
     def test_overload_and_accessor_groups_are_not_duplicates(self):
         assert duplicate_names(self.OVERLOADS) == [], (
             "a legitimately repeated name counted as a redefinition — the "
@@ -185,3 +258,13 @@ class C:
         assert duplicate_names(self.REAL_DUPLICATE) == [
             "clear_pin x2", "C.heal x2"
         ]
+
+    def test_CONTROL_a_duplicate_in_a_nested_class_still_trips_the_guard(self):
+        """The class finder descends statement bodies only. A class inside a
+        function, a block or another class must still be reached, or the
+        speedup silently narrows what the package-wide case checks."""
+        assert sorted(duplicate_names(self.NESTED_DUPLICATES)) == sorted([
+            "InFunction.a x2", "InIf.b x2", "InElse.c x2", "InTry.d x2",
+            "InExcept.e x2", "InFinally.f x2", "InWith.g x2", "InFor.h x2",
+            "InWhile.i x2", "InMatch.j x2", "InClass.k x2",
+        ])

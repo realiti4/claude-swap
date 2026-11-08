@@ -17,6 +17,7 @@ import time
 import pytest
 
 from claude_swap import oauth
+from claude_swap import switcher as switcher_module
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.locking import FileLock
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -510,7 +511,7 @@ class TestTheAdoptIsASlotMutation:
         return sw
 
     def test_it_does_not_write_while_another_holder_has_the_slot_lock(
-            self, switcher):
+            self, switcher, monkeypatch):
         """A held lock means a slot mutation is in flight. The adopt must
         stand down for this pass, not write beside it, and not raise into a
         display refresh.
@@ -520,6 +521,10 @@ class TestTheAdoptIsASlotMutation:
         lock's default 10s wait would freeze the display for 10s PER SLOT
         against any concurrent switch. Measured on a held lock: the default
         acquire returns False after 10.01s."""
+        # The shipped constant is bounded here; the run waits a shorter one
+        # so the case does not spend the real half second on a held lock.
+        assert switcher_module._ADOPT_LOCK_WAIT_S < 2.0
+        monkeypatch.setattr(switcher_module, "_ADOPT_LOCK_WAIT_S", 0.05)
         held = FileLock(switcher.lock_file)
         assert held.acquire(timeout=5), "premise: the test could take the lock"
         try:
