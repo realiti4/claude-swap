@@ -8041,6 +8041,182 @@ class TestProvenanceGuard:
         assert switcher.list_unclaimed_credentials() == {}
         assert op["warnings"] == []
 
+    _LAPSE_1 = 1_900_000_000_000
+    _LAPSE_2 = 1_900_500_000_000
+
+    def _lineage_creds(self, access, refresh, lapse):
+        oauth_blob = {"accessToken": access, "refreshToken": refresh}
+        if lapse is not None:
+            oauth_blob["refreshTokenExpiresAt"] = lapse
+        return json.dumps({"claudeAiOauth": oauth_blob})
+
+    def _lineage_setup(self, temp_home, sample_sequence_data):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        a1 = self._lineage_creds("at-1", "rt-1", self._LAPSE_1)
+        a2 = self._lineage_creds("at-2", "rt-2", self._LAPSE_2)
+        creds_store[("1", "test@example.com")] = a1
+        creds_store[("2", "account2@example.com")] = a2
+        return switcher, creds_store, configs_store, a1, a2
+
+    def test_desktop_relabel_live_is_other_slots_exact_bytes_offline(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The label says slot 1 but the live credential is slot 2's, byte for
+        byte, and the profile call is down: the fail-open backup used to write
+        slot 2's login into slot 1. Lineage evidence names slot 2 instead."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": a2}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == a1
+        assert creds_store[("2", "account2@example.com")] == a2
+        assert switcher.list_unclaimed_credentials() == {}  # slot 2 has it
+        assert any("Account-2" in w for w in op["warnings"])
+
+    def test_desktop_relabel_live_is_rotated_copy_of_other_slot_offline(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A rotated copy of slot 2's login (new refresh token, same lapse
+        date) under slot 1's label is preserved, never written into slot 1."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        rotated = self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2)
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == a1
+        stash = switcher.list_unclaimed_credentials()
+        assert len(stash) == 1
+        entry_id, meta = next(iter(stash.items()))
+        assert meta["reason"] == "foreign"
+        assert _read_safety_copy(switcher, entry_id) == rotated
+        # No identity was resolved, so none is claimed, and slot 2's own
+        # backup is left as it was.
+        assert meta["resolvedIdentity"] is None
+        assert creds_store[("2", "account2@example.com")] == a2
+        assert any("Account-2" in w for w in op["warnings"])
+
+    def test_unresolved_live_sharing_outgoing_lapse_backs_up_as_own_rotation(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Full refresh-token rotation of the outgoing account, oracle down:
+        the lapse date matches the outgoing slot's, so it is its own
+        rotation, backed up quietly."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        rotated = self._lineage_creds("at-1b", "rt-1b", self._LAPSE_1)
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == rotated
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
+    def test_no_lapse_data_anywhere_still_fails_open(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Without lapse dates or a fingerprint match there is no offline
+        evidence: the exact pre-fix backup, as before."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._lineage_creds(
+            "at-1", "rt-1", None)
+        creds_store[("2", "account2@example.com")] = self._lineage_creds(
+            "at-2", "rt-2", None)
+        mystery = self._lineage_creds("at-x", "rt-x", None)
+        live_state = {"creds": mystery}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == mystery
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
+    def test_slots_already_sharing_a_lapse_keep_fail_open(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Outgoing and another slot already hold the same login: lineage
+        cannot tell them apart, so the old behaviour stands."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._lineage_creds(
+            "at-1", "rt-1", self._LAPSE_2)
+        rotated = self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2)
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == rotated
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
+    def test_slot_for_login_lineage_ambiguous_or_unreadable_is_none(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Two other slots share the live lapse → ambiguous → None; a read
+        error is no match, never an exception."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        data = {"accounts": {
+            "1": {"email": "test@example.com"},
+            "2": {"email": "account2@example.com"},
+            "3": {"email": "account3@example.com"},
+        }}
+        stored = {
+            "1": a1,
+            "2": a2,
+            "3": self._lineage_creds("at-3", "rt-3", self._LAPSE_2),
+        }
+        live = self._lineage_creds("at-z", "rt-z", self._LAPSE_2)
+        with patch.object(
+            switcher, "_read_account_credentials",
+            side_effect=lambda num, email, **kw: stored[num],
+        ):
+            assert switcher._slot_for_login_lineage(live, "1", data) is None
+            del data["accounts"]["3"]
+            assert switcher._slot_for_login_lineage(live, "1", data) == "2"
+        with patch.object(
+            switcher, "_read_account_credentials", side_effect=OSError("x"),
+        ):
+            assert switcher._slot_for_login_lineage(live, "1", data) is None
+
 
 class TestSelfSwitchProvenance:
     """The already-active short-circuits must not hide a diverged live login."""

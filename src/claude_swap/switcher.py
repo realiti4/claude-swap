@@ -7096,7 +7096,10 @@ class ClaudeAccountSwitcher:
           slot (``foreign_slot``) holding a different lineage; backing it up
           here would destroy this slot's only refresh token (issue #117's
           poisoning). Preserved in a safety copy, never written into any
-          slot: identity proves ownership, not generation freshness.
+          slot: identity proves ownership, not generation freshness. Also
+          reached offline, without any resolved identity, when the live
+          credential shares *login lineage* (see ``_slot_for_login_lineage``)
+          with exactly one other slot and not with this one.
         - ``"foreign-synced"`` — resolved to another managed slot whose
           stored backup already holds this exact lineage; nothing needs
           preserving, nothing may be written.
@@ -7129,7 +7132,14 @@ class ClaudeAccountSwitcher:
           fail-closed behavior this design forbids. The caller falls back to
           the exact pre-fix backup: the identity oracle is advisory, and
           endpoint state must never change switch behavior beyond skipping
-          the extra safety.
+          the extra safety. The one exception is offline lineage evidence:
+          a refresh-token lapse date (``refreshTokenExpiresAt``) is fixed per
+          ``/login`` and survives every rotation, so a live credential
+          sharing it with another slot is that account's login, and one
+          sharing it with this slot is this account's own rotation — both
+          decided without the oracle (an expired access token makes the
+          profile call 401 after any idle night, so the oracle is silent
+          exactly when Desktop's relabel needs it).
         """
         backup = self._read_account_credentials(current_account, current_email)
         if backup and backup == original_creds:
@@ -7153,7 +7163,9 @@ class ClaudeAccountSwitcher:
                 )
             ) is False:
                 return ("known-foreign", None)
-            return ("unresolved", None)
+            return self._classify_by_login_lineage(
+                current_account, original_creds, data
+            )
         r_email = resolved.get("email") or ""
         r_org = resolved.get("organizationUuid") or ""
         r_uuid = (resolved.get("uuid") or "").strip()
@@ -7199,7 +7211,9 @@ class ClaudeAccountSwitcher:
             # any other oracle degradation, not preserve-and-skip.
             if r_email and resolved.get("organizationUuid") is not None:
                 return ("alien", None)
-            return ("unresolved", None)
+            return self._classify_by_login_lineage(
+                current_account, original_creds, data
+            )
         # A cross-slot attribution must be uuid-positive: an email+org match
         # against a slot with no recorded uuid (add-token placeholder) is not
         # evidence enough to name that slot in user output — treat as alien.
@@ -7217,6 +7231,100 @@ class ClaudeAccountSwitcher:
         ):
             return ("foreign-synced", slot)
         return ("foreign", slot)
+
+    def _slot_for_login_lineage(
+        self, creds: str, current_account: str, data: dict
+    ) -> str | None:
+        """The one *other* managed slot whose stored credential shares the
+        live credential's login lineage, or ``None``.
+
+        Lineage is the same refresh-token fingerprint, or both
+        ``refreshTokenExpiresAt`` values present and equal. That lapse date is
+        fixed per ``/login``: refreshes never move it and rotated copies keep
+        it, so it identifies a login with no network (a rotated copy of a
+        slot's credential has a new fingerprint but the same lapse date).
+
+        ``None`` when nothing matches, when several other slots match, or when
+        the outgoing slot's own stored credential shares the lineage too —
+        the lineage is then duplicated and cannot say whose it is, so the
+        caller keeps its old behaviour. Skips slots with no stored credential.
+        Never raises: a read error is no match.
+        """
+        try:
+            live_fp = oauth.credential_fingerprint(creds)
+            live_lapse = oauth._refresh_token_expires_at_ms(creds)
+
+            def shares(stored: str | None) -> bool:
+                if not stored:
+                    return False
+                if live_fp and oauth.credential_fingerprint(stored) == live_fp:
+                    return True
+                return (
+                    live_lapse is not None
+                    and oauth._refresh_token_expires_at_ms(stored) == live_lapse
+                )
+
+            accounts = data.get("accounts", {})
+            own_email = accounts.get(current_account, {}).get("email", "")
+            if shares(self._read_account_credentials(current_account, own_email)):
+                return None
+            matches = [
+                num
+                for num, acct in accounts.items()
+                if num != current_account
+                and shares(
+                    self._read_account_credentials(num, acct.get("email", ""))
+                )
+            ]
+            return matches[0] if len(matches) == 1 else None
+        except Exception as e:
+            self._logger.debug(f"Login-lineage lookup raised: {e!r}")
+            return None
+
+    def _classify_by_login_lineage(
+        self, current_account: str, original_creds: str, data: dict
+    ) -> tuple[str, str | None]:
+        """Offline fallback for ``_classify_outgoing_credential``'s would-be
+        ``"unresolved"`` verdicts: decide from login lineage alone.
+
+        Another slot's login → ``"foreign-synced"`` when that slot's backup
+        already holds this fingerprint, else ``"foreign"``. The outgoing
+        slot's own lapse date → ``"own-rotated"`` (same write the fail-open
+        makes, now correctly named). Anything else stays ``"unresolved"``.
+        Never raises.
+        """
+        try:
+            slot = self._slot_for_login_lineage(
+                original_creds, current_account, data
+            )
+            if slot is not None:
+                email = data.get("accounts", {}).get(slot, {}).get("email", "")
+                stored = self._read_account_credentials(slot, email)
+                if stored and (
+                    stored == original_creds
+                    or oauth.credential_fingerprint(stored)
+                    == oauth.credential_fingerprint(original_creds)
+                ):
+                    return ("foreign-synced", slot)
+                return ("foreign", slot)
+            live_lapse = oauth._refresh_token_expires_at_ms(original_creds)
+            if live_lapse is not None:
+                own_email = (
+                    data.get("accounts", {}).get(current_account, {})
+                    .get("email", "")
+                )
+                own_stored = self._read_account_credentials(
+                    current_account, own_email
+                )
+                if (
+                    own_stored
+                    and oauth._refresh_token_expires_at_ms(own_stored)
+                    == live_lapse
+                ):
+                    return ("own-rotated", None)
+        except Exception as e:
+            self._logger.debug(f"Login-lineage classification raised: {e!r}")
+        return ("unresolved", None)
 
     def _stash_live_credential(
         self,
