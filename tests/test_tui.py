@@ -17,6 +17,8 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -30,6 +32,8 @@ from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
+from claude_swap.tui.autoview import AutoScreen
+from claude_swap.tui.theme import CSWAP_DARK
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
 
 
@@ -1690,12 +1694,6 @@ def _autoview_text(snap, active, settings, width=None):
     `width` is the panel box (the screen's less 4); None leaves the rows
     unfitted, as before the panel's first layout. A pilot render of the same
     fleet costs about 0.4 s, this about 2 ms."""
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock, patch
-
-    from claude_swap.tui.autoview import AutoScreen
-    from claude_swap.tui.theme import CSWAP_DARK
-
     def query_one(*_args):
         if width is None:
             raise AttributeError("the panel has no layout yet")
