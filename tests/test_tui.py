@@ -1586,6 +1586,7 @@ class TestAutoScreen:
         import json as _json
 
         from claude_swap.settings import load_pin_settings
+        from textual import events
         from textual.widgets import RichLog, Static
 
         path = tmp_path / "settings.json"
@@ -1600,7 +1601,14 @@ class TestAutoScreen:
             summary = screen.query_one("#auto-summary", Static)
             toggle = getattr(screen, f"action_toggle_{field}")
             assert f"{text} on" in summary.render().plain
-            await pilot.press(key)  # the one real key press: binding to action
+            # The one real key press: binding to action. The driver's own path (an
+            # events.Key posted to the app). pilot.press and pilot.pause wait for CPU
+            # idle (~0.07 s here); the handler is synchronous, so wait for its effect.
+            app.post_message(events.Key(key, key))
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if getattr(load_pin_settings(tmp_path), field) is False:
+                    break
             assert getattr(load_pin_settings(tmp_path), field) is False
             assert f"{text} off" in summary.render().plain
             toggle()
