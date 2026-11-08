@@ -32,6 +32,7 @@ from tests.test_tui import (
     make_account,
     make_app,
     make_entry,
+    quick_pilot,  # noqa: F401 - Textual's idle check at 2 ms, used by name
     settle,
 )
 
@@ -232,6 +233,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
             assert "(line" not in self._row(plain, "user3@example.com")
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_a_capped_candidate_is_marked_and_ranked_last(
         self, tmp_path, fake_engine
     ):
@@ -272,6 +274,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             )
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
         self, tmp_path, fake_engine
     ):

@@ -280,6 +280,19 @@ def make_app(fake: FakeSwitcher):
     return CswapApp(fake)
 
 
+@pytest.fixture
+def quick_pilot(monkeypatch):
+    """Poll Textual's idle check every 2 ms instead of every 20 ms.
+
+    ``pilot.pause()`` waits on ``wait_for_idle`` once and ``pilot.press()``
+    twice, and each wait sleeps at least one ``SLEEP_GRANULARITY`` (20 ms) per
+    look at the process CPU. The rule it applies (CPU under 5% of wall clock
+    means settled) is unchanged; only the look is ten times as frequent.
+    """
+    monkeypatch.setattr("textual._wait.SLEEP_GRANULARITY", 0.002)
+    monkeypatch.setattr("textual._wait.SLEEP_IDLE", 0.002 / 20.0)
+
+
 async def settle(pilot) -> None:
     """Let thread workers finish and their UI updates apply.
 
@@ -1296,6 +1309,7 @@ class TestDashboard:
             await settle(pilot)
             assert ("set_disabled", "2", False) in fake.calls
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_cap_menu_sets_and_clears_an_accounts_weekly_cap(self, tmp_path):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2, policy=AccountPolicy(weekly_cap=85.0))],
@@ -1337,6 +1351,7 @@ class TestDashboard:
             assert ("set_cap", "2", None) in fake.calls
             assert ("set_threshold", "2", None) in fake.calls
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_a_rejected_cap_is_reported_not_raised(self, tmp_path):
         """`set_account_weekly_cap` rejects a value out of range with
         `ValueError`; the action reports it like any switcher error."""
@@ -1900,6 +1915,7 @@ class TestAutoScreen:
             assert app.threshold_pct == 90.0
             assert fake._poll_inputs_override is None
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_strategy_cycle_is_session_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
@@ -1985,6 +2001,7 @@ class TestAutoScreen:
             screen.action_cycle_strategy()
             assert screen._settings.strategy == "best"
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_strategy_cycle_refreshes_a_strategy_gated_footer(
         self, tmp_path, fake_engine
     ):
@@ -2240,6 +2257,7 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_candidates_drop_the_model_gate_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):
@@ -2287,6 +2305,7 @@ class TestAutoScreen:
                 "user3@example.com"
             )
 
+    @pytest.mark.usefixtures("quick_pilot")
     async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):

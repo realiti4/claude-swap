@@ -157,6 +157,25 @@ class TestDynamicNeverMovesBestOrConsumeFirst:
             )
 
 
+# Every (strategy, model, seed) the cross-revision tests below read. One
+# driver run answers them all: measured, 0.43 s of its 0.66 s is importing
+# `_BASE_REV`'s own test module, a cost each separate run paid again.
+_BASE_REV_JOBS = (
+    *((strategy, model, _SEED) for strategy, model in _GOLDEN),
+    ("dynamic", "Fable", _DYNAMIC_SEED),
+    ("best", "Fable", _DYNAMIC_SEED),
+    ("consume-first", "Fable", _DYNAMIC_SEED),
+)
+
+
+@pytest.fixture(scope="module")
+def base_rev_digests(tmp_path_factory):
+    """`_BASE_REV`'s digests for `_BASE_REV_JOBS`, once per worker."""
+    return TestDynamicLeavesTheBaseRevisionAlone._digests_at_base_rev(
+        tmp_path_factory.mktemp("base_rev"), _BASE_REV_JOBS
+    )
+
+
 class TestDynamicLeavesTheBaseRevisionAlone:
     """The actual adr/0009 measurement: golden values above pin FUTURE
     drift on this branch, which is not the same claim as "this round left
@@ -178,12 +197,13 @@ class TestDynamicLeavesTheBaseRevisionAlone:
     """
 
     @staticmethod
-    def _digests_at_base_rev(tmp_path, combos, seed):
-        """`{"strategy|model": digest}` computed against `_BASE_REV`, in a
-        subprocess (a different `claude_swap` package must not share
-        `sys.modules` with this process). Shared by every test in this
-        class so each one states only WHICH combos it needs and what it
-        expects of them.
+    def _digests_at_base_rev(tmp_path, jobs):
+        """`{"strategy|model|seed": digest}` for each `(strategy, model,
+        seed)` job, computed against `_BASE_REV` in ONE subprocess (a
+        different `claude_swap` package must not share `sys.modules` with
+        this process). The `base_rev_digests` fixture runs it once per
+        worker for every job the tests below need, so each test states only
+        WHICH job it reads and what it expects of it.
         """
         repo_root = Path(__file__).resolve().parents[1]
         probe = subprocess.run(
@@ -199,7 +219,7 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         )
         with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
             tf.extractall(old_root, filter="data")  # trusted: our own repo's history
-        combos_literal = json.dumps(list(combos))
+        jobs_literal = json.dumps(list(jobs))
         driver = (
             "import sys, json\n"
             f"sys.path.insert(0, {str(old_root)!r})\n"
@@ -210,9 +230,9 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             "import hashlib, json as _json\n"
             "import claude_swap\n"
             "out = {'_claude_swap_file': claude_swap.__file__}\n"
-            f"for i, (strategy, model) in enumerate({combos_literal}):\n"
-            "    trace = _run_trace(Path(sys.argv[1]) / f'b{i}', strategy, model, int(sys.argv[2]))\n"
-            "    out[f'{strategy}|{model}'] = hashlib.sha256("
+            f"for i, (strategy, model, seed) in enumerate({jobs_literal}):\n"
+            "    trace = _run_trace(Path(sys.argv[1]) / f'b{i}', strategy, model, seed)\n"
+            "    out[f'{strategy}|{model}|{seed}'] = hashlib.sha256("
             "_json.dumps(trace, sort_keys=True).encode()).hexdigest()\n"
             "print(_json.dumps(out))\n"
         )
@@ -234,7 +254,7 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             "no_proxy": "", "NO_PROXY": "",
         }
         result = subprocess.run(
-            [sys.executable, str(driver_path), str(runs_dir), str(seed)],
+            [sys.executable, str(driver_path), str(runs_dir)],
             capture_output=True, text=True, cwd=str(old_root), env=child_env,
         )
         assert result.returncode == 0, (
@@ -291,24 +311,25 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             return real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", spy)
-        self._digests_at_base_rev(tmp_path, [("best", "")], _SEED)
+        self._digests_at_base_rev(tmp_path, [("best", "", _SEED)])
         env = seen.get("env") or {}
         got = {k: env.get(k) for k in expected}
         assert got == expected, (
             f"driver env's proxy keys are {got!r}, not the dead-proxy six {expected!r}"
         )
 
-    def test_e9afe401_produces_the_same_four_digests(self, tmp_path):
-        got = self._digests_at_base_rev(tmp_path, _GOLDEN.keys(), _SEED)
+    def test_e9afe401_produces_the_same_four_digests(self, base_rev_digests):
         for (strategy, model), golden in _GOLDEN.items():
-            key = f"{strategy}|{model}"
-            assert got[key] == golden, (
+            got = base_rev_digests[f"{strategy}|{model}|{_SEED}"]
+            assert got == golden, (
                 f"{strategy}/model={model or '(none)'}: {_BASE_REV} gives "
-                f"{got[key]}, HEAD gives {golden} — this round moved "
+                f"{got}, HEAD gives {golden} — this round moved "
                 "behaviour this strategy never authorized"
             )
 
-    def test_dynamic_actually_moved_from_the_base_revision(self, tmp_path):
+    def test_dynamic_actually_moved_from_the_base_revision(
+        self, tmp_path, base_rev_digests
+    ):
         """The four `best`/`consume-first` combos above passing is equally
         consistent with "dynamic's bar correctly reaches neither strategy"
         and with "the seed-2 fleet never reaches any line this branch
@@ -324,10 +345,7 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         digest both sides) — reported rather than adjusting the
         assertion; `_DYNAMIC_SEED` was found by sweeping for one that
         does."""
-        got = self._digests_at_base_rev(
-            tmp_path, [("dynamic", "Fable")], _DYNAMIC_SEED
-        )
-        base_digest = got["dynamic|Fable"]
+        base_digest = base_rev_digests[f"dynamic|Fable|{_DYNAMIC_SEED}"]
         head_digest = _digest(tmp_path / "head", "dynamic", "Fable", _DYNAMIC_SEED)
         assert base_digest != head_digest, (
             f"got the same digest ({head_digest}) on both {_BASE_REV} and "
@@ -336,7 +354,7 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         )
 
     def test_the_discriminating_seed_still_leaves_best_and_consume_first_alone(
-        self, tmp_path
+        self, tmp_path, base_rev_digests
     ):
         """`_DYNAMIC_SEED` was picked because its fleet reaches dynamic's
         new code (the test above) — that alone does not say `best`/
@@ -344,11 +362,9 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         `_SEED`'s fleet says so on a fleet proven NOT to reach the new
         code at all. Same population `_DYNAMIC_SEED` exercises, both
         strategies, still byte-identical to `_BASE_REV`."""
-        combos = [("best", "Fable"), ("consume-first", "Fable")]
-        got = self._digests_at_base_rev(tmp_path, combos, _DYNAMIC_SEED)
-        for i, (s, m) in enumerate(combos):
-            key = f"{s}|{m}"
-            assert got[key] == _digest(tmp_path / f"h{i}", s, m, _DYNAMIC_SEED), (
+        for i, (s, m) in enumerate([("best", "Fable"), ("consume-first", "Fable")]):
+            got = base_rev_digests[f"{s}|{m}|{_DYNAMIC_SEED}"]
+            assert got == _digest(tmp_path / f"h{i}", s, m, _DYNAMIC_SEED), (
                 f"{s}/{m}: digest moved between {_BASE_REV} and HEAD on "
                 "_DYNAMIC_SEED's own fleet"
             )

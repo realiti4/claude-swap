@@ -3130,6 +3130,14 @@ class TestFailoverSkipsAStaleTopCandidate:
 
 _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 
+# One worker's base-engine runs, so a later case asks the base once, not
+# again: the archive, the subprocess and the import of this module against
+# the base cost about 0.5 s (measured). A run is a pure function of its
+# arguments; whether this module can be imported against a base is a
+# property of the base alone.
+_BASE_ENGINE_RUNS: dict = {}
+_BASE_ENGINE_SKIPS: dict[str, str] = {}
+
 
 def _base_engine_results(
     tmp_path: Path, strategy: str, seed: int, n_fleets: int,
@@ -3153,6 +3161,14 @@ def _base_engine_results(
     `git show` there would redden every job today and every run forever
     once the branch is deleted post-merge.
     """
+    run_key = (
+        base_sha, strategy, seed, n_fleets,
+        json.dumps(custom_fleets), json.dumps(settings_kwargs, sort_keys=True),
+    )
+    if base_sha in _BASE_ENGINE_SKIPS:
+        pytest.skip(_BASE_ENGINE_SKIPS[base_sha])
+    if run_key in _BASE_ENGINE_RUNS:
+        return _BASE_ENGINE_RUNS[run_key]
     repo_root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
@@ -3237,10 +3253,11 @@ def _base_engine_results(
             None,
         )
         if import_line is not None:
-            pytest.skip(
+            _BASE_ENGINE_SKIPS[base_sha] = (
                 f"base {base_sha[:8]} cannot import this test "
                 f"module: {import_line}"
             )
+            pytest.skip(_BASE_ENGINE_SKIPS[base_sha])
     assert result.returncode == 0, (
         f"base-engine driver failed: rc={result.returncode}\n"
         f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
@@ -3253,10 +3270,11 @@ def _base_engine_results(
         f"the subprocess imported claude_swap from outside {old_root} — "
         f"this compared HEAD against itself, not against {base_sha}"
     )
-    return [
+    _BASE_ENGINE_RUNS[run_key] = [
         (name, active, tuple(tuple(e) for e in events))
         for name, active, events in out["results"]
     ]
+    return _BASE_ENGINE_RUNS[run_key]
 
 
 class TestOutcomeDigestAgainstBase:
@@ -3282,6 +3300,9 @@ class TestOutcomeDigestAgainstBase:
     # Cost: the two digest classes went 12.1s -> 4.8s run alone.
     _N_FLEETS = 8
     _DIGEST_SEED = 20260321
+    # Per worker: the head digest is a pure function of (strategy, settings),
+    # and several digest cases ask for the same ones.
+    _head_digests: dict = {}
 
     def _fleet(self, rng: random.Random, now: float):
         resets = (_R_SOON, _R_LATER, _R_LATEST)   # module globals, late-bound
@@ -3381,6 +3402,9 @@ class TestOutcomeDigestAgainstBase:
         return results
 
     def _head(self, tmp_path, strategy, **settings_kwargs):
+        key = (strategy, tuple(sorted(settings_kwargs.items())))
+        if key in self._head_digests:
+            return self._head_digests[key]
         rng = random.Random(self._DIGEST_SEED)
         now = 1_000_000.0
         fleets: list[dict] = []
@@ -3392,7 +3416,19 @@ class TestOutcomeDigestAgainstBase:
         head_results = self._run(
             AutoSwitchEngine, tmp_path, "head", fleets, strategy, **settings_kwargs
         )
-        return fleets, stale_by_fleet, head_results
+        self._head_digests[key] = fleets, stale_by_fleet, head_results
+        return self._head_digests[key]
+
+    @pytest.fixture
+    def head_digest(self, tmp_path_factory, strategy):
+        return self._head(tmp_path_factory.mktemp("head"), strategy)
+
+    @pytest.fixture
+    def base_digest(self, tmp_path_factory, strategy):
+        return _base_engine_results(
+            tmp_path_factory.mktemp("base"), strategy,
+            self._DIGEST_SEED, self._N_FLEETS,
+        )
 
     def _mutant(self, tmp_path, fleets, strategy, **settings_kwargs):
         # Neutralize ONLY the exclusions the admission gate can reach (the
@@ -3416,9 +3452,9 @@ class TestOutcomeDigestAgainstBase:
             )
 
     @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
-    def test_mutant_moves_the_head_digest(self, tmp_path, strategy):
+    def test_mutant_moves_the_head_digest(self, tmp_path, strategy, head_digest):
         """Needs no base checkout, so it runs on CI's shallow clone too."""
-        fleets, _stale, head_results = self._head(tmp_path, strategy)
+        fleets, _stale, head_results = head_digest
         mutant_results = self._mutant(tmp_path, fleets, strategy)
         assert mutant_results != head_results, (
             "the mutant must move the digest — a no-op injection proves nothing"
@@ -3435,11 +3471,11 @@ class TestOutcomeDigestAgainstBase:
     # `TestOutcomeDigestAgainstBase375` below re-proves the SAME shape of
     # invariant against THIS round's own base/head instead.
     @pytest.mark.parametrize("strategy", ["best", "consume-first"])
-    def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
-        fleets, stale_by_fleet, head_results = self._head(tmp_path, strategy)
-        base_results = _base_engine_results(
-            tmp_path, strategy, self._DIGEST_SEED, self._N_FLEETS
-        )
+    def test_digest_matches_base_except_the_stale_exclusion(
+        self, tmp_path, strategy, head_digest, base_digest
+    ):
+        fleets, stale_by_fleet, head_results = head_digest
+        base_results = base_digest
         # The consume-first HOLD keeps the `stale-usage` literal; a SKIP
         # (`proactive`, or `failover` on the fleet's own unhealthy-active
         # path — reachable under ANY strategy, `consume-first`/`dynamic`
