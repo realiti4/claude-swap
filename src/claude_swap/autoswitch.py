@@ -442,7 +442,7 @@ def _expiring_walk(
     """``expiring_order``'s walk: the fleet's burn rate (7d points per second;
     0.0 and no rows when none is measurable) and one ``(account, need, reset)``
     row per walked account in reset order, ``need`` the Ultra points of room to
-    spend through that account. The one place the deadline arithmetic lives."""
+    spend through that account."""
     def weight(n: str) -> float:
         return 1.0 / _PLAN_COST_SCALE.get(plans.get(n), 1.0)
 
@@ -484,12 +484,18 @@ def _expiring_walk(
     return rate, rows
 
 
+def _spend_lead_s(rate: float, need: float) -> float:
+    """Seconds before its reset an account's room must start to be spent: the
+    ``need`` points at the fleet's rate, started ``EXPIRING_RATE_MARGIN`` early."""
+    return need * EXPIRING_RATE_MARGIN / rate
+
+
 def _expiring_due(rate: float, rows: _WalkRows, now: float) -> list[str]:
     """The walk's rows up to and including the last whose deadline has come: an
-    account is due once ``need * EXPIRING_RATE_MARGIN / rate`` reaches its reset."""
+    account is due once ``_spend_lead_s`` reaches its reset."""
     last_due = max(
         (i for i, (_, need, reset) in enumerate(rows, 1)
-         if need * EXPIRING_RATE_MARGIN / rate >= reset - now),
+         if _spend_lead_s(rate, need) >= reset - now),
         default=0,
     )
     return [n for n, _, _ in rows[:last_due]]
@@ -502,19 +508,28 @@ def _hhmm_z(ts: float, now: float) -> str:
     )
 
 
-def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float) -> str:
-    """What `dynamic` decided when no row is due: the walked account whose
-    deadline (``reset - need * EXPIRING_RATE_MARGIN / rate``) comes first, and when."""
+def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float, current: str) -> str:
+    """What `dynamic` decided when no row is due: at the first deadline
+    (``reset - _spend_lead_s``) the rows up to that account are due, and the tick
+    then acts on the first row (`_tick_inner`'s ``ahead``): it takes the switch,
+    or, when it is the active, the active spends its window. ``need`` is the
+    room through the deadline's row, in Ultra points, not that row's own."""
     if not rows:
         return "nothing expiring; " + (
             "no account has 7d room it can spend now" if rate else "no fleet burn rate to time a deadline"
         )
     due, n, need, reset = min(
-        (reset - need * EXPIRING_RATE_MARGIN / rate, n, need, reset) for n, need, reset in rows
+        (reset - _spend_lead_s(rate, need), n, need, reset) for n, need, reset in rows
+    )
+    first = rows[0][0]
+    act = (
+        f"the active (#{current}) starts spending its expiring window" if first == current
+        else f"switch to #{first}"
     )
     return (
-        f"nothing expiring yet; next: #{n} due at {_hhmm_z(due, now)} ({need:.0f} pts room, "
-        f"{(reset - due) / 3600:.1f} h at {rate * 3600:.1f} pts/h, resets {_hhmm_z(reset, now)})"
+        f"nothing expiring yet; next at {_hhmm_z(due, now)}: {act} (needs {need:.0f} pts through "
+        f"#{n} by its {_hhmm_z(reset, now)} reset, {(reset - due) / 3600:.1f} h at "
+        f"{rate * 3600:.1f} pts/h)"
     )
 
 
@@ -3391,17 +3406,17 @@ class AutoSwitchEngine:
                     f"active account is healthy ({pct_label(active_headroom)}"
                     "% headroom, not about to wall)"
                 )
-                # The hold names what `dynamic` decided, not the threshold or
-                # the step it did not need: its own expiring window, or when
-                # the next account comes due (`_expiring_walk`'s reading).
-                if not expiring:
-                    detail = _nothing_expiring_detail(*walk, now)
-                elif spend_first and not alternation_admissible:
+                # The hold says what `dynamic` decided: its own expiring window,
+                # or, with nothing expiring, what the next due account does and
+                # when (`_expiring_walk`'s reading), after the cause that holds.
+                if spend_first and not alternation_admissible:
                     detail = healthy + "; spending its expiring window first"
                 else:
                     detail = healthy + (
                         "; the alternation step is not reached" if step_holds else ""
                     )
+                    if not expiring:
+                        detail += "; " + _nothing_expiring_detail(*walk, now, current)
                 self._emit(NoSwitchEvent(reason=reason, detail=detail))
                 return TickOutcome.NO_ACTION
             else:

@@ -440,4 +440,5 @@ def test_a_cold_only_fleet_not_yet_due_says_the_step_holds_it_not_the_floor(temp
     _track(h, anchor=40.0)
     assert _tick(h, {"1": _u(45.0), "2": _u(10.0), "3": _u(100.0, 100.0)}) is TickOutcome.NO_ACTION
     event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
-    assert event.reason == "below-threshold" and "nothing expiring" in event.detail
+    assert event.reason == "below-threshold"
+    assert "step" in event.detail and "nothing expiring" in event.detail

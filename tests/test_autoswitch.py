@@ -6993,6 +6993,9 @@ class TestWarmthAndAlternation375:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-floor"], reasons
         assert h.active_number() == 1
+        # The floor stays the label and the headroom stays in the line; the reading is appended.
+        detail = next(e.detail for e in h.events if isinstance(e, NoSwitchEvent))
+        assert detail.startswith("active account is healthy (") and "; nothing expiring" in detail
 
     def test_f2_healthy_active_cold_candidate_above_floor_still_refused(
         self, temp_home
@@ -7037,7 +7040,7 @@ class TestWarmthAndAlternation375:
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         )
         assert "<" not in detail, detail
-        assert "nothing expiring" in detail, detail
+        assert "healthy" in detail and "nothing expiring" in detail, detail
 
     def test_f2_walled_active_admits_the_cold_candidate_above_floor(
         self, temp_home
@@ -17830,6 +17833,18 @@ def _xw_hold(h) -> NoSwitchEvent:
     return [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
 
 
+def _xw_later(h, fleet: dict, rate: float, t0: float, hours: float) -> dict:
+    """``fleet`` (account -> (7d %, seconds to reset) at ``t0``) as it reads ``hours`` on: the
+    clock moves, each reset is that much nearer, and account 4 (spent, never a candidate)
+    has burned ``rate`` points an hour, which keeps the fleet's rate what it was."""
+    h.clock.advance(t0 + hours * _H - h.clock.now)
+    return {
+        n: _xw(h, 100.0 if n == "4" else 10.0, pct + (rate * hours if n == "4" else 0.0),
+               left - hours * _H)
+        for n, (pct, left) in fleet.items()
+    }
+
+
 class TestAnExpiringWindowPullsTheSwitch:
     """The 2026-11-06 specimen: the active at 7d 32% (6.5 d to reset) held
     `below-threshold` while two peers at 86-87% (2-3 h to reset) let their last
@@ -17942,10 +17957,56 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert h.active_number() == 1
         assert _xw_hold(h).reason == "below-threshold"
         assert _xw_hold(h).detail == (
-            "nothing expiring yet; next: #2 due at 03:52Z "
-            "(17 pts room, 5.9 h at 4.3 pts/h, resets 09:46Z)"
+            "active account is healthy (60% headroom, not about to wall); "
+            "the alternation step is not reached; nothing expiring yet; next at 03:52Z: "
+            "switch to #2 (needs 17 pts through #2 by its 09:46Z reset, 5.9 h at 4.3 pts/h)"
         )
         assert _xw_hold(h).human() == f"no switch: below-threshold ({_xw_hold(h).detail})"
+
+    def test_the_hold_names_the_account_the_tick_then_switches_to(self, temp_home):
+        """Active 1; 2 resets in 20 h with 5 pts of room, 3 in 21 h with 25 more. 264
+        points over 80.35 h of mean elapsed time is 3.29 pts/h: 3's 30 pts through it take
+        30 x 1.5 / 3.29 = 13.7 h, due 7.3 h out, and 2's 5 pts 2.3 h, due 17.7 h out. At
+        3's due time the walk is [2, 3] and the tick takes its first row, 2, not 3."""
+        h = _xw_harness(temp_home)
+        fleet = {
+            "1": (40.0, 6 * _D), "2": (92.0, 20 * _H), "3": (72.0, 21 * _H), "4": (60.0, 6.9 * _D),
+        }
+        rate = 264 / 80.35
+        reading = (
+            "nothing expiring yet; next at 21:04Z: switch to #2 "
+            "(needs 30 pts through #3 by its 10:46Z reset, 13.7 h at 3.3 pts/h)"
+        )
+        t0 = h.clock.now
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 0.0)) is TickOutcome.NO_ACTION
+        assert _xw_hold(h).detail.endswith("; " + reading)
+        # Just before it, the same reading; just after, the tick does what the line said.
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 7.2)) is TickOutcome.NO_ACTION
+        assert _xw_hold(h).detail.endswith("; " + reading)
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 7.4)) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "expiring-window")
+
+    def test_the_hold_says_the_active_spends_its_own_window_when_it_resets_first(self, temp_home):
+        """Active 1 resets first, in 20 h, with 17 pts of room: 190 points over 58.6 h
+        is 3.24 pts/h, so its 17 pts take 7.9 h, due 12.1 h out. Nothing switches then:
+        the active is the first row, and the hold says it spends the window first."""
+        h = _xw_harness(temp_home)
+        fleet = {
+            "1": (80.0, 20 * _H), "2": (20.0, 5 * _D), "3": (30.0, 5.5 * _D), "4": (60.0, 6.9 * _D),
+        }
+        rate = 190 / 58.6
+        reading = (
+            "nothing expiring yet; next at 01:54Z: the active (#1) starts spending its expiring "
+            "window (needs 17 pts through #1 by its 09:46Z reset, 7.9 h at 3.2 pts/h)"
+        )
+        t0 = h.clock.now
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 0.0)) is TickOutcome.NO_ACTION
+        assert _xw_hold(h).detail.endswith("; " + reading)
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 12.0)) is TickOutcome.NO_ACTION
+        assert _xw_hold(h).detail.endswith("; " + reading)
+        assert _xw_tick(h, _xw_later(h, fleet, rate, t0, 12.2)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _xw_hold(h).detail.endswith("; spending its expiring window first")
 
     def test_another_strategy_keeps_the_threshold_wording(self, temp_home):
         h = _xw_harness(temp_home)
@@ -18217,7 +18278,7 @@ def test_the_nothing_expiring_reading_says_when_no_account_will_come_due():
 
     def reading(usage: dict, headroom: dict) -> str:
         rate, rows = _expiring_walk(["1", "2"], usage, headroom, {}, {}, {}, lambda n: 0.0, now)
-        return _nothing_expiring_detail(rate, rows, now)
+        return _nothing_expiring_detail(rate, rows, now, "1")
 
     walled = {"1": 0.0, "2": 0.0}  # both at their wall: read for the rate, never walked
     assert reading(_xw_unit(now, **{"1": (32.0, 6 * _D), "2": (87.0, 2 * _H)}), walled) == (
@@ -18236,9 +18297,9 @@ def test_a_due_time_a_day_or_more_out_names_its_weekday():
     rate, rows = _expiring_walk(
         ["1", "2"], usage, {"1": 0.0, "2": 70.0}, {}, {}, {}, lambda n: 0.0, now
     )
-    assert _nothing_expiring_detail(rate, rows, now) == (
-        "nothing expiring yet; next: #2 due at Thu 03:25Z "
-        "(67 pts room, 58.4 h at 1.7 pts/h, resets Sat 13:46Z)"
+    assert _nothing_expiring_detail(rate, rows, now, "1") == (
+        "nothing expiring yet; next at Thu 03:25Z: switch to #2 "
+        "(needs 67 pts through #2 by its Sat 13:46Z reset, 58.4 h at 1.7 pts/h)"
     )
 
 
