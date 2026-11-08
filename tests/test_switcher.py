@@ -13549,3 +13549,144 @@ class TestSalvageCopyMode:
         assert salvage.read_bytes() == config_path.read_bytes()
         assert salvage.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob("*.tmp"))
+
+
+def _lineage_creds(token: str, expires_in_s: float = 7200, lapse_ms: int | None = None,
+                   refresh: str | None = None) -> str:
+    """Credential JSON with an optional ``refreshTokenExpiresAt`` and an
+    explicit refresh token (so a test can share, or not share, a fingerprint)."""
+    data = {
+        "accessToken": token,
+        "refreshToken": refresh if refresh is not None else f"rt-{token}",
+        "expiresAt": int((time.time() + expires_in_s) * 1000),
+    }
+    if lapse_ms is not None:
+        data["refreshTokenExpiresAt"] = lapse_ms
+    return json.dumps({"claudeAiOauth": data})
+
+
+def _lineage_row(num: int, creds: str, active: bool = False) -> tuple:
+    return (num, f"a{num}@example.com", "Org", "org-uuid", active, creds, "")
+
+
+class TestSharedLineageSlots:
+    """A slot whose login another row holds must never be refreshed."""
+
+    def test_fingerprint_collision_is_shared(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        a = _lineage_creds("sk-a1", refresh="rt-same")
+        b = _lineage_creds("sk-a2", refresh="rt-same")
+        rows = [_lineage_row(1, a, True), _lineage_row(2, b)]
+        assert switcher._shared_lineage_slots(rows) == frozenset({"1", "2"})
+
+    def test_lapse_collision_is_shared(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-a", lapse_ms=1_900_000_000_000), True),
+            _lineage_row(2, _lineage_creds("sk-b", lapse_ms=1_900_000_000_000)),
+        ]
+        assert switcher._shared_lineage_slots(rows) == frozenset({"1", "2"})
+
+    def test_no_collision_is_empty(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-a", lapse_ms=1_900_000_000_000)),
+            _lineage_row(2, _lineage_creds("sk-b", lapse_ms=1_900_000_000_001)),
+        ]
+        assert switcher._shared_lineage_slots(rows) == frozenset()
+
+    def test_missing_keys_never_match(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.oauth.credential_fingerprint", return_value=None):
+            rows = [
+                _lineage_row(1, _lineage_creds("sk-a")),
+                _lineage_row(2, _lineage_creds("sk-b")),
+            ]
+            assert switcher._shared_lineage_slots(rows) == frozenset()
+
+    def test_empty_creds_are_skipped(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [_lineage_row(1, ""), _lineage_row(2, "")]
+        assert switcher._shared_lineage_slots(rows) == frozenset()
+
+    def test_only_the_sharing_pair_is_returned(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-a", lapse_ms=1_900_000_000_000)),
+            _lineage_row(2, _lineage_creds("sk-b", lapse_ms=1_900_000_000_000)),
+            _lineage_row(3, _lineage_creds("sk-c", lapse_ms=1_800_000_000_000)),
+        ]
+        assert switcher._shared_lineage_slots(rows) == frozenset({"1", "2"})
+
+    def test_never_raises(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.oauth.credential_fingerprint", side_effect=RuntimeError):
+            rows = [_lineage_row(1, _lineage_creds("sk-a"))]
+            assert switcher._shared_lineage_slots(rows) == frozenset()
+
+
+class TestFetchAccountUsageSharedLineage:
+    def _idle(self, creds: str) -> tuple:
+        return _lineage_row(2, creds)
+
+    def _run(self, switcher, creds, shared, outcome=None):
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials", return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=outcome or oauth.UsageOutcome({"five_hour": {"pct": 5}})
+                   ) as mock_fetch:
+            record = switcher._fetch_account_usage(
+                self._idle(creds), shared_lineage=shared
+            )
+        return record, mock_fetch
+
+    def test_shared_idle_slot_is_fetched_read_only(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        creds = _lineage_creds("sk-b", 7200)
+        record, mock_fetch = self._run(switcher, creds, True)
+        assert record.usage == {"five_hour": {"pct": 5}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == creds
+        assert kwargs.get("is_active") is True
+        assert "refresh_via" not in kwargs
+
+    def test_shared_idle_slot_with_expired_token_is_sentinel(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        record, mock_fetch = self._run(switcher, _lineage_creds("sk-b", -60), True)
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_unshared_idle_slot_still_refreshes(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        _, mock_fetch = self._run(switcher, _lineage_creds("sk-b", 7200), False)
+        _, kwargs = mock_fetch.call_args
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("refresh_via") == switcher.consume_backup_grant
+
+
+class TestCollectorServesSharedLineageReadOnly:
+    def test_idle_row_sharing_the_live_login_is_read_only(self, temp_home: Path):
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        lapse = 1_900_000_000_000
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-live", lapse_ms=lapse), True),
+            _lineage_row(2, _lineage_creds("sk-stored", lapse_ms=lapse)),
+            _lineage_row(3, _lineage_creds("sk-other", lapse_ms=lapse + 1)),
+        ]
+        # Only the idle rows are fetched in this pass: the active row is
+        # not claimed, yet still has to count toward the shared lineage.
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials", return_value=None), \
+             patch.object(switcher, "_fetch_active_usage",
+                          return_value=FetchRecord(usage={"five_hour": {"pct": 1}})), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            switcher._collect_usage_entries(rows, fetch={"2", "3"})
+
+        by_email = {c.args[1]: c.kwargs for c in mock_fetch.call_args_list}
+        assert "refresh_via" not in by_email["a2@example.com"]
+        assert by_email["a2@example.com"]["is_active"] is True
+        assert by_email["a3@example.com"]["refresh_via"] == switcher.consume_backup_grant
