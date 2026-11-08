@@ -48,18 +48,17 @@ from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRE
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
-from claude_swap.switcher import ClaudeAccountSwitcher
-
-
-class FakeClock:
-    def __init__(self, now: float = 1_000_000.0):
-        self.now = now
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
+from tests._digest_harness import (
+    _R_LATER,
+    _R_LATEST,
+    _R_PAST,
+    _R_SOON,
+    EngineHarness,
+    _entry_for,
+    _usage7,
+    fleet,
+    run_fleets,
+)
 
 
 def _iso_at(epoch: float) -> str:
@@ -78,15 +77,6 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     if resets_at:
         window["resets_at"] = resets_at
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
-
-
-def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
-    """Synthesize the store entry a live fetch would have produced."""
-    if isinstance(value, dict):
-        return UsageEntry(last_good=value, fetched_at=now, age_s=0.0)
-    if isinstance(value, str):
-        return UsageEntry(sentinel=value)
-    return UsageEntry()
 
 
 def _seed_org_twin(h, num, email, org):
@@ -110,120 +100,6 @@ def _blind_quarantine(h, num, email, reason="identity-conflict"):
 
     with patch.object(store, "_read_account_credentials", side_effect=unreadable):
         h.engine._quarantine(num, email, reason)
-
-
-class EngineHarness:
-    """Seeded switcher + engine + captured events, on the Linux file backend."""
-
-    def __init__(self, temp_home: Path, *, engine_cls=None, **settings_kwargs):
-        self.temp_home = temp_home
-        # Base-vs-head comparison (TestOutcomeDigestAgainstBase) drives the
-        # SAME switcher/settings/clock through a different `AutoSwitchEngine`
-        # class (a pre-fix source loaded separately) — this is the one hook
-        # that needs, so the harness itself stays a single implementation.
-        self._engine_cls = engine_cls or AutoSwitchEngine
-        # get_backup_root() (switcher.py) resolves via Path.home() on every
-        # platform (both its XDG branch and its legacy
-        # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
-        # but on LINUX/WSL, $XDG_DATA_HOME takes precedence over Path.home()
-        # when set (paths.py:102-106). Patching Path.home() alone is not a
-        # superset of patching $XDG_DATA_HOME alone: a developer/CI with
-        # XDG_DATA_HOME exported would have every EngineHarness's XDG branch
-        # resolve to that ONE ambient value regardless of Path.home(),
-        # aliasing all harnesses in the process onto one store. Keep BOTH
-        # patches — neither mechanism dominates the other, and each covers
-        # the platforms/environments where the other is silent.
-        with (
-            patch("pathlib.Path.home", return_value=self.temp_home),
-            patch.dict(
-                os.environ,
-                {"XDG_DATA_HOME": str(self.temp_home / ".local" / "share")},
-            ),
-        ):
-            self.switcher = ClaudeAccountSwitcher()
-            self.switcher.platform = Platform.LINUX
-            self.switcher._setup_directories()
-            self.switcher._init_sequence_file()
-        self.settings = AutoSwitchSettings(**settings_kwargs)
-        self.events: list = []
-        self.clock = FakeClock()
-        # Keep the usage store on the same fake clock as the engine so
-        # freshness/claims/poll scheduling are deterministic in tests.
-        self.switcher._usage_store.clock = self.clock
-        self.engine = self._make_engine()
-
-    def _make_engine(self, **kwargs) -> AutoSwitchEngine:
-        return self._engine_cls(
-            self.switcher,
-            self.settings,
-            self.events.append,
-            clock=self.clock,
-            **kwargs,
-        )
-
-    def seed(self, num: int, email: str, *, expires_at: int | None = None) -> None:
-        oauth_blob: dict = {
-            "accessToken": f"sk-{num}",
-            "refreshToken": f"rt-{num}",
-        }
-        if expires_at is not None:
-            oauth_blob["expiresAt"] = expires_at
-        self.switcher._write_account_credentials(
-            str(num), email, json.dumps({"claudeAiOauth": oauth_blob})
-        )
-        self.switcher._write_account_config(
-            str(num),
-            email,
-            json.dumps({
-                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-            }),
-        )
-        data = self.switcher._get_sequence_data()
-        data["accounts"][str(num)] = {
-            "email": email,
-            "uuid": f"uuid-{num}",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": "2024-01-01T00:00:00Z",
-        }
-        if num not in data["sequence"]:
-            data["sequence"].append(num)
-            data["sequence"].sort()
-        if data["activeAccountNumber"] is None:
-            data["activeAccountNumber"] = num
-        self.switcher._write_json(self.switcher.sequence_file, data)
-
-    def make_live(self, email: str, num: int) -> None:
-        (self.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
-        }))
-        (self.temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-        }))
-
-    def tick_with_usage(self, usage: dict) -> TickOutcome:
-        entries = {
-            num: _entry_for(value, self.clock.now) for num, value in usage.items()
-        }
-        return self.tick_with_entries(entries)
-
-    def tick_with_entries(self, entries: dict[str, UsageEntry]) -> TickOutcome:
-        with patch.object(
-            self.switcher, "usage_entries_by_account", return_value=entries
-        ):
-            return self.engine.tick()
-
-    def active_number(self) -> int | None:
-        return self.switcher._get_sequence_data()["activeAccountNumber"]
-
-    def kinds(self) -> list[str]:
-        return [e.kind for e in self.events]
-
-    def state(self) -> dict:
-        path = self.switcher.backup_dir / "autoswitch_state.json"
-        if not path.exists():
-            return {}
-        return json.loads(path.read_text())
 
 
 @pytest.fixture
@@ -3131,116 +3007,69 @@ class TestFailoverSkipsAStaleTopCandidate:
 
 _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 
-# Whether this module can be imported against a base is a property of the
-# base alone, so one failed driver (about 0.5 s measured: the archive, the
-# subprocess, `claude_swap` and `pytest` imported, then the ImportError)
-# answers every later case on this worker.
-_BASE_ENGINE_SKIPS: dict[str, str] = {}
+# Per worker, `{base sha: {job: results}}`: one child per sha answers every job
+# the digest cases read (measured: 0.32 s for two jobs, 0.47 s for five).
+_BASE_RESULTS: dict[str, dict[str, list]] = {}
 
 
-def _base_engine_results(
-    tmp_path: Path, strategy: str, seed: int, n_fleets: int,
-    *, base_sha: str = _PR_321_BASE_SHA, custom_fleets: list[dict] | None = None,
-    settings_kwargs: dict | None = None,
-):
-    """`n_fleets` fleets generated from `seed` (the same generator
-    `TestOutcomeDigestAgainstBase._fleet` uses) — or, when `custom_fleets`
-    is given, those NAMED fleets verbatim instead — run through the
-    `base_sha` `AutoSwitchEngine` in a fresh subprocess against ITS OWN
-    `claude_swap` package — a different `usage_store`/`switcher`/`settings`/
-    `autoswitch`, not merely a fresh module namespace sharing this process's
-    `sys.modules`. Same technique as `test_dynamic_isolation.py`'s
-    `_digests_at_base_rev`: guard-and-skip, `git archive` + `tarfile`, a
-    driver subprocess, a positive control on where `claude_swap` resolved
-    from.
+def _digest_job(strategy: str, settings=None, fleets=None) -> str:
+    """A job `_base_engine_results` can be asked for, as the JSON the child
+    reads and the key its answer is cached under."""
+    return json.dumps(
+        {"strategy": strategy, "settings": settings or {}, "fleets": fleets},
+        sort_keys=True,
+    )
 
-    SKIPPED, not failed, when `base_sha` is not in the object database —
-    CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
-    branch's own pre-PR base is never in that checkout, and a bare
-    `git show` there would redden every job today and every run forever
-    once the branch is deleted post-merge.
-    """
-    if base_sha in _BASE_ENGINE_SKIPS:
-        pytest.skip(_BASE_ENGINE_SKIPS[base_sha])
+
+def _base_jobs(base_sha: str) -> list[str]:
+    """Every job the digest cases read at `base_sha`."""
+    jobs = [_digest_job(s) for s in ("best", "consume-first")]
+    if base_sha == _ROUND_375_BASE_SHA:
+        jobs += [_digest_job(s, _RAISED_THRESHOLD) for s in ("best", "consume-first")]
+        jobs.append(_digest_job(
+            "dynamic", fleets=[TestOutcomeDigest375._motivating_fleet(1_000_000.0)]
+        ))
+    return jobs
+
+
+def _run_base_child(tmp_path: Path, base_sha: str) -> dict[str, list]:
+    """`_base_jobs(base_sha)` through `base_sha`'s engine in one child."""
     repo_root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
     )
     if probe.returncode != 0:
         pytest.skip(f"{base_sha} is not in this checkout's object database")
-    old_root = tmp_path / "base_src"
-    old_root.mkdir()
+    root = tmp_path / "base"
+    root.mkdir()
     archive = subprocess.run(
         ["git", "-C", str(repo_root), "archive", "--format=tar", base_sha, "src"],
         capture_output=True, check=True,
     )
     with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
-        tf.extractall(old_root, filter="data")  # trusted: our own repo's history
-    module_dir = tmp_path / "base_driver"
-    module_dir.mkdir()
-    # HEAD's test module runs against BASE's package: the driver stubs a name
-    # this file imports from `claude_swap` that post-dates the base sha.
-    (module_dir / "test_autoswitch.py").write_text(
-        Path(__file__).read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    homes_dir = tmp_path / f"base_homes_{strategy}"
-    homes_dir.mkdir()
-    driver = module_dir / "_zz_base_engine_driver.py"
-    if custom_fleets is not None:
-        # `custom_fleets`: raw {account: usage-dict} maps (JSON-friendly);
-        # `_run` wants {account: UsageEntry} same as `_fleet` produces, so
-        # the driver converts via `_entry_for` at the SAME `now` `_fleet`
-        # anchors on.
-        fleets_dir = tmp_path / "custom_fleets"
-        fleets_dir.mkdir()
-        fleets_file = fleets_dir / "fleets.json"
-        fleets_file.write_text(json.dumps(custom_fleets))
-        fleets_setup = (
-            f"raw_fleets = json.loads(Path({str(fleets_file)!r}).read_text())\n"
-            "fleets = [\n"
-            "    {num: ta._entry_for(v, 1_000_000.0) for num, v in raw.items()}\n"
-            "    for raw in raw_fleets\n"
-            "]\n"
-        )
-    else:
-        fleets_setup = (
-            f"rng = random.Random({seed})\n"
-            "fleets = []\n"
-            f"for _ in range({n_fleets}):\n"
-            "    entries, _ = ta.TestOutcomeDigestAgainstBase._fleet(None, rng, 1_000_000.0)\n"
-            "    fleets.append(entries)\n"
-        )
+        tf.extractall(root, filter="data")  # trusted: our own repo's history
+    driver = root / "driver.py"
     driver.write_text(
-        "import sys, json, random\n"
+        "import sys, json, os\n"
         "from pathlib import Path\n"
-        f"sys.path.insert(0, {str(old_root / 'src')!r})\n"
-        f"sys.path.insert(0, {str(module_dir)!r})\n"
-        "import claude_swap, claude_swap.oauth, os\n"
+        f"sys.path.insert(0, {str(root / 'src')!r})\n"
+        f"sys.path.insert(1, {str(repo_root)!r})\n"
+        "import claude_swap, claude_swap.oauth\n"
         # conftest's hermetic stubs do not reach this interpreter: without
         # them a base switch opens a live oauth-profile request (2.7 of 3.5 s).
         "claude_swap.oauth.fetch_oauth_profile = lambda token: None\n"
         "os.fsync = lambda fd: None\n"
-        "import importlib, re\n"
-        "while True:\n"
-        # A name HEAD's test module imports that post-dates the base is
-        # stubbed: the digest jobs never call it, and one that did would
-        # fail loudly (None is not callable) instead of skipping.
-        "    try:\n"
-        "        import test_autoswitch as ta\n"
-        "        break\n"
-        "    except ImportError as e:\n"
-        "        m = re.match(r\"cannot import name '(\\w+)' from '(claude_swap[\\w.]*)'\", str(e))\n"
-        "        if not m:\n"
-        "            raise\n"
-        "        setattr(importlib.import_module(m[2]), m[1], None)\n"
-        f"{fleets_setup}"
-        "results = ta.TestOutcomeDigestAgainstBase._run(\n"
-        f"    None, ta.AutoSwitchEngine, Path(sys.argv[1]), 'base', fleets, {strategy!r},\n"
-        f"    **{settings_kwargs or {}!r}\n"
-        ")\n"
+        "from claude_swap.autoswitch import AutoSwitchEngine\n"
+        "from tests._digest_harness import run_jobs\n"
+        "jobs, seed, n_fleets = json.loads(sys.argv[2])\n"
+        "results = run_jobs(AutoSwitchEngine, Path(sys.argv[1]), "
+        "[json.loads(j) for j in jobs], seed, n_fleets)\n"
         "print(json.dumps({'_claude_swap_file': claude_swap.__file__, "
         "'results': results}))\n"
     )
+    homes_dir = root / "homes"
+    homes_dir.mkdir()
+    jobs = _base_jobs(base_sha)
     # Dead proxy, as in test_dynamic_isolation.py: the base tree's code must
     # not reach the network (that test measured 7 lookups without it).
     dead_proxy = "http://127.0.0.1:1"
@@ -3250,33 +3079,14 @@ def _base_engine_results(
         "HTTP_PROXY": dead_proxy, "HTTPS_PROXY": dead_proxy,
         "no_proxy": "", "NO_PROXY": "",
     }
+    digest = TestOutcomeDigestAgainstBase
     result = subprocess.run(
-        [sys.executable, str(driver), str(homes_dir)],
+        [
+            sys.executable, str(driver), str(homes_dir),
+            json.dumps([jobs, digest._DIGEST_SEED, digest._N_FLEETS]),
+        ],
         capture_output=True, text=True, env=child_env,
     )
-    if result.returncode != 0:
-        # The digest is a PR-branch invariant (base vs THIS PR's head), not
-        # an integration one. The driver stubs as None a name that `from
-        # claude_swap[.mod] import name` or `from claude_swap import newmod`
-        # cannot find; `from claude_swap.newmod import X` raises
-        # ModuleNotFoundError, which it does not stub. Base's package (frozen
-        # at `base_sha`) then cannot satisfy this module and the comparison
-        # is undefined, so SKIP, as this function already skips when the
-        # base object itself is absent. Any OTHER subprocess failure (a real
-        # digest-run crash) still reds.
-        import_line = next(
-            (
-                line for line in result.stderr.splitlines()
-                if "ImportError" in line or "ModuleNotFoundError" in line
-            ),
-            None,
-        )
-        if import_line is not None:
-            _BASE_ENGINE_SKIPS[base_sha] = (
-                f"base {base_sha[:8]} cannot import this test "
-                f"module: {import_line}"
-            )
-            pytest.skip(_BASE_ENGINE_SKIPS[base_sha])
     assert result.returncode == 0, (
         f"base-engine driver failed: rc={result.returncode}\n"
         f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
@@ -3285,18 +3095,52 @@ def _base_engine_results(
     # POSITIVE CONTROL, per test_dynamic_isolation.py: an editable install
     # could resolve `claude_swap` to the working tree regardless of
     # `sys.path` order, which would compare HEAD against itself.
-    assert out["_claude_swap_file"].startswith(str(old_root)), (
-        f"the subprocess imported claude_swap from outside {old_root} — "
+    assert out["_claude_swap_file"].startswith(str(root / "src")), (
+        f"the subprocess imported claude_swap from outside {root / 'src'}: "
         f"this compared HEAD against itself, not against {base_sha}"
     )
-    return [
-        (name, active, tuple(tuple(e) for e in events))
-        for name, active, events in out["results"]
+    return {
+        job: [
+            (name, active, tuple(tuple(e) for e in events))
+            for name, active, events in results
+        ]
+        for job, results in zip(jobs, out["results"])
+    }
+
+
+def _base_engine_results(
+    tmp_path: Path, strategy: str,
+    *, base_sha: str = _PR_321_BASE_SHA, custom_fleets: list[dict] | None = None,
+    settings_kwargs: dict | None = None,
+):
+    """The fleets of `TestOutcomeDigestAgainstBase` (fixed seed) at
+    `settings_kwargs`, or `custom_fleets` verbatim (raw `{account: usage}`
+    maps), run through the `base_sha` `AutoSwitchEngine` in a fresh subprocess
+    against ITS OWN `claude_swap` package: a different `usage_store`/
+    `switcher`/`settings`/`autoswitch`, not merely a fresh module namespace
+    sharing this process's `sys.modules`. Same technique as
+    `test_dynamic_isolation.py`'s `_digests_at_base_rev`: guard-and-skip,
+    `git archive` + `tarfile`, a driver subprocess, a positive control on
+    where `claude_swap` resolved from. The child imports only
+    `tests/_digest_harness.py`, never this module: HEAD's 18k-line test module
+    names things the base does not define, and compiling it cost most of the
+    child. A job `_base_jobs` does not list is a KeyError, add it there.
+
+    SKIPPED, not failed, when `base_sha` is not in the object database --
+    CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
+    branch's own pre-PR base is never in that checkout, and a bare
+    `git show` there would redden every job today and every run forever
+    once the branch is deleted post-merge.
+    """
+    if base_sha not in _BASE_RESULTS:
+        _BASE_RESULTS[base_sha] = _run_base_child(tmp_path, base_sha)
+    return _BASE_RESULTS[base_sha][
+        _digest_job(strategy, settings_kwargs, custom_fleets)
     ]
 
 
 # One xdist worker runs both digest classes, so `_head_digests` and
-# `_BASE_ENGINE_SKIPS` are built once, not per worker.
+# `_BASE_RESULTS` are each built once per worker.
 @pytest.mark.xdist_group("outcome-digests")
 class TestOutcomeDigestAgainstBase:
     """The #321 invariant: `best`'s ranking/admission must stay identical to
@@ -3324,103 +3168,8 @@ class TestOutcomeDigestAgainstBase:
     # Per worker: the head digest is a pure function of (strategy, settings),
     # and several digest cases ask for the same ones.
     _head_digests: dict = {}
-
-    def _fleet(self, rng: random.Random, now: float):
-        resets = (_R_SOON, _R_LATER, _R_LATEST)   # module globals, late-bound
-        active = _entry_for(
-            _usage7(rng.uniform(80, 99), rng.uniform(0, 50), rng.choice(resets)),
-            now,
-        )
-        entries = {"1": active}
-        stale_nums = set()
-        for num in ("2", "3"):
-            last_good = _usage7(
-                rng.uniform(0, 60), rng.uniform(0, 60), rng.choice(resets)
-            )
-            roll = rng.random()
-            if roll < 0.35:
-                stale_nums.add(num)
-                entries[num] = UsageEntry(
-                    last_good=last_good,
-                    fetched_at=now - rng.uniform(200, 2000),
-                    age_s=rng.uniform(200, 2000),
-                    consecutive_failures=rng.randint(3, 12),
-                    last_error=rng.choice(["http-429", "timeout"]),
-                    backoff_until=now + rng.uniform(50, 500),
-                    trust_extended=True,
-                )
-            elif roll < 0.45:
-                # Collector-struck while still FRESH: the `token_dead()` half
-                # of the exclusion, which the freshness half alone admits.
-                stale_nums.add(num)
-                entries[num] = UsageEntry(
-                    last_good=last_good, fetched_at=now, age_s=0.0,
-                    auth_dead_strikes=2,
-                )
-            elif roll < 0.55:
-                # m-1: FRESH but just failed once -- `fetched_at` moves only
-                # on success, `backoffUntil`/`consecutiveFailures` only on
-                # failure, the reviewer's own shape. Decision-trusted
-                # (well inside `STALE_OK_S`) -- deliberately NOT added to
-                # `stale_nums`, so the assertions below can tell an
-                # authorized exclusion from an over-exclusion: this cell
-                # must never be the one a diff traces to.
-                entries[num] = UsageEntry(
-                    last_good=last_good,
-                    fetched_at=now - rng.uniform(5, 60),
-                    age_s=rng.uniform(5, 60),
-                    consecutive_failures=1,
-                    last_error="http-429",
-                    backoff_until=now + rng.uniform(500, 3600),
-                )
-            else:
-                entries[num] = _entry_for(last_good, now)
-        return entries, stale_nums
-
-    def _run(
-        self,
-        engine_cls,
-        tmp_path: Path,
-        tag: str,
-        fleets: list[dict],
-        strategy: str,
-        **settings_kwargs,
-    ):
-        # `EngineHarness.__init__` only patches `Path.home()` for its own
-        # setup — every OTHER test in this file relies on the `temp_home`
-        # fixture holding that patch for the whole test. This one drives
-        # its own directories, so it holds the same patch itself; without
-        # it `seed`/`make_live`/`current_account_number()` read the REAL
-        # `$HOME` and every tick reads unmanaged-active-account.
-        results = []
-        for i, entries in enumerate(fleets):
-            home = tmp_path / f"{tag}{i}"
-            (home / ".claude").mkdir(parents=True)
-            with (
-                patch("pathlib.Path.home", return_value=home),
-                patch.dict(
-                    os.environ,
-                    {
-                        "HOME": str(home),
-                        "USERPROFILE": str(home),
-                        "XDG_DATA_HOME": str(home / ".local" / "share"),
-                    },
-                ),
-            ):
-                h = EngineHarness(
-                    home,
-                    engine_cls=engine_cls,
-                    strategy=strategy,
-                    **settings_kwargs,
-                )
-                h.seed(1, "a@example.com")
-                h.seed(2, "b@example.com")
-                h.seed(3, "c@example.com")
-                h.make_live("a@example.com", 1)
-                outcome = h.tick_with_entries(entries)
-            events = tuple((e.kind, getattr(e, "reason", None)) for e in h.events)
-            results.append((outcome.name, h.active_number(), events))
-        return results
+    _fleet = staticmethod(fleet)
+    _run = staticmethod(run_fleets)
 
     def _head(self, tmp_path, strategy, **settings_kwargs):
         key = (strategy, tuple(sorted(settings_kwargs.items())))
@@ -3446,10 +3195,7 @@ class TestOutcomeDigestAgainstBase:
 
     @pytest.fixture
     def base_digest(self, tmp_path_factory, strategy):
-        return _base_engine_results(
-            tmp_path_factory.mktemp("base"), strategy,
-            self._DIGEST_SEED, self._N_FLEETS,
-        )
+        return _base_engine_results(tmp_path_factory.mktemp("base"), strategy)
 
     def _mutant(self, tmp_path, fleets, strategy, **settings_kwargs):
         # Neutralize ONLY the exclusions the admission gate can reach (the
@@ -3474,14 +3220,21 @@ class TestOutcomeDigestAgainstBase:
                 strategy, **settings_kwargs,
             )
 
+    def _mutant_moves_the_digest(self, tmp_path, fleets, head_results, strategy):
+        """Whether the mutant differs from head on any fleet, stopping at the
+        first one that does (the digests differ as a whole iff any fleet does)."""
+        return any(
+            self._mutant(tmp_path / f"m{i}", [entries], strategy)[0] != head
+            for i, (entries, head) in enumerate(zip(fleets, head_results))
+        )
+
     @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
     def test_mutant_moves_the_head_digest(self, tmp_path, strategy, head_digest):
         """Needs no base checkout, so it runs on CI's shallow clone too."""
         fleets, _stale, head_results = head_digest
-        mutant_results = self._mutant(tmp_path, fleets, strategy)
-        assert mutant_results != head_results, (
-            "the mutant must move the digest — a no-op injection proves nothing"
-        )
+        assert self._mutant_moves_the_digest(
+            tmp_path, fleets, head_results, strategy
+        ), "the mutant must move the digest: a no-op injection proves nothing"
 
     # `dynamic` excluded here (#375): this checks base ``_PR_321_BASE_SHA``
     # (PR #321's OWN base commit) against head, on the invariant "nothing
@@ -3598,6 +3351,7 @@ class TestOutcomeDigestAgainstBase:
 
 
 _ROUND_375_BASE_SHA = "a32a34d779ac5cb2838afe49df1cc41ec801be27"
+_RAISED_THRESHOLD = {"threshold": 99.0}
 
 
 @pytest.mark.xdist_group("outcome-digests")
@@ -3687,7 +3441,7 @@ class TestOutcomeDigest375:
             "switch)"
         )
         base_results = _base_engine_results(
-            tmp_path, "dynamic", seed=0, n_fleets=1,
+            tmp_path, "dynamic",
             base_sha=_ROUND_375_BASE_SHA,
             custom_fleets=[self._motivating_fleet(1_000_000.0)],
         )
@@ -3737,15 +3491,15 @@ class TestOutcomeDigest375:
     ):
         fleets, stale_by_fleet, head_results = self._base._head(tmp_path, strategy)
         base_results = _base_engine_results(
-            tmp_path, strategy, self._base._DIGEST_SEED, self._base._N_FLEETS,
-            base_sha=_ROUND_375_BASE_SHA,
+            tmp_path, strategy, base_sha=_ROUND_375_BASE_SHA
         )
         assert head_results == base_results, (
             f"{strategy} must be byte-identical against this round's own "
             f"base — #375 touches `dynamic` only"
         )
-        mutant_results = self._base._mutant(tmp_path, fleets, strategy)
-        assert mutant_results != head_results, (
+        assert self._base._mutant_moves_the_digest(
+            tmp_path, fleets, head_results, strategy
+        ), (
             "the existing stale-candidate mutant control must still move "
             "the digest — a no-op injection proves nothing"
         )
@@ -3765,7 +3519,7 @@ class TestOutcomeDigest375:
         their active in [97, 99) -- the positive control below fails loudly
         if that ever stops being true.
         """
-        raised = {"threshold": 99.0}
+        raised = _RAISED_THRESHOLD
         probe_rng = random.Random(self._base._DIGEST_SEED)
         active_pcts = [
             self._base._fleet(probe_rng, 1_000_000.0)[0]["1"].last_good[
@@ -3782,7 +3536,7 @@ class TestOutcomeDigest375:
             tmp_path, strategy, **raised
         )
         base_results = _base_engine_results(
-            tmp_path, strategy, self._base._DIGEST_SEED, self._base._N_FLEETS,
+            tmp_path, strategy,
             base_sha=_ROUND_375_BASE_SHA, settings_kwargs=raised,
         )
         assert head_results == base_results, (
@@ -6100,23 +5854,6 @@ class TestTheRetryAdmitsOnlyAnImprovement:
 
 
 # --- consume-first strategy ----------------------------------------------------
-
-# Weekly-reset instants in ascending order (all valid ISO-8601, absolute).
-# The 2024 dates are all far in the FUTURE relative to FakeClock's epoch
-# (1_000_000.0 ≈ 1970-01-12); _R_PAST is before it.
-_R_PAST = "1970-01-10T00:00:00Z"
-_R_SOON = "2024-01-05T00:00:00Z"
-_R_LATER = "2024-01-08T00:00:00Z"
-_R_LATEST = "2024-01-10T00:00:00Z"
-
-
-def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
-    """Usage with an explicit 7-day window (utilization + optional reset)."""
-    seven: dict = {"pct": pct7}
-    if reset7:
-        seven["resets_at"] = reset7
-    return {"five_hour": {"pct": pct5}, "seven_day": seven}
-
 
 class TestDynamicStrategy:
     """``dynamic``: consume-first's ranking key, the model basis re-picked
