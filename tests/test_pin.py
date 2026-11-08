@@ -11351,7 +11351,8 @@ class TestASourceFileIsReadAsUTF8:
         (sorted), which is every node that can be a `read_text` call: the
         attribute sits on such a line, inside the call and each ancestor.
         Skips the subtrees `ast.walk` would visit for nothing; a node with no
-        position (`arguments`, `comprehension`) is passed through."""
+        position (`arguments`, `comprehension`) is passed through, and a
+        decorated def or class spans from its first decorator."""
         import ast
         import bisect
 
@@ -11360,6 +11361,9 @@ class TestASourceFileIsReadAsUTF8:
             node = todo.pop()
             lo = getattr(node, "lineno", None)
             if lo is not None:
+                # Decorators sit above a def's or class's own `lineno`.
+                if getattr(node, "decorator_list", None):
+                    lo = node.decorator_list[0].lineno
                 k = bisect.bisect_left(hit_lines, lo)
                 if k == len(hit_lines) or hit_lines[k] > node.end_lineno:
                     continue
@@ -11420,10 +11424,13 @@ class TestASourceFileIsReadAsUTF8:
         the failure mode every lint in this file has had at least once."""
         import ast
 
-        # The lint's own traversal, on a one-line and on a multi-line call.
+        # The lint's own traversal, on a one-line call, a multi-line call and
+        # one inside a decorator (which sits above its def's `lineno`).
         for planted, hits in (
             ('src = pathlib.Path(__file__).read_text()\n', [1]),
             ('src = (\n    pathlib.Path(__file__)\n    .read_text()\n)\n', [3]),
+            ('@skipif(pathlib.Path(__file__).read_text())\ndef f():\n    pass\n',
+             [1]),
         ):
             tree = ast.parse(planted)
             found = [n for n in self._nodes_spanning(tree, hits)

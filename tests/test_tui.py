@@ -1422,13 +1422,6 @@ PIN_TOGGLES = [
 ]
 
 
-@pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
-def test_the_auto_view_binds_each_pin_key_to_its_toggle(key, json_key, field, text):
-    """The keystroke half of the flip case below, read off the bindings."""
-    bound = {b.key: b.action for b in AutoScreen.BINDINGS}
-    assert bound[key] == f"toggle_{field}"
-
-
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
@@ -1607,7 +1600,7 @@ class TestAutoScreen:
             summary = screen.query_one("#auto-summary", Static)
             toggle = getattr(screen, f"action_toggle_{field}")
             assert f"{text} on" in summary.render().plain
-            toggle()
+            await pilot.press(key)  # the one real key press: binding to action
             assert getattr(load_pin_settings(tmp_path), field) is False
             assert f"{text} off" in summary.render().plain
             toggle()
@@ -1620,7 +1613,7 @@ class TestAutoScreen:
             assert any(f"{text} on" in ln.text for ln in log.lines)
 
     # One key: both toggles share `_toggle_pin_switch`, so the failed-save
-    # branch is the same code for `o`; the `o` mapping is the binding test above.
+    # branch is the same code for `o`; the `o` mapping is the flip case's press.
     @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES[:1])
     async def test_pin_toggle_reports_a_failed_save_and_keeps_the_old_state(
         self, tmp_path, fake_engine, monkeypatch, key, json_key, field, text

@@ -85,6 +85,7 @@ class TestThePinTuiSurface:
             assert menu.index == 2, "a poll moved the cursor"
 
             items = list(menu.query(MenuItem))
+            assert "pin-menu" not in [it.action_id for it in items]
             target = next(
                 i for i, it in enumerate(items) if it.action_id == "remove-menu"
             )
