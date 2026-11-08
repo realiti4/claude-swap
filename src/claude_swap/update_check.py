@@ -308,13 +308,130 @@ def check_for_update(current_version: str) -> str | None:
         return None
 
 
+def _installed_version_on_disk() -> str | None:
+    """The version claude-swap actually has on disk after an upgrade.
+
+    importlib.metadata resolves the running environment, so it still reports
+    the pre-upgrade version from inside this process. A fresh interpreter
+    started from sys.executable reads the tool directory uv/pipx rewrote,
+    giving an honest after-version for both install methods without parsing
+    `uv tool list` / `pipx list` output. Best effort: any failure or timeout
+    returns None so a verification hiccup never masks the upgrade's own exit
+    status.
+    """
+    code = (
+        "import importlib.metadata as m\n"
+        "print(m.version('claude-swap'))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    version = result.stdout.strip()
+    return version or None
+
+
+def install_identity() -> dict:
+    """``{"version", "source"}`` of the claude-swap this process runs.
+
+    ``source`` is the VCS commit for a git install (importlib.metadata's
+    ``direct_url.json``), else None. Two builds can share a version string and
+    differ only here — anyone installed from a branch, for instance — so a
+    "did the build change?" question compares both.
+    """
+    from importlib import metadata
+
+    from claude_swap import __version__
+
+    source = None
+    try:
+        raw = metadata.distribution("claude-swap").read_text("direct_url.json")
+        if raw:
+            source = (json.loads(raw).get("vcs_info") or {}).get("commit_id") or None
+    except (OSError, ImportError, ValueError, AttributeError, TypeError):
+        source = None  # no metadata, or not the shape pip/uv write: not a git install
+    return {"version": __version__, "source": source}
+
+
+def describe_identity(identity: dict | None) -> str:
+    """``1.0.0 (3fec656)`` for a git install, ``1.0.0`` otherwise."""
+    if not identity:
+        return "unknown"
+    source = identity.get("source")
+    version = str(identity.get("version") or "unknown")
+    return f"{version} ({str(source)[:7]})" if source else version
+
+
+def _installed_identity_on_disk() -> dict | None:
+    """:func:`install_identity` as a fresh interpreter sees it after an upgrade.
+
+    Same reasoning as :func:`_installed_version_on_disk`: this process still
+    reports the pre-upgrade build. Best effort, None on any failure.
+    """
+    code = (
+        "import json\n"
+        "from claude_swap.update_check import install_identity\n"
+        "print(json.dumps(install_identity()))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        identity = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    return identity if isinstance(identity, dict) else None
+
+
+def _restart_menubar_if_rebuilt(before: dict) -> None:
+    """Restart a RUNNING menu bar service when the upgrade changed the build.
+
+    launchd keeps the old process until something restarts it; until now the
+    README asked for a manual kickstart. Only a running service is touched — a
+    quit one stays quit, which is the user's choice to keep. "Changed" compares
+    version and commit, so a git install that keeps its version string counts.
+    Other upgrade routes (``uv tool upgrade`` by hand) are covered by the next
+    plain ``cswap menubar``, which compares the worker's build stamp.
+    """
+    from claude_swap.printer import warning
+
+    after = _installed_identity_on_disk()
+    if after is None or after == before:
+        return
+    from claude_swap import launch_agent
+    from claude_swap.exceptions import ClaudeSwitchError
+
+    try:
+        pid = launch_agent.service_pid()
+        if pid is None:
+            return
+        launch_agent.kickstart(restart=True)
+    except (ClaudeSwitchError, OSError) as exc:
+        # The upgrade itself succeeded; only the restart did not.
+        warning(f"Menu bar not restarted onto the new build: {exc}")
+        return
+    print(f"Menu bar restarted onto {describe_identity(after)} (was pid {pid}).")
+
+
 def run_self_upgrade(current_version: str | None = None) -> int:
     """Run the appropriate upgrade command for the current install method.
 
     Returns the subprocess exit code, or 1 if detection failed or the package
-    manager is missing from PATH. A uv install with a release cooldown gets
-    told about a release the cooldown hides, since uv itself only reports
-    "Nothing to upgrade".
+    manager is missing from PATH. After a successful run it verifies what
+    actually landed on disk and reports the before -> after, since a package
+    manager can exit 0 without changing anything (uv's "Nothing to upgrade",
+    #491). A uv install with a release cooldown also gets told about a release
+    the cooldown hides, since uv itself only reports "Nothing to upgrade".
     """
     from claude_swap.printer import accent, error, warning
 
@@ -322,6 +439,8 @@ def run_self_upgrade(current_version: str | None = None) -> int:
         from claude_swap import __version__
 
         current_version = __version__
+    before = current_version
+    before_identity = install_identity()
 
     method = _detect_install_method()
     commands = {
@@ -362,7 +481,26 @@ def run_self_upgrade(current_version: str | None = None) -> int:
             "Run the upgrade manually from a shell where it is available."
         )
         return 1
-    if result.returncode == 0 and method == "uv":
+
+    if result.returncode != 0:
+        return result.returncode
+
+    # The package manager can exit 0 without changing anything, so verify
+    # what landed on disk and say so rather than trusting its wording (#491).
+    # importlib.metadata in a fresh interpreter reads the directory uv/pipx
+    # rewrote, so the report is honest for both install methods. Verification
+    # is best effort: a failure or timeout returns None and we stay silent,
+    # never masking the upgrade's own exit status.
+    after = _installed_version_on_disk()
+    if before and after and after != before:
+        print(accent(f"claude-swap upgraded: {before} -> {after}"))
+    elif before and after:
+        print(f"claude-swap is still at {after}.")
+
+    if sys.platform == "darwin":
+        _restart_menubar_if_rebuilt(before_identity)
+
+    if method == "uv":
         notice = held_back_release_notice(current_version)
         if notice:
             warning(notice)

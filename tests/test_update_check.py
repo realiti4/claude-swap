@@ -13,6 +13,7 @@ from claude_swap.update_check import (
     CACHE_TTL,
     FAILURE_TTL,
     _detect_install_method,
+    _installed_version_on_disk,
     check_for_update,
     held_back_release_notice,
     run_self_upgrade,
@@ -600,14 +601,20 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert held_back_release_notice("0.27.2") is None
 
     @patch("claude_swap.update_check.subprocess.run")
-    def test_cswap_upgrade_prints_notice_after_uv(self, mock_run, tmp_path, capsys):
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value="0.28.0")
+    def test_cswap_upgrade_prints_notice_after_uv(
+        self, mock_on_disk, mock_run, tmp_path, capsys
+    ):
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.side_effect = [MagicMock(returncode=0), _uv_pip_list(_OUTDATED)]
 
         assert run_self_upgrade("0.27.2") == 0
 
         out = capsys.readouterr().out
+        # The before -> after report is printed ahead of the held-back notice.
+        assert "claude-swap upgraded: 0.27.2 -> 0.28.0" in out
         assert "claude-swap 0.28.0 is on PyPI" in out
+        assert out.index("upgraded:") < out.index("is on PyPI")
         assert 'uv tool upgrade claude-swap --exclude-newer "0 days"' in out
         upgrade, listing = (c.args[0] for c in mock_run.call_args_list)
         assert upgrade == ["uv", "tool", "upgrade", "claude-swap"]
@@ -624,7 +631,10 @@ class TestHeldBackReleaseNotice(_UvInstall):
         mock_run.assert_called_once()
 
     @patch("claude_swap.update_check.subprocess.run")
-    def test_pipx_install_gets_no_notice(self, mock_run, tmp_path, monkeypatch, capsys):
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
+    def test_pipx_install_gets_no_notice(
+        self, mock_on_disk, mock_run, tmp_path, monkeypatch, capsys
+    ):
         monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "pipx")
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.return_value = MagicMock(returncode=0)
@@ -653,8 +663,9 @@ class TestHeldBackReleaseNotice(_UvInstall):
 @patch("claude_swap.update_check.sys.platform", "linux")
 class TestRunSelfUpgrade:
     @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
-    def test_uv_invokes_uv_tool_upgrade(self, mock_detect, mock_run):
+    def test_uv_invokes_uv_tool_upgrade(self, mock_detect, mock_on_disk, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
 
         assert run_self_upgrade() == 0
@@ -663,8 +674,9 @@ class TestRunSelfUpgrade:
         )
 
     @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
     @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
-    def test_pipx_invokes_pipx_upgrade(self, mock_detect, mock_run):
+    def test_pipx_invokes_pipx_upgrade(self, mock_detect, mock_on_disk, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
 
         assert run_self_upgrade() == 0
@@ -701,6 +713,71 @@ class TestRunSelfUpgrade:
         assert "PATH" in err
 
 
+@patch("claude_swap.update_check.sys.platform", "linux")
+class TestRunSelfUpgradeReport:
+    """After a successful upgrade, report what actually landed on disk so the
+    user is not misled by a package manager that exits 0 without changing
+    anything (#491). Verification is best effort: it never masks the
+    upgrade's own exit status."""
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_reports_successful_upgrade(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "claude_swap.update_check._installed_version_on_disk", return_value="0.28.0"
+        ):
+            assert run_self_upgrade("0.27.2") == 0
+        assert "claude-swap upgraded: 0.27.2 -> 0.28.0" in capsys.readouterr().out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_reports_unchanged_upgrade(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "claude_swap.update_check._installed_version_on_disk", return_value="0.27.2"
+        ):
+            assert run_self_upgrade("0.27.2") == 0
+        assert "claude-swap is still at 0.27.2" in capsys.readouterr().out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_no_result_line_when_verification_fails(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "claude_swap.update_check._installed_version_on_disk", return_value=None
+        ):
+            assert run_self_upgrade("0.27.2") == 0
+        out = capsys.readouterr().out
+        assert "upgraded:" not in out
+        assert "is still at" not in out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_no_result_line_when_verification_times_out(self, mock_detect, mock_run, capsys):
+        # The verification subprocess.run times out; _installed_version_on_disk
+        # catches subprocess.SubprocessError and returns None, so we stay
+        # silent and keep the upgrade's exit status.
+        mock_run.side_effect = [
+            MagicMock(returncode=0),
+            subprocess.TimeoutExpired("py", 10),
+            MagicMock(returncode=0, stdout="[]"),
+        ]
+        assert run_self_upgrade("0.27.2") == 0
+        out = capsys.readouterr().out
+        assert "upgraded:" not in out
+        assert "is still at" not in out
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_failed_upgrade_reports_nothing(self, mock_detect, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=2)
+        assert run_self_upgrade("0.27.2") == 2
+        out = capsys.readouterr().out
+        assert "upgraded:" not in out
+        assert "is still at" not in out
+
+
 @patch("claude_swap.update_check.sys.platform", "win32")
 class TestRunSelfUpgradeWindows:
     """On Windows the running .exe is locked, so we never upgrade in place --
@@ -731,3 +808,131 @@ class TestRunSelfUpgradeWindows:
         assert "uv tool upgrade claude-swap" in err
         assert "pipx upgrade claude-swap" in err
         assert "pip install --upgrade claude-swap" in err
+
+
+# --- build identity + the menu bar restart after an upgrade ------------------
+
+
+class _Dist:
+    def __init__(self, direct_url):
+        self._direct_url = direct_url
+
+    def read_text(self, name):
+        assert name == "direct_url.json"
+        return self._direct_url
+
+
+class TestInstallIdentity:
+    def test_git_install_carries_its_commit(self):
+        from claude_swap import update_check
+
+        direct = json.dumps({"url": "https://x/y.git", "vcs_info": {"vcs": "git", "commit_id": "3fec656abc"}})
+        with patch("importlib.metadata.distribution", return_value=_Dist(direct)):
+            identity = update_check.install_identity()
+        assert identity["source"] == "3fec656abc"
+        assert identity["version"] == update_check.__version__ if hasattr(update_check, "__version__") else True
+        assert update_check.describe_identity(identity).endswith("(3fec656)")
+
+    def test_pypi_install_has_no_source(self):
+        from claude_swap import update_check
+
+        with patch("importlib.metadata.distribution", return_value=_Dist(None)):
+            identity = update_check.install_identity()
+        assert identity["source"] is None
+        assert "(" not in update_check.describe_identity(identity)
+
+    def test_unreadable_metadata_is_not_fatal(self):
+        from importlib.metadata import PackageNotFoundError
+
+        from claude_swap import update_check
+
+        with patch("importlib.metadata.distribution", side_effect=PackageNotFoundError("claude-swap")):
+            assert update_check.install_identity()["source"] is None
+        assert update_check.describe_identity(None) == "unknown"
+
+
+_OLD_BUILD = {"version": "0.27.2", "source": None}
+_NEW_BUILD = {"version": "0.28.0", "source": None}
+
+
+@patch("claude_swap.update_check.sys.platform", "darwin")
+class TestUpgradeRestartsARunningMenuBar:
+
+    def _launchd(self, monkeypatch, pid):
+        calls = []
+        monkeypatch.setattr("claude_swap.launch_agent.service_pid", lambda *a, **k: pid)
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.kickstart", lambda *a, **k: calls.append(k)
+        )
+        return calls
+
+    def test_restarts_a_running_service_when_the_build_changed(self, monkeypatch, capsys):
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        assert calls == [{"restart": True}]
+        assert "Menu bar restarted onto 0.28.0 (was pid 4242)" in capsys.readouterr().out
+
+    def test_leaves_a_quit_service_quit(self, monkeypatch):
+        # Only a running instance is touched: a deliberate Quit stays quit.
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, None)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        assert calls == []
+
+    def test_does_nothing_when_the_build_did_not_change_or_is_unknown(self, monkeypatch):
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _OLD_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: None)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        assert calls == []
+
+    def test_a_same_version_git_install_still_counts_as_changed(self, monkeypatch):
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(
+            update_check,
+            "_installed_identity_on_disk",
+            lambda: {"version": "1.0.0b1", "source": "bbbbbbb"},
+        )
+        update_check._restart_menubar_if_rebuilt({"version": "1.0.0b1", "source": "aaaaaaa"})
+        assert calls == [{"restart": True}]
+
+    def test_a_failed_restart_is_a_warning_not_a_failed_upgrade(self, monkeypatch, capsys):
+        from claude_swap import update_check
+        from claude_swap.exceptions import ClaudeSwitchError
+
+        monkeypatch.setattr("claude_swap.launch_agent.service_pid", lambda *a, **k: 4242)
+
+        def boom(*a, **k):
+            raise ClaudeSwitchError("launchctl kickstart failed (exit 3)")
+
+        monkeypatch.setattr("claude_swap.launch_agent.kickstart", boom)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        captured = capsys.readouterr()
+        assert "not restarted" in captured.out + captured.err
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_run_self_upgrade_wires_the_restart_in(self, mock_detect, mock_run, monkeypatch, capsys):
+        from claude_swap import update_check
+
+        mock_run.return_value = MagicMock(returncode=0)
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(update_check, "install_identity", lambda: _OLD_BUILD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        with patch("claude_swap.update_check._installed_version_on_disk", return_value="0.28.0"):
+            assert run_self_upgrade("0.27.2") == 0
+        assert calls == [{"restart": True}]
+        out = capsys.readouterr().out
+        assert "claude-swap upgraded: 0.27.2 -> 0.28.0" in out
+        assert "Menu bar restarted" in out

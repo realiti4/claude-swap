@@ -53,6 +53,7 @@ class TestConfigList:
             "ui.showOrgTag",
             "run.shareHistory",
             "updates.check",
+            "usage.headerProbe",
         ):
             assert key in out
         assert out.count("(default)") == 13
