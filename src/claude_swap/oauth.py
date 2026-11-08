@@ -53,6 +53,8 @@ def extract_oauth_data(credentials: str) -> dict | None:
         data = json.loads(credentials)
     except json.JSONDecodeError:
         return None
+    if not isinstance(data, dict):
+        return None
     oauth = data.get("claudeAiOauth")
     return oauth if isinstance(oauth, dict) else None
 
@@ -86,6 +88,22 @@ def access_token_fingerprint(credentials: str) -> str | None:
     return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
 
 
+def _refresh_token_expires_at_ms(credentials: str) -> float | None:
+    """Raw ``refreshTokenExpiresAt`` (epoch milliseconds), or ``None`` when
+    absent/unreadable. Shared parse behind :func:`login_expires_at_iso` and
+    :func:`login_expires_at_epoch` so there is one reader of the field."""
+    data = extract_oauth_data(credentials)
+    value = data.get("refreshTokenExpiresAt") if data else None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        return None
+    return float(value)
+
+
 def login_expires_at_iso(credentials: str) -> str | None:
     """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
 
@@ -97,15 +115,78 @@ def login_expires_at_iso(credentials: str) -> str | None:
     is the date worth showing *before* that happens. Logins issued before Claude
     Code recorded the field carry nothing, which means "unknown", never "now".
     """
-    data = extract_oauth_data(credentials)
-    value = data.get("refreshTokenExpiresAt") if data else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    value = _refresh_token_expires_at_ms(credentials)
+    if value is None:
         return None
     return (
         datetime.fromtimestamp(value / 1000, tz=timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def login_expires_at_epoch(credentials: str) -> float | None:
+    """Epoch-seconds twin of :func:`login_expires_at_iso`: what
+    ``AccountSnapshot.login_expires_at`` and :func:`format_login_expiry` want,
+    without an ISO round-trip."""
+    value = _refresh_token_expires_at_ms(credentials)
+    return value / 1000 if value is not None else None
+
+
+# How far ahead a stored login's expiry is worth showing. Claude Code's own
+# notice fires inside the last three days; a week leaves time to plan the
+# re-logins of several accounts without every view nagging for a month.
+LOGIN_DUE_WITHIN_S = 7 * 86400
+
+
+def login_time_left(
+    expires_at: float | None, quarantined: bool, now: float | None = None
+) -> float | None:
+    """Seconds until a stored login must be redone, when that is worth saying.
+
+    ``None`` means "nothing to say": the stamp is unknown (logins older than
+    the field, API-key slots), the expiry is further out than
+    ``LOGIN_DUE_WITHIN_S``, or the slot is quarantined, whose usage sentinel
+    already reads "re-login needed". Otherwise the seconds left, ``0.0`` once
+    the stamp is past.
+    """
+    if quarantined or expires_at is None:
+        return None
+    now = now if now is not None else datetime.now(timezone.utc).timestamp()
+    remaining = expires_at - now
+    if remaining > LOGIN_DUE_WITHIN_S:
+        return None
+    return max(0.0, remaining)
+
+
+def format_login_expiry(
+    expires_at: float | None,
+    quarantined: bool,
+    now: float | None = None,
+    short: bool = False,
+) -> str | None:
+    """``"re-login in 5d 12h"`` while a stored login is due (see
+    :func:`login_time_left`), ``"re-login needed"`` once its stamp is past,
+    ``None`` when there is nothing to say. The countdown is the reset
+    counters' (:func:`format_countdown`); ``short`` keeps its first unit
+    (``"re-login in 5d"``) for rows with little room.
+    """
+    left = login_time_left(expires_at, quarantined, now)
+    if left is None:
+        return None
+    if left <= 0:
+        return "re-login needed"
+    countdown = format_countdown(left)
+    return f"re-login in {countdown.split(' ')[0] if short else countdown}"
+
+
+def login_expiry_clock(expires_at: float, now: float | None = None) -> str:
+    """The stamp as the local clock string the reset columns use."""
+    now_utc = (
+        datetime.fromtimestamp(now, tz=timezone.utc) if now is not None
+        else datetime.now(timezone.utc)
+    )
+    return reset_clock_string(datetime.fromtimestamp(expires_at, tz=timezone.utc), now_utc)
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
@@ -364,20 +445,20 @@ def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
     now = datetime.now(timezone.utc)
-    remaining = reset_utc - now
-    total_seconds = max(0, int(remaining.total_seconds()))
-    days, remainder = divmod(total_seconds, 86400)
+    return format_countdown((reset_utc - now).total_seconds()), reset_clock_string(reset_utc, now)
+
+
+def format_countdown(seconds: float) -> str:
+    """``"5d 12h"`` / ``"1h 59m"`` / ``"45m"``: the grammar of every countdown shown."""
+    total = max(0, int(seconds))
+    days, remainder = divmod(total, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
-
     if days > 0:
-        countdown = f"{days}d {hours}h"
-    elif hours > 0:
-        countdown = f"{hours}h {minutes}m"
-    else:
-        countdown = f"{minutes}m"
-
-    return countdown, reset_clock_string(reset_utc, now)
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def reset_clock_string(reset_utc: datetime, now_utc: datetime) -> str:
@@ -439,8 +520,8 @@ def is_setup_token(oauth: dict | None) -> bool:
 
 
 # Marks a usage dict read from rate-limit headers (``usage["source"]``). The
-# headers can omit a window the endpoint always reports, so such a reading
-# gates decisions only when it is complete (see :func:`relevant_windows`).
+# headers can omit a window the endpoint reports, so such a reading gates
+# decisions only when it is complete (see :func:`relevant_windows`).
 USAGE_SOURCE_HEADERS = "headers"
 
 # Unified rate-limit header prefix → usage API window key.
@@ -465,6 +546,12 @@ def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
     return round(fraction * 100, 2), _epoch_header_iso(headers.get(f"{base}-reset"))
 
 
+def _unified_window_present(headers, prefix: str) -> bool:
+    """Whether any ``anthropic-ratelimit-unified-<prefix>-*`` header is sent."""
+    start = f"anthropic-ratelimit-unified-{prefix}-"
+    return any(k.lower().startswith(start) for k in headers.keys())
+
+
 def _epoch_header_iso(raw) -> str | None:
     """An epoch-seconds header value as ISO 8601, or None when unusable."""
     try:
@@ -482,7 +569,9 @@ def parse_unified_ratelimit_headers(headers) -> dict:
 
     ``-utilization`` is a 0-1 fraction (the API's ``utilization`` is a
     percentage) and ``-reset`` is epoch seconds (the API's ``resets_at`` is
-    ISO 8601). A window with a missing or unusable utilization is left out.
+    ISO 8601). A 5h or 7d window with no header at all is left out; one whose
+    headers are present without a usable utilization is kept so
+    :func:`build_usage_result` rejects it.
     Fable's ``7d_oi`` bucket becomes a ``weekly_scoped`` limit named "Fable";
     the headers carry no other per-model window and no ``extra_usage``.
     A ``rejected`` unified status adds a ``rejected`` entry (see
@@ -492,6 +581,8 @@ def parse_unified_ratelimit_headers(headers) -> dict:
     for prefix, key in _UNIFIED_WINDOWS:
         window = _unified_window(headers, prefix)
         if window is None:
+            if _unified_window_present(headers, prefix):
+                data[key] = {"utilization": math.nan}  # unusable: fail the reading
             continue
         pct, resets_at = window
         data[key] = {"utilization": pct}
@@ -631,10 +722,9 @@ def _reported_window(data: dict, key: str) -> dict | None:
 
     Absent means missing or ``null``: from the usage endpoint, a limit the
     account does not have (a verified Ultra account reports ``five_hour:
-    null``); from the header probe, a window it did not carry, which
-    :func:`relevant_windows` treats as incomplete. ``{}`` counts as absent
-    too, a compatibility exception for the falsy check this replaces. Any
-    other non-object value is a malformed response.
+    null``); from the header probe, a window it did not carry. ``{}`` counts
+    as absent too, a compatibility exception for the falsy check this
+    replaces. Any other non-object value is a malformed response.
     """
     if key not in data or data[key] is None:
         return None
@@ -815,11 +905,13 @@ REJECTED_LABEL = "rejected"
 def _header_reading_complete(usage: dict, models: Sequence[str]) -> bool:
     """Whether a header-probe reading carries every window a decision needs.
 
-    The 5h and 7d windows always, plus each configured per-model window; the
-    headers only carry Fable's, so ``all`` (every per-model window the
-    account has) can never be shown complete.
+    The 7d window always, plus each configured per-model window; the headers
+    only carry Fable's, so ``all`` (every per-model window the account has)
+    can never be shown complete. A missing 5h window is not a gap: an Ultra
+    account has none (a 5h header without a usable utilization fails the
+    reading instead, see :func:`parse_unified_ratelimit_headers`).
     """
-    if not all(isinstance(usage.get(k), dict) for k in ("five_hour", "seven_day")):
+    if not isinstance(usage.get("seven_day"), dict):
         return False
     if not models:
         return True
@@ -854,7 +946,8 @@ def relevant_windows(
     A header-probe reading (``source: headers``) missing any window the
     decision needs (:func:`_header_reading_complete`) yields none of its
     windows, so it reads as unknown — still shown, never ranked: one 5h
-    window at 5% must not pass for 95% headroom. A refused probe
+    window at 5% must not pass for 95% headroom. A reading without a 5h
+    window is complete unless a per-model window is needed. A refused probe
     (``rejected``) adds a 100% ``"rejected"`` window resetting when the
     refusal ends, so the account reads as at its limit until then.
     """

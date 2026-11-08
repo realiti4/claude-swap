@@ -1687,6 +1687,27 @@ class TestAdaptiveScheduler:
         assert "2" not in counts
         assert counts["3"] >= 1
 
+    def test_disabled_account_polled_after_switchable_candidates_without_escalating(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        h.switcher.set_account_disabled("3", True)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        # t0: switchable candidate 2 takes priority for the alternate slot.
+        self._tick(h, counts, usage)
+        assert counts == {"1": 1, "2": 1}
+        # t60: candidate 2 is not due yet, so disabled account 3 is polled
+        # for store-only display surfaces (menu bar, TUI auto screen).
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        # Escalation only refreshes switchable candidates, never disabled ones.
+        h.clock.advance(360)
+        usage["1"] = _usage(80)
+        self._tick(h, counts, usage)
+        assert counts == {"1": 2, "2": 2, "3": 1}
+
     def test_expired_active_enters_idle_hold_even_during_backoff(
         self, temp_home, monkeypatch
     ):
@@ -7354,6 +7375,28 @@ class TestHeaderProbeReadings:
         outcome = harness.tick_with_usage({
             "1": _usage(95),
             "2": _header_usage(five_hour={"pct": 5.0}, seven_day={"pct": 5.0}),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_weekly_only_active_reading_does_not_fail_over(self, harness):
+        # No 5h header (Ultra): the 7d reading decides, not unknown three ticks.
+        for _ in range(3):
+            outcome = harness.tick_with_usage({
+                "1": _header_usage(seven_day={"pct": 50.0}),
+                "2": _usage(10),
+                "3": _usage(10),
+            })
+            assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"] * 3
+
+    def test_weekly_only_reading_is_a_target(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(seven_day={"pct": 0.0}),
             "3": _usage(40),
         })
         assert outcome is TickOutcome.SWITCHED

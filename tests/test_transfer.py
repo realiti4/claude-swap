@@ -641,6 +641,28 @@ class TestValidation:
         with pytest.raises(TransferError, match="not found"):
             import_accounts(s, str(temp_home / "nope.cswap"))
 
+    def test_still_encrypted_file_rejected(self, temp_home: Path):
+        """`cswap export - | gpg -c > backup.gpg` is documented, so importing
+        the result without decrypting it first is the obvious slip. The
+        undecrypted bytes must surface as a TransferError carrying the decrypt
+        hint, not as a bare UnicodeDecodeError."""
+        s = _linux_switcher(temp_home)
+        blob = temp_home / "backup.cswap.gpg"
+        # Head of a real `gpg -c` payload: the OpenPGP packet tag plus the
+        # symmetric-key-encrypted session-key packet, invalid UTF-8 at byte 0.
+        blob.write_bytes(b"\x8c\x0d\x04\x09\x03\x02\xff\xd8\xab\x12\x00\xff\xfe")
+
+        with pytest.raises(TransferError, match="decrypt"):
+            import_accounts(s, str(blob))
+
+    def test_directory_source_rejected(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        src = temp_home / "backups"
+        src.mkdir()
+
+        with pytest.raises(TransferError, match="not a directory"):
+            import_accounts(s, str(src))
+
 
 # ---------------------------------------------------------------------------
 # Stdin / stdout pipe support
@@ -689,6 +711,19 @@ class TestPipeMode:
 
         seq = s._get_sequence_data()
         assert seq["accounts"]["1"]["email"] == "alice@example.com"
+
+    def test_import_from_stdin_rejects_binary(self, temp_home: Path):
+        """`cat backup.gpg | cswap import -` is the pipe-mode form of the same
+        slip: a strict-UTF-8 stdin raises while reading, before any JSON is
+        parsed, so the guard has to sit on the read itself."""
+        s = _linux_switcher(temp_home)
+        stdin = io.TextIOWrapper(
+            io.BytesIO(b"\x8c\x0d\x04\x09\x03\x02\xff\xd8\xab\x12\x00\xff\xfe"),
+            encoding="utf-8",
+        )
+        with patch.object(sys, "stdin", stdin):
+            with pytest.raises(TransferError, match="decrypt"):
+                import_accounts(s, "-")
 
 
 # ---------------------------------------------------------------------------
