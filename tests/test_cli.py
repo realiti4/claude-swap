@@ -446,6 +446,10 @@ class TestCLI:
         monkeypatch.setattr(sys, "argv", ["cswap", "--menubar"])
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr("claude_swap.menubar.run", _fake_run, raising=False)
+        # Plain `cswap menubar` runs the app only when it IS the launchd job.
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.service_pid", lambda *a, **k: os.getpid()
+        )
         # geteuid only exists on POSIX; ensure non-root path
         monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
 
@@ -472,6 +476,10 @@ class TestCLI:
         monkeypatch.setattr(sys, "argv", ["cswap", "menubar"])
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr("claude_swap.menubar.run", _fake_run, raising=False)
+        # Plain `cswap menubar` runs the app only when it IS the launchd job.
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.service_pid", lambda *a, **k: os.getpid()
+        )
         monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
 
         with pytest.raises(SystemExit) as exc:
@@ -516,12 +524,23 @@ class TestCLI:
                     "program": ["/tmp/cswap", "menubar"],
                     "stdout_log": "/tmp/o.log",
                     "stderr_log": "/tmp/e.log",
+                    "profile_changes": [],
                 },
             ),
         )
         monkeypatch.setattr(
             "claude_swap.launch_agent.uninstall",
-            _record("uninstall", {"label": "com.cswap.menubar", "was_loaded": True, "removed_plist": True}),
+            _record(
+                "uninstall",
+                {
+                    "label": "com.cswap.menubar",
+                    "was_loaded": True,
+                    "removed_plist": True,
+                    "removed": ["/tmp/p.plist", "/Applications/claude-swap Menubar.app"],
+                    "cleared_override": False,
+                    "bundle_error": None,
+                },
+            ),
         )
         monkeypatch.setattr(
             "claude_swap.launch_agent.status",
@@ -530,10 +549,38 @@ class TestCLI:
                 {
                     "label": "com.cswap.menubar",
                     "installed": True,
+                    "start_at_login": True,
+                    "session_plist": None,
+                    "configured": True,
                     "loaded": True,
                     "state": "running",
                     "pid": 4242,
                     "plist": "/tmp/p.plist",
+                    "switched_off": False,
+                    "running_build": None,
+                    "installed_build": "1.0.0",
+                    "stale_build": False,
+                },
+            ),
+        )
+        monkeypatch.setattr("claude_swap.launch_agent.service_pid", lambda *a, **k: None)
+        # The dev venv has no rumps; the service paths must see the extra as present.
+        monkeypatch.setattr(cli, "_menubar_extra_missing", lambda: None)
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.ensure",
+            _record(
+                "ensure",
+                {
+                    "label": "com.cswap.menubar",
+                    "action": "first-setup",
+                    "start_at_login": True,
+                    "plist": "/tmp/p.plist",
+                    "program": ["/tmp/cswap", "menubar", "--foreground"],
+                    "stdout_log": "/tmp/o.log",
+                    "stderr_log": "/tmp/e.log",
+                    "pid": 4242,
+                    "switched_off": False,
+                    "stale_build": False,
                 },
             ),
         )
@@ -641,7 +688,12 @@ class TestCLI:
         def fake_install():
             at_install["enabled"] = json.loads(path.read_text())["auto_switch_enabled"]
             seen["called"] = "install"
-            return {"label": "com.cswap.menubar", "plist": "/tmp/p.plist", "stderr_log": "/tmp/e.log"}
+            return {
+                "label": "com.cswap.menubar",
+                "plist": "/tmp/p.plist",
+                "stderr_log": "/tmp/e.log",
+                "profile_changes": [],
+            }
 
         monkeypatch.setattr("claude_swap.launch_agent.install", fake_install)
 
@@ -678,8 +730,16 @@ class TestCLI:
 
         assert "auto-switch: on" in capsys.readouterr().out
 
-    def test_auto_switch_flag_requires_install_service(self, monkeypatch, capsys):
-        monkeypatch.setattr(sys, "argv", ["cswap", "menubar", "--auto-switch"])
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["cswap", "menubar", "--foreground", "--auto-switch"],
+            ["cswap", "menubar", "--service-status", "--no-auto-switch"],
+            ["cswap", "list", "--auto-switch"],
+        ],
+    )
+    def test_auto_switch_is_rejected_where_nothing_would_read_it(self, monkeypatch, argv, capsys):
+        monkeypatch.setattr(sys, "argv", argv)
 
         with pytest.raises(SystemExit) as exc:
             cli.main()
@@ -723,8 +783,43 @@ class TestCLI:
 
         assert json.loads(path.read_text())["auto_switch_enabled"] is False
 
-    def test_plain_menubar_does_not_touch_the_service(self, monkeypatch):
+    def _ensure_payload(self, **overrides):
+        payload = {
+            "label": "com.cswap.menubar",
+            "action": "started",
+            "start_at_login": True,
+            "plist": "/tmp/p.plist",
+            "program": ["/tmp/cswap", "menubar", "--foreground"],
+            "stdout_log": "/tmp/o.log",
+            "stderr_log": "/tmp/e.log",
+            "pid": 4242,
+            "switched_off": False,
+            "stale_build": False,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_plain_menubar_starts_the_service_and_returns(self, monkeypatch, capsys):
+        # The menu bar is launchd's to run: the command makes sure it is up and
+        # comes back, instead of blocking this terminal for the life of the icon.
         seen = self._service_harness(monkeypatch, ["cswap", "menubar"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert seen["called"] == "ensure"
+        assert seen["menubar_ran"] is False
+        out = capsys.readouterr().out
+        assert "Menu bar started (pid 4242)" in out
+        assert "starts at login" in out  # first setup says what it arranged
+
+    def test_plain_menubar_inside_the_launchd_job_runs_the_app(self, monkeypatch):
+        # launchd's own job is recognised by pid, so a plist written before the
+        # --foreground flag existed (plain `cswap menubar`) still draws the icon
+        # instead of trying to start the service it already is.
+        seen = self._service_harness(monkeypatch, ["cswap", "menubar"])
+        monkeypatch.setattr("claude_swap.launch_agent.service_pid", lambda *a, **k: os.getpid())
 
         with pytest.raises(SystemExit) as exc:
             cli.main()
@@ -732,6 +827,317 @@ class TestCLI:
         assert exc.value.code == 0
         assert seen["menubar_ran"] is True
         assert "called" not in seen
+
+    def test_plain_menubar_reports_an_already_running_service(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar"])
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.ensure",
+            lambda **k: self._ensure_payload(action="already-running"),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert "already running (pid 4242)" in capsys.readouterr().out
+
+    def test_plain_menubar_says_when_the_start_is_for_this_session_only(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar"])
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.ensure",
+            lambda **k: self._ensure_payload(action="started", start_at_login=False),
+        )
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        out = capsys.readouterr().out
+        assert "Menu bar started (pid 4242)" in out
+        assert "Start at login is off" in out
+
+    def test_plain_menubar_says_when_the_login_items_switch_is_off(self, monkeypatch, capsys):
+        # macOS lets the manual start through; the switch governs the login start.
+        self._service_harness(monkeypatch, ["cswap", "menubar"])
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.ensure",
+            lambda **k: self._ensure_payload(action="started", switched_off=True),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        captured = capsys.readouterr()
+        assert "Menu bar started (pid 4242)" in captured.out
+        assert "will not start it at login" in captured.err
+
+    def test_service_status_says_when_the_login_items_switch_is_off(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+        status = {
+            "label": "com.cswap.menubar", "installed": True, "start_at_login": True,
+            "session_plist": None, "configured": True, "loaded": True,
+            "state": "running", "pid": 4242, "plist": "/tmp/p.plist", "switched_off": True,
+            "running_build": None, "installed_build": "1.0.0", "stale_build": False,
+        }
+        monkeypatch.setattr("claude_swap.launch_agent.status", lambda *a, **k: status)
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        assert "will not start it at login" in capsys.readouterr().err
+
+    def test_foreground_runs_the_app_when_no_service_is_running(self, monkeypatch):
+        seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--foreground"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert seen["menubar_ran"] is True
+        assert "called" not in seen
+
+    def test_foreground_refuses_while_the_service_is_running(self, monkeypatch, capsys):
+        # Two instances would draw two icons over the same accounts.
+        seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--foreground"])
+        monkeypatch.setattr("claude_swap.launch_agent.service_pid", lambda *a, **k: 4242)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 1
+        assert seen["menubar_ran"] is False
+        assert "already running as a service (pid 4242)" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["cswap", "menubar", "--install-service", "--uninstall-service"],
+            ["cswap", "menubar", "--foreground", "--service-status"],
+            ["cswap", "menubar", "--install-service", "--foreground"],
+        ],
+    )
+    def test_contradictory_service_flags_are_rejected(self, monkeypatch, argv, capsys):
+        # Before, install + uninstall quietly chose install.
+        self._service_harness(monkeypatch, argv)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 2
+        assert "not allowed with" in capsys.readouterr().err
+
+    def test_foreground_is_rejected_outside_menubar(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["cswap", "list", "--foreground"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 2
+        assert "can only be used with 'menubar'" in capsys.readouterr().err
+
+    def test_plain_menubar_auto_switch_sets_the_toggle_then_restarts_a_running_service(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # The menu bar reads the toggle once at launch: write first, then make
+        # sure a running service is restarted so the new value applies.
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--auto-switch"])
+        at_ensure = {}
+
+        def fake_ensure(*, restart=False):
+            at_ensure["enabled"] = json.loads(path.read_text())["auto_switch_enabled"]
+            at_ensure["restart"] = restart
+            return self._ensure_payload(action="restarted", pid=4243)
+
+        monkeypatch.setattr("claude_swap.launch_agent.ensure", fake_ensure)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert at_ensure == {"enabled": True, "restart": True}
+        out = capsys.readouterr().out
+        assert "restarted (pid 4243) to apply the auto-switch setting" in out
+        assert "auto-switch: on" in out
+
+    def test_plain_menubar_auto_switch_already_on_does_not_ask_for_a_restart(
+        self, monkeypatch, tmp_path
+    ):
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        path.write_text(json.dumps({"auto_switch_enabled": True}))
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--auto-switch"])
+        seen_restart = {}
+
+        def fake_ensure(*, restart=False):
+            seen_restart["restart"] = restart
+            return self._ensure_payload(action="already-running")
+
+        monkeypatch.setattr("claude_swap.launch_agent.ensure", fake_ensure)
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        assert seen_restart == {"restart": False}
+
+    def test_plain_menubar_failure_restores_the_toggle(self, monkeypatch, tmp_path):
+        path = self._menubar_settings(monkeypatch, tmp_path)
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--auto-switch"])
+
+        def failing_ensure(**k):
+            raise RuntimeError("bootstrap failed")
+
+        monkeypatch.setattr("claude_swap.launch_agent.ensure", failing_ensure)
+
+        with pytest.raises(BaseException):
+            cli.main()
+
+        assert json.loads(path.read_text())["auto_switch_enabled"] is False
+
+    @pytest.mark.parametrize("argv", [["cswap", "menubar"], ["cswap", "menubar", "--install-service"]])
+    def test_the_service_is_never_installed_without_the_menubar_extra(
+        self, monkeypatch, argv, capsys
+    ):
+        # A worker that dies on `import rumps` would crash-loop under launchd at
+        # every login; refuse before anything is written or bootstrapped.
+        seen = self._service_harness(monkeypatch, argv)
+        monkeypatch.setattr(
+            cli,
+            "_menubar_extra_missing",
+            lambda: "The menu bar needs the 'menubar' extra. Install it with: x",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 1
+        assert "called" not in seen
+        assert "needs the 'menubar' extra" in capsys.readouterr().err
+
+    def test_menubar_extra_missing_names_the_installers_own_command(self, monkeypatch):
+        import importlib.util
+
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+        monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "uv")
+        assert "uv tool install --force 'claude-swap[menubar]'" in cli._menubar_extra_missing()
+        monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "pipx")
+        assert "pipx install --force" in cli._menubar_extra_missing()
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+        assert cli._menubar_extra_missing() is None
+
+    def test_uninstall_service_lists_what_went(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--uninstall-service"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "Menu bar service removed." in out
+        assert "removed /tmp/p.plist" in out
+        assert "removed /Applications/claude-swap Menubar.app" in out
+
+    def _purge_harness(self, monkeypatch, platform):
+        calls = {}
+
+        class _FakeSwitcher:
+            backup_dir = Path("/tmp/backup-root")
+
+            def __init__(self, *a, **k):
+                pass
+
+            def _is_running_in_container(self):
+                return False
+
+            def purge(self):
+                calls["purged"] = True
+
+        def fake_uninstall(**kwargs):
+            calls["uninstall"] = kwargs
+            return {
+                "label": "com.cswap.menubar",
+                "was_loaded": True,
+                "removed_plist": True,
+                "removed": ["/tmp/p.plist"],
+                "cleared_override": False,
+                "bundle_error": None,
+            }
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", ["cswap", "purge"])
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr("claude_swap.launch_agent.uninstall", fake_uninstall)
+        monkeypatch.setattr("claude_swap.update_check.check_for_update", lambda *a, **k: None)
+        return calls
+
+    def test_purge_also_removes_the_menu_bar_service_on_macos(self, monkeypatch, capsys):
+        # The LaunchAgent, the wrapper app and the logs live outside the data
+        # directory; "remove all traces" has to reach them.
+        calls = self._purge_harness(monkeypatch, "darwin")
+
+        try:
+            cli.main()
+        except SystemExit as exc:
+            assert exc.code in (0, None)
+
+        assert calls["purged"] is True
+        assert calls["uninstall"] == {"backup_dir": Path("/tmp/backup-root")}
+        assert "Removed the menu bar service" in capsys.readouterr().out
+
+    def test_purge_leaves_launchd_alone_off_macos(self, monkeypatch):
+        calls = self._purge_harness(monkeypatch, "linux")
+
+        try:
+            cli.main()
+        except SystemExit as exc:
+            assert exc.code in (0, None)
+
+        assert calls["purged"] is True
+        assert "uninstall" not in calls
+
+    def test_install_service_says_when_the_profile_moved(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.install",
+            lambda **k: {
+                "label": "com.cswap.menubar", "plist": "/tmp/p.plist",
+                "program": ["/tmp/cswap", "menubar", "--foreground"],
+                "stdout_log": "/tmp/o.log", "stderr_log": "/tmp/e.log",
+                "profile_changes": [("CLAUDE_CONFIG_DIR", None, "/new/profile")],
+            },
+        )
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        err = capsys.readouterr().err
+        assert "now follows CLAUDE_CONFIG_DIR=/new/profile (was (unset))" in err
+
+    def test_service_status_shows_the_running_build_and_a_stale_one(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+        status = {
+            "label": "com.cswap.menubar", "installed": True, "start_at_login": True,
+            "session_plist": None, "configured": True, "loaded": True,
+            "state": "running", "pid": 4242, "plist": "/tmp/p.plist", "switched_off": False,
+            "running_build": "1.0.0b1 (3fec656)", "installed_build": "1.0.0b1 (6a2a182)",
+            "stale_build": True,
+        }
+        monkeypatch.setattr("claude_swap.launch_agent.status", lambda *a, **k: status)
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert "build: 1.0.0b1 (3fec656)" in captured.out
+        assert "installed build is 1.0.0b1 (6a2a182)" in captured.err
+
+    def test_service_status_reports_the_login_state(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        assert "starts at login: yes" in capsys.readouterr().out
 
 
 class TestUpdateCheckSetting:

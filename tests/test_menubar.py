@@ -797,3 +797,166 @@ def test_engine_error_table_is_pruned():
     should_surface_engine_error(ErrorEvent(message="x"), seen, now=ENGINE_ERROR_REPEAT_S)
     assert list(seen) == ["x"]
 
+
+
+# --- sentinel rows: the state, not the remedy ---------------------------------
+
+
+def test_menu_note_keeps_the_state_and_drops_the_remedy():
+    from claude_swap.switcher import USAGE_RELOGIN_REQUIRED
+
+    note = menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    assert "cswap add" in note, "premise: the note carries a remedy"
+    assert menubar.menu_note(note) == "re-login needed"
+
+
+def test_every_sentinel_note_fits_a_menu_row():
+    # A menu is as wide as its widest row; one expired account must not
+    # double it (the 614pt row #171 measured against 314pt for the others).
+    for note in menubar.SENTINEL_NOTES.values():
+        short = menubar.menu_note(note)
+        assert " — " not in short
+        assert len(short) <= menubar.MENU_NOTE_LIMIT
+
+
+def test_menu_note_truncates_an_unknown_long_state_with_an_ellipsis():
+    short = menubar.menu_note("x" * 60)
+    assert short.endswith("…")
+    assert len(short) == menubar.MENU_NOTE_LIMIT
+
+
+def test_menu_note_leaves_a_short_note_alone():
+    assert menubar.menu_note("API key (no quota)") == "API key (no quota)"
+    assert menubar.usage_summary("no credentials") == "no credentials"
+
+
+def test_account_row_shows_the_sentinel_state_not_the_remedy():
+    from claude_swap.switcher import USAGE_RELOGIN_REQUIRED
+
+    label = menubar.format_account_label(
+        2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    )
+    assert label.endswith("re-login needed")
+    assert "cswap add" not in label
+
+
+def test_set_tooltip_reaches_the_native_item_and_tolerates_its_absence():
+    class _NSMenuItem:
+        tip = None
+
+        def setToolTip_(self, text):
+            self.tip = text
+
+    class _Item:
+        def __init__(self):
+            self._menuitem = _NSMenuItem()
+
+    item = _Item()
+    menubar._set_tooltip(item, "re-login needed — the full remedy")
+    assert item._menuitem.tip == "re-login needed — the full remedy"
+    menubar._set_tooltip(object(), "ignored")  # no native item behind it: no error
+
+
+# --- health row: auto-switch state + refresh age -------------------------------
+
+
+def test_health_label_off():
+    label, attention = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=90, refresh_interval=60
+    )
+    assert label == "Auto-switch off · usage read 1m ago"
+    assert attention is False
+
+
+def test_health_label_running():
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=30, refresh_interval=60
+    )
+    assert label == "Auto-switch running · usage read just now"
+    assert attention is False
+
+
+def test_health_label_enabled_but_not_running_needs_attention():
+    # The state that used to look healthy: the toggle on, no engine behind it.
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=False, usage_age=30, refresh_interval=60
+    )
+    assert label.startswith("⚠ Auto-switch stopped, click to restart")
+    assert attention is True
+
+
+def test_health_label_dates_a_stale_reading_and_a_missing_one():
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=2 * 3600, refresh_interval=60
+    )
+    assert "usage stale, read 2h 0m ago" in label
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=None, refresh_interval=60
+    )
+    assert label.endswith("no usage reading yet")
+
+
+def test_health_label_stale_threshold_has_a_floor():
+    # Three 30 s display intervals is not stale while the engine polls the
+    # active account every few minutes; the floor is fifteen minutes.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=600, refresh_interval=30
+    )
+    assert "stale" not in label
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=16 * 60, refresh_interval=30
+    )
+    assert "stale" in label
+    # With a long interval the multiple wins: 3 x 600 s = 30 min.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=20 * 60, refresh_interval=600
+    )
+    assert "stale" not in label
+
+
+def _row(num, is_active, fetched_at):
+    return (num, f"a{num}@x.com", is_active, {}, {}, None, False, fetched_at)
+
+
+def test_active_usage_age_dates_the_active_accounts_reading_not_the_snapshot():
+    # A store-only refresh is new; the reading it serves can be hours old.
+    snapshot = {"accounts": [_row(1, False, 1000.0), _row(2, True, 1000.0 - 2.5 * 3600)]}
+    assert menubar.active_usage_age(snapshot, now=1000.0) == 2.5 * 3600
+
+
+def test_active_usage_age_is_none_without_an_active_reading():
+    assert menubar.active_usage_age({"accounts": [_row(1, False, 10.0)]}, now=20.0) is None
+    assert menubar.active_usage_age({"accounts": [_row(1, True, None)]}, now=20.0) is None
+    assert menubar.active_usage_age(dict(menubar.EMPTY_SNAPSHOT), now=20.0) is None
+
+
+@pytest.mark.parametrize(
+    "seconds, text",
+    [(5, "just now"), (120, "2m ago"), (3900, "1h 5m ago"), (90000, "1d 1h ago")],
+)
+def test_age_text(seconds, text):
+    assert menubar._age_text(seconds) == text
+
+
+def test_engine_exit_applies_only_to_the_hosted_engine():
+    old, new = object(), object()
+    assert menubar.engine_exit_applies(old, old) is True
+    # Restart race: the predecessor's thread finishes after the replacement
+    # started; its exit must not clear the replacement.
+    assert menubar.engine_exit_applies(new, old) is False
+    # Already let go through the app's own stop.
+    assert menubar.engine_exit_applies(None, old) is False
+
+
+def test_engine_stopped_event_names_the_error_or_the_plain_end():
+    engine = object()
+    assert menubar.EngineStoppedEvent(engine, "RuntimeError: boom").human() == "RuntimeError: boom"
+    assert menubar.EngineStoppedEvent(engine).human() == "the engine loop ended on its own"
+    assert menubar.EngineStoppedEvent.kind == "engine-stopped"
+
+
+def test_format_title_attention_prefix():
+    settings = menubar.MenuBarSettings()
+    assert menubar.format_title(None, None, settings, attention=True) == "⚠ ⇄"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, settings, attention=True).startswith("⚠ ⇄ ")
+    assert not menubar.format_title("loc@papaya.asia", _USAGE, settings).startswith("⚠")

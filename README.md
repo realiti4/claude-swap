@@ -157,7 +157,8 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 <details>
 <summary>How it behaves — chat history, MCP servers, tokens</summary>
 
-- **Chat history.** Shared by default: every account reads and writes the history in `~/.claude`. History an account kept on its own before is merged in on its next launch, and nothing already saved is lost (a file that differs on both sides is kept aside in `history-conflicts/` in the backup directory). `cswap config set run.shareHistory false` gives each account its own history; `--no-share-history` does it for one launch. On Windows, conversations are shared through a directory junction, which needs no special rights; the prompt-history file (`history.jsonl`) is shared only when Windows lets cswap create a symlink (Developer Mode, or an elevated terminal) and otherwise stays per-account.
+- **Chat history.** Shared by default: every account reads and writes the history in `~/.claude`. History an account kept on its own before is merged in on its next launch, and nothing already saved is lost (a file that differs on both sides is kept aside in `history-conflicts/` in the backup directory). `cswap config set run.shareHistory false` gives each account its own history; `--no-share-history` does it for one launch.
+- **On Windows**, conversations are shared through a directory junction, which needs no special rights; the prompt-history file (`history.jsonl`) is shared only when Windows lets cswap create a symlink (Developer Mode, or an elevated terminal) and otherwise stays per-account.
 - **MCP servers.** User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` stops sharing your `~/.claude` setup (settings, skills, etc.) and removes the mirrored MCP config (profiles that never mirrored are left alone). Chat history is separate: it stays shared unless you also pass `--no-share-history`.
 - **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead, and also refuses when no account is named and the directory maps to no usable account (the other way `cswap run` reaches the default login).
@@ -229,6 +230,7 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap swap 2 3                  # Exchange two accounts' slot numbers
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
@@ -281,21 +283,18 @@ uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar
 cswap menubar
 ```
 
-Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. `cswap menubar` hands it to launchd and returns: it keeps running after you close the terminal, comes back at login, and is restarted if it crashes. *Quit* in the menu stops it until the next login; *Settings → Start at login* turns the login start off.
 
-`cswap menubar` runs from a small wrapper app, `/Applications/claude-swap Menubar.app`, that it builds (and refreshes after upgrades) on every start. The wrapper gives it the bundle identifier `com.claude-swap.menubar`, which menu bar managers (Dimble, Ice, Bartender, SaneBar) need to list, hide and order the icon. If `/Applications` is not writable the bundle lands in the data directory with a one-line warning; there, the first time a manager hides anything the icon goes down with it. Set `CLAUDE_SWAP_NO_BUNDLE=1` to run in the plain interpreter instead.
-
-**Keep it running without a terminal.** `cswap menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash. Auto-switch is a menu toggle that starts off, so a service installed from a terminal only shows usage until you turn it on; `--auto-switch` does that at install time (`--no-auto-switch` turns it off), and both commands say which it is:
+Auto-switching is off until you turn it on, with *Settings → Auto-switch accounts* or `cswap menubar --auto-switch`. It runs the same engine as [`cswap auto`](#automatic-switching) with the same `autoswitch.*` settings, so the menu bar and CLI stay in sync, and the menu's first row shows whether it is running, off, or stopped (click to restart) and when usage was last refreshed.
 
 ```bash
-cswap menubar --install-service     # start now, and at every login
-cswap menubar --install-service --auto-switch  # same, with auto-switch turned on
-cswap menubar --install-service --no-auto-switch  # same, with auto-switch turned off
-cswap menubar --service-status      # installed? loaded? pid? auto-switch on?
-cswap menubar --uninstall-service   # stop it and remove the plist
+cswap menubar --service-status      # running? pid? starts at login? auto-switch on?
+cswap menubar --auto-switch         # turn auto-switch on (--no-auto-switch: off)
+cswap menubar --uninstall-service   # stop it and remove the LaunchAgent
+cswap menubar --foreground          # run attached to this terminal, for debugging
 ```
 
-The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to `~/Library/Logs/com.cswap.menubar.{log,err}`. After `cswap upgrade` the running process keeps the old build until it restarts: re-run `--install-service`, or `launchctl kickstart -k gui/$(id -u)/com.cswap.menubar`.
+`cswap upgrade` restarts a running menu bar when the build changed. The wrapper app in `/Applications`, file locations, environment handling and the Login Items switch are in [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md).
 
 </details>
 
@@ -421,6 +420,7 @@ cswap add-token --email user@example.com     # optional label override
 
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
+- [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
 
 `cswap --help` and `cswap <command> --help` document every flag.
 
