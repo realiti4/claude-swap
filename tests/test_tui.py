@@ -887,6 +887,7 @@ class TestDashboard:
                 "add-menu",
                 "disable-menu",
                 "login-sync-menu",
+                "remote-menu",
                 "remove-menu",
                 "theme-menu",
                 "quit",

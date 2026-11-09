@@ -85,6 +85,7 @@ class CswapApp(App):
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:
             self._theme_name = "auto"
+        self._remote_sync = None
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -418,6 +419,37 @@ class CswapApp(App):
             if acc.number == str(slot):
                 return acc.email
         return None
+
+    # -- remote sync --------------------------------------------------------------
+
+    def remote_sync(self):
+        """The :class:`claude_swap.remote.RemoteSync` over this switcher's store."""
+        if self._remote_sync is None:
+            from claude_swap.remote import RemoteSync
+
+            self._remote_sync = RemoteSync(self.switcher)
+        return self._remote_sync
+
+    def open_remote(self, remote_id: str, passphrase: str | None = None) -> None:
+        from claude_swap.tui.remote import RemoteScreen
+
+        self.push_screen(RemoteScreen(self.remote_sync(), remote_id, passphrase))
+
+    def action_add_remote(self) -> None:
+        from claude_swap.tui.remote import AddRemoteModal, start_add_remote
+
+        def added(cfg, message: str, passphrase: str) -> None:
+            self.notify(message, title="Remote sync")
+            refresh = getattr(self.screen, "refresh_remote_menu", None)
+            if refresh is not None:
+                self.call_later(refresh)
+            self.open_remote(cfg.id, passphrase)
+
+        def entered(form) -> None:
+            if form is not None:
+                start_add_remote(self, self.remote_sync(), form, added)
+
+        self.push_screen(AddRemoteModal(), entered)
 
     # -- navigation -------------------------------------------------------------
 

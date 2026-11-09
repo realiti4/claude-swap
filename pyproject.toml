@@ -28,6 +28,7 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+remote = ["cryptography>=42"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -46,7 +47,7 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5", "cryptography>=42"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

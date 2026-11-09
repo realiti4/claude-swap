@@ -80,6 +80,7 @@ class DashboardScreen(Screen):
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Login sync on / off…", "login-sync-menu"),
+            ("Remote sync…", "remote-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -145,6 +146,25 @@ class DashboardScreen(Screen):
             )
         entries.append(_BACK)
         return entries
+
+    def _remote_entries(self) -> MenuEntries:
+        """One row per repository this machine knows, then "add"."""
+        try:
+            remotes = self.app.remote_sync().remotes()
+        except Exception:  # noqa: BLE001 -- unreadable config: offer add only
+            remotes = []
+        entries: MenuEntries = [
+            (f"{cfg.name}   {cfg.url}", f"remote-open:{cfg.id}") for cfg in remotes
+        ]
+        entries.append(("+ Add repository…", "remote-add"))
+        entries.append(_BACK)
+        return entries
+
+    async def refresh_remote_menu(self) -> None:
+        """Re-list the repositories after one was added or removed."""
+        if self._menu_stack and self._menu_stack[-1][0] == "remote sync":
+            self._menu_stack[-1] = ("remote sync", self._remote_entries())
+            await self._render_menu()
 
     def _theme_entries(self) -> MenuEntries:
         """dark / light / auto, with the active setting marked."""
@@ -243,6 +263,12 @@ class DashboardScreen(Screen):
                 "Login sync doesn't apply: API-key and setup-token accounts "
                 "never change in use."
             )
+        elif action_id == "remote-menu":
+            await self._push_menu("remote sync", self._remote_entries())
+        elif action_id.startswith("remote-open:"):
+            app.open_remote(action_id.split(":", 1)[1])
+        elif action_id == "remote-add":
+            app.action_add_remote()
         elif action_id.startswith("login-sync:"):
             # A toggle list: Enter flips the row and stays put, so several
             # accounts can be set in one visit; Back/Esc leaves.

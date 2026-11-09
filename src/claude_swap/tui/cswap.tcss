@@ -123,7 +123,8 @@ MenuItem Static.menu-item-muted { color: $secondary; }
 
 /* -- modals ----------------------------------------------------------------- */
 
-ConfirmModal, AddTokenModal, OutputModal {
+ConfirmModal, AddTokenModal, OutputModal,
+PassphraseModal, NewPassphraseModal, RemoteTokenModal, AddRemoteModal {
     align: center middle;
     background: $background 60%;
 }
@@ -200,6 +201,35 @@ ConfirmModal, AddTokenModal, OutputModal {
     color: $error;
 }
 
-AddTokenModal Input {
+AddTokenModal Input, NewPassphraseModal Input, RemoteTokenModal Input {
     margin-bottom: 1;
+}
+
+AddRemoteModal .modal-box {
+    max-height: 95%;
+}
+
+/* Compact one-line fields: nine bordered inputs would not fit a terminal. */
+AddRemoteModal Input {
+    border: none;
+    height: 1;
+    padding: 0 1;
+    margin-bottom: 1;
+    background: $panel;
+}
+
+AddRemoteModal Input:focus {
+    background: $panel-lighten-1;
+}
+
+AddRemoteModal Checkbox {
+    border: none;
+    padding: 0;
+    background: transparent;
+}
+
+#remote-note {
+    height: auto;
+    padding: 0 3;
+    color: $secondary;
 }

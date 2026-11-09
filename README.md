@@ -226,6 +226,7 @@ cswap priority 2 --unset        # Return account 2 to tier 0
 cswap priority                  # Show every account's tier
 cswap login-sync 2 off          # Don't let auto-switch store new logins for account 2
 cswap login-sync                # Show login sync on/off for every account
+cswap remote show team          # Compare a shared setup-token repository with this machine (see Remote sync)
 cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
@@ -267,6 +268,8 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+
+Remote sync keeps `remotes.json` and a `remotes/` folder in the backup directory. The folder holds cswap's clone of each repository and, outside macOS, the saved passphrases.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -413,12 +416,29 @@ cswap add-token --email user@example.com     # optional label override
 
 </details>
 
+### Share setup-tokens between machines (remote sync)
+
+Keep setup-token accounts in a private git repository, encrypted with a passphrase, and copy them to and from each machine. Only `claude setup-token` accounts can be shared, because they never refresh. A normal login copied to a second machine would sign the first one out at its next refresh.
+
+```bash
+uv tool install --force 'claude-swap[remote]'                # adds the encryption library
+cswap remote add team git@github.com:me/claude-tokens.git    # empty private repo; asks for a new passphrase
+cswap remote push team                                       # share this machine's setup-token accounts
+# on the other machine:
+cswap remote add team git@github.com:me/claude-tokens.git    # same passphrase
+cswap remote show team                                       # here only / repo only / differs / in sync
+cswap remote pull team                                       # add them here
+```
+
+Nothing runs in the background: each command fetches first. A token that differs between the two sides is only replaced after you confirm (`--yes` accepts them all). `cswap remote add-token team -` puts a token in the repository without adding it on this machine. In the dashboard it is under *Remote sync…*. HTTPS tokens, SSH key files, skipping an account on one machine, and how the repository is encrypted are covered in [docs/remote-sync.md](https://github.com/realiti4/claude-swap/blob/main/docs/remote-sync.md).
+
 **Note:** Third-party providers configured through `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` are not managed or switched; those exported variables stay in effect after a switch, so unset them to use the swapped account.
 
 ## Documentation
 
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
+- [docs/remote-sync.md](https://github.com/realiti4/claude-swap/blob/main/docs/remote-sync.md) — sharing setup-tokens through an encrypted git repository: how accounts are matched, what push and pull do, git logins, the passphrase and the file format. Read it before you trust a repository with tokens.
 - [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
 
 `cswap --help` and `cswap <command> --help` document every flag.

@@ -1465,6 +1465,10 @@ def main() -> None:
     if argv and argv[0] == "login-sync":
         _login_sync_command(argv[1:])
         return
+    if argv and argv[0] == "remote":
+        from claude_swap.remote_cli import remote_command
+        remote_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1515,6 +1519,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s remote ...                 share setup-tokens via an encrypted git repo
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

@@ -2072,7 +2072,7 @@ class ClaudeAccountSwitcher:
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
     USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
-        "alias", "disabled", "threshold", "priority", "loginSync",
+        "alias", "disabled", "threshold", "priority", "loginSync", "remotes",
     )
 
     @classmethod
@@ -8225,6 +8225,16 @@ class ClaudeAccountSwitcher:
             print("  - All stored account credential files")
         if session_dirs:
             print("  - All session profiles and their Keychain entries")
+        try:
+            from claude_swap.remote import RemoteSync
+
+            remote_sync = RemoteSync(self, use_keychain=self.platform == Platform.MACOS)
+            remotes = remote_sync.remotes()
+        except Exception:  # noqa: BLE001 -- unreadable: the rmtree still takes the files
+            remote_sync, remotes = None, []
+        if remotes:
+            print("  - Remote sync settings and saved passphrases "
+                  "(the repositories themselves are not changed)")
         # The quarantine tree sits inside the backup dir, so rmtree below takes
         # it with everything else. Every file in it is the losing half of a
         # transcript collision that history migration deliberately refused to
@@ -8311,6 +8321,15 @@ class ClaudeAccountSwitcher:
                                 )
                         except Exception:
                             pass  # Ignore errors during purge
+
+        # Remote-sync secrets: Keychain items on macOS are keyed by remote ids
+        # that live in the backup dir, so they go first, like session entries.
+        for cfg in remotes:
+            try:
+                remote_sync.secrets.delete_all(cfg.id)
+                removed_items.append(f"Remote sync secrets: {cfg.name}")
+            except Exception:
+                pass  # Ignore errors during purge
 
         # Session-profile keychain entries must go BEFORE the backup dir:
         # the hashed service names are derived from the dir paths and can't

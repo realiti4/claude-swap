@@ -42,6 +42,18 @@ class OwnershipUnverified(ConfigError):
     pass
 
 
+class RemoteError(ClaudeSwitchError):
+    """Remote sync failed: git, the repository format, or a refused operation."""
+
+    pass
+
+
+class PassphraseError(RemoteError):
+    """The passphrase does not open this remote repository."""
+
+    pass
+
+
 class SwitchError(ClaudeSwitchError):
     """Error during account switch operation."""
 
