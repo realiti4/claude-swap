@@ -38,6 +38,9 @@ USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 # The unified headers carry a per-model weekly bucket only on responses to
 # that model's own requests: a Haiku probe never sees Fable's ``7d_oi``. So a
 # second, best-effort 1-token probe per scoped model reads just that bucket.
+# Sonnet and Opus probes carry no per-model bucket (checked 2026-11), so they
+# are not probed; a new bucket needs its model here and its header prefix in
+# ``_UNIFIED_SCOPED_WINDOWS``.
 USAGE_PROBE_SCOPED_MODELS = ("claude-fable-5-1",)
 
 _logger = logging.getLogger("claude-swap")
