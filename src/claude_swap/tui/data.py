@@ -29,12 +29,11 @@ from claude_swap.autoswitch import (
     ThresholdMap,
     _binding_at,
     _classify_dynamic_trigger,
+    _departure_wall,
     _dynamic_active_headroom,
-    _expiring_due,
     _headroom_by_account,
     _model_window_binds_everywhere,
     _seven_day_reset_ts,
-    _wall_headroom,
     dynamic_candidate_order,
     dynamic_expiring_walk,
     rank_candidates_pass,
@@ -310,7 +309,7 @@ def rank_switch_candidates(
             return "unreadable-active"
         if settings.strategy == "dynamic":
             return _classify_dynamic_trigger(
-                active_headroom, _wall_headroom(bars.get(active_number))
+                active_headroom, _departure_wall(active_number, expiring, bars)
             )
         # Each window against its OWN line, as `_tick_inner` judges the active:
         # the active's own bar stands in for the strategy's (`departure_pct`).
@@ -350,7 +349,6 @@ def rank_switch_candidates(
         dwell, the landing floor) is a tick-only decision: the list is the order it
         would take them in.
         """
-        last = last_active_at or {}
         headroom = _headroom_by_account(usage, axis)
         ordered, rank_axis = dynamic_candidate_order(
             oauth_candidates, headroom, usage, entries, bars, last, settings, now,
@@ -358,10 +356,7 @@ def rank_switch_candidates(
             # The active reads as the engine passes it: widened on the model axis,
             # its own unmodeled headroom on the retry.
             active_headroom=active_headroom if axis else headroom.get(active_number),
-            expiring=_expiring_due(dynamic_expiring_walk(
-                active_number, oauth_candidates, usage, model_headroom, bars, policies,
-                entries, last, settings, now,
-            )[1], now),
+            expiring=expiring,
             trigger=trigger, model_window_dropped=dropped, reasons=reasons,
             raw_active_headroom=model_headroom.get(active_number), models=models,
         )
@@ -415,6 +410,18 @@ def rank_switch_candidates(
         return ordered, rank_axis
 
     model_headroom = _headroom_by_account(usage, models)
+    # The primary the engine would walk to, priced on the model-gated headroom as the
+    # tick prices it, also on the unmodeled retry (`dropped`); it is the wall of the
+    # active when it is the active (`_departure_wall`).
+    last = last_active_at or {}
+    expiring = (
+        [n for n, _, _ in dynamic_expiring_walk(
+            active_number, oauth_candidates, usage, model_headroom, bars, policies,
+            entries, last, settings, now,
+        )[1]]
+        if settings.strategy == "dynamic"
+        else []
+    )
     active_disabled = next(
         (acc.disabled for acc in snap.accounts if acc.number == active_number), False
     )

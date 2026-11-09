@@ -51,6 +51,7 @@ def _capture(name: str, seven: float | None = None) -> dict:
             window["resets_at"] = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
     usage = oauth.build_usage_result(raw)
     assert usage is not None and "five_hour" not in usage
+    usage["seven_day"].pop("resets_at", None)  # T3400: a known reset makes the account the primary
     if seven is not None:
         usage["seven_day"]["pct"] = seven
     return usage
@@ -245,24 +246,18 @@ def test_an_account_without_room_for_the_step_is_not_admissible_even_warm(temp_h
 # -- ranking: a reset-from-full account is first-class ------------------------
 
 
-@pytest.mark.parametrize(
-    "reset_b, expect",
-    [
-        (3 * DAY, 3),        # nobody resets within a day: the fresh account has the most room
-        (3 * 3600.0, 2),     # B resets in 3 h: use it or lose it
-    ],
-)
-def test_a_zero_percent_account_with_no_reset_is_not_ranked_last(temp_home, reset_b, expect):
+def test_a_zero_percent_account_with_no_reset_is_not_the_primary(temp_home):
+    """T3400: the primary is the soonest reset there is. 3, reset-from-full, has
+    none, so 2 (3 days out, headroom 20) is landed on before it, as `expiring-window`."""
     h = _harness(temp_home)
     now = h.clock.now + 360.0
     outcome = _tick(h, {
         "1": _u(98.0),                                  # walled
-        # 7d 80: with less used its room could not be spent at the fleet's rate before the reset, so expiring_order moves it first (another case)
-        "2": _u(30.0, 80.0, reset7=now + reset_b),      # cold, headroom 20
+        "2": _u(30.0, 80.0, reset7=now + 3 * DAY),      # cold, headroom 20
         "3": _u(0.0, 0.0),                              # cold, reset-from-full: no resets_at
     })
     assert outcome is TickOutcome.SWITCHED
-    assert (h.active_number(), _trigger(h)) == (expect, "proactive")
+    assert (h.active_number(), _trigger(h)) == (2, "expiring-window")
 
 
 # -- the binding window of an account without a 5h window ---------------------

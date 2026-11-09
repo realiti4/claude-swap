@@ -151,6 +151,12 @@ HORIZON_HEADROOM_RATIO = 2.0
 # this much.
 SPENT_HEADROOM_PCT = 3.0
 
+# The wall of the primary (T3400), the soonest-resetting usable account: it is spent
+# to a 1-point band and left at a 99% reading. Not 100: a departure at the limit is a
+# live 429 the pin relays as a 401, which kills subagents. Every other account keeps
+# SPENT_HEADROOM_PCT, and an account's own threshold replaces either.
+PRIMARY_WALL_PCT = 1.0
+
 # The engine's own wake floor while the active is within two margins of that
 # bar (adr/0010 R2). The fleet runs `intervalSeconds` 360, so the engine can
 # read 96% at one tick and a wall at the next, never seeing the 3-point band
@@ -257,12 +263,23 @@ def _capped_weekly_line(
     return min(cap, threshold if weekly is None else weekly)
 
 
-def _wall_headroom(own_bar: float | None) -> float:
+def _wall_headroom(own_bar: float | None, default: float = SPENT_HEADROOM_PCT) -> float:
     """The headroom `dynamic` calls walled for one account: its own switch
-    threshold (the ``threshold`` key, a used-%) when it has one, else the fixed
-    ``SPENT_HEADROOM_PCT``. The one place a per-account bar becomes a wall, so
-    the land bar and the hold bar of an account stay the same number."""
-    return SPENT_HEADROOM_PCT if own_bar is None else 100.0 - own_bar
+    threshold (the ``threshold`` key, a used-%) when it has one, else ``default``
+    (``SPENT_HEADROOM_PCT``; the primary's is ``PRIMARY_WALL_PCT``). The one place
+    a per-account bar becomes a wall, so the land bar and the hold bar of an
+    account stay the same number."""
+    return default if own_bar is None else 100.0 - own_bar
+
+
+def _departure_wall(
+    current: str | None, expiring: Sequence[str], bars: Mapping[str, float]
+) -> float:
+    """The headroom the active leaves at: its own bar's, else ``PRIMARY_WALL_PCT`` when
+    it is the primary (``expiring``, the walk's account), else ``SPENT_HEADROOM_PCT``."""
+    return _wall_headroom(
+        bars.get(current), PRIMARY_WALL_PCT if current in expiring else SPENT_HEADROOM_PCT
+    )
 
 
 def _about_to_wall(
@@ -468,25 +485,15 @@ def expiring_order(
     landing_cost: Callable[[str], float],
     now: float,
 ) -> list[str]:
-    """The accounts whose 7d room must be spent now to be spent at all (T3310,
-    T3398): those whose 7d window resets within ``PERISH_SOON_S``, soonest reset
-    first (the Next best list's own rule, ``_perish_then_room_key``). Nothing
-    is timed against a burn rate: whatever the active spends before that reset
-    is room the expiring account may lose.
-
-    ``accounts[0]`` is the active, the rest the admissible OAuth candidates (an
-    equal reset keeps the active ahead). Room is what is left under the
-    account's own bar and the weekly cap on its fullest weekly window. An
-    account is not walked when it cannot serve (``headroom`` at its wall),
-    when its 5h window cannot absorb ``landing_cost`` (5h points, 0 for the
-    active or a warm one: it lands once that window rolls), or when its room
-    does not exceed that cost in 7d points.
-    """
+    """The primary (T3400), as a list of at most one account: the soonest-resetting
+    account whose 7d room is worth spending first, which is the engine's default
+    landing and is spent to ``PRIMARY_WALL_PCT``. ``accounts[0]`` is the active, the
+    rest the admissible OAuth candidates. See ``_expiring_walk``."""
     _, rows = _expiring_walk(accounts, usage, headroom, bars, caps, plans, landing_cost, now)
-    return _expiring_due(rows, now)
+    return [n for n, _, _ in rows]
 
 
-_WalkRows = list[tuple[str, float, float]]  # (account, room, reset), in reset order
+_WalkRows = list[tuple[str, float, float]]  # (account, room, reset): the primary, or none
 
 
 def _expiring_walk(
@@ -499,9 +506,17 @@ def _expiring_walk(
     landing_cost: Callable[[str], float],
     now: float,
 ) -> tuple[float, _WalkRows]:
-    """``expiring_order``'s walk: the fleet's burn rate (7d points per second, 0.0
-    when none is measurable; it only words the hold) and one ``(account, room,
-    reset)`` row per walked account in reset order, ``room`` its Ultra points."""
+    """The fleet's burn rate (7d points per second, 0.0 when none is measurable; it
+    only words the plan) and the primary's ``(account, room, reset)`` row, ``room`` its
+    Ultra points to its wall, or no row when no account qualifies.
+
+    The primary is the first account in 7d reset order that is readable with room
+    under its wall (its own bar, else ``PRIMARY_WALL_PCT``) and the weekly cap, and
+    that serves (``headroom`` over that wall on every window). A reset's distance is no
+    test, and neither is what a cold landing costs against the room: only a cold
+    landing the 5h window cannot absorb waits for its roll, since it would wall that
+    window on arrival.
+    """
     def weight(n: str) -> float:
         return 1.0 / _PLAN_COST_SCALE.get(plans.get(n), 1.0)
 
@@ -516,10 +531,9 @@ def _expiring_walk(
     elapsed = sum(max(_SEVEN_DAYS_S - (r - now), 0.0) for _, r in seen.values()) / len(seen)
     spent = sum(pct * weight(n) for n, (pct, _) in seen.items())
     rate = spent / elapsed if spent > 0 and elapsed > 0 else 0.0
-    rows: _WalkRows = []
     for n in sorted((n for n in accounts if n in seen), key=lambda n: seen[n][1]):
         pct, reset = seen[n]
-        wall = _wall_headroom(bars.get(n))
+        wall = _wall_headroom(bars.get(n), PRIMARY_WALL_PCT)
         room = 100.0 - pct - wall
         if caps.get(n) is not None and caps[n] < 100.0:  # 100 is no cap (models.py)
             weekly = max(  # a header-probe reading shows no `all` window: its 7d is what is known
@@ -527,22 +541,15 @@ def _expiring_walk(
                 default=pct,
             )
             room = min(room, caps[n] - weekly)
-        cost = landing_cost(n)
         five = _window_pcts(usage[n], ()).get("5h")
         if (
             (headroom.get(n) or 0.0) <= wall
-            or room <= cost / WEEKLY_OVER_FIVE_HOUR
-            or (five is not None and 100.0 - five - cost <= wall)
+            or room <= 0
+            or (five is not None and 100.0 - five - landing_cost(n) <= wall)
         ):
             continue
-        rows.append((n, room * weight(n), reset))
-    return rate, rows
-
-
-def _expiring_due(rows: _WalkRows, now: float) -> list[str]:
-    """The walk's rows whose reset is within ``PERISH_SOON_S``: the prefix, as
-    the rows are in reset order."""
-    return [n for n, _, reset in rows if reset - now <= PERISH_SOON_S]
+        return rate, [(n, room * weight(n), reset)]
+    return rate, []
 
 
 def _hhmm_z(ts: float, now: float) -> str:
@@ -552,32 +559,27 @@ def _hhmm_z(ts: float, now: float) -> str:
     )
 
 
-def _spend_note(rate: float, row: tuple[str, float, float], now: float) -> str:
-    """What an expiring window has to spend, for the holds: the room and its reset,
-    and the fleet's rate when one is measurable."""
-    n, room, reset = row
-    return (
-        f"#{n}'s {room:.0f} pts before its {_hhmm_z(reset, now)} reset"
-        + (f", at {rate * 3600:.1f} pts/h" if rate else "")
-    )
-
-
-def _nothing_expiring_detail(rate: float, rows: _WalkRows, now: float, current: str) -> str:
-    """What `dynamic` decided when no row is within ``PERISH_SOON_S`` of its
-    reset: the soonest row becomes expiring a day before that reset, and the
-    tick then acts on it (`_tick_inner`'s ``ahead``): it takes the switch, or,
-    when it is the active, the active spends its own window."""
+def _plan_note(
+    rate: float, rows: _WalkRows, now: float, bars: Mapping[str, float],
+    warming: str | None, settings: AutoSwitchSettings,
+) -> str:
+    """What `dynamic` plans, for the holds: the primary's room to its wall and the
+    reset it is spent before, the share of the fleet's turns that room covers at the
+    measured rate, and the partner kept warm (a turn every ``cache_ttl_seconds`` less
+    one ``alternation_chunk_seconds``)."""
     if not rows:
         return "nothing expiring; no account has 7d room it can spend now"
-    n, _, reset = rows[0]
-    act = (
-        f"the active (#{n}) starts spending its expiring window" if n == current
-        else f"switch to #{n}"
+    n, room, reset = rows[0]
+    note = (
+        f"#{n}: {room:.0f} pts to {100.0 - _wall_headroom(bars.get(n), PRIMARY_WALL_PCT):g}% "
+        f"by {_hhmm_z(reset, now)}"
     )
-    return (
-        f"nothing expiring yet; next at {_hhmm_z(reset - PERISH_SOON_S, now)}: {act} "
-        f"(spends {_spend_note(rate, rows[0], now)})"
-    )
+    if rate:
+        note += f", ~{min(room / (rate * (reset - now)), 1.0) * 100:.0f}% of turns"
+    if warming:
+        minutes = (settings.cache_ttl_seconds - settings.alternation_chunk_seconds) / 60
+        note += f"; warming #{warming} every {minutes:g} min"
+    return note
 
 
 def _stay_progress(
@@ -732,9 +734,9 @@ def dynamic_expiring_walk(
     last_active_at: dict,
     settings: AutoSwitchSettings,
     now: float,
-) -> list[str]:
+) -> tuple[float, _WalkRows]:
     """`_expiring_walk` on the inputs the tick reads: the tick and the "Next best"
-    panel both call it, so one fleet is priced one way."""
+    panel both call it, so one fleet names one primary."""
     def landing_cost(n: str) -> float:
         """A cold landing's cost in 5h points, scaled by plan."""
         if n == current or _is_warm(n, last_active_at, now, settings.cache_ttl_seconds):
@@ -754,12 +756,9 @@ def dynamic_expiring_walk(
 def _expiring_ahead(
     expiring: list[str], current: str | None, walled: bool
 ) -> list[str]:
-    """The expiring accounts a healthy active yields to: those whose window perishes
-    before its own. None while it sits at its wall: its escape prices the landing
-    instead (#403)."""
-    if walled:
-        return []
-    return expiring[: expiring.index(current)] if current in expiring else expiring
+    """The primary a healthy active yields to: ``expiring`` unless the active is it.
+    None while it sits at its wall: its escape prices the landing instead (#403)."""
+    return [] if walled or current in expiring else expiring
 
 
 def _rotation_order(
@@ -872,14 +871,14 @@ def dynamic_candidate_order(
     the real wall lifts the peers' own lines when none is left, and the cold tier
     puts the candidates that clear their plan-scaled landing cost first (not on the
     unmodeled retry, ``model_window_dropped``, whose floor the tick applies itself). The
-    `expiring` accounts go in front, all of them.
+    primary (``expiring``) goes in front when the pass admitted it.
 
     `dynamic-healthy`: an active whose own model-gated reading (``raw_active_headroom``)
     is at its wall leaves by `_escape_order` over `_walled_escape_candidates`, the
     tick's own selection; where that admits nobody, and for any other active, the order
-    is `_rotation_order` and the `expiring` accounts ahead of the active
-    (`_expiring_ahead`) go in front. Admission (the landing floor, the step, the dwell)
-    is the tick's, not applied here.
+    is `_rotation_order` and the primary (``expiring``), unless the active is it
+    (`_expiring_ahead`), goes in front, admitted or not. Admission (the landing floor,
+    the step, the warm turn) is the tick's, not applied here.
 
     ``reasons`` is the panel's side channel (see `_rank_dynamic_candidates`); the tick
     passes none.
@@ -910,7 +909,7 @@ def dynamic_candidate_order(
             )
         ordered, front = warm + cold, expiring
     else:
-        walled = _about_to_wall(raw_active_headroom, _wall_headroom(bars.get(current)))
+        walled = _about_to_wall(raw_active_headroom, _departure_wall(current, expiring, bars))
         front = _expiring_ahead(expiring, current, walled)
         escape: list[str] = []
         if walled:
@@ -928,8 +927,11 @@ def dynamic_candidate_order(
             ordered = _rotation_order(warm, cold, headroom, usage, settings, now)
             if settings.alternation_chunk_pct > 0:
                 axis = _ROOM_AXIS
-    ordered = [n for n in front if n in ordered] + [n for n in ordered if n not in front]
-    return ordered, (f"expiring window, then {axis}" if set(front) & set(ordered) else axis)
+    # The tick lands on the primary a healthy active yields to whatever the rotation's
+    # floor says; the `proactive` list keeps the candidates the pass admitted.
+    front = front if not proactive else [n for n in front if n in ordered]
+    ordered = [*front, *(n for n in ordered if n not in front)]
+    return ordered, (f"expiring window, then {axis}" if front else axis)
 
 
 def _blackout_retry_admission_bar(
@@ -1113,7 +1115,11 @@ def last_engine_switch(backup_dir: Path) -> tuple[str, str] | None:
     cswap-pin's session-affinity keep reads it and yields its keep to
     ``expiring-window`` and ``manual``. A missing or malformed field drops that
     entry; ``None`` when neither is left. No lock: the writers are atomic."""
-    state = _read_state_file(backup_dir / STATE_FILENAME)
+    return _newest_switch(_read_state_file(backup_dir / STATE_FILENAME))
+
+
+def _newest_switch(state: dict) -> tuple[str, str] | None:
+    """``last_engine_switch`` on a state already read."""
     engine_trigger = state.get("lastSwitchTrigger") or state.get("leftTrigger")
     limit_trigger = state.get("lastLimitSwitchTrigger") or "at-limit"
     entries = []
@@ -2976,6 +2982,32 @@ class AutoSwitchEngine:
             and active_headroom is not None
             and active_headroom <= 2 * SPENT_HEADROOM_PCT
         )
+        # -- candidate selection ------------------------------------------
+        switchable = self.switcher.switchable_account_numbers()
+        candidates = [
+            num
+            for num in switchable
+            if num != current and num not in quarantined and _capped(num) is None
+        ]
+        oauth_candidates = [
+            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+        ]
+        last_active_at = state.get("lastActiveAt")
+        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
+        # T3400: the primary, the soonest-resetting usable account, is spent to
+        # `PRIMARY_WALL_PCT` and `_active_wall` is that wall while it is the active, so
+        # the classification below leaves it at a 99% reading. `_bars` stays the owner's
+        # thresholds (it also feeds the poll cadence).
+        expiring: list[str] = []
+        walk: tuple[float, _WalkRows] = (0.0, [])
+        if settings.strategy == "dynamic":
+            now = self.clock()
+            walk = dynamic_expiring_walk(
+                current, oauth_candidates, usage, headroom, self._bars, policies,
+                entries, last_active_at, settings, now,
+            )
+            expiring = [n for n, _, _ in walk[1]]
+            self._active_wall = _departure_wall(current, expiring, self._bars)
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -3104,16 +3136,6 @@ class AutoSwitchEngine:
         # Priority's strict landing would hold a capped active in place.
         priority_mode = priority_mode and trigger != "weekly-capped"
 
-        # -- candidate selection ------------------------------------------
-        switchable = self.switcher.switchable_account_numbers()
-        candidates = [
-            num
-            for num in switchable
-            if num != current and num not in quarantined and _capped(num) is None
-        ]
-        oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
-        ]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -3162,9 +3184,6 @@ class AutoSwitchEngine:
         # below — the `dynamic-healthy` arm does NOT call it (see that
         # arm's own comment: the bar would permanently block a deliberate,
         # healthy alternation between two unchanged accounts).
-        last_active_at = state.get("lastActiveAt")
-        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
-
         # What a cold landing eats and the bare floor a warm one must clear
         # (the same figure), per account: 5h points where a 5h window exists,
         # 7d points where not, scaled by the account's plan.
@@ -3195,28 +3214,18 @@ class AutoSwitchEngine:
                 bar_active = False
             return ordered, bar_active
 
-        # T3310: an account whose 7d window expires with room left pulls the
-        # switch (`expiring_order`'s walk); its logged trigger is `expiring-window`,
-        # while every gate downstream keeps reading `alternation`.
-        expiring: list[str] = []
-        walk = (0.0, [])
+        # T3310, T3400: a switch to the primary is logged `expiring-window` while every
+        # gate downstream keeps reading `alternation` (or `proactive`).
         logged_trigger: str | None = None
-        if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
-            now = self.clock()
-            walk = dynamic_expiring_walk(
-                current, oauth_candidates, usage, headroom, self._bars, policies,
-                entries, last_active_at, settings, now,
-            )
-            expiring = _expiring_due(walk[1], now)
 
-        # On a healthy active, the expiring accounts ahead of its own window pull the
-        # switch. An active walled on its own model-gated axis leaves by the walled
+        # A healthy active that is not the primary yields to it once its warm turn is
+        # served. An active walled on its own model-gated axis leaves by the walled
         # escape below (#403), which prices the landing and breaks ties by warmth.
         walled = _about_to_wall(raw_active_headroom, self._active_wall)
         healthy = trigger == "dynamic-healthy"
         ahead = _expiring_ahead(expiring, current, walled) if healthy else []
-        # The active is itself the soonest expiring window: it spends it, and
-        # only a candidate whose own window perishes sooner may take over.
+        # The active is itself the primary: it is spent to its wall, and its partner
+        # takes a turn only when that partner's warming is due.
         spend_first = healthy and bool(expiring) and not walled and not ahead
 
         dynamic_ordered: list[str] | None = None
@@ -3312,6 +3321,23 @@ class AutoSwitchEngine:
                     floor_headroom.get(n) is not None for n in oauth_candidates
                 )
         elif ahead:
+            # A partner's warm turn (the engine's own `alternation` landing here, no
+            # hand or pin wall switch since) runs its chunk first.
+            since = last_active_at.get(current)
+            if (
+                _newest_switch(state) == (current, "alternation")
+                and since is not None
+                and now - since < settings.alternation_chunk_seconds
+            ):
+                self._emit(NoSwitchEvent(
+                    reason="below-threshold",
+                    detail=(
+                        f"active account is healthy ({pct_label(active_headroom)}% headroom, "
+                        "not about to wall); "
+                        + _plan_note(*walk, now, self._bars, current, settings)
+                    ),
+                ))
+                return TickOutcome.NO_ACTION
             if self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
@@ -3456,15 +3482,20 @@ class AutoSwitchEngine:
                     cold_ordered=cold_ordered, ranked=rotation,
                     floor_headroom=floor_headroom,
                     active_headroom=active_headroom, cold_cost=_cold_cost,
+                    primary_active=spend_first,
                 )
             partner = next(iter(alternation_admissible), None)
-            # T3310: an active spending its own expiring window yields only to a
-            # candidate that perishes sooner; `partner` (unfiltered) still labels a hold.
+            # T3400: the active is the primary. The step and the dwell no longer move it:
+            # its first partner takes a turn when that partner's cache would lapse before
+            # the next one (a cold one, never warmed or past the TTL, is due now);
+            # `partner` (unfiltered) still labels a hold.
             if spend_first:
-                alternation_admissible = [
-                    n for n in alternation_admissible
-                    if _perishes_before_active(usage.get(n), usage.get(current), now)
-                ]
+                rotation_due = True
+                if partner is not None and _is_warm(
+                    partner, last_active_at, now,
+                    settings.cache_ttl_seconds - settings.alternation_chunk_seconds,
+                ):
+                    alternation_admissible = []
             # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
             # NEVER-widened model-gated reading — the widen above can call
             # this active "healthy" (dynamic-healthy, not at-limit) purely
@@ -3540,19 +3571,17 @@ class AutoSwitchEngine:
                     f"active account is healthy ({pct_label(active_headroom)}"
                     "% headroom, not about to wall)"
                 )
-                # The hold says what `dynamic` decided: its own expiring window,
-                # or, with nothing expiring, what the soonest-resetting account does
-                # and when (`_expiring_walk`'s reading), after the cause that holds.
-                if spend_first and not alternation_admissible:
-                    detail = healthy + "; spending its expiring window first: " + _spend_note(
-                        walk[0], walk[1][0], now
+                # The hold says the plan (`_plan_note`) after the cause that holds.
+                if spend_first:
+                    detail = healthy + "; " + _plan_note(
+                        *walk, now, self._bars, partner, settings
                     )
                 else:
                     detail = healthy + (
                         "; the alternation step is not reached" if step_holds else ""
                     )
                     if not expiring:
-                        detail += "; " + _nothing_expiring_detail(*walk, now, current)
+                        detail += "; " + _plan_note(*walk, now, self._bars, None, settings)
                 self._emit(NoSwitchEvent(reason=reason, detail=detail))
                 return TickOutcome.NO_ACTION
             else:
@@ -3921,6 +3950,13 @@ class AutoSwitchEngine:
                 raise _EngineStopped()
             email = self.switcher.account_email(num)
             is_priority = priority_mode and num in oauth_candidates
+            # Every switch TO the primary is `expiring-window`: the pin rebinds warm
+            # sessions on that label only. A partner's turn stays `alternation`.
+            label = (
+                "expiring-window"
+                if num in expiring and trigger in ("proactive", "alternation")
+                else logged_trigger
+            )
             if trigger in _FRESHEN_GATED_TRIGGERS or is_priority:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
@@ -4018,7 +4054,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot, logged_trigger)
+                return self._perform(num, email, trigger, left_snapshot, label)
             status = self._freshen_target(num, email)
             if self._stop.is_set():
                 # `_freshen_target` POSTs the consume-gate refresh, the one
@@ -4058,7 +4094,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot, logged_trigger)
+            return self._perform(num, email, trigger, left_snapshot, label)
 
         if logged_trigger:
             # A discretionary pull never blocks or fails a healthy active.
@@ -5745,6 +5781,7 @@ class AutoSwitchEngine:
         floor_headroom: dict[str, float | None],
         active_headroom: float,
         cold_cost: Callable[[str], float],
+        primary_active: bool = False,
     ) -> tuple[list[str], bool]:
         """`dynamic`'s percent step (T3167): ``(ordered, ready)``, the targets a
         rotation may land on and whether it should happen now.
@@ -5765,6 +5802,10 @@ class AutoSwitchEngine:
         next forced move needs, ``step + SPENT``, the top ranked cold landing that
         keeps ``step + SPENT`` after its re-write, and more than the active has,
         is taken NOW, while the prefix is smallest, at most once per dwell.
+
+        ``primary_active`` (T3400): the active is the primary, which the step and the
+        dwell never move off. Every ranked candidate that keeps ``need`` is returned, and
+        the caller decides when its warm turn is due.
         """
         levels = _window_pcts(usage.get(current), ())
         if not levels:
@@ -5784,7 +5825,7 @@ class AutoSwitchEngine:
         def room(n: str) -> float:
             return h[n] - (cold_cost(n) if n in cold else 0.0)
 
-        if _step_due(track, max(levels.values()), now, since, step, dwell):
+        if primary_active or _step_due(track, max(levels.values()), now, since, step, dwell):
             return [n for n in ranked if room(n) >= need], True
         if since is None or now - since < dwell:
             return [], False

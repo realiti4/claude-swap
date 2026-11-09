@@ -1724,8 +1724,8 @@ def _warm_fixture_accounts():
     a warm candidate ahead of every cold one regardless of reset time, so
     every screen must list "2" before "3": the other surfaces must agree
     with the auto view, not just re-derive it.
-    "3" sits at 5h 85%: a cold landing's cost does not fit what is left, so
-    `expiring_order` does not pull it ahead of the warm partner."""
+    "3" sits at 5h 85%: a cold landing's cost does not fit what is left, so it is
+    not the primary, and 2 (the next reset) is listed first."""
     return [
         make_account(1, active=True, entry=make_entry(50.0, 50.0)),
         make_account(2, entry=UsageEntry(
@@ -2427,6 +2427,36 @@ class TestPanelOrderIsTheEnginesOrder:
         assert order == ["1", "2", "3"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
+    @pytest.mark.parametrize(
+        "active_resets_in, trigger",
+        [(20 * 3600, "dynamic-healthy"), (6 * 86400, "proactive")],
+        ids=["primary", "partner"],
+    )
+    def test_an_active_at_97_is_walled_unless_it_is_the_primary(
+        self, active_resets_in, trigger
+    ):
+        """T3400: the soonest reset is spent to 99%, so the panel's trigger for an active
+        at 97% (5h) reads healthy while it is that account, as the tick does."""
+        def entry(five, secs):
+            return UsageEntry(
+                last_good={
+                    "five_hour": {"pct": five},
+                    "seven_day": {"pct": 10.0, "resets_at": _iso_in(secs)},
+                },
+                fetched_at=time.time(), age_s=0.0,
+            )
+
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=entry(97.0, active_resets_in)),
+                make_account(2, entry=entry(10.0, 2 * 86400)),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        got = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
+        assert got[2] == trigger, got
+
     def test_a_capped_api_key_peer_is_not_the_last_resort(self):
         """The engine drops a capped peer before it splits the rest by kind,
         so a capped API-key slot is no last resort either."""
@@ -2447,30 +2477,30 @@ class TestPanelOrderIsTheEnginesOrder:
         assert ordered == [], ordered
 
     @pytest.mark.parametrize(
-        "five, soon, pick, header",
+        "five, resets, pick, header",
         [
             (97.0, True, "2", f"expiring window, then {COLD_PARTITION_KEY}"),
             (10.0, True, "2", f"expiring window, then {ROOM_KEY}"),
-            (97.0, False, "3", COLD_PARTITION_KEY),
+            (99.0, False, "3", COLD_PARTITION_KEY),
         ],
-        ids=["walled-expiring", "healthy-expiring", "walled-nothing-expiring"],
+        ids=["walled-primary", "healthy-primary", "walled-no-reset-known"],
     )
     def test_dynamic_lists_the_account_the_tick_lands_on_first_and_names_its_key(
-        self, temp_home, five, soon, pick, header
+        self, temp_home, five, resets, pick, header
     ):
-        """Account 2 (7d 40%, a reset 20 h out) is inside the 24 h expiring
-        window, so `expiring_order` pulls it ahead of 3 (98 points of room),
-        which the most-room key alone ranks first. The tick lands on 2, and the
-        panel's order and header are the tick's, never "(soonest reset)"."""
+        """Account 2 (7d 40%, a reset 20 h out) is the soonest reset, the primary, so
+        it is pulled ahead of 3 (98 points of room), which the most-room key alone
+        ranks first. The tick lands on 2, and the panel's order and header are the
+        tick's, never "(soonest reset)". With no reset known there is no primary."""
         def w(five_pct, seven_pct, secs):
-            return {
-                "five_hour": {"pct": five_pct},
-                "seven_day": {"pct": seven_pct, "resets_at": _iso_in(secs)},
-            }
+            seven = {"pct": seven_pct}
+            if resets:
+                seven["resets_at"] = _iso_in(secs)
+            return {"five_hour": {"pct": five_pct}, "seven_day": seven}
 
         fleet = {
             "1": w(five, 10.0, 6 * 86400),
-            "2": w(10.0, 40.0, 20 * 3600 if soon else 6 * 86400),
+            "2": w(10.0, 40.0, 20 * 3600),
             "3": w(10.0, 2.0, 6 * 86400),
             "4": w(100.0, 1.0, 6 * 86400),
         }
@@ -4403,15 +4433,15 @@ class TestUnswitchableRowsAreListed:
             self._acct("7", "active@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 5.0}, "seven_day": {"pct": 98.0},
             }),
+            # T3400: 5h 85 keeps close from being the primary (a cold landing costs 20),
+            # and far has no reset known, so neither is pulled ahead of the partition.
             self._acct("4", "close@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {
+                "five_hour": {"pct": 85.0}, "seven_day": {
                     "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
                 },
             }),
             self._acct("2", "far@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {
-                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
-                },
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 40.0},
             }),
         ), active="7", settings=settings)
 
