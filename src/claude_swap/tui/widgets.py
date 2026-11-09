@@ -255,9 +255,15 @@ def account_card_text(
     for badge in _policy_badges(acc, "   "):
         text.append(badge, style=palette.muted)
     _append_plan(text, acc, "   ", palette)
-    age = data.format_age(acc.usage.age_s)
-    if age:
-        text.append(f"   {age}", style=palette.muted)
+    if acc.setup_token and acc.usage.age_s is not None:
+        # Always shown: with the probe off these readings only change when
+        # someone checks (Watch's `u`) or the account answers in Claude Code
+        # (`cswap statusline`), so their age is the point.
+        text.append(f"   · updated {data.format_ago(acc.usage.age_s)}", style=palette.muted)
+    else:
+        age = data.format_age(acc.usage.age_s)
+        if age:
+            text.append(f"   {age}", style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:

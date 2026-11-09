@@ -580,18 +580,32 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     return rows
 
 
+# `cswap auto` flag (argparse dest) -> AutoSwitchSettings field it overrides.
+_CLI_OVERRIDES = (
+    ("threshold", "threshold"),
+    ("weekly_threshold", "weekly_threshold"),
+    ("interval", "interval_seconds"),
+    ("cooldown", "cooldown_seconds"),
+    ("include_api_key_accounts", "include_api_key_accounts"),
+    ("model", "model"),
+    ("strategy", "strategy"),
+)
+
+
+def cli_override_keys(args) -> tuple[str, ...]:
+    """The settings keys (``autoswitch.threshold``...) a `cswap auto`
+    command line overrides with its flags."""
+    return tuple(
+        f"autoswitch.{_AUTOSWITCH_KEYS[field]}"
+        for attr, field in _CLI_OVERRIDES
+        if getattr(args, attr, None) is not None
+    )
+
+
 def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
     overrides = {}
-    for attr, field in (
-        ("threshold", "threshold"),
-        ("weekly_threshold", "weekly_threshold"),
-        ("interval", "interval_seconds"),
-        ("cooldown", "cooldown_seconds"),
-        ("include_api_key_accounts", "include_api_key_accounts"),
-        ("model", "model"),
-        ("strategy", "strategy"),
-    ):
+    for attr, field in _CLI_OVERRIDES:
         value = getattr(args, attr, None)
         if value is not None:
             overrides[field] = value

@@ -173,6 +173,13 @@ def format_age(age_s: float | None) -> str | None:
     return f"· {format_duration(age_s)} ago"
 
 
+def format_ago(age_s: float) -> str:
+    """'just now', '45s ago', '12m ago', '2h 13m ago'."""
+    if age_s < 5:
+        return "just now"
+    return f"{format_duration(age_s)} ago"
+
+
 def clock_stamp() -> str:
     """HH:MM:SS local-time stamp for the event log."""
     return time.strftime("%H:%M:%S")
@@ -182,6 +189,7 @@ __all__ = [
     "ActionResult",
     "SnapshotSource",
     "format_age",
+    "format_ago",
     "format_duration",
     "last_seen_note",
     "reset_clock",

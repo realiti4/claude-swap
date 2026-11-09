@@ -190,6 +190,10 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+*Settings…* in its menu changes every `cswap config` setting in place. After a change, it says when the change applies. If an auto-switch loop is already running (`cswap auto`, the menu bar, another dashboard's auto view), it names each one, because they read their settings only when they start. It also says how to restart each one, and flags a `cswap auto` whose own command-line flag overrides the setting. Changing `run.shareHistory` also lists any `cswap run` sessions still running on the old value.
+
+*Account settings…* edits one account's alias, switch threshold, priority tier, auto-rotation (`cswap disable`/`enable`) and login sync. These need no restart: a running auto-switch rereads them on every check.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
@@ -227,6 +231,7 @@ cswap priority                  # Show every account's tier
 cswap login-sync 2 off          # Don't let auto-switch store new logins for account 2
 cswap login-sync                # Show login sync on/off for every account
 cswap remote show team          # Compare a shared setup-token repository with this machine (see Remote sync)
+cswap statusline install        # Take setup-token usage from Claude Code's status line (see add-token)
 cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
@@ -270,6 +275,8 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
 Remote sync keeps `remotes.json` and a `remotes/` folder in the backup directory. The folder holds cswap's clone of each repository and, outside macOS, the saved passphrases.
+
+`cswap statusline install` changes `statusLine` in Claude Code's `~/.claude/settings.json` (it keeps the original as `settings.json.cswap-backup`). The readings it saves go in `statusline/` in the backup directory.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -322,7 +329,7 @@ cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
 
-`cswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `cswap config` is just a safer front door. `list` and `get` take `--json` for scripting.
+`cswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `cswap config` is just a safer front door. `list` and `get` take `--json` for scripting. The dashboard's *Settings…* screen edits the same keys. Running auto-switch loops (`cswap auto`, the menu bar) read their settings only when they start, so restart them after a change; the screen names the ones that are running.
 
 </details>
 
@@ -410,7 +417,8 @@ cswap add-token --email user@example.com     # optional label override
 <details>
 <summary>Limits — setup-token usage & API-key accounts</summary>
 
-- **Setup-tokens show `usage unavailable` by default**, because the usage endpoint does not answer them (their scope is inference-only). With `cswap config set usage.headerProbe true`, cswap reads their 5h/7d utilization (and Fable's weekly window) from the rate-limit headers of a 1-output-token Haiku request instead, sent at the normal poll cadence. Each probe is a real (tiny) request on that account's subscription, which is why it is off by default.
+- **Setup-tokens show `usage unavailable` by default**, because the usage endpoint does not answer them (their scope is inference-only). With `cswap config set usage.headerProbe true`, cswap reads their 5h/7d utilization (and Fable's weekly window) from the rate-limit headers of a 1-output-token Haiku request instead, sent at the normal poll cadence. Each probe is a real (tiny) request on that account's subscription, which is why it is off by default. With it off, press `u` in `cswap watch` to read every setup-token account once, on demand; their cards say when they were last read.
+- **Usage from Claude Code itself.** After each response, Claude Code hands its status line the account's 5h and 7d usage. `cswap statusline install` puts a small command (`cswap-statusline`) in front of your status line. It runs your command as before and saves those numbers, and cswap uses them for setup-token accounts. That costs no requests at all, and the account you're working in stays current. Without a status line of your own you get a short one: `team · 5h 25% (1h 59m) · 7d 61%`. `cswap statusline` shows the last readings, and `cswap statusline uninstall` puts your status line back. Details: [docs/statusline.md](https://github.com/realiti4/claude-swap/blob/main/docs/statusline.md).
 - **What the probe can't do.** Other per-model windows and extra-usage spend are not in those headers. A reading missing the 5h or 7d window (or a window `autoswitch.model` names) is shown but not used for auto-switching. An account the server rejects for quota is marked as at its limit, with no further probe, until the refusal's `Retry-After` passes.
 - **API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token (`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses after `/login` with a key). It switches like any other account, but API keys have no subscription quota, so they show no usage and the usage-aware `switch` strategies never skip them as rate-limited. Use keys scoped to a single workspace: a multi-workspace key needs an `anthropic-workspace-id` header on every request, which Claude Code does not add for a stored key.
 
@@ -439,6 +447,7 @@ Nothing runs in the background: each command fetches first. A token that differs
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
 - [docs/remote-sync.md](https://github.com/realiti4/claude-swap/blob/main/docs/remote-sync.md) — sharing setup-tokens through an encrypted git repository: how accounts are matched, what push and pull do, git logins, the passphrase and the file format. Read it before you trust a repository with tokens.
+- [docs/statusline.md](https://github.com/realiti4/claude-swap/blob/main/docs/statusline.md) — reading setup-token usage from Claude Code's status line: what the hook saves, how a reading is matched to an account, and when one is dropped.
 - [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
 
 `cswap --help` and `cswap <command> --help` document every flag.
@@ -450,6 +459,8 @@ Remove all data:
 ```bash
 cswap purge
 ```
+
+This also puts your status line back if `cswap statusline install` changed it. Without a purge, run `cswap statusline uninstall` before uninstalling the tool: otherwise Claude Code's status line points at a command that's gone.
 
 Then uninstall the tool:
 

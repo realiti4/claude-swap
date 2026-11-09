@@ -124,7 +124,8 @@ MenuItem Static.menu-item-muted { color: $secondary; }
 /* -- modals ----------------------------------------------------------------- */
 
 ConfirmModal, AddTokenModal, OutputModal,
-PassphraseModal, NewPassphraseModal, RemoteTokenModal, AddRemoteModal {
+PassphraseModal, NewPassphraseModal, RemoteTokenModal, AddRemoteModal,
+ValueModal {
     align: center middle;
     background: $background 60%;
 }
@@ -201,7 +202,8 @@ PassphraseModal, NewPassphraseModal, RemoteTokenModal, AddRemoteModal {
     color: $error;
 }
 
-AddTokenModal Input, NewPassphraseModal Input, RemoteTokenModal Input {
+AddTokenModal Input, NewPassphraseModal Input, RemoteTokenModal Input,
+ValueModal Input {
     margin-bottom: 1;
 }
 
@@ -237,4 +239,18 @@ AddRemoteModal Checkbox {
     height: auto;
     padding: 0 3;
     color: $secondary;
+}
+
+/* -- settings ------------------------------------------------------------------ */
+
+/* The highlighted setting's description, range and default: up to two lines. */
+#settings-help {
+    height: 2;
+    padding: 0 3;
+    color: $secondary;
+}
+
+/* A config value can be long (a model list); errors wrap. */
+ValueModal .form-error {
+    height: auto;
 }

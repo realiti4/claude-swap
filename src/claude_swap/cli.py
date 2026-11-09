@@ -790,6 +790,117 @@ Examples:
         sys.exit(130)
 
 
+def _statusline_command(argv: list[str]) -> None:
+    """Handle `cswap statusline [status|install|uninstall]`."""
+    from claude_swap import statusline
+
+    parser = argparse.ArgumentParser(
+        prog="cswap statusline",
+        description=(
+            "Read usage from Claude Code's status line. After each response "
+            "Claude Code hands its status line the account's 5-hour and 7-day "
+            "usage; installed, cswap-statusline saves those numbers for cswap "
+            "and then runs your own status line command unchanged. cswap uses "
+            "them for setup-token accounts, whose usage it can't read otherwise."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  status       whether it is installed, and the last readings (the default)
+  install      put cswap-statusline in front of your status line command
+  uninstall    put your status line command back as it was
+
+Without a status line of your own, install sets up a short one:
+  team · 5h 25% (1h 59m) · 7d 61%
+        """,
+    )
+    parser.add_argument(
+        "action", nargs="?", default="status", choices=("status", "install", "uninstall")
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    path = statusline.settings_path()
+    try:
+        if args.action == "install":
+            state, wrapped = statusline.install(path=path)
+            if state == "already":
+                print(f"Already installed in {path}.")
+            elif wrapped:
+                print(f"{accent('Installed')} in {path}.")
+                print(f"  Claude Code's status line runs cswap-statusline, which runs {wrapped}")
+                print("  as before and saves the usage it is shown for cswap.")
+            else:
+                print(f"{accent('Installed')} in {path}.")
+                print("  You had no status line, so Claude Code now shows cswap's short one:")
+                print("  account · 5h usage (time to reset) · 7d usage.")
+            if state != "already":
+                print(dimmed("  New Claude Code sessions use it. `cswap statusline uninstall` undoes it."))
+        elif args.action == "uninstall":
+            changed, restored = statusline.uninstall(path=path)
+            if not changed:
+                print(f"Not installed in {path}.")
+            elif restored:
+                print(f"{accent('Uninstalled')}. The status line runs {restored} again.")
+            else:
+                print(f"{accent('Uninstalled')}. Claude Code has no status line again.")
+        else:
+            _statusline_status(path)
+    except statusline.SetupError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def _statusline_status(path) -> None:
+    import time as _time
+
+    from claude_swap import statusline
+    from claude_swap.tui.data import format_ago
+
+    try:
+        current = json.loads(path.read_text(encoding="utf-8")).get("statusLine")
+    except (OSError, ValueError, AttributeError):
+        current = None
+    if statusline.is_hook(current):
+        wrapped = statusline.wrapped_command(current)
+        print(f"{accent('Installed')} in {path}.")
+        print(f"  Runs: {wrapped}" if wrapped else "  Shows cswap's short status line.")
+    else:
+        print(f"Not installed in {path}. `cswap statusline install` sets it up.")
+    for override in statusline.project_overrides():
+        warning(
+            f"  {override} sets its own status line, so in this project "
+            "Claude Code doesn't run cswap's."
+        )
+
+    switcher = ClaudeAccountSwitcher()
+    report = switcher.statusline_report()
+    if not report:
+        print(dimmed("No readings yet: they arrive with Claude Code's next response."))
+        return
+    now = _time.time()
+    print(bolded("Last readings:"))
+    for record, slots in report:
+        where = record.get("profile") or "default profile"
+        windows = record.get("rateLimits") or {}
+        parts = [
+            f"{label} {windows[key]['used_percentage']:.0f}%"
+            for key, label in (("five_hour", "5h"), ("seven_day", "7d"))
+            if key in windows
+        ]
+        taken = record.get("responseAt")
+        age = format_ago(now - taken) if isinstance(taken, (int, float)) else "?"
+        if slots:
+            to = ", ".join(f"Account-{s} ({switcher.account_email(s)})" for s in slots)
+        else:
+            to = "not used (not a setup-token account, or taken just after a switch)"
+        print(f"  {where}: {' · '.join(parts)}, {age} → {to}")
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -918,7 +1029,7 @@ Defaults live in settings.json in the backup root; flags override them.
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import load_settings, merged_with_cli
+    from claude_swap.settings import cli_override_keys, load_settings, merged_with_cli
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -947,6 +1058,8 @@ Defaults live in settings.json in the backup root; flags override them.
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            host="cswap auto",
+            overrides=cli_override_keys(args),
         )
 
         if args.once:
@@ -1469,6 +1582,9 @@ def main() -> None:
         from claude_swap.remote_cli import remote_command
         remote_command(argv[1:])
         return
+    if argv and argv[0] == "statusline":
+        _statusline_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1520,6 +1636,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s remote ...                 share setup-tokens via an encrypted git repo
+  %(prog)s statusline [install]       read setup-token usage from Claude Code's status line
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

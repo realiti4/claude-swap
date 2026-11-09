@@ -224,6 +224,7 @@ class AutoScreen(Screen):
             self._settings,
             self._emit_from_thread,
             dry_run=dry_run,
+            host="TUI auto view",
         )
         self._engine = engine
         self.run_worker(

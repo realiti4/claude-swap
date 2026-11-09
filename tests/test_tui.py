@@ -199,6 +199,38 @@ class FakeSwitcher:
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
 
+    def _update(self, identifier: str, **fields) -> None:
+        self._accounts = [
+            dataclasses.replace(a, **fields) if a.number == str(identifier) else a
+            for a in self._accounts
+        ]
+
+    def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
+        self.calls.append(("set_alias", str(identifier), alias))
+        self._update(identifier, alias=alias)
+        return str(identifier), alias  # the real setter prints nothing either
+
+    def unset_alias(self, identifier: str) -> str:
+        self.calls.append(("unset_alias", str(identifier)))
+        self._update(identifier, alias="")
+        return str(identifier)
+
+    def _policy(self, identifier: str):
+        return next(a.policy for a in self._accounts if a.number == str(identifier))
+
+    def set_account_threshold(self, identifier: str, threshold) -> None:
+        self.calls.append(("set_threshold", str(identifier), threshold))
+        value = None if threshold is None else float(threshold)
+        self._update(identifier, policy=dataclasses.replace(self._policy(identifier), threshold=value))
+        print(f"Set Account-{identifier} threshold to {value}" if value is not None
+              else f"Cleared threshold for Account-{identifier}")
+
+    def set_account_priority(self, identifier: str, priority) -> None:
+        self.calls.append(("set_priority", str(identifier), priority))
+        value = 0 if priority is None else int(priority)
+        self._update(identifier, policy=dataclasses.replace(self._policy(identifier), priority=value))
+        print(f"Account-{identifier} priority: {value} (used by priority-consume-first).")
+
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
         print("Added Account 9: fresh@example.com")
@@ -885,10 +917,12 @@ class TestDashboard:
                 "watch",
                 "auto",
                 "add-menu",
+                "account-settings-menu",
                 "disable-menu",
                 "login-sync-menu",
                 "remote-menu",
                 "remove-menu",
+                "settings",
                 "theme-menu",
                 "quit",
             ]

@@ -917,6 +917,7 @@ def run(switcher) -> int:
                     load_settings(self.switcher.backup_dir),
                     self._on_engine_event,
                     dry_run=False,
+                    host="menu bar",
                 )
             except Exception as e:  # never let a bad start crash the menu bar
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)

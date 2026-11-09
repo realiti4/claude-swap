@@ -263,7 +263,7 @@ class TestConfigMisc:
 
         class FakeEngine:
             def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                         state_path=None, clock=None):
+                         state_path=None, clock=None, host=None, overrides=()):
                 captured["settings"] = settings
 
             def tick(self):
@@ -317,7 +317,7 @@ class TestWeeklyThresholdConfig:
 
         class FakeEngine:
             def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                         state_path=None, clock=None):
+                         state_path=None, clock=None, host=None, overrides=()):
                 captured["settings"] = settings
 
             def tick(self):

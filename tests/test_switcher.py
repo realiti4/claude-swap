@@ -1394,6 +1394,7 @@ class TestSetupTokenHeaderProbeWiring:
         assert entry.last_error == "setup-token"
         lines = _usage_entry_lines(entry)
         assert "usage.headerProbe true" in lines[0]
+        assert "cswap statusline install" in lines[0]
 
     def test_partial_and_rejected_readings_stay_visible(self):
         partial = {"five_hour": {"pct": 5.0}, "source": oauth.USAGE_SOURCE_HEADERS}

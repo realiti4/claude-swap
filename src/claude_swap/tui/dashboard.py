@@ -78,10 +78,12 @@ class DashboardScreen(Screen):
             ("Watch accounts", "watch"),
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
+            ("Account settings…", "account-settings-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Login sync on / off…", "login-sync-menu"),
             ("Remote sync…", "remote-menu"),
             ("Remove account…", "remove-menu"),
+            ("Settings…", "settings"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
         ]
@@ -103,6 +105,26 @@ class DashboardScreen(Screen):
             )
             for acc in (snap.accounts if snap else ())
         ]
+        entries.append(_BACK)
+        return entries
+
+    def _account_settings_entries(self) -> MenuEntries:
+        """One row per account, with the settings it has that aren't defaults."""
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            notes = []
+            if acc.policy.threshold is not None:
+                notes.append(f"threshold {acc.policy.threshold:g}%")
+            if acc.policy.priority:
+                notes.append(f"priority {acc.policy.priority}")
+            if acc.disabled:
+                notes.append("auto-rotation off")
+            if not acc.login_sync and not acc.setup_token and acc.kind != "api_key":
+                notes.append("login sync off")
+            suffix = f"   · {' · '.join(notes)}" if notes else ""
+            entries.append((f"{acc.number}  {name}{suffix}", f"account-settings:{acc.number}"))
         entries.append(_BACK)
         return entries
 
@@ -227,6 +249,7 @@ class DashboardScreen(Screen):
             "auto": app.action_open_auto,
             "add-login": app.action_add_current,
             "add-token": app.action_add_token,
+            "settings": app.action_open_settings,
             "quit": app.exit,
         }
         if action_id == "back":
@@ -250,6 +273,10 @@ class DashboardScreen(Screen):
             app.apply_theme(name)
             app.notify(f"Theme: {name}")
             await self._pop_menu()
+        elif action_id == "account-settings-menu":
+            await self._push_menu("account settings", self._account_settings_entries())
+        elif action_id.startswith("account-settings:"):
+            app.open_account_settings(action_id.split(":", 1)[1])
         elif action_id == "disable-menu":
             await self._push_menu("disable / enable", self._disable_entries())
         elif action_id.startswith("disable:"):
@@ -416,7 +443,9 @@ class WatchScreen(AccountListScreen):
 
     ``s`` arms selection (cursor appears on the active account); Enter then
     switches and stays here — you keep watching on the new account. Esc
-    disarms selection first, then leaves the screen.
+    disarms selection first, then leaves the screen. ``u`` reads usage now for
+    every setup-token account (one header probe each, see
+    ``ClaudeAccountSwitcher.check_setup_token_usage``).
     """
 
     _WATCH_TITLE = "watching all accounts"
@@ -424,6 +453,7 @@ class WatchScreen(AccountListScreen):
 
     BINDINGS = [
         Binding("s", "toggle_select", "Switch"),
+        Binding("u", "app.check_usage", "Check setup-token usage"),
         Binding("enter", "select_highlighted", "Confirm", priority=True),
         Binding("f", "app.refresh_full", "Refresh", show=False),
         Binding("escape,q", "back", "Back"),

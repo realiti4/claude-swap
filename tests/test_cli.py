@@ -1612,11 +1612,13 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, host=None, overrides=()):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.host = host
+            self.overrides = tuple(overrides)
             type(self).instances.append(self)
 
         def tick(self):

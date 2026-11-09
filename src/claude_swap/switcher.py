@@ -87,6 +87,7 @@ from claude_swap.printer import (
 )
 from claude_swap.paths import (
     get_backup_root,
+    get_claude_config_home,
     get_credentials_path,
     get_default_claude_config_home,
     get_global_config_path,
@@ -102,6 +103,7 @@ from claude_swap.settings import (
     settings_path,
 )
 from claude_swap.usage_store import (
+    CLIENT_SIDE_ERRORS,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -229,8 +231,9 @@ ERROR_NOTES = {
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
     "setup-token": (
-        "setup-tokens cannot read the usage endpoint — "
-        "`cswap config set usage.headerProbe true` reads it from a 1-token request"
+        "no reading yet — `cswap statusline install` takes it from Claude Code "
+        "as you work, `u` in `cswap watch` reads it now, "
+        "`cswap config set usage.headerProbe true` on every poll"
     ),
 }
 
@@ -352,6 +355,33 @@ class LoginSyncResult:
     email: str
     updated: bool
     detail: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class UsageCheckResult:
+    """One account's outcome in :meth:`ClaudeAccountSwitcher.check_setup_token_usage`.
+
+    ``outcome``: ``"updated"`` (a fresh reading is stored), ``"failed"`` (the
+    request was sent and failed; ``detail`` says how) or ``"skipped"`` (not
+    sent; ``detail`` says why, e.g. the server asked to wait).
+    """
+
+    number: str
+    email: str
+    outcome: str
+    detail: str = ""
+
+
+def _wait_text(seconds: float) -> str:
+    """'45s', '4m', '2h 5m': how long until a backoff lifts."""
+    s = max(1, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m = -(-s // 60)
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m" if m else f"{h}h"
 
 
 class ClaudeAccountSwitcher:
@@ -1988,6 +2018,80 @@ class ClaudeAccountSwitcher:
             for num, entry in self._usage_store.entries(identities).items()
         }
 
+    def check_setup_token_usage(self) -> list[UsageCheckResult]:
+        """Read usage now for every setup-token account (the TUI's ``u``).
+
+        One header probe each, whatever ``usage.headerProbe`` says and however
+        fresh the stored reading: the user asked for it, which is what the
+        setting's opt-in protects. Readings are stored and paced like any
+        other fetch. What still holds an account back is the server's word
+        (a 429's backoff, a quota refusal until it ends), a dead token, a
+        reading held from another machine, or another cswap reading it right
+        now; the backoff from "probe off" is cswap's own and does not count.
+        Blocking (network): call it off the UI thread.
+        """
+        accounts_info = self._build_accounts_info()
+        targets = {
+            str(info[0]): info for info in accounts_info
+            if self._static_usage_sentinel(info) is None
+            and oauth.is_setup_token(oauth.extract_oauth_data(info[5] or ""))
+        }
+        if not targets:
+            return []
+        store = self._usage_store
+        identities = {num: (info[1], info[3] or "") for num, info in targets.items()}
+        _threshold, _weekly, models = self._poll_policy_inputs()
+        pre = store.entries(identities, models)
+        claims = store.reserve(list(targets), identities, respect_plans=False, force=True)
+        records: dict[str, FetchRecord] = {}
+        accepted: set[str] = set()
+        if claims:
+            records = self._run_usage_fetches(
+                [targets[num] for num in claims], pre, header_probe=True
+            )
+            plans = self._plans_after_fetch(records, pre, targets)
+            accepted = store.record(records, identities, claims, plans)
+        now = store.clock()
+        after = store.entries(identities, models)
+        results: list[UsageCheckResult] = []
+        for num, info in targets.items():
+            email = info[1]
+            if num not in claims:
+                reason = self._usage_check_skip_reason(after[num], now)
+                results.append(UsageCheckResult(num, email, "skipped", reason))
+                continue
+            rec = records[num]
+            if num not in accepted:
+                results.append(UsageCheckResult(
+                    num, email, "skipped", "another cswap stored a reading meanwhile"))
+            elif rec.sentinel is not None:
+                results.append(UsageCheckResult(num, email, "failed", rec.sentinel))
+            elif rec.error is not None:
+                detail = rec.error
+                if rec.retry_after_s:
+                    detail += f", retry in {_wait_text(rec.retry_after_s)}"
+                results.append(UsageCheckResult(num, email, "failed", detail))
+            elif isinstance(rec.usage, dict) and rec.usage.get("rejected"):
+                results.append(UsageCheckResult(num, email, "updated", "at its limit"))
+            else:
+                results.append(UsageCheckResult(num, email, "updated"))
+        return results
+
+    @staticmethod
+    def _usage_check_skip_reason(entry: UsageEntry, now: float) -> str:
+        if entry.token_dead():
+            return "its token was refused; add it again"
+        if entry.in_backoff(now) and entry.last_error not in CLIENT_SIDE_ERRORS:
+            wait = _wait_text(entry.backoff_until - now)
+            if entry.last_error is None:
+                return f"at its limit, the server refuses for {wait}"
+            return f"the server asked to wait ({entry.last_error}), {wait} left"
+        if entry.held(now):
+            return "showing another machine's reading (import-usage hold)"
+        if entry.claim_until is not None and now < entry.claim_until:
+            return "another cswap is reading it right now"
+        return "not checked"
+
     def set_poll_policy_inputs(
         self,
         threshold: float,
@@ -2028,6 +2132,11 @@ class ClaudeAccountSwitcher:
         )
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def _probe_on(self, override: bool | None) -> bool:
+        """The header-probe switch for one fetch: an explicit override (the
+        manual check), else ``usage.headerProbe``."""
+        return self._header_probe_enabled() if override is None else override
 
     def _header_probe_enabled(self) -> bool:
         """``usage.headerProbe`` from the settings file (reloaded only when it
@@ -4837,7 +4946,8 @@ class ClaudeAccountSwitcher:
         return accounts_info
 
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str, org_uuid: str = ""
+        self, account_num: str, email: str, creds: str, org_uuid: str = "",
+        header_probe: bool | None = None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -4905,7 +5015,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
-                header_probe=self._header_probe_enabled(),
+                header_probe=self._probe_on(header_probe),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -5397,7 +5507,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
-            header_probe=self._header_probe_enabled(),
+            header_probe=self._probe_on(header_probe),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5589,16 +5699,20 @@ class ClaudeAccountSwitcher:
         self,
         account_info: tuple[int, str, str, str, bool, str, str],
         rejected_fp: str | None = None,
+        header_probe: bool | None = None,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises. ``rejected_fp``
-        is the row's refused-credential stamp, if any."""
+        is the row's refused-credential stamp, if any. ``header_probe``
+        overrides ``usage.headerProbe`` for this fetch (None: the setting)."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds, org_uuid)
+            return self._fetch_active_usage(
+                str(num), email, creds, org_uuid, header_probe=header_probe
+            )
 
         from claude_swap.session import (
             read_session_credentials,
@@ -5673,7 +5787,9 @@ class ClaudeAccountSwitcher:
                 # active account in _fetch_active_usage).
                 if oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                return self._read_only_fetch(str(num), email, session_creds, rejected_fp)
+                return self._read_only_fetch(
+                    str(num), email, session_creds, rejected_fp, header_probe
+                )
 
         if has_live_session:
             # No profile credential to read (wiped under the session, or
@@ -5683,13 +5799,13 @@ class ClaudeAccountSwitcher:
             backup_oauth = oauth.extract_oauth_data(creds) or {}
             if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-            return self._read_only_fetch(str(num), email, creds, rejected_fp)
+            return self._read_only_fetch(str(num), email, creds, rejected_fp, header_probe)
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=False,
             refresh_via=self.consume_backup_grant,
-            header_probe=self._header_probe_enabled(),
+            header_probe=self._probe_on(header_probe),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5699,7 +5815,8 @@ class ClaudeAccountSwitcher:
         )
 
     def _read_only_fetch(
-        self, num: str, email: str, creds: str, rejected_fp: str | None
+        self, num: str, email: str, creds: str, rejected_fp: str | None,
+        header_probe: bool | None = None,
     ) -> FetchRecord:
         """A fetch with a live session's credential, which cswap must never
         refresh. A 401 is the live claude having rotated past the copy we
@@ -5713,7 +5830,7 @@ class ClaudeAccountSwitcher:
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
         outcome = oauth.try_fetch_usage_for_account(
             num, email, creds, is_active=True,
-            header_probe=self._header_probe_enabled(),
+            header_probe=self._probe_on(header_probe),
         )
         if outcome.error == "http-401":
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
@@ -5727,10 +5844,13 @@ class ClaudeAccountSwitcher:
         self,
         infos: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry] | None = None,
+        *,
+        header_probe: bool | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant. ``entries``
-        is the pre-fetch snapshot, for each row's refused-credential stamp."""
+        is the pre-fetch snapshot, for each row's refused-credential stamp;
+        ``header_probe`` as in :meth:`_fetch_account_usage`."""
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
@@ -5739,14 +5859,92 @@ class ClaudeAccountSwitcher:
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             entry = entries.get(num) if entries else None
+            # The override rides only when set, so a normal pass calls with
+            # the same shape as before.
+            override = {} if header_probe is None else {"header_probe": header_probe}
             return num, self._fetch_account_usage(
-                info, entry.rejected_fingerprint if entry else None
+                info, entry.rejected_fingerprint if entry else None, **override
             )
 
         with ThreadPoolExecutor() as executor:
             return dict(
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
+
+    def _ingest_statusline(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        identities: dict[str, tuple[str, str]],
+    ) -> set[str]:
+        """Take the readings ``cswap-statusline`` saved (see :mod:`claude_swap.statusline`).
+
+        Setup-token accounts only: their usage can't be read from the usage
+        endpoint, and a reading from a response's headers is all there is.
+        A refreshing login's endpoint reading has every window, so a
+        header reading would replace a fuller one. Returns the slots whose
+        reading was replaced.
+        """
+        from claude_swap import statusline
+
+        records = statusline.read_inbox(self.backup_dir, now=time.time())
+        if not records:
+            return set()
+        matchers = self._statusline_matchers(accounts_info)
+        if not matchers["eligible"]:
+            return set()
+        readings = statusline.readings(records, now=time.time(), **matchers)
+        if not readings:
+            return set()
+        return self._usage_store.adopt(readings, {num: identities[num] for num in readings})
+
+    def _statusline_matchers(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+    ) -> dict:
+        """How a status line record is matched to a slot: the keyword
+        arguments of ``statusline.readings`` other than the records."""
+        from claude_swap import statusline
+
+        token_slots: dict[str, list[str]] = {}
+        emails: dict[str, str] = {}
+        for num, email, _org_name, _org, _active, creds, _alias in accounts_info:
+            data = oauth.extract_oauth_data(creds or "")
+            token = data.get("accessToken") if oauth.is_setup_token(data) else None
+            if isinstance(token, str) and token:
+                token_slots.setdefault(statusline.token_sha256(token), []).append(str(num))
+                emails[str(num)] = email
+        seq = self._get_sequence_data() or {}
+
+        def profile_slot(profile: str) -> str | None:
+            for num, email in emails.items():
+                try:
+                    if self._session_dir(num, email).resolve() == Path(profile):
+                        return num
+                except OSError:
+                    continue
+            return None
+
+        return {
+            "eligible": set(emails),
+            "token_slots": token_slots,
+            "identity_slot": lambda email, org: self._find_account_slot(seq, email, org),
+            "profile_slot": profile_slot,
+        }
+
+    def statusline_report(self) -> list[tuple[dict, list[str]]]:
+        """The saved status line records, each with the setup-token slots its
+        reading is credited to (``[]``: none). For ``cswap statusline status``;
+        reads files only."""
+        from claude_swap import statusline
+
+        records = statusline.read_inbox(self.backup_dir, now=time.time())
+        if not records:
+            return []
+        matchers = self._statusline_matchers(self._build_accounts_info())
+        eligible = matchers.pop("eligible")
+        return [
+            (record, [s for s in statusline.attribute(record, **matchers) if s in eligible])
+            for record in records
+        ]
 
     def _collect_usage_entries(
         self,
@@ -5780,6 +5978,10 @@ class ClaudeAccountSwitcher:
         # Scoped-window models so the 429-stale trust bound honors per-model
         # (e.g. Fable) resets, matching the poll planner's window view.
         _threshold, _weekly_threshold, models = self._poll_policy_inputs()
+        try:
+            self._ingest_statusline(accounts_info, identities)
+        except Exception as e:  # noqa: BLE001 -- a bad record never stops a pass
+            self._logger.warning(f"Status line readings skipped: {e}")
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
@@ -8157,6 +8359,25 @@ class ClaudeAccountSwitcher:
         except OSError:
             return 0
 
+    @staticmethod
+    def _statusline_settings_with_hook() -> list[Path]:
+        """Claude Code settings files (default profile and ``CLAUDE_CONFIG_DIR``'s)
+        whose status line runs ``cswap-statusline``."""
+        from claude_swap import statusline
+
+        found: list[Path] = []
+        for home in (get_default_claude_config_home(), get_claude_config_home()):
+            path = home / "settings.json"
+            try:
+                if path.resolve() in [p.resolve() for p in found]:
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and statusline.is_hook(data.get("statusLine")):
+                found.append(path)
+        return found
+
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
 
@@ -8235,6 +8456,10 @@ class ClaudeAccountSwitcher:
         if remotes:
             print("  - Remote sync settings and saved passphrases "
                   "(the repositories themselves are not changed)")
+        hooked = self._statusline_settings_with_hook()
+        for path in hooked:
+            print(f"  - The cswap status line hook in {path} "
+                  "(your own status line command is put back)")
         # The quarantine tree sits inside the backup dir, so rmtree below takes
         # it with everything else. Every file in it is the losing half of a
         # transcript collision that history migration deliberately refused to
@@ -8328,6 +8553,18 @@ class ClaudeAccountSwitcher:
             try:
                 remote_sync.secrets.delete_all(cfg.id)
                 removed_items.append(f"Remote sync secrets: {cfg.name}")
+            except Exception:
+                pass  # Ignore errors during purge
+
+        # The status line hook lives in Claude Code's settings, outside the
+        # backup dir; left behind it would point at a command that may soon
+        # be uninstalled.
+        from claude_swap import statusline
+
+        for path in hooked:
+            try:
+                if statusline.uninstall(path=path)[0]:
+                    removed_items.append(f"Status line hook: {path}")
             except Exception:
                 pass  # Ignore errors during purge
 

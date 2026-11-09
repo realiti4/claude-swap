@@ -29,6 +29,18 @@ from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, Tok
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
 
+def usage_check_summary(results) -> str:
+    """One line for the notification: how many were read, and why any were not."""
+    if not results:
+        return "No setup-token accounts to check."
+    total = len(results)
+    read = sum(r.outcome == "updated" for r in results)
+    noun = "account" if total == 1 else "accounts"
+    count = f"{total}" if read == total else f"{read} of {total}"
+    notes = [f"{r.number}: {r.detail}" for r in results if r.detail]
+    return " · ".join([f"Usage read for {count} setup-token {noun}", *notes])
+
+
 class CswapApp(App):
     """claude-swap interactive dashboard."""
 
@@ -248,29 +260,34 @@ class CswapApp(App):
     # -- mutating actions (single-flight, captured, off-thread) ---------------
 
     def _start_action(
-        self, label: str, fn, *, show_output: bool = False, on_done=None
+        self, label: str, fn, *, show_output: bool = False, on_done=None,
+        note: str | None = None,
     ) -> None:
         """Run ``fn`` in a worker. ``on_done`` (optional) runs on the UI
         thread once it finished, success or failure, after the busy flag
-        clears -- for a screen that redraws in place instead of navigating."""
+        clears -- for a screen that redraws in place instead of navigating.
+        ``note`` is appended to the success notification (when it applies)."""
         if self.busy:
             self.notify("Another action is still running", severity="warning")
             return
         self.busy = True
         self.run_worker(
-            partial(self._action_blocking, label, fn, show_output, on_done),
+            partial(self._action_blocking, label, fn, show_output, on_done, note),
             thread=True,
             group="action",
             exit_on_error=False,
             name=label,
         )
 
-    def _action_blocking(self, label: str, fn, show_output: bool, on_done=None) -> None:
+    def _action_blocking(
+        self, label: str, fn, show_output: bool, on_done=None, note: str | None = None
+    ) -> None:
         result = run_action(fn)
-        self.call_from_thread(self._action_done, label, result, show_output, on_done)
+        self.call_from_thread(self._action_done, label, result, show_output, on_done, note)
 
     def _action_done(
-        self, label: str, result: ActionResult, show_output: bool, on_done=None
+        self, label: str, result: ActionResult, show_output: bool, on_done=None,
+        note: str | None = None,
     ) -> None:
         self.busy = False
         self.request_refresh()
@@ -292,7 +309,7 @@ class CswapApp(App):
         if show_output and result.output.strip():
             self.push_screen(OutputModal(label, result.output))
         elif result.first_line:
-            self.notify(result.first_line)
+            self.notify(f"{result.first_line} {note}" if note else result.first_line)
 
     # -- account operations ----------------------------------------------------
 
@@ -420,6 +437,17 @@ class CswapApp(App):
                 return acc.email
         return None
 
+    def action_check_usage(self) -> None:
+        """Read usage now for every setup-token account (Watch's ``u``)."""
+        snap = self.snapshot
+        if snap is not None and not any(a.setup_token for a in snap.accounts):
+            self.notify("No setup-token accounts to check.")
+            return
+        self._start_action("Check setup-token usage", self._check_usage_blocking)
+
+    def _check_usage_blocking(self) -> None:
+        print(usage_check_summary(self.switcher.check_setup_token_usage()))
+
     # -- remote sync --------------------------------------------------------------
 
     def remote_sync(self):
@@ -467,6 +495,17 @@ class CswapApp(App):
             return
         self.push_screen(WatchScreen())
 
+    def open_account_settings(self, number: str) -> None:
+        from claude_swap.tui.account_settings import AccountSettingsScreen
+
+        self.push_screen(AccountSettingsScreen(number))
+
+    def action_open_settings(self) -> None:
+        from claude_swap.tui.settings_screen import SettingsScreen
+
+        if not isinstance(self.screen, SettingsScreen):
+            self.push_screen(SettingsScreen())
+
     # -- theme --------------------------------------------------------------
 
     def _resolved_theme(self) -> str:
@@ -475,15 +514,18 @@ class CswapApp(App):
             return self._detected or "dark"
         return self._theme_name
 
-    def apply_theme(self, name: str) -> None:
+    def apply_theme(self, name: str, *, persist: bool = True) -> None:
         """Switch the live theme: TUI + captured printer output + persistence.
 
         ``name`` is the setting; ``auto`` resolves against the pre-driver
-        detection (never re-probes mid-session)."""
+        detection (never re-probes mid-session). ``persist=False`` is for a
+        caller that already wrote the setting (the settings screen)."""
         self._theme_name = name
         resolved = self._resolved_theme()
         self.theme = f"cswap-{resolved}"
         printer.set_theme(resolved)
+        if not persist:
+            return
         try:
             set_setting(self.switcher.backup_dir, "ui.theme", name)
         except Exception as exc:  # persistence is best-effort; never crash the UI

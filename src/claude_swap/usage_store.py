@@ -1060,6 +1060,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        force: bool = False,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1083,6 +1084,9 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+        - ``force=True`` (a manual "read it now"): freshness and plans are
+          ignored. The hard gates above still hold, except a backoff that a
+          client-side error installed (see ``CLIENT_SIDE_ERRORS``).
         """
         nums = list(nums)
         if not nums:
@@ -1099,7 +1103,7 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row, now, respect_plans, repair_overslept, force
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -1331,16 +1335,25 @@ def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+#: Fetch errors cswap reports without asking the server ("setup-token": the
+#: header probe is off, so nothing was sent). The backoff they install paces
+#: the scheduled passes, but carries no server ask, so a forced (manual) read
+#: is not held back by it.
+CLIENT_SIDE_ERRORS = frozenset({"setup-token"})
+
+
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False,
+    force: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
-    (see :meth:`UsageStore.reserve` for the two caller modes)."""
+    (see :meth:`UsageStore.reserve` for the caller modes)."""
     if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
-        return False
+        if not (force and row.get("lastError") in CLIENT_SIDE_ERRORS):
+            return False
     held_until = _num_or_none(row.get("heldUntil"))
     if held_until is not None and now < held_until:
         return False
@@ -1350,6 +1363,8 @@ def _row_eligible(
         now,
     ):
         return False
+    if force:
+        return True
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))

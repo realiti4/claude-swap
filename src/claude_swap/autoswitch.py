@@ -65,6 +65,10 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
+#: Running auto-switch loops announce themselves here (``<pid>-<id>.json``),
+#: so a settings change can say which of them must restart to see it: an
+#: engine reads its settings once, when it starts.
+ENGINES_DIRNAME = "engines"
 STATE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("claude-swap")
@@ -702,9 +706,15 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        host: str = "cswap auto",
+        overrides: Sequence[str] = (),
     ):
         self.switcher = switcher
         self.settings = settings
+        # Who runs this engine, and which settings keys its command line
+        # overrides: what `running_engines` reports while ``run_loop`` runs.
+        self.host = host
+        self.overrides = tuple(overrides)
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -2783,7 +2793,17 @@ class AutoSwitchEngine:
             return delay
 
     def run_loop(self) -> int:
-        """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        """Tick forever (until :meth:`stop`); a failing tick never kills it.
+
+        While it runs, the engine is listed by :func:`running_engines`.
+        """
+        record = _register_engine(self)
+        try:
+            return self._loop()
+        finally:
+            _unregister_engine(record)
+
+    def _loop(self) -> int:
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
@@ -2810,3 +2830,121 @@ class AutoSwitchEngine:
                     )
                 )
             self._wake.wait(delay)
+
+
+# ---------------------------------------------------------------------------
+# running engines
+# ---------------------------------------------------------------------------
+
+
+def _engines_dir(backup_dir: Path) -> Path:
+    return Path(backup_dir) / ENGINES_DIRNAME
+
+
+def _own_start() -> dict:
+    """How this process's start is stamped, so a recycled pid isn't taken
+    for it: Linux start ticks, else ``ps``'s start time."""
+    import os
+
+    from claude_swap.process_detection import process_start_ticks, process_started_at
+
+    pid = os.getpid()
+    ticks = process_start_ticks(pid)
+    if ticks is not None:
+        return {"procStart": ticks}
+    started = process_started_at(pid)
+    return {"procStartedAt": started} if started is not None else {}
+
+
+def _register_engine(engine: AutoSwitchEngine) -> Path | None:
+    """Announce a running loop; best effort (never stops the engine)."""
+    import os
+    import uuid
+
+    try:
+        folder = _engines_dir(engine.switcher.backup_dir)
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = folder / f"{os.getpid()}-{uuid.uuid4().hex[:8]}.json"
+        atomic_write_json(path, {
+            "pid": os.getpid(),
+            "host": engine.host,
+            "dryRun": engine.dry_run,
+            "overrides": list(engine.overrides),
+            "startedAt": time.time(),
+            **_own_start(),
+        })
+        return path
+    except Exception:  # the registry is advisory: never stop the engine
+        _logger.debug("could not register the auto-switch engine", exc_info=True)
+        return None
+
+
+def _unregister_engine(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        _logger.debug("could not unregister the auto-switch engine", exc_info=True)
+
+
+def _engine_alive(record: dict) -> bool:
+    from claude_swap.process_detection import (
+        PID_REUSE_SLACK_S,
+        is_pid_alive,
+        process_start_ticks,
+        process_started_at,
+    )
+
+    pid = record.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not is_pid_alive(pid):
+        return False
+    ticks = record.get("procStart")
+    if isinstance(ticks, str) and ticks:
+        current = process_start_ticks(pid)
+        return current is None or current == ticks
+    started = record.get("procStartedAt")
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        current = process_started_at(pid)
+        return current is None or abs(current - started) <= PID_REUSE_SLACK_S
+    return True  # nothing to tell a recycled pid by (Windows): assume it's ours
+
+
+def running_engines(backup_dir: Path) -> list[dict]:
+    """Auto-switch loops running now, on this machine, for this data folder.
+
+    Each is ``{pid, host, dryRun, overrides, startedAt}``: ``host`` says who
+    runs it (``cswap auto``, ``menu bar``, ``TUI auto view``) and
+    ``overrides`` the settings keys its command line overrides. Records of
+    processes that are gone are deleted. ``cswap auto --once`` never shows:
+    it reads the settings afresh every run.
+    """
+    folder = _engines_dir(backup_dir)
+    try:
+        paths = sorted(p for p in folder.iterdir() if p.suffix == ".json")
+    except OSError:
+        return []
+    found = []
+    for path in paths:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if not _engine_alive(record):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        overrides = record.get("overrides")
+        found.append({
+            "pid": record["pid"],
+            "host": str(record.get("host") or "cswap auto"),
+            "dryRun": record.get("dryRun") is True,
+            "overrides": [o for o in overrides if isinstance(o, str)]
+            if isinstance(overrides, list) else [],
+            "startedAt": record.get("startedAt"),
+        })
+    return found
