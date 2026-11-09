@@ -429,12 +429,11 @@ cswap add-token --email user@example.com     # optional label override
 Keep setup-token accounts in a private git repository, encrypted with a passphrase, and copy them to and from each machine. Only `claude setup-token` accounts can be shared, because they never refresh. A normal login copied to a second machine would sign the first one out at its next refresh.
 
 ```bash
-uv tool install --force 'claude-swap[remote]'                # adds the encryption library
 cswap remote add team git@github.com:me/claude-tokens.git    # empty private repo; asks for a new passphrase
 cswap remote push team                                       # share this machine's setup-token accounts
 # on the other machine:
 cswap remote add team git@github.com:me/claude-tokens.git    # same passphrase
-cswap remote show team                                       # here only / repo only / differs / in sync
+cswap remote show team                                       # local / remote / differs / synced
 cswap remote pull team                                       # add them here
 ```
 

@@ -92,6 +92,7 @@ name = "claude-swap"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "textual" },
     { name = "truststore" },
 ]
@@ -100,13 +101,9 @@ dependencies = [
 menubar = [
     { name = "rumps" },
 ]
-remote = [
-    { name = "cryptography" },
-]
 
 [package.dev-dependencies]
 dev = [
-    { name = "cryptography" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-xdist" },
@@ -114,16 +111,15 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cryptography", marker = "extra == 'remote'", specifier = ">=42" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
     { name = "textual", specifier = ">=8.2.8,<9" },
     { name = "truststore", specifier = ">=0.10.4" },
 ]
-provides-extras = ["menubar", "remote"]
+provides-extras = ["menubar"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "cryptography", specifier = ">=42" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-xdist", specifier = ">=3.5" },

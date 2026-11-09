@@ -37,6 +37,16 @@ MenuEntries = list[tuple[str, str]]  # (label, action_id)
 
 _BACK = ("← back", "back")
 
+#: Submenus that list the accounts, by title, with the method that builds
+#: them. An open one is rebuilt when its rows change (an account removed or
+#: added, a label's state flipped), so it never offers an account that is gone.
+_ACCOUNT_MENUS = {
+    "remove account": "_remove_entries",
+    "account settings": "_account_settings_entries",
+    "disable / enable": "_disable_entries",
+    "login sync": "_login_sync_entries",
+}
+
 
 class DashboardScreen(Screen):
     BINDINGS = [
@@ -67,6 +77,30 @@ class DashboardScreen(Screen):
     async def on_mount(self) -> None:
         self.query_one("#menu", ListView).focus()
         await self._push_menu("menu", self._root_entries())
+        self.watch(self.app, "snapshot", self._on_snapshot, init=False)
+
+    async def _on_snapshot(self, _snap) -> None:
+        """Keep an open account submenu in step with the accounts."""
+        if not self._menu_stack:
+            return
+        title, entries = self._menu_stack[-1]
+        builder = _ACCOUNT_MENUS.get(title)
+        if builder is None:
+            return
+        fresh = getattr(self, builder)()
+        if fresh != entries:
+            await self._replace_menu(fresh)
+
+    async def _replace_menu(self, entries: MenuEntries) -> None:
+        """Swap the open submenu's rows, keeping the cursor on the same row,
+        or at the same place when that row is gone."""
+        menu = self.query_one("#menu", ListView)
+        current = menu.highlighted_child
+        keep = current.action_id if isinstance(current, MenuItem) else None
+        ids = [action_id for _label, action_id in entries]
+        index = ids.index(keep) if keep in ids else min(menu.index or 0, len(entries) - 1)
+        self._menu_stack[-1] = (self._menu_stack[-1][0], entries)
+        await self._render_menu(index=index)
 
     # -- menu plumbing --------------------------------------------------------
 
@@ -221,7 +255,7 @@ class DashboardScreen(Screen):
             self._menu_stack.pop()
             await self._render_menu()
 
-    async def _render_menu(self) -> None:
+    async def _render_menu(self, index: int = 0) -> None:
         title, entries = self._menu_stack[-1]
         crumb = " › ".join(t for t, _ in self._menu_stack)
         self.query_one("#menu-title", Static).update(crumb)
@@ -234,7 +268,7 @@ class DashboardScreen(Screen):
             )
             for label, action_id in entries
         )
-        menu.index = 0
+        menu.index = index
 
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item

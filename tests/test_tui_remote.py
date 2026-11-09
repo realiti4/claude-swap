@@ -9,7 +9,6 @@ import subprocess
 
 import pytest
 
-pytest.importorskip("cryptography")
 pytest.importorskip("textual")
 
 from claude_swap import remote as rm  # noqa: E402
@@ -94,11 +93,11 @@ class TestRemoteScreen:
             assert isinstance(app.screen, RemoteScreen)
             ids = menu_ids(app)
             assert ids[0] == "push-all" and "row:0" in ids
-            assert "here only" in menu_labels(app)["row:0"]
+            assert "local" in menu_labels(app)["row:0"]
 
             await menu_select(pilot, "push-all")
             await settle(pilot)
-            assert "in sync" in menu_labels(app)["row:0"]
+            assert "synced" in menu_labels(app)["row:0"]
             assert "push-all" not in menu_ids(app)
         assert cfg.id in here.record(num)["remotes"]
 
@@ -111,12 +110,12 @@ class TestRemoteScreen:
         async with app.run_test(size=(110, 40)) as pilot:
             await settle(pilot)
             await open_remote(pilot, cfg)
-            assert "repo only" in menu_labels(app)["row:0"]
+            assert "remote" in menu_labels(app)["row:0"]
             await menu_select(pilot, "row:0")
             assert menu_ids(app)[:3] == ["act-pull:0", "act-skip:0", "act-rm:0"]
             await menu_select(pilot, "act-pull:0")
             await settle(pilot)
-            assert "in sync" in menu_labels(app)["row:0"]
+            assert "synced" in menu_labels(app)["row:0"]
         num = here.s._find_account_slot(here.s._get_sequence_data(), "spare@example.com", "")
         assert here.token_of(num) == TOKEN_B
 

@@ -125,13 +125,14 @@ _REMOVED_NOTE = "removed from the repository"
 
 
 def _aesgcm():
+    # Imported on first use: only remote sync needs it, and it is slow to load.
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError:
         raise RemoteError(
-            "Remote sync needs the 'cryptography' package. Install the extra: "
-            "uv tool install --force 'claude-swap[remote]' "
-            "(or pip install 'claude-swap[remote]')."
+            "Remote sync needs the 'cryptography' package, which comes with "
+            "claude-swap; this install is missing it. Reinstall: "
+            "uv tool install --force claude-swap (or pip install --force-reinstall claude-swap)."
         ) from None
     return AESGCM
 
@@ -1003,7 +1004,7 @@ class RemoteSync:
             raise ValidationError("An HTTPS access token is required for this login type.")
         if not passphrase:
             raise ValidationError("A passphrase is required.")
-        _aesgcm()  # missing extra: say so before touching the network
+        _aesgcm()  # a broken install: say so before touching the network
 
         cfg = RemoteConfig(
             id=str(uuid.uuid4()), name=name, url=url, branch=branch, auth=auth,

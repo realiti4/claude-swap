@@ -322,8 +322,12 @@ class AutoScreen(Screen):
         weekly = settings.weekly_threshold if settings else None
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
         lines: dict[str, Text] = {}
+        held_out = False
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
+                continue
+            if acc.disabled:  # out of auto-rotation: the engine never picks it
+                held_out = True
                 continue
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
@@ -363,7 +367,8 @@ class AutoScreen(Screen):
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
-            text.append("\n  no other switchable accounts", style=palette.muted)
+            empty = "no other accounts in auto-rotation" if held_out else "no other switchable accounts"
+            text.append(f"\n  {empty}", style=palette.muted)
             return text
         for _pct, number in sorted(ranked):
             text.append(lines[number])

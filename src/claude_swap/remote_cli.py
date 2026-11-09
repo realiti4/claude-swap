@@ -39,8 +39,8 @@ Examples:
   cswap remote add team https://github.com/me/claude-tokens.git --token -
   cswap remote add team git@host:x.git --ssh-key ~/.ssh/tokens_deploy
   cswap remote show team
-  cswap remote push team            # everything here-only, asks about changes
-  cswap remote pull team --yes      # everything repo-only, takes all changes
+  cswap remote push team            # every local account, asks about changes
+  cswap remote pull team --yes      # every remote account, takes all changes
   cswap remote add-token team - --email spare@example.com < token.txt
 
 The passphrase is remembered on this machine unless --no-remember is given
@@ -116,10 +116,10 @@ def _print_report(report) -> None:
 
 
 _STATE_STYLE = {
-    "in-sync": ("in sync", dimmed),
+    "in-sync": ("synced", dimmed),
     "differs": ("differs", accent),
-    "here-only": ("here only", bolded),
-    "repo-only": ("repo only", bolded),
+    "here-only": ("local", bolded),
+    "repo-only": ("remote", bolded),
     "skipped": ("skipped", muted),
     "unreadable": ("unreadable", yellowed),
     "not-shareable": ("not shareable", muted),
@@ -146,9 +146,9 @@ def _show(sync, name: str) -> None:
     counts = {s: sum(r.state == s for r in status.rows) for s in (rm.HERE_ONLY, rm.REPO_ONLY, rm.DIFFERS)}
     hints = []
     if counts[rm.HERE_ONLY]:
-        hints.append(f"`cswap remote push {cfg.name}` shares the here-only accounts")
+        hints.append(f"`cswap remote push {cfg.name}` shares the local accounts")
     if counts[rm.REPO_ONLY]:
-        hints.append(f"`cswap remote pull {cfg.name}` adds the repo-only ones here")
+        hints.append(f"`cswap remote pull {cfg.name}` adds the remote ones here")
     if counts[rm.DIFFERS]:
         hints.append("push or pull asks which copy to keep for each that differs")
     for hint in hints:

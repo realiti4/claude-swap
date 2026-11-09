@@ -33,10 +33,10 @@ The first time a repository and a machine meet, accounts are matched by token: a
 
 | State | Meaning |
 |-------|---------|
-| in sync | same token on both sides |
+| synced | same token on both sides |
 | differs | linked, but the tokens are different; push or pull asks which to keep |
-| here only | a local setup-token account the repository doesn't have |
-| repo only | a repository entry this machine doesn't have |
+| local | a setup-token account on this machine that the repository doesn't have |
+| remote | a repository entry this machine doesn't have |
 | skipped | a repository entry marked *not on this machine* (`skip`) |
 | unreadable | an entry file that doesn't decrypt or validate; left alone |
 | not shareable | a refreshing login or an API key |
@@ -45,14 +45,14 @@ A local account with the same email label as an entry is **not** a match, becaus
 
 ## What push and pull do
 
-`push NAME` with no accounts named adds every *here only* account, except:
+`push NAME` with no accounts named adds every *local* account, except:
 
 - one that was in the repository and has been removed from it (`rm-entry` on any machine). Name it to add it again.
 - one whose email label the repository already holds with a different token. Pull that entry to take its token, or name the account to add it as a second entry.
 
 For every *differs* account it asks whether to replace the repository's copy. `--yes` accepts all of them; without a terminal and without `--yes` the repository keeps its copy.
 
-`pull NAME` with no entries named adds every *repo only* entry, except skipped ones and any whose email label a local account already uses (cswap keeps one token account per label). Naming an entry pulls it even when skipped, and clears the skip. `--replace` lets a named entry overwrite the token of the local account with its label. For every *differs* account it asks whether to replace this machine's token.
+`pull NAME` with no entries named adds every *remote* entry, except skipped ones and any whose email label a local account already uses (cswap keeps one token account per label). Naming an entry pulls it even when skipped, and clears the skip. `--replace` lets a named entry overwrite the token of the local account with its label. For every *differs* account it asks whether to replace this machine's token.
 
 `add-token` puts a token in the repository without adding an account on this machine. Without `--email` the entry gets a placeholder label.
 

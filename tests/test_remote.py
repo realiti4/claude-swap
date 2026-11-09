@@ -17,11 +17,9 @@ from unittest.mock import patch
 
 import pytest
 
-pytest.importorskip("cryptography")
-
-from claude_swap import remote as rm  # noqa: E402
-from claude_swap.exceptions import PassphraseError, RemoteError, ValidationError  # noqa: E402
-from claude_swap.switcher import ClaudeAccountSwitcher  # noqa: E402
+from claude_swap import remote as rm
+from claude_swap.exceptions import PassphraseError, RemoteError, ValidationError
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 PASS = "correct horse battery"
 TOKEN_A = "sk-ant-oat01-" + "A" * 30
@@ -380,7 +378,7 @@ class TestSync:
         num_b = b.token_account(TOKEN_B, "team@example.com")
 
         row = b.rows()["team@example.com"]
-        # B's own account is here-only; the repository's is repo-only with a conflict.
+        # B's own account is local; the repository's is remote, with a conflict.
         repo_row = next(r for r in b.r.status("shared", PASS).rows if r.state == rm.REPO_ONLY)
         assert repo_row.conflict_num == num_b
         assert row is not None

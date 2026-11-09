@@ -1072,6 +1072,63 @@ class TestDashboard:
             await settle(pilot)
             assert ("remove", "2", True) in fake.calls
 
+    async def test_removed_account_leaves_the_open_menu(self, tmp_path):
+        """The remove submenu stays open after a removal (to remove several),
+        so it must drop the row of the account that is gone, with the cursor
+        on the row that took its place."""
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import MenuItem
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "remove-menu")
+            await menu_select(pilot, "remove:2")
+            await pilot.press("y")
+            await settle(pilot)
+            menu = app.screen.query_one("#menu", ListView)
+            ids = [item.action_id for item in menu.query(MenuItem)]
+            assert ids == ["remove:1", "remove:3", "back"]
+            assert menu.highlighted_child.action_id == "remove:3"
+
+    async def test_account_menus_follow_the_accounts(self, tmp_path):
+        """An account removed or added elsewhere (the CLI, another window)
+        shows up in whichever account list is open, keeping the cursor's row."""
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import MenuItem
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            for menu_id, prefix in (
+                ("account-settings-menu", "account-settings:"),
+                ("disable-menu", "disable:"),
+                ("login-sync-menu", "login-sync:"),
+            ):
+                fake._accounts = [make_account(1, active=True), make_account(2), make_account(3)]
+                app.request_refresh()
+                await settle(pilot)
+                await menu_select(pilot, menu_id)
+                menu = app.screen.query_one("#menu", ListView)
+                menu.index = 2  # account 3
+                await pilot.pause()
+                fake._accounts = [make_account(1, active=True), make_account(3), make_account(4)]
+                app.request_refresh()
+                await settle(pilot)
+                ids = [item.action_id for item in menu.query(MenuItem)]
+                assert ids == [f"{prefix}1", f"{prefix}3", f"{prefix}4", "back"], menu_id
+                assert menu.highlighted_child.action_id == f"{prefix}3", menu_id
+                await pilot.press("escape")
+                await settle(pilot)
+
     async def test_remove_via_menu_cancel_is_safe(self, tmp_path):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
@@ -1727,6 +1784,47 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
+
+    async def test_candidates_leave_out_accounts_out_of_rotation(self, tmp_path, fake_engine):
+        """A disabled account is never a switch target, so it is not a candidate,
+        however much headroom it has."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(80.0, 10.0)),
+                make_account(3, entry=make_entry(5.0, 5.0), disabled=True),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "user2@example.com" in plain
+            assert "user3@example.com" not in plain
+
+    async def test_candidates_when_every_other_account_is_out_of_rotation(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 5.0), disabled=True),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "user2@example.com" not in plain
+            assert "no other accounts in auto-rotation" in plain
 
     async def test_candidates_rank_by_policy_headroom_under_a_weekly_line(
         self, tmp_path, fake_engine

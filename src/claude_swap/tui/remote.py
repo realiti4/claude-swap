@@ -2,8 +2,8 @@
 
 Opening a repository fetches it (asking for the passphrase when none is
 saved, or the saved one stopped working), then lists every setup-token
-account by where it is: here only, in the repository only, in both but
-different, in sync. Enter on an account offers what applies to it; every
+account by where it is: local (this machine only), remote (the repository
+only), differs (in both, different tokens), synced. Enter on an account offers what applies to it; every
 action fetches again first (``RemoteSync`` does) and redraws from a fresh
 comparison afterwards.
 
@@ -37,10 +37,10 @@ MenuEntries = list[tuple[str, str]]
 _BACK = ("← back", "back")
 
 STATE_LABEL = {
-    rm.IN_SYNC: "in sync",
+    rm.IN_SYNC: "synced",
     rm.DIFFERS: "differs",
-    rm.HERE_ONLY: "here only",
-    rm.REPO_ONLY: "repo only",
+    rm.HERE_ONLY: "local",
+    rm.REPO_ONLY: "remote",
     rm.SKIPPED: "skipped",
     rm.UNREADABLE: "unreadable",
     rm.NOT_SHAREABLE: "n/a",
@@ -414,9 +414,9 @@ class RemoteScreen(Screen):
         there = sum(r.state == rm.REPO_ONLY and not r.conflict_num for r in rows)
         entries: MenuEntries = []
         if here:
-            entries.append((f"↑ Push every here-only account ({here})", "push-all"))
+            entries.append((f"↑ Push every local account ({here})", "push-all"))
         if there:
-            entries.append((f"↓ Pull every repo-only account ({there})", "pull-all"))
+            entries.append((f"↓ Pull every remote account ({there})", "pull-all"))
         entries += [(row_label(r), f"row:{i}") for i, r in enumerate(rows)]
         if status is not None and not rows:
             entries.append(("No setup-token accounts here or in the repository yet.", "noop"))
