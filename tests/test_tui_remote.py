@@ -198,20 +198,91 @@ class TestAddRepository:
             assert isinstance(app.screen, RemoteScreen)
         assert [r.name for r in here.r.remotes()] == ["team"]
 
-    async def test_failed_add_shows_the_error(self, here, tmp_path):
-        from claude_swap.tui.modals import OutputModal
+    async def test_unreachable_url_keeps_the_form_open_and_filled(self, here, tmp_path):
+        from claude_swap.tui.remote import AddRemoteModal
 
+        app = app_for(here, tmp_path)
+        missing = (tmp_path / "missing.git").as_uri()
+        async with app.run_test(size=(110, 50)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "remote-menu")
+            await menu_select(pilot, "remote-add")
+            modal = app.screen
+            fill(modal, name="gone", url=missing, passphrase=PASS, again=PASS)
+            modal._submit()
+            await settle(pilot)
+            assert app.screen is modal and isinstance(modal, AddRemoteModal)
+            assert "git fetch failed" in str(modal.query_one("#form-error").render())
+            assert modal.query_one("#name").value == "gone"
+            assert modal.query_one("#url").value == missing
+            assert modal.query_one("#passphrase").value == PASS
+            assert app.focused is modal.query_one("#url")
+            assert not app.busy and not modal.query_one("#ok").disabled
+        assert here.r.remotes() == []
+
+    async def test_wrong_passphrase_is_caught_before_the_form_closes(self, here, other, bare, tmp_path):
+        from claude_swap.tui.remote import RemoteScreen
+
+        other.r.add("team", bare.as_uri(), passphrase=PASS)
         app = app_for(here, tmp_path)
         async with app.run_test(size=(110, 50)) as pilot:
             await settle(pilot)
             await menu_select(pilot, "remote-menu")
             await menu_select(pilot, "remote-add")
             modal = app.screen
-            modal.query_one("#name").value = "gone"
-            modal.query_one("#url").value = (tmp_path / "missing.git").as_uri()
-            modal.query_one("#passphrase").value = PASS
-            modal.query_one("#again").value = PASS
+            fill(modal, name="team", url=bare.as_uri(), ssh_key="",
+                 passphrase="not the passphrase", again="not the passphrase")
             modal._submit()
             await settle(pilot)
-            assert isinstance(app.screen, OutputModal)
-        assert here.r.remotes() == []
+            assert app.screen is modal
+            assert "Wrong passphrase" in str(modal.query_one("#form-error").render())
+            assert modal.query_one("#name").value == "team"
+            assert modal.query_one("#url").value == bare.as_uri()
+            assert modal.query_one("#passphrase").value == "" == modal.query_one("#again").value
+            assert app.focused is modal.query_one("#passphrase")
+
+            fill(modal, passphrase=PASS, again=PASS)
+            modal._submit()
+            await settle(pilot)
+            await settle(pilot)
+            assert isinstance(app.screen, RemoteScreen)
+        assert [r.name for r in here.r.remotes()] == ["team"]
+
+
+    async def test_escape_while_connecting_does_not_lose_the_form(self, here, bare, tmp_path):
+        import threading
+
+        from tests.test_tui import wait_event
+
+        started, release = threading.Event(), threading.Event()
+        real_add = here.r.add
+
+        def slow_add(*args, **kwargs):
+            started.set()
+            release.wait(5)
+            return real_add(*args, **kwargs)
+
+        here.r.add = slow_add
+        app = app_for(here, tmp_path)
+        async with app.run_test(size=(110, 50)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "remote-menu")
+            await menu_select(pilot, "remote-add")
+            modal = app.screen
+            fill(modal, name="team", url=bare.as_uri(), passphrase=PASS, again=PASS)
+            modal._submit()
+            await wait_event(started)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.screen is modal
+            assert modal.query_one("#name").disabled and app.busy
+            assert "Still connecting" in str(modal.query_one("#form-error").render())
+            release.set()
+            await settle(pilot)
+            await settle(pilot)
+            assert app.screen is not modal and not app.busy
+        assert [r.name for r in here.r.remotes()] == ["team"]
+
+def fill(modal, **values) -> None:
+    for field_id, value in values.items():
+        modal.query_one(f"#{field_id}").value = value

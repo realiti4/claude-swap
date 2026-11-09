@@ -214,8 +214,42 @@ class RemoteForm:
         return "default"
 
 
+@dataclass
+class AddedRemote:
+    """What a successful add dismisses with."""
+
+    cfg: rm.RemoteConfig
+    message: str
+    passphrase: str
+
+
+def _field_for(error: ClaudeSwitchError) -> str:
+    """The form field an add failure points at, to focus it."""
+    if isinstance(error, PassphraseError):
+        return "passphrase"
+    text = str(error).lower()
+    for needle, field_id in (
+        ("remote name", "name"), ("already exists", "name"),
+        ("ssh key", "ssh_key"), ("branch", "branch"),
+        ("token", "token"), ("https login", "token"),
+    ):
+        if needle in text:
+            return field_id
+    return "url"
+
+
 class AddRemoteModal(_FormModal):
-    """Where the repository is, how git logs in, and its passphrase."""
+    """Where the repository is, how git logs in, and its passphrase.
+
+    It adds the repository itself and stays open until that worked: a wrong
+    passphrase, an unreachable URL or a refused login shows here, next to
+    the fields, with everything typed still in place.
+    """
+
+    def __init__(self, sync: rm.RemoteSync) -> None:
+        super().__init__()
+        self.sync = sync
+        self._working = False
 
     def compose(self) -> ComposeResult:
         # Scrolls: nine fields outgrow a short terminal, and focus moving
@@ -240,6 +274,8 @@ class AddRemoteModal(_FormModal):
             yield from self._buttons("Add")
 
     def _submit(self) -> None:
+        if self._working:
+            return
         form = RemoteForm(
             name=self._value("name").strip(),
             url=self._value("url").strip(),
@@ -260,8 +296,62 @@ class AddRemoteModal(_FormModal):
             self._error(f"The passphrase needs at least {rm.MIN_PASSPHRASE} characters.")
         elif form.passphrase != self._value("again"):
             self._error("The two passphrase entries differ.")
+        elif self.app.busy:
+            self._error("Another action is still running; try again in a moment.")
         else:
-            self.dismiss(form)
+            self._start(form)
+
+    def _set_working(self, working: bool) -> None:
+        self._working = working
+        for widget in self.query("Input, Checkbox, Button"):
+            widget.disabled = working
+
+    def _start(self, form: RemoteForm) -> None:
+        self.app.busy = True
+        self._set_working(True)
+        self._error(f"Connecting to {form.url}…")
+        self.run_worker(
+            partial(self._add_blocking, form),
+            thread=True, group="action", exit_on_error=False, name="Add repository",
+        )
+
+    def _add_blocking(self, form: RemoteForm) -> None:
+        try:
+            cfg, created, count = _quiet(lambda: self.sync.add(
+                form.name, form.url, passphrase=form.passphrase, branch=form.branch,
+                auth=form.auth, ssh_key=form.ssh_key, username=form.username,
+                token=form.token, remember=form.remember,
+            ))
+        except ClaudeSwitchError as e:
+            self.app.call_from_thread(self._add_failed, e)
+            return
+        if created:
+            message = f"Set up '{cfg.name}' as a new remote"
+        else:
+            message = f"Added '{cfg.name}': {count} shared account{'s' if count != 1 else ''}"
+        self.app.call_from_thread(self._add_done, AddedRemote(cfg, message, form.passphrase))
+
+    def _add_failed(self, error: ClaudeSwitchError) -> None:
+        self.app.busy = False
+        self._set_working(False)
+        field_id = _field_for(error)
+        if field_id == "passphrase":
+            # Wrong for this repository: both copies have to be typed again.
+            self.query_one("#passphrase", Input).value = ""
+            self.query_one("#again", Input).value = ""
+        self._error(str(error))
+        self.query_one(f"#{field_id}", Input).focus()
+
+    def _add_done(self, added: AddedRemote) -> None:
+        self.app.busy = False
+        self._working = False
+        self.dismiss(added)
+
+    def action_cancel(self) -> None:
+        if self._working:
+            self._error("Still connecting; this ends by itself if the server doesn't answer.")
+            return
+        self.dismiss(None)
 
 
 # ---------------------------------------------------------------------------
@@ -624,42 +714,3 @@ class RemoteScreen(Screen):
 
     def action_cursor_up(self) -> None:
         self.query_one("#menu", ListView).action_cursor_up()
-
-
-# ---------------------------------------------------------------------------
-# adding a repository (from the dashboard's remote menu)
-# ---------------------------------------------------------------------------
-
-
-def start_add_remote(app: "CswapApp", sync: rm.RemoteSync, form: RemoteForm, on_added) -> None:
-    """Add the repository in a worker; ``on_added(cfg, message, passphrase)`` on success."""
-    if app.busy:
-        app.notify("Another action is still running", severity="warning")
-        return
-    app.busy = True
-    app.notify(f"Connecting to {form.url}…", timeout=3)
-
-    def blocking() -> None:
-        try:
-            cfg, created, count = _quiet(lambda: sync.add(
-                form.name, form.url, passphrase=form.passphrase, branch=form.branch,
-                auth=form.auth, ssh_key=form.ssh_key, username=form.username,
-                token=form.token, remember=form.remember,
-            ))
-            if created:
-                message = f"Set up '{cfg.name}' as a new remote"
-            else:
-                message = f"Added '{cfg.name}': {count} shared account{'s' if count != 1 else ''}"
-            outcome = (cfg, message, None)
-        except ClaudeSwitchError as e:
-            outcome = (None, None, str(e))
-        app.call_from_thread(done, *outcome)
-
-    def done(cfg, message, error) -> None:
-        app.busy = False
-        if error is not None:
-            app.push_screen(OutputModal("Add repository — failed", f"Error: {error}"))
-            return
-        on_added(cfg, message, form.passphrase)
-
-    app.run_worker(blocking, thread=True, group="action", exit_on_error=False, name="Add repository")

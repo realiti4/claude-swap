@@ -436,20 +436,20 @@ class CswapApp(App):
         self.push_screen(RemoteScreen(self.remote_sync(), remote_id, passphrase))
 
     def action_add_remote(self) -> None:
-        from claude_swap.tui.remote import AddRemoteModal, start_add_remote
+        """The add form connects and checks the passphrase itself, staying
+        open on failure; on success, open the new repository."""
+        from claude_swap.tui.remote import AddRemoteModal
 
-        def added(cfg, message: str, passphrase: str) -> None:
-            self.notify(message, title="Remote sync")
+        def added(result) -> None:
+            if result is None:
+                return
+            self.notify(result.message, title="Remote sync")
             refresh = getattr(self.screen, "refresh_remote_menu", None)
             if refresh is not None:
                 self.call_later(refresh)
-            self.open_remote(cfg.id, passphrase)
+            self.open_remote(result.cfg.id, result.passphrase)
 
-        def entered(form) -> None:
-            if form is not None:
-                start_add_remote(self, self.remote_sync(), form, added)
-
-        self.push_screen(AddRemoteModal(), entered)
+        self.push_screen(AddRemoteModal(self.remote_sync()), added)
 
     # -- navigation -------------------------------------------------------------
 

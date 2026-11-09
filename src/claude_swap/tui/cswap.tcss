@@ -222,6 +222,11 @@ AddRemoteModal Input:focus {
     background: $panel-lighten-1;
 }
 
+/* Errors from git can run to a few lines; the form stays open to show them. */
+AddRemoteModal .form-error {
+    height: auto;
+}
+
 AddRemoteModal Checkbox {
     border: none;
     padding: 0;
