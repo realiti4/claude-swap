@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -17622,7 +17623,7 @@ class TestThePrimaryIsSpentToItsWall:
         until the reset. 2 is the partner kept warm, a turn every 50 minutes (the TTL
         3600 s less the 600 s chunk)."""
         h = _xw_harness(temp_home)
-        _xw_stamp(h, **{"2": 120.0})
+        _xw_stamp(h, **{"2": 120.0, "3": 120.0})  # both warm: no turn is due
         fleet = {
             "1": (80.0, 26 * _H), "2": (20.0, 5 * _D), "3": (30.0, 5.5 * _D),
             "4": (60.0, 6.9 * _D),
@@ -17739,10 +17740,56 @@ class TestThePrimaryIsSpentToItsWall:
             assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert not [e for e in h.events if isinstance(e, (SwitchEvent, ErrorEvent))]
-        assert _xw_hold(h).detail == (
-            "active account is healthy (60% headroom, not about to wall); "
-            "1 warming account(s) could not be landed on"
-        )
+        assert re.fullmatch(
+            r"active account is healthy \(60% headroom, not about to wall\); "
+            r"1 warming account\(s\) could not be landed on; "
+            r"#1: \d+ pts to 99% by .+Z(, ~\d+% of turns)?; warming #2 every 50 min",
+            _xw_hold(h).detail,
+        ), _xw_hold(h).detail
+
+    @pytest.mark.parametrize(
+        "stamps", [{"2": 4000.0, "3": 4000.0}, {"3": 3100.0}], ids=["both-cold", "warm-and-due"]
+    )
+    def test_a_partner_that_keeps_failing_does_not_starve_the_other_due_one(
+        self, temp_home, stamps
+    ):
+        """3 tops the rotation and its turn is due, but a long `cswap run` holds it every
+        tick: 2, due as well, takes the turn instead of never being warmed."""
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **stamps)
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
+        with patch.object(
+            h.switcher, "live_session_pids_for",
+            side_effect=lambda num, email: [4242] if num == "3" else [],
+        ):
+            assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "alternation")
+
+    def test_every_due_partner_failing_holds_with_the_count(self, temp_home):
+        h = _xw_harness(temp_home)
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "2 warming account(s) could not be landed on; #1: " in _xw_hold(h).detail
+
+    def test_a_cold_partner_is_due_while_a_warm_one_is_not(self, temp_home):
+        """3 was warmed 100 s ago: it is never taken. 2 is cold, so its turn is due."""
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"3": 100.0})
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (25.0, 5.5 * _D)})
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "alternation")
+
+    def test_a_warm_partner_short_of_room_is_not_the_one_the_hold_names(self, temp_home):
+        """2 resets within a day so it ranks first, but 5h 85 leaves it 15 points, under the
+        step's 23: the partner is 3 (the TUI's panel names the same one)."""
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"2": 100.0, "3": 100.0})
+        usage = self._primary_active(h, {"3": (25.0, 5 * _D)})
+        usage["2"] = _xw(h, 85.0, 20.0, 20 * _H)
+        assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert _xw_hold(h).detail.endswith("warming #3 every 50 min")
 
     def test_a_partner_at_97_leaves_for_the_primary_at_98_and_it_holds_there(self, temp_home):
         h = _xw_harness(temp_home)
@@ -17865,6 +17912,22 @@ def test_it_names_nothing_without_a_readable_reset_and_needs_no_burn_rate():
     assert order({}) == []
     assert order({"1": {"seven_day": {"pct": 32.0}}, "2": "token expired"}) == []  # no resets
     assert order(_xw_unit(now, **{"1": (0.0, 6 * _D), "2": (0.0, 2 * _H)})) == ["2"]  # nothing spent
+
+
+@pytest.mark.parametrize("chunk_pct", [20.0, 0.0], ids=["step", "time-only"])
+def test_the_warm_turn_drops_a_warm_partner_short_of_room_on_either_admission(chunk_pct):
+    """The tick and the panel share `primary_warm_turn`: 2 (15 points) clears neither the
+    step's 23 nor the landing floor, so the partner is 3, and it is warm and not due."""
+    from claude_swap.autoswitch import primary_warm_turn
+
+    now = 1_000_000.0
+    got = primary_warm_turn(
+        ["2", "3"], floor_headroom={"2": 15.0, "3": 80.0},
+        usage={n: {"five_hour": {"pct": 10.0}} for n in "23"}, entries={}, current="1",
+        models=(), settings=AutoSwitchSettings(strategy="dynamic", alternation_chunk_pct=chunk_pct),
+        last_active_at={"2": now - 100, "3": now - 100}, now=now,
+    )
+    assert got == ("3", [])
 
 
 def _xw_note(usage: dict, headroom: dict, now: float, warming: str | None = None) -> str:

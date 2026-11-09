@@ -35,9 +35,9 @@ from claude_swap.autoswitch import (
     _model_window_binds_everywhere,
     _plan_note,
     _seven_day_reset_ts,
-    _warming_partner,
     dynamic_candidate_order,
     dynamic_expiring_walk,
+    primary_warm_turn,
     rank_candidates_pass,
     rank_priority_candidates,
 )
@@ -435,7 +435,8 @@ def rank_switch_candidates(
     )
     trigger = _trigger_for(active_headroom, active_disabled)
     unmodeled = trigger in _UNMODELED_TRIGGERS
-    ordered, rank_axis = _rank_on(models, trigger)
+    axis = models
+    ordered, rank_axis = _rank_on(axis, trigger)
     if (
         not ordered
         and models
@@ -444,7 +445,8 @@ def rank_switch_candidates(
             usage, models, settings.threshold, settings.weekly_threshold, bars
         )
     ):
-        ordered, rank_axis = _rank_on((), trigger, dropped=True)
+        axis = ()
+        ordered, rank_axis = _rank_on(axis, trigger, dropped=True)
     if (
         not ordered
         and api_key_candidates
@@ -454,9 +456,16 @@ def rank_switch_candidates(
         ordered, rank_axis = api_key_candidates, None
     plan = None
     if settings.strategy == "dynamic":
-        # The partner the primary keeps warm is named only while it is the healthy active.
+        # The partner the primary keeps warm is named only while it is the healthy active
+        # (the engine's `spend_first`; its `not walled` is implied, the walk skips an active
+        # at its wall), by the engine's own `primary_warm_turn` over the axis that ranked.
         warming = (
-            _warming_partner(ordered, last, now, settings)
+            primary_warm_turn(
+                [n for n in ordered if n in oauth_candidates],
+                floor_headroom=_headroom_by_account(usage, axis), usage=usage, entries=entries,
+                current=active_number, models=axis, settings=settings, last_active_at=last,
+                now=now,
+            )[0]
             if active_number in expiring and trigger == "dynamic-healthy"
             else None
         )

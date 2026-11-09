@@ -2458,7 +2458,7 @@ class TestPanelOrderIsTheEnginesOrder:
         assert got[2] == trigger, got
 
     @staticmethod
-    def _plan_snap(active_resets_in):
+    def _plan_snap(active_resets_in, two=(10.0, 20.0, 2 * 86400)):
         def entry(five, seven, secs):
             return UsageEntry(
                 last_good={
@@ -2471,7 +2471,7 @@ class TestPanelOrderIsTheEnginesOrder:
         return AccountsSnapshot(
             accounts=[
                 make_account(1, active=True, entry=entry(10.0, 40.0, active_resets_in)),
-                make_account(2, entry=entry(10.0, 20.0, 2 * 86400)),
+                make_account(2, entry=entry(*two)),
                 make_account(3, entry=entry(10.0, 25.0, 3 * 86400)),
             ],
             active_number="1", taken_at=0.0,
@@ -2498,6 +2498,18 @@ class TestPanelOrderIsTheEnginesOrder:
         heading, line = rendered.splitlines()[:2]
         assert heading.startswith("Next best")
         assert re.fullmatch(rf"  {plan}", line), line
+
+    def test_the_partner_named_is_the_one_the_engines_hold_names(self):
+        """2 is warm and ranks first (its 7d resets within a day) but 5h 85 leaves it 15
+        points, under the step's 23, so the engine drops it: 3 is the partner, as in
+        `test_a_warm_partner_short_of_room_is_not_the_one_the_hold_names`."""
+        now = time.time()
+        rendered = _autoview_text(
+            self._plan_snap(20 * 3600, two=(85.0, 20.0, 22 * 3600)), "1",
+            AutoSwitchSettings(strategy="dynamic", threshold=90.0),
+            {"2": now - 100, "3": now - 100},
+        )
+        assert rendered.splitlines()[1].endswith("warming #3 every 50 min"), rendered
 
     def test_another_strategy_states_no_plan(self):
         rendered = _autoview_text(

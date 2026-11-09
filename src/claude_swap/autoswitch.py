@@ -767,15 +767,85 @@ def _warming_interval(settings: AutoSwitchSettings) -> float:
     return max(settings.cache_ttl_seconds - chunk, chunk)
 
 
-def _warming_partner(
-    ranked: Sequence[str], last_active_at: dict, now: float, settings: AutoSwitchSettings
-) -> str | None:
-    """The ONE partner the primary keeps warm (T3400): the first of ``ranked`` whose cache
-    is still inside the TTL, else (none is) the top of the rotation."""
-    return next(
-        (n for n in ranked if _is_warm(n, last_active_at, now, settings.cache_ttl_seconds)),
-        next(iter(ranked), None),
-    )
+def _step_admissible(
+    ranked: Sequence[str],
+    floor_headroom: Mapping[str, float | None],
+    cold: set[str],
+    cold_cost: Callable[[str], float],
+    settings: AutoSwitchSettings,
+) -> list[str]:
+    """The ``ranked`` candidates that keep a step's worth of room, ``step + SPENT``
+    points, after a cold landing's re-write is charged to them (`_step_alternation`'s cut)."""
+    need = settings.alternation_chunk_pct + SPENT_HEADROOM_PCT
+    return [
+        n for n in ranked
+        if (floor_headroom.get(n) or 0.0) - (cold_cost(n) if n in cold else 0.0) >= need
+    ]
+
+
+def _clears_landing_floor(
+    n: str,
+    *,
+    floor_headroom: Mapping[str, float | None],
+    usage: Mapping[str, dict | str | None],
+    current: str,
+    models: Sequence[str],
+    cold: set[str],
+    cold_cost: Callable[[str], float],
+    now: float,
+) -> bool:
+    """The time-only alternation's landing floor (``alternation_chunk_pct`` 0): a warm
+    candidate keeps the cold cost's worth of headroom, a cold one strictly more than
+    ``SPENT_HEADROOM_PCT`` after paying it. A candidate whose 7d resets before the active's
+    is waived on that window alone (T0758, T1850): its other windows still clear it."""
+    h = floor_headroom.get(n, 0.0)
+    if _perishes_before_active(usage.get(n), usage.get(current), now):
+        windows = oauth.relevant_windows(usage.get(n), models)
+        h = 100.0 - max((pct for label, pct, _ in windows if label != "7d"), default=0.0)
+    if n in cold:
+        return h - cold_cost(n) > SPENT_HEADROOM_PCT
+    return h >= cold_cost(n)
+
+
+def primary_warm_turn(
+    rotation: Sequence[str],
+    *,
+    floor_headroom: Mapping[str, float | None],
+    usage: Mapping[str, dict | str | None],
+    entries: Mapping[str, UsageEntry],
+    current: str,
+    models: Sequence[str],
+    settings: AutoSwitchSettings,
+    last_active_at: dict,
+    now: float,
+) -> tuple[str | None, list[str]]:
+    """``(partner, due)`` for an active that is the primary (T3400); the tick and the "Next
+    best" panel both call it. ``rotation`` is `_rotation_order`'s, ``floor_headroom`` and
+    ``models`` its axis. A partner is admitted as the tick admits one: the percent step's room
+    cut (`_step_admissible`), or with the step off the landing floor. ``partner`` is the first
+    admitted, a cache still inside the TTL ahead of the cold ones: the one a hold names.
+    ``due`` is the admitted partners whose turn is due, in that order: a cold one, or one
+    not warm within `_warming_interval`. A warm partner that is not due is never taken."""
+    cold = {n for n in rotation if not _is_warm(n, last_active_at, now, settings.cache_ttl_seconds)}
+
+    def cold_cost(n: str) -> float:
+        return cold_landing_cost(n, usage, entries, settings)
+
+    if settings.alternation_chunk_pct > 0:
+        admitted = _step_admissible(rotation, floor_headroom, cold, cold_cost, settings)
+    else:
+        admitted = [
+            n for n in rotation
+            if _clears_landing_floor(
+                n, floor_headroom=floor_headroom, usage=usage, current=current, models=models,
+                cold=cold, cold_cost=cold_cost, now=now,
+            )
+        ]
+    admitted.sort(key=lambda n: n in cold)  # stable: warm ahead of cold
+    interval = _warming_interval(settings)
+    return next(iter(admitted), None), [
+        n for n in admitted if not _is_warm(n, last_active_at, now, interval)
+    ]
 
 
 def _rotation_order(
@@ -3244,8 +3314,8 @@ class AutoSwitchEngine:
         walled = _about_to_wall(raw_active_headroom, self._active_wall)
         healthy = trigger == "dynamic-healthy"
         ahead = _expiring_ahead(expiring, current, walled) if healthy else []
-        # The active is itself the primary: it is spent to its wall, and its partner
-        # takes a turn only when that partner's warming is due.
+        # The active is itself the primary: it is spent to its wall, and a partner
+        # takes a turn only when its warming is due.
         spend_first = healthy and bool(expiring) and not walled and not ahead
 
         dynamic_ordered: list[str] | None = None
@@ -3471,22 +3541,13 @@ class AutoSwitchEngine:
             # Warm pays no re-write cost, so its floor stays the bare,
             # unchanged `>=`.
             cold_set = set(cold_ordered)
+            axis_models = () if model_window_dropped else self._models
+
             def _clears_the_landing_floor(n):
-                h = floor_headroom.get(n, 0.0)
-                if _perishes_before_active(usage.get(n), usage.get(current), now):
-                    h = 100.0 - max(
-                        (
-                            pct for label, pct, _ in oauth.relevant_windows(
-                                usage.get(n),
-                                () if model_window_dropped else self._models,
-                            )
-                            if label != "7d"
-                        ),
-                        default=0.0,
-                    )
-                if n in cold_set:
-                    return h - _cold_cost(n) > SPENT_HEADROOM_PCT
-                return h >= _cold_cost(n)
+                return _clears_landing_floor(
+                    n, floor_headroom=floor_headroom, usage=usage, current=current,
+                    models=axis_models, cold=cold_set, cold_cost=_cold_cost, now=now,
+                )
             rotation = _rotation_order(
                 warm_ordered, cold_ordered, floor_headroom, usage, settings, now
             )
@@ -3502,21 +3563,18 @@ class AutoSwitchEngine:
                     cold_ordered=cold_ordered, ranked=rotation,
                     floor_headroom=floor_headroom,
                     active_headroom=active_headroom, cold_cost=_cold_cost,
-                    primary_active=spend_first,
                 )
             partner = next(iter(alternation_admissible), None)
             # T3400: the active is the primary. The step and the dwell no longer move it:
-            # ONE partner (`_warming_partner`) takes a turn when its cache would lapse
-            # before the next one (a cold one, never warmed or past the TTL, is due now),
-            # and no other is tried in its place; `partner` still labels a hold.
+            # a partner takes a turn when its cache would lapse before the next one (a cold
+            # one, never warmed or past the TTL, is due now), the warm ones first. Every due
+            # partner is tried, so one that cannot be landed on does not starve the rest.
             if spend_first:
                 rotation_due = True
-                partner = _warming_partner(alternation_admissible, last_active_at, now, settings)
-                alternation_admissible = (
-                    [partner]
-                    if partner is not None
-                    and not _is_warm(partner, last_active_at, now, _warming_interval(settings))
-                    else []
+                partner, alternation_admissible = primary_warm_turn(
+                    rotation, floor_headroom=floor_headroom, usage=usage, entries=entries,
+                    current=current, models=axis_models, settings=settings,
+                    last_active_at=last_active_at, now=now,
                 )
             # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
             # NEVER-widened model-gated reading — the widen above can call
@@ -3613,8 +3671,7 @@ class AutoSwitchEngine:
                 trigger = "alternation"
                 # I1: the full admissible warm list, not just `partner`
                 # — an untrustworthy top pick must not strand the tick when
-                # a lower-ranked warm candidate is admissible. Not the primary's
-                # warm turn (`spend_first`): that is the one partner or none.
+                # a lower-ranked warm candidate is admissible.
                 dynamic_ordered = alternation_admissible
 
         if (
@@ -4131,6 +4188,10 @@ class AutoSwitchEngine:
                         f"{'expiring' if logged_trigger else 'warming'} account(s) "
                         "could not be landed on"
                         + (f"; {_SYSTEMIC_MESSAGES[systemic]}" if systemic else "")
+                        + (
+                            "; " + _plan_note(*walk, now, self._bars, partner, settings)
+                            if spend_first else ""
+                        )
                     ),
                 )
             )
@@ -5806,7 +5867,6 @@ class AutoSwitchEngine:
         floor_headroom: dict[str, float | None],
         active_headroom: float,
         cold_cost: Callable[[str], float],
-        primary_active: bool = False,
     ) -> tuple[list[str], bool]:
         """`dynamic`'s percent step (T3167): ``(ordered, ready)``, the targets a
         rotation may land on and whether it should happen now.
@@ -5827,10 +5887,6 @@ class AutoSwitchEngine:
         next forced move needs, ``step + SPENT``, the top ranked cold landing that
         keeps ``step + SPENT`` after its re-write, and more than the active has,
         is taken NOW, while the prefix is smallest, at most once per dwell.
-
-        ``primary_active`` (T3400): the active is the primary, which the step and the
-        dwell never move off. Every ranked candidate that keeps ``need`` is returned, and
-        the caller decides when its warm turn is due.
         """
         levels = _window_pcts(usage.get(current), ())
         if not levels:
@@ -5850,8 +5906,8 @@ class AutoSwitchEngine:
         def room(n: str) -> float:
             return h[n] - (cold_cost(n) if n in cold else 0.0)
 
-        if primary_active or _step_due(track, max(levels.values()), now, since, step, dwell):
-            return [n for n in ranked if room(n) >= need], True
+        if _step_due(track, max(levels.values()), now, since, step, dwell):
+            return _step_admissible(ranked, floor_headroom, cold, cold_cost, settings), True
         if since is None or now - since < dwell:
             return [], False
         warm_room = max(active_headroom - SPENT_HEADROOM_PCT, 0.0) + sum(
