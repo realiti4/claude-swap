@@ -246,28 +246,35 @@ class CswapApp(App):
 
     # -- mutating actions (single-flight, captured, off-thread) ---------------
 
-    def _start_action(self, label: str, fn, *, show_output: bool = False) -> None:
+    def _start_action(
+        self, label: str, fn, *, show_output: bool = False, on_done=None
+    ) -> None:
+        """Run ``fn`` in a worker. ``on_done`` (optional) runs on the UI
+        thread once it finished, success or failure, after the busy flag
+        clears -- for a screen that redraws in place instead of navigating."""
         if self.busy:
             self.notify("Another action is still running", severity="warning")
             return
         self.busy = True
         self.run_worker(
-            partial(self._action_blocking, label, fn, show_output),
+            partial(self._action_blocking, label, fn, show_output, on_done),
             thread=True,
             group="action",
             exit_on_error=False,
             name=label,
         )
 
-    def _action_blocking(self, label: str, fn, show_output: bool) -> None:
+    def _action_blocking(self, label: str, fn, show_output: bool, on_done=None) -> None:
         result = run_action(fn)
-        self.call_from_thread(self._action_done, label, result, show_output)
+        self.call_from_thread(self._action_done, label, result, show_output, on_done)
 
     def _action_done(
-        self, label: str, result: ActionResult, show_output: bool
+        self, label: str, result: ActionResult, show_output: bool, on_done=None
     ) -> None:
         self.busy = False
         self.request_refresh()
+        if on_done is not None:
+            on_done()
         if not result.ok:
             self.push_screen(OutputModal(f"{label} — failed", result.output))
             return
@@ -314,6 +321,25 @@ class CswapApp(App):
         self._start_action(
             f"{verb} account {number}",
             partial(self.switcher.set_account_disabled, number, target),
+        )
+
+    def do_toggle_login_sync(self, number: str, on_done=None) -> None:
+        """Flip one account's background login sync (see
+        ``ClaudeAccountSwitcher.sync_active_login``); ``on_done`` as in
+        :meth:`_start_action`."""
+        try:
+            enabled = self.switcher.login_sync_states().get(number, True)
+        except Exception:  # noqa: BLE001 -- unreadable store
+            self.notify("Could not read the login sync setting", severity="warning")
+            return
+        if enabled is None:
+            self.notify("Login sync doesn't apply to this account.")
+            return
+        target = not enabled
+        self._start_action(
+            f"Login sync {'on' if target else 'off'} for account {number}",
+            partial(self.switcher.set_account_login_sync, number, target),
+            on_done=on_done,
         )
 
     def confirm_remove(self, number: str, email: str) -> None:

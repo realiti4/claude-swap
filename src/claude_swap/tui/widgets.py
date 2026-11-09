@@ -222,11 +222,17 @@ def account_card_text(
     weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    show_login_sync: bool = False,
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
     5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
-    per-model rows, which reset weekly."""
+    per-model rows, which reset weekly.
+
+    ``show_login_sync`` adds ``login sync on`` to OAuth accounts whose login
+    sync is on (nothing when off, and never on API-key or setup-token
+    accounts, which it cannot apply to); the switch and watch lists pass it, the
+    dashboard panel does not."""
     now = now if now is not None else time.time()
 
     text = Text()
@@ -241,6 +247,11 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    if (
+        show_login_sync and acc.login_sync
+        and acc.kind != "api_key" and not acc.setup_token
+    ):
+        text.append("   login sync on", style=palette.muted)
     for badge in _policy_badges(acc, "   "):
         text.append(badge, style=palette.muted)
     _append_plan(text, acc, "   ", palette)
@@ -454,6 +465,7 @@ class AccountCard(Static):
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
+            show_login_sync=True,
         )
 
 

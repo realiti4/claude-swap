@@ -247,6 +247,13 @@ class AccountSnapshot:
     #: None for a slot whose plan has never been fetched. Defaulted for the
     #: same reason as ``policy``.
     subscription_plan: dict | None = None
+    #: Whether the background login sync may store a new /login for this
+    #: slot (``loginSync`` absent = on). Defaulted like ``policy``.
+    login_sync: bool = True
+    #: The stored credential is a ``claude setup-token`` (long-lived access
+    #: token, no refresh token). Login sync never applies to one: it cannot
+    #: change in use. Defaulted like ``policy``.
+    setup_token: bool = False
 
     @property
     def display_tag(self) -> str:

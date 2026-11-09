@@ -741,6 +741,55 @@ def _priority_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _login_sync_command(argv: list[str]) -> None:
+    """Handle `cswap login-sync [NUM|EMAIL|ALIAS] [on|off]`.
+
+    Lists, or turns on/off, the background login sync for one account: while
+    an auto-switch engine runs (`cswap auto`, the menu bar, the TUI's auto
+    view), a changed live login for an account cswap already manages is
+    stored into its slot without a manual `cswap add`. On by default.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap login-sync",
+        description=(
+            "Turn the background login sync on or off for one account, or list "
+            "it for every account. While auto-switch runs, a new login for an "
+            "account cswap already manages is stored into its slot "
+            "automatically. It never adds an account. On by default."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap login-sync 2 off     # leave account 2's stored login alone
+  cswap login-sync 2 on
+  cswap login-sync           # show the setting for every account
+        """,
+    )
+    parser.add_argument("account", nargs="?", metavar="NUM|EMAIL|ALIAS")
+    parser.add_argument("state", nargs="?", choices=("on", "off"))
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.account is not None and args.state is None:
+        parser.error("on|off is required")
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if args.account is None:
+            print(bolded("Login sync (stores a new login for a managed account):"))
+            for num, enabled in switcher.login_sync_states().items():
+                state = "n/a" if enabled is None else ("on" if enabled else "off")
+                print(f"  Account-{num}  {switcher.account_email(num)}  {state}")
+            print(dimmed("Runs while cswap auto, the menu bar or the TUI auto view is running."))
+            print(dimmed("n/a: API-key and setup-token accounts never change in use."))
+            return
+        switcher.set_account_login_sync(args.account, args.state == "on")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1412,6 +1461,9 @@ def main() -> None:
         return
     if argv and argv[0] == "priority":
         _priority_command(argv[1:])
+        return
+    if argv and argv[0] == "login-sync":
+        _login_sync_command(argv[1:])
         return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])

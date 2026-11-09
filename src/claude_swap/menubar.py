@@ -969,6 +969,14 @@ def run(switcher) -> int:
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
                     rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                elif ev.kind == "login-synced":
+                    # Updates are routine (every /login and token rotation);
+                    # only a refusal -- a token that belongs to another
+                    # account -- needs the user.
+                    if not getattr(ev, "updated", True):
+                        rumps.notification("claude-swap", "Login not stored", ev.human())
+                    else:
+                        self.refresh_async()
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
@@ -1076,6 +1084,7 @@ def run(switcher) -> int:
                 None,
                 self._add_menu(rumps),
                 self._disable_menu(rumps),
+                self._login_sync_menu(rumps),
                 self._remove_menu(rumps),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
@@ -1115,6 +1124,34 @@ def run(switcher) -> int:
                 # A check-mark reads as "held out of rotation" — same glyph the
                 # active row uses, but here it means disabled, not selected.
                 item.state = 1 if disabled else 0
+                menu.add(item)
+            return menu
+
+        def _login_sync_menu(self, rumps):
+            menu = rumps.MenuItem("Login sync")
+            accounts = self.snapshot["accounts"]
+            if not accounts:
+                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+                return menu
+            try:
+                states = self.switcher.login_sync_states()
+            except Exception:  # noqa: BLE001 -- a menu build must not die on a read
+                states = {}
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
+                name = f"{alias}  ({email})" if alias else email
+                enabled = states.get(str(num), True)
+                if enabled is None:
+                    # API key or setup-token: never changes in use, nothing
+                    # to sync. Listed so the menu matches the accounts, but
+                    # not clickable.
+                    menu.add(rumps.MenuItem(f"{num}  {name}  (n/a)", callback=None))
+                    continue
+                item = rumps.MenuItem(
+                    f"{num}  {name}", callback=self._make_toggle_login_sync(num, enabled)
+                )
+                # Checked = on: the background sync stores a new /login for
+                # this account into its slot (the default).
+                item.state = 1 if enabled else 0
                 menu.add(item)
             return menu
 
@@ -1240,6 +1277,16 @@ def run(switcher) -> int:
                     lambda: self.switcher.set_account_disabled(str(num), target)
                 ):
                     self.refresh_async()
+            return cb
+
+        def _make_toggle_login_sync(self, num, enabled):
+            # `enabled` is this row's current state; selecting it flips it.
+            target = not enabled
+            def cb(_sender):
+                if self._guard(
+                    lambda: self.switcher.set_account_login_sync(str(num), target)
+                ):
+                    self.rebuild_menu()
             return cb
 
         def on_add_login(self, _sender):

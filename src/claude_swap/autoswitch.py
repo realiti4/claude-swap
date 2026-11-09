@@ -408,6 +408,38 @@ class UnquarantineEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class LoginSyncEvent(AutoSwitchEvent):
+    """The active account's live login was re-stored into its slot
+    (``updated``), or refused because the token belongs to another account.
+    See :meth:`ClaudeAccountSwitcher.sync_active_login`."""
+
+    kind: ClassVar[str] = "login-synced"
+    number: str
+    email: str
+    updated: bool = True
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {
+            "number": self.number,
+            "email": self.email,
+            "updated": self.updated,
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        if self.updated:
+            return (
+                f"Account-{self.number} ({self.email}): stored login updated "
+                "from the live session"
+            )
+        return (
+            f"Account-{self.number} ({self.email}): live login not stored: "
+            f"{self.detail}"
+        )
+
+
+@dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
@@ -795,6 +827,29 @@ class AutoSwitchEngine:
             self._emit(UnquarantineEvent(number=number, email=email, reason=reason))
         return state
 
+    # -- login sync -----------------------------------------------------------
+
+    def _sync_active_login(self) -> None:
+        """Bring the active slot's stored login up to the live one, if changed.
+
+        Contained: the sync is a side task of the tick, so a failure in it is
+        logged and must never cost the tick its switch decision.
+        """
+        try:
+            result = self.switcher.sync_active_login()
+        except Exception:  # noqa: BLE001 -- see docstring
+            self.switcher._logger.debug("Login sync failed", exc_info=True)
+            return
+        if result is not None:
+            self._emit(
+                LoginSyncEvent(
+                    number=result.number,
+                    email=result.email,
+                    updated=result.updated,
+                    detail=result.detail,
+                )
+            )
+
     # -- freshening -----------------------------------------------------------
 
     def _freshen_target(self, number: str, email: str) -> str:
@@ -1066,6 +1121,10 @@ class AutoSwitchEngine:
         self._idle_hold_slow = False
         settings = self.settings
         priority_mode = settings.strategy == "priority-consume-first"
+        if not self.dry_run:
+            # Ahead of the quarantine release below, so a re-login of a
+            # quarantined active account is stored AND released this tick.
+            self._sync_active_login()
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are

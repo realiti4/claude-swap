@@ -79,6 +79,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            ("Login sync on / off…", "login-sync-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -119,6 +120,32 @@ class DashboardScreen(Screen):
         entries.append(_BACK)
         return entries
 
+    def _login_sync_entries(self) -> MenuEntries:
+        """One row per account with its login-sync state and what selecting
+        it does. On (the default): a new /login for that account is stored
+        into its slot by auto-switch, no `cswap add` needed."""
+        snap = self.app.snapshot
+        try:
+            states = self.app.switcher.login_sync_states()
+        except Exception:  # noqa: BLE001 -- unreadable: show the default
+            states = {}
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            on = states.get(acc.number, True)
+            if on is None:
+                entries.append(
+                    (f"{acc.number}  [n/a]  {name}", f"login-sync-na:{acc.number}")
+                )
+                continue
+            state = "on " if on else "off"
+            action = "→ turn off" if on else "→ turn on"
+            entries.append(
+                (f"{acc.number}  [{state}]  {name}   {action}", f"login-sync:{acc.number}")
+            )
+        entries.append(_BACK)
+        return entries
+
     def _theme_entries(self) -> MenuEntries:
         """dark / light / auto, with the active setting marked."""
         current = self.app._theme_name
@@ -128,6 +155,20 @@ class DashboardScreen(Screen):
         ]
         entries.append(_BACK)
         return entries
+
+    def _relabel_login_sync_menu(self) -> None:
+        """Redraw the login-sync rows in place after a toggle, keeping the
+        cursor where it was. No-op once the user has left that submenu."""
+        if not self._menu_stack or self._menu_stack[-1][0] != "login sync":
+            return
+        entries = self._login_sync_entries()
+        self._menu_stack[-1] = ("login sync", entries)
+        labels = dict((action_id, label) for label, action_id in entries)
+        menu = self.query_one("#menu", ListView)
+        for item in menu.query(MenuItem):
+            label = labels.get(item.action_id)
+            if label is not None:
+                item.query_one(Static).update(label)
 
     async def _push_menu(self, title: str, entries: MenuEntries) -> None:
         self._menu_stack.append((title, entries))
@@ -145,7 +186,10 @@ class DashboardScreen(Screen):
         menu = self.query_one("#menu", ListView)
         await menu.clear()
         await menu.extend(
-            MenuItem(label, action_id, muted=(action_id == "back"))
+            MenuItem(
+                label, action_id,
+                muted=(action_id == "back" or action_id.startswith("login-sync-na:")),
+            )
             for label, action_id in entries
         )
         menu.index = 0
@@ -192,6 +236,18 @@ class DashboardScreen(Screen):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
             await self._pop_menu()
+        elif action_id == "login-sync-menu":
+            await self._push_menu("login sync", self._login_sync_entries())
+        elif action_id.startswith("login-sync-na:"):
+            app.notify(
+                "Login sync doesn't apply: API-key and setup-token accounts "
+                "never change in use."
+            )
+        elif action_id.startswith("login-sync:"):
+            # A toggle list: Enter flips the row and stays put, so several
+            # accounts can be set in one visit; Back/Esc leaves.
+            number = action_id.split(":", 1)[1]
+            app.do_toggle_login_sync(number, on_done=self._relabel_login_sync_menu)
         else:
             actions[action_id]()
 

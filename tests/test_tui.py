@@ -81,6 +81,8 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    login_sync: bool = True,
+    setup_token: bool = False,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -93,6 +95,8 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        login_sync=login_sync,
+        setup_token=setup_token,
     )
 
 
@@ -167,6 +171,22 @@ class FakeSwitcher:
         self.calls.append(("remove", str(identifier), assume_yes))
         self._accounts = [a for a in self._accounts if a.number != str(identifier)]
         print(f"Removed account {identifier}")
+
+    def login_sync_states(self) -> dict[str, bool | None]:
+        return {
+            a.number: None if (a.setup_token or a.kind == "api_key") else a.login_sync
+            for a in self._accounts
+        }
+
+    def set_account_login_sync(self, identifier: str, enabled: bool) -> None:
+        self.calls.append(("set_login_sync", str(identifier), enabled))
+        self._accounts = [
+            dataclasses.replace(a, login_sync=enabled)
+            if a.number == str(identifier)
+            else a
+            for a in self._accounts
+        ]
+        print(f"Login sync {'on' if enabled else 'off'} for Account-{identifier}.")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         self.calls.append(("set_disabled", str(identifier), disabled))
@@ -866,6 +886,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                "login-sync-menu",
                 "remove-menu",
                 "theme-menu",
                 "quit",
@@ -1073,6 +1094,111 @@ class TestDashboard:
             await menu_select(pilot, "disable:2")
             await settle(pilot)
             assert ("set_disabled", "2", False) in fake.calls
+
+    async def test_login_sync_enter_toggles_in_place(self, tmp_path):
+        """Enter flips the highlighted row and stays in the submenu with the
+        cursor where it was; Esc leaves."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            menu = app.screen.query_one("#menu", ListView)
+
+            def rows():
+                return {
+                    item.action_id: item.query_one(Static).render().plain
+                    for item in menu.query(MenuItem)
+                }
+
+            await menu_select(pilot, "login-sync-menu")
+            assert "[on ]" in rows()["login-sync:2"]
+            await menu_select(pilot, "login-sync:2")
+            await settle(pilot)
+            assert ("set_login_sync", "2", False) in fake.calls
+            # still in the submenu, cursor still on account 2, label redrawn
+            assert "login-sync:2" in rows()
+            assert menu.highlighted_child.action_id == "login-sync:2"
+            assert "[off]" in rows()["login-sync:2"]
+            assert "turn on" in rows()["login-sync:2"]
+            assert "[on ]" in rows()["login-sync:1"]
+
+            # Enter again flips it back, still in place
+            await pilot.press("enter")
+            await settle(pilot)
+            assert ("set_login_sync", "2", True) in fake.calls
+            assert "[on ]" in rows()["login-sync:2"]
+            assert menu.highlighted_child.action_id == "login-sync:2"
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert [item.action_id for item in menu.query(MenuItem)][0] == "switch"
+
+    async def test_switch_and_watch_cards_show_login_sync_state(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2, login_sync=False)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountCard
+
+            def card_lines():
+                return {
+                    card._acc.number: card.render().plain.splitlines()[0]
+                    for card in app.screen.query(AccountCard)
+                }
+
+            for key in ("s", "w"):
+                await pilot.press(key)
+                await settle(pilot)
+                lines = card_lines()
+                assert "login sync on" in lines["1"], (key, lines)
+                assert "login sync" not in lines["2"], (key, lines)
+                await pilot.press("escape")
+                await settle(pilot)
+
+            # toggling from the menu is reflected on the next visit
+            await menu_select(pilot, "login-sync-menu")
+            await menu_select(pilot, "login-sync:2")
+            await settle(pilot)
+            await pilot.press("escape")
+            await settle(pilot)
+            await pilot.press("s")
+            await settle(pilot)
+            assert "login sync on" in card_lines()["2"]
+
+    async def test_login_sync_menu_shows_setup_tokens_as_not_applicable(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2, setup_token=True)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            await menu_select(pilot, "login-sync-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            rows = {
+                item.action_id: item.query_one(Static).render().plain
+                for item in menu.query(MenuItem)
+            }
+            assert "[n/a]" in rows["login-sync-na:2"]
+            assert "turn" not in rows["login-sync-na:2"]
+            await menu_select(pilot, "login-sync-na:2")
+            await settle(pilot)
+            assert not any(call[0] == "set_login_sync" for call in fake.calls)
+            # still in the submenu
+            assert "login-sync-na:2" in [i.action_id for i in menu.query(MenuItem)]
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
         fake = FakeSwitcher(

@@ -18,9 +18,11 @@ from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     LockError,
+    OwnershipUnverified,
     SessionError,
     SwitchError,
     ValidationError,
@@ -337,7 +339,19 @@ def _same_directory(left: Path, right: Path) -> bool:
         return left == right
 
 
+@dataclasses.dataclass(frozen=True)
+class LoginSyncResult:
+    """What :meth:`ClaudeAccountSwitcher.sync_active_login` did to a slot.
 
+    ``updated`` True: the slot now holds the live login. False: the live
+    token resolved to a different account and nothing was written; ``detail``
+    says why.
+    """
+
+    number: str
+    email: str
+    updated: bool
+    detail: str = ""
 
 
 class ClaudeAccountSwitcher:
@@ -418,6 +432,10 @@ class ClaudeAccountSwitcher:
         self._probe_verdicts: dict[
             tuple[str, str, str, str, str, str], bool
         ] = {}
+        # sync_active_login's per-(slot, lineage) back-off: when a changed
+        # login that could not be verified (or was refused) may be tried
+        # again. In-memory, like the verdicts above; a refusal is ``inf``.
+        self._login_sync_retry_at: dict[tuple[str, str], float] = {}
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -1921,7 +1939,7 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
-        for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             n = str(num)
             if is_active:
                 active_number = n
@@ -1939,6 +1957,13 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
                     subscription_plan=plans.get(n),
+                    login_sync=(
+                        (seq_data.get("accounts", {}).get(n) or {}).get("loginSync")
+                        is not False
+                    ),
+                    setup_token=oauth.is_setup_token(
+                        oauth.extract_oauth_data(creds or "")
+                    ),
                 )
             )
         return AccountsSnapshot(
@@ -2046,7 +2071,9 @@ class ClaudeAccountSwitcher:
     #: rewrites from the new credential. ``add_account`` and
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
-    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
+        "alias", "disabled", "threshold", "priority", "loginSync",
+    )
 
     @classmethod
     def _carried_settings(cls, record: dict | None) -> dict:
@@ -3627,7 +3654,8 @@ class ClaudeAccountSwitcher:
         )
 
     def _reject_foreign_credential_capture(
-        self, creds: str, email: str, org_uuid: str, account_uuid: str
+        self, creds: str, email: str, org_uuid: str, account_uuid: str,
+        *, strict: bool = False,
     ) -> str:
         """Guard for ``add_account``: the stored token must be THIS account's.
 
@@ -3674,6 +3702,11 @@ class ClaudeAccountSwitcher:
         only a matching email gets the benefit of an absent org.
         """
         def unverified(why: str) -> str:
+            # ``strict`` (the background login sync) fails CLOSED instead: an
+            # unattended write has nobody to read the notice, and it retries
+            # on a later tick where the check can complete.
+            if strict:
+                raise OwnershipUnverified(why)
             # Fail-open, but never silently: registering with the ownership
             # question unanswered is the state the field incident was in.
             print(
@@ -3952,6 +3985,247 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    def _store_login_in_place(
+        self, account_num: str, identity: tuple[str, str, str], creds: str
+    ) -> None:
+        """Write an ownership-checked live login over its existing slot.
+
+        The shared tail of ``add_account``'s refresh-in-place branch and
+        :meth:`sync_active_login`. ``creds`` must already have passed
+        ``_reject_foreign_credential_capture`` against ``identity``; this runs
+        the post-verify drift guards, then writes the credential and config
+        backups. ``sequence.json`` is the caller's to update.
+        """
+        email, org_uuid, _ = identity
+        self._reject_credential_drift_since_verify(creds)
+
+        config_path = self._get_claude_config_path()
+        try:
+            current_config = config_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise ConfigError("Claude config file not found")
+        except PermissionError:
+            raise ConfigError("Permission denied reading Claude config")
+
+        # AFTER the read, because it licenses those bytes. Ahead of it, a
+        # `/login` landing between the check and the read stores a config
+        # the check never saw. The create path in ``add_account`` has always
+        # had this order.
+        #
+        # THE TRIPLE THAT WAS READ, never a rebuild from the unpacked
+        # names. A sibling change overwrites two of them with an un-spliced
+        # email and org while leaving the third literal, and the mix
+        # describes no real account -- so the guard would compare it against
+        # a fresh read, never match, and refuse every time instead of only
+        # on a race.
+        self._reject_identity_drift_since_verify(identity)
+
+        self._write_account_credentials(account_num, email, creds)
+        self._write_account_config(account_num, email, current_config)
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (email, org_uuid)}
+        )
+
+    #: How long a changed login whose ownership could not be confirmed
+    #: (offline, expired access token, lookup failed) or whose write lost a
+    #: race waits before :meth:`sync_active_login` tries it again.
+    LOGIN_SYNC_RETRY_S = 300.0
+
+    def login_sync_enabled(self, account_num: str) -> bool:
+        """Whether the background login sync may refresh this slot (default on)."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num)) or {}
+        return record.get("loginSync") is not False
+
+    def _login_sync_applies(self, account_num: str, record: dict) -> bool:
+        """Whether login sync can ever do anything for a slot.
+
+        Not for API-key slots, and not for setup-tokens: a ``claude
+        setup-token`` credential has no refresh token, so it never changes in
+        use and there is nothing to re-store. The stored credential is read
+        through the display cache (no repeated Keychain calls from a menu).
+        """
+        if record.get("kind") == "api_key":
+            return False
+        try:
+            creds = self._read_account_credentials(
+                str(account_num), record.get("email", ""), cached=True
+            )
+        except Exception:  # noqa: BLE001 -- unreadable: assume it applies
+            return True
+        return not oauth.is_setup_token(oauth.extract_oauth_data(creds or ""))
+
+    def login_sync_states(self) -> dict[str, bool | None]:
+        """Every managed slot's login-sync switch, in sequence order.
+
+        ``True``/``False`` is the switch; ``None`` means login sync does not
+        apply to that slot (API key or setup-token), so there is nothing to
+        toggle.
+        """
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        out: dict[str, bool | None] = {}
+        for num in data.get("sequence", []):
+            record = accounts.get(str(num)) or {}
+            if not self._login_sync_applies(str(num), record):
+                out[str(num)] = None
+            else:
+                out[str(num)] = record.get("loginSync") is not False
+        return out
+
+    def sync_active_login(self, now: float | None = None) -> LoginSyncResult | None:
+        """Re-store the live login into its managed slot when it has changed.
+
+        What ``cswap add`` does for an account cswap already manages, run
+        unattended: after a ``/login`` (or a token rotation by Claude Code)
+        the slot's backup is brought up to the live credential, so nobody has
+        to remember ``cswap add`` afterwards. Called by the auto-switch engine
+        once per tick.
+
+        NEVER ADDS AN ACCOUNT. A live login no slot matches is left alone,
+        which is also what keeps ``cswap remove`` of the active account from
+        being undone a tick later. Slots with ``loginSync: false`` (``cswap
+        login-sync N off``) and API-key slots are skipped.
+
+        Stricter than ``cswap add``: the ownership check must POSITIVELY
+        resolve the token to this account (``strict=True``); "could not tell"
+        skips and retries after ``LOGIN_SYNC_RETRY_S`` instead of writing.
+        A token that resolves to a DIFFERENT account is refused once per
+        credential lineage and reported, never retried.
+
+        Returns ``None`` when there was nothing to do (or it was deferred),
+        otherwise a :class:`LoginSyncResult` describing the update or refusal.
+        Never raises for the expected cases; the network round-trip happens
+        outside ``lock_file``, the write under it.
+        """
+        now = time.time() if now is None else now
+        try:
+            self._refuse_session_shell()
+        except ClaudeSwitchError:
+            return None
+        identity = self._get_current_identity_triple()
+        if identity is None:
+            return None
+        email, org_uuid, account_uuid = identity
+        data = self._get_sequence_data() or {}
+        account_num = self._find_account_slot(data, email, org_uuid)
+        if account_num is None:
+            return None  # unmanaged: never added by the sync
+        record = data.get("accounts", {}).get(account_num) or {}
+        if record.get("loginSync") is False or record.get("kind") == "api_key":
+            return None
+
+        try:
+            live = self._read_capture_credentials()
+        except Exception:  # noqa: BLE001 -- unreadable store: try next tick
+            return None
+        if not live or oauth.extract_oauth_data(live) is None:
+            return None  # empty, or a live API key: not an OAuth login to sync
+        live_fp = oauth.credential_fingerprint(live)
+        if live_fp is None:
+            return None  # no refresh token (wiped after invalid_grant)
+        try:
+            backup = self._read_account_credentials(account_num, email)
+        except Exception:  # noqa: BLE001 -- unreadable backup: try next tick
+            return None
+        if oauth.is_setup_token(oauth.extract_oauth_data(backup or "")) or (
+            oauth.is_setup_token(oauth.extract_oauth_data(live))
+        ):
+            # A setup-token never changes in use, so there is nothing to
+            # re-store -- and its fingerprint hashes the whole credential file,
+            # so an unrelated change there (e.g. an MCP login in the same
+            # file) would otherwise look like a new login and send a profile
+            # lookup a setup-token can never pass.
+            return None
+        if backup and oauth.credential_fingerprint(backup) == live_fp:
+            return None  # the slot already holds this lineage
+
+        memo_key = (account_num, live_fp)
+        retry_at = self._login_sync_retry_at.get(memo_key)
+        if retry_at is not None and now < retry_at:
+            return None
+
+        try:
+            self._reject_live_api_key_capture(live)
+            self._reject_foreign_credential_capture(
+                live, email, org_uuid, account_uuid, strict=True
+            )
+        except OwnershipUnverified as e:
+            self._login_sync_retry_at[memo_key] = now + self.LOGIN_SYNC_RETRY_S
+            self._logger.debug(
+                "Login sync for account %s deferred: ownership unverified (%s)",
+                account_num, e,
+            )
+            return None
+        except ClaudeSwitchError as e:
+            self._login_sync_retry_at[memo_key] = float("inf")
+            self._logger.warning(
+                "Login sync for account %s refused: %s", account_num, e
+            )
+            return LoginSyncResult(account_num, email, updated=False, detail=str(e))
+
+        lock = FileLock(self.lock_file)
+        if not lock.acquire(timeout=2.0):
+            self._login_sync_retry_at[memo_key] = now + self.LOGIN_SYNC_RETRY_S
+            return None  # a switch or another writer holds it; try later
+        try:
+            # Re-resolve under the lock: a switch, remove or toggle may have
+            # landed during the network check.
+            data = self._get_sequence_data() or {}
+            if self._find_account_slot(data, email, org_uuid) != account_num:
+                return None
+            record = data["accounts"][account_num]
+            if record.get("loginSync") is False:
+                return None
+            try:
+                self._store_login_in_place(account_num, identity, live)
+            except ClaudeSwitchError as e:
+                # Identity or credential moved since the check: a login is in
+                # flight. Its result is a new lineage, checked afresh.
+                self._login_sync_retry_at[memo_key] = now + self.LOGIN_SYNC_RETRY_S
+                self._logger.debug(
+                    "Login sync for account %s deferred: %s", account_num, e
+                )
+                return None
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        finally:
+            lock.release()
+
+        self._login_sync_retry_at.pop(memo_key, None)
+        self._logger.info(
+            "Login sync updated credentials for account %s: %s", account_num, email
+        )
+        return LoginSyncResult(account_num, email, updated=True)
+
+    def set_account_login_sync(self, identifier: str, enabled: bool) -> None:
+        """Turn the background login sync on or off for one account.
+
+        On is the default and is stored as the ABSENCE of ``loginSync``; only
+        ``loginSync: false`` is ever written, like every other per-account
+        setting that pops its default.
+        """
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        if not self._login_sync_applies(account_num, record):
+            raise ValidationError(
+                f"Login sync does not apply to Account-{account_num} ({email}): "
+                "API-key and setup-token accounts never change in use, so "
+                "there is nothing to store."
+            )
+        state = "on" if enabled else "off"
+        if (record.get("loginSync") is not False) == enabled:
+            print(dimmed(f"Account-{account_num} ({email}) login sync is already {state}."))
+            return
+        if enabled:
+            record.pop("loginSync", None)
+        else:
+            record["loginSync"] = False
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Login sync {state} for account {account_num}: {email}")
+        print(f"{accent('Login sync ' + state)} for Account-{account_num} ({email}).")
+
     def add_account(
         self,
         slot: int | None = None,
@@ -4013,34 +4287,7 @@ class ClaudeAccountSwitcher:
                 current_creds, current_email, current_org_uuid,
                 current_account_uuid,
             )
-            self._reject_credential_drift_since_verify(current_creds)
-
-            config_path = self._get_claude_config_path()
-            try:
-                current_config = config_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                raise ConfigError("Claude config file not found")
-            except PermissionError:
-                raise ConfigError("Permission denied reading Claude config")
-
-            # AFTER the read, because it licenses those bytes. Ahead of it, a
-            # `/login` landing between the check and the read stores a config
-            # the check never saw. The create path below has always had this
-            # order.
-            #
-            # THE TRIPLE THAT WAS READ, never a rebuild from the unpacked
-            # names. A sibling change overwrites two of them with an un-spliced
-            # email and org while leaving the third literal, and the mix
-            # describes no real account -- so the guard would compare it against
-            # a fresh read, never match, and refuse every time instead of only
-            # on a race.
-            self._reject_identity_drift_since_verify(identity)
-
-            self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (current_email, current_org_uuid)}
-            )
+            self._store_login_in_place(account_num, identity, current_creds)
 
             if alias is not None:
                 seq["accounts"][account_num]["alias"] = alias
@@ -6141,6 +6388,11 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            record = seq_data.get("accounts", {}).get(str(num)) or {}
+            if record.get("loginSync") is False and self._login_sync_applies(
+                str(num), record
+            ):
+                markers += f" {muted('(login sync off)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):

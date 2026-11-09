@@ -116,6 +116,7 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 - `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target.
 - `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
 - `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
+- `cswap login-sync <num|email> on|off` controls whether auto-switch stores a new login for that account by itself (on by default). After a `/login` as an account cswap already manages, the next tick re-stores it into its slot, so no `cswap add` is needed; a quarantined account comes back into rotation the same tick. It only writes once Anthropic's profile endpoint confirms the token belongs to that account, and it never adds an account cswap doesn't manage.
 
 **Good to know**
 
@@ -223,6 +224,8 @@ cswap threshold                 # Show the global default and every per-account 
 cswap priority 2 100            # Use account 2 before lower tiers (priority-consume-first strategy)
 cswap priority 2 --unset        # Return account 2 to tier 0
 cswap priority                  # Show every account's tier
+cswap login-sync 2 off          # Don't let auto-switch store new logins for account 2
+cswap login-sync                # Show login sync on/off for every account
 cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases

@@ -31,6 +31,17 @@ class ConfigError(ClaudeSwitchError):
     pass
 
 
+class OwnershipUnverified(ConfigError):
+    """The ownership check could not answer whose token a credential is.
+
+    Raised only in strict mode (the background login sync). The manual
+    ``cswap add`` treats the same condition as "register anyway, with a
+    notice"; an unattended write must not.
+    """
+
+    pass
+
+
 class SwitchError(ClaudeSwitchError):
     """Error during account switch operation."""
 
