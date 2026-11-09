@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import random
-import re
 import subprocess
 import sys
 import threading
@@ -17623,7 +17622,7 @@ class TestThePrimaryIsSpentToItsWall:
         until the reset. 2 is the partner kept warm, a turn every 50 minutes (the TTL
         3600 s less the 600 s chunk)."""
         h = _xw_harness(temp_home)
-        _xw_stamp(h, **{"2": 120.0, "3": 120.0})  # both warm: no turn is due
+        _xw_stamp(h, **{"2": 120.0})
         fleet = {
             "1": (80.0, 26 * _H), "2": (20.0, 5 * _D), "3": (30.0, 5.5 * _D),
             "4": (60.0, 6.9 * _D),
@@ -17672,22 +17671,19 @@ class TestThePrimaryIsSpentToItsWall:
         self, temp_home
     ):
         h = _xw_harness(temp_home)
+        h.make_live("acct2@example.invalid", 2)  # the primary is active (no account just left)
         _xw_stamp(h, **{"3": 3100.0})  # left 3100 s ago: its cache lapses in 500 s
-        assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
-        assert h.active_number() == 2
         # 3's turn is due 50 minutes (ttl 3600 less the 600 s chunk) after it was left.
-        h.events.clear()
-        h.clock.advance(400.0)
-        usage = self._fleet(h, **{"2": _xw(h, 10.0, 94.0, 4 * _H - 400.0)})
+        usage = self._fleet(h, **{"2": _xw(h, 10.0, 94.0, 4 * _H)})
         assert _xw_tick(h, usage) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (3, "alternation")
         h.events.clear()
         h.clock.advance(301.0)  # past the cooldown, short of the chunk: the turn runs on
-        usage = self._fleet(h, **{"2": _xw(h, 10.0, 94.0, 4 * _H - 701.0)})
+        usage = self._fleet(h, **{"2": _xw(h, 10.0, 94.0, 4 * _H - 301.0)})
         assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
         assert h.active_number() == 3
         h.clock.advance(300.0)  # the chunk is served
-        usage = self._fleet(h, **{"2": _xw(h, 10.0, 94.0, 4 * _H - 1001.0)})
+        usage = self._fleet(h, **{"2": _xw(h, 10.0, 94.0, 4 * _H - 601.0)})
         assert _xw_tick(h, usage) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (2, "expiring-window")
 
@@ -17729,32 +17725,33 @@ class TestThePrimaryIsSpentToItsWall:
         fleet.update({n: _xw(h, 10.0, pct, left) for n, (pct, left) in partners.items()})
         return fleet
 
-    def test_a_due_partner_that_cannot_be_landed_on_does_not_pass_its_turn_on(self, temp_home):
+    def test_a_due_partner_that_cannot_be_landed_on_passes_its_turn_to_the_next(self, temp_home):
+        """2, warm and due, is the pair and always refused (a long `cswap run`): 3 lands. Later
+        3 is the pair, warm with the latest stamp, so its due turn comes before 2's, which
+        tops the rotation and is landable again but is not tried."""
         h = _xw_harness(temp_home)
-        _xw_stamp(h, **{"2": 3100.0, "3": 100.0})  # 2 is due; 3 was warmed 100 s ago
-        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (25.0, 5.5 * _D)})
+        _xw_stamp(h, **{"2": 3100.0})
+        fleet = {"2": (19.0, 5.5 * _D), "3": (20.0, 5 * _D)}
         with patch.object(
             h.switcher, "live_session_pids_for",
             side_effect=lambda num, email: [4242] if num == "2" else [],
         ):
-            assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+            assert _xw_tick(h, self._primary_active(h, fleet)) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (3, "alternation")
+        h.clock.advance(700.0)  # the chunk is served: the primary takes it back
+        assert _xw_tick(h, self._primary_active(h, fleet)) is TickOutcome.SWITCHED
         assert h.active_number() == 1
-        assert not [e for e in h.events if isinstance(e, (SwitchEvent, ErrorEvent))]
-        assert re.fullmatch(
-            r"active account is healthy \(60% headroom, not about to wall\); "
-            r"1 warming account\(s\) could not be landed on; "
-            r"#1: \d+ pts to 99% by .+Z(, ~\d+% of turns)?; warming #2 every 50 min",
-            _xw_hold(h).detail,
-        ), _xw_hold(h).detail
+        h.events.clear()
+        h.clock.advance(3000.0)  # 3 left 3000 s ago: due again, and warm; 2 is past its TTL
+        assert _xw_tick(h, self._primary_active(h, fleet)) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (3, "alternation")
 
     @pytest.mark.parametrize(
         "stamps", [{"2": 4000.0, "3": 4000.0}, {"3": 3100.0}], ids=["both-cold", "warm-and-due"]
     )
-    def test_a_partner_that_keeps_failing_does_not_starve_the_other_due_one(
-        self, temp_home, stamps
-    ):
-        """3 tops the rotation and its turn is due, but a long `cswap run` holds it every
-        tick: 2, due as well, takes the turn instead of never being warmed."""
+    def test_a_partner_that_keeps_failing_does_not_starve_the_other(self, temp_home, stamps):
+        """3 is the pair (it tops the rotation, or is the one warm) and a long `cswap run`
+        holds it every tick: 2, a fallback, takes the turn instead of never being warmed."""
         h = _xw_harness(temp_home)
         _xw_stamp(h, **stamps)
         usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
@@ -17765,7 +17762,7 @@ class TestThePrimaryIsSpentToItsWall:
             assert _xw_tick(h, usage) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (2, "alternation")
 
-    def test_every_due_partner_failing_holds_with_the_count(self, temp_home):
+    def test_every_partner_failing_holds_with_the_count(self, temp_home):
         h = _xw_harness(temp_home)
         usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
         with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
@@ -17773,13 +17770,38 @@ class TestThePrimaryIsSpentToItsWall:
         assert h.active_number() == 1
         assert "2 warming account(s) could not be landed on; #1: " in _xw_hold(h).detail
 
-    def test_a_cold_partner_is_due_while_a_warm_one_is_not(self, temp_home):
-        """3 was warmed 100 s ago: it is never taken. 2 is cold, so its turn is due."""
+    def test_a_warm_partner_not_due_holds_the_primary_though_a_cold_one_tops_the_rotation(
+        self, temp_home
+    ):
+        """2 was warmed 100 s ago: it is the pair, and its turn is not due. 3 is cold and has
+        more room, so it tops the rotation, but a cold one is no pair while one is warm."""
         h = _xw_harness(temp_home)
-        _xw_stamp(h, **{"3": 100.0})
-        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (25.0, 5.5 * _D)})
+        _xw_stamp(h, **{"2": 100.0})
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
+        assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _xw_hold(h).detail.endswith("warming #2 every 50 min")
+
+    @pytest.mark.parametrize(
+        ("stamps", "pair"), [({"2": 3200.0, "3": 3100.0}, 3), ({"2": 3100.0, "3": 3200.0}, 2)]
+    )
+    def test_of_two_warm_partners_the_most_recently_warmed_is_the_pair(
+        self, temp_home, stamps, pair
+    ):
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **stamps)
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
         assert _xw_tick(h, usage) is TickOutcome.SWITCHED
-        assert (h.active_number(), _xw_switch(h).trigger) == (2, "alternation")
+        assert (h.active_number(), _xw_switch(h).trigger) == (pair, "alternation")
+
+    def test_the_pair_not_due_holds_though_another_warm_partner_is(self, temp_home):
+        """3 was warmed 200 s ago, 2 3100 s ago (due, cache lapsing): 3 is the pair, so 2's
+        turn is not taken and the hold names 3."""
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"2": 3100.0, "3": 200.0})
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
+        assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert _xw_hold(h).detail.endswith("warming #3 every 50 min")
 
     def test_a_warm_partner_short_of_room_is_not_the_one_the_hold_names(self, temp_home):
         """2 resets within a day so it ranks first, but 5h 85 leaves it 15 points, under the

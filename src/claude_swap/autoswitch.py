@@ -819,13 +819,14 @@ def primary_warm_turn(
     last_active_at: dict,
     now: float,
 ) -> tuple[str | None, list[str]]:
-    """``(partner, due)`` for an active that is the primary (T3400); the tick and the "Next
+    """``(pair, admitted)`` for an active that is the primary (T3400); the tick and the "Next
     best" panel both call it. ``rotation`` is `_rotation_order`'s, ``floor_headroom`` and
-    ``models`` its axis. A partner is admitted as the tick admits one: the percent step's room
-    cut (`_step_admissible`), or with the step off the landing floor. ``partner`` is the first
-    admitted, a cache still inside the TTL ahead of the cold ones: the one a hold names.
-    ``due`` is the admitted partners whose turn is due, in that order: a cold one, or one
-    not warm within `_warming_interval`. A warm partner that is not due is never taken."""
+    ``models`` its axis. The partners are those the tick admits: the percent step's room cut
+    (`_step_admissible`), or with the step off the landing floor. ``pair`` is the one partner
+    kept warm: the warm one with the latest `last_active_at`, else the top of the rotation.
+    ``admitted`` is empty while its turn is not due (a cold one, or not warm within
+    `_warming_interval`: the primary holds), else the pair then the other partners in
+    rotation order, which are fallbacks for a pair that cannot be landed on."""
     cold = {n for n in rotation if not _is_warm(n, last_active_at, now, settings.cache_ttl_seconds)}
 
     def cold_cost(n: str) -> float:
@@ -841,11 +842,11 @@ def primary_warm_turn(
                 cold=cold, cold_cost=cold_cost, now=now,
             )
         ]
-    admitted.sort(key=lambda n: n in cold)  # stable: warm ahead of cold
-    interval = _warming_interval(settings)
-    return next(iter(admitted), None), [
-        n for n in admitted if not _is_warm(n, last_active_at, now, interval)
-    ]
+    warm = [n for n in admitted if n not in cold]
+    pair = max(warm, key=last_active_at.__getitem__) if warm else next(iter(admitted), None)
+    if warm and _is_warm(pair, last_active_at, now, _warming_interval(settings)):
+        return pair, []
+    return pair, [pair, *(n for n in admitted if n != pair)] if pair else []
 
 
 def _rotation_order(
@@ -3566,9 +3567,9 @@ class AutoSwitchEngine:
                 )
             partner = next(iter(alternation_admissible), None)
             # T3400: the active is the primary. The step and the dwell no longer move it:
-            # a partner takes a turn when its cache would lapse before the next one (a cold
-            # one, never warmed or past the TTL, is due now), the warm ones first. Every due
-            # partner is tried, so one that cannot be landed on does not starve the rest.
+            # one partner (`primary_warm_turn`) takes a turn when its cache would lapse before
+            # the next one (a cold one, never warmed or past the TTL, is due now); one that
+            # cannot be landed on passes the turn to the next, which then becomes the pair.
             if spend_first:
                 rotation_due = True
                 partner, alternation_admissible = primary_warm_turn(

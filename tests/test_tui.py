@@ -2480,15 +2480,15 @@ class TestPanelOrderIsTheEnginesOrder:
     @pytest.mark.parametrize(
         "active_resets_in, plan",
         [
-            (20 * 3600, r"#1: \d+ pts to 99% by .+Z(, ~\d+% of turns)?; warming #2 every 50 min"),
+            (20 * 3600, r"#1: \d+ pts to 99% by .+Z(, ~\d+% of turns)?; warming #3 every 50 min"),
             (6 * 86400, r"#2: \d+ pts to 99% by .+Z(, ~\d+% of turns)?"),
         ],
         ids=["the-active-is-the-primary", "a-partner-is-the-primary"],
     )
     def test_dynamic_states_the_plan_under_the_next_best_heading(self, active_resets_in, plan):
         """T3400: the hold line's `_plan_note`, under the heading: the primary's room to 99%
-        by its reset and its share of turns, and the partner it keeps warm (the first of
-        the list inside the cache TTL) when it is the active."""
+        by its reset and its share of turns, and the partner it keeps warm (the warm one
+        used last: 3, not 2) when it is the active."""
         now = time.time()
         rendered = _autoview_text(
             self._plan_snap(active_resets_in), "1",
