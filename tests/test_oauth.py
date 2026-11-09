@@ -1257,7 +1257,13 @@ class TestSetupTokenHeaderProbe:
         assert outcome.usage["source"] == oauth.USAGE_SOURCE_HEADERS
         assert "rejected" not in outcome.usage
         # Never the usage endpoint: its inference-only scope cannot read it.
-        assert [c.full_url for c in calls] == [oauth.USAGE_PROBE_URL]
+        # The main probe, then one per scoped model (Fable's weekly bucket).
+        assert [c.full_url for c in calls] == [oauth.USAGE_PROBE_URL] * (
+            1 + len(oauth.USAGE_PROBE_SCOPED_MODELS)
+        )
+        assert [json.loads(c.data)["model"] for c in calls[1:]] == list(
+            oauth.USAGE_PROBE_SCOPED_MODELS
+        )
         probe = calls[0]
         assert probe.get_method() == "POST"
         assert probe.get_header("Authorization") == f"Bearer {self.TOKEN}"
@@ -1271,6 +1277,72 @@ class TestSetupTokenHeaderProbe:
             r.levelno >= logging.WARNING for r in caplog.records
         )
         assert not any(self.TOKEN in m for m in messages)
+
+    def _route_by_model(self, by_model: dict):
+        """urlopen fake answering each probe by its request's model."""
+        calls: list = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            assert req.full_url == oauth.USAGE_PROBE_URL
+            result = by_model[json.loads(req.data)["model"]]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return fake_urlopen, calls
+
+    _FABLE_HEADERS = {
+        **_UNIFIED_HEADERS,
+        "anthropic-ratelimit-unified-7d_oi-status": "allowed_warning",
+        "anthropic-ratelimit-unified-7d_oi-utilization": "0.97",
+        "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
+    }
+
+    def test_fable_bucket_is_read_from_a_fable_probe(self):
+        """The Haiku probe never carries ``7d_oi``; the Fable probe does."""
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._ok(self._FABLE_HEADERS),
+        })
+        usage = self._fetch(fake).usage
+        assert usage["seven_day"]["pct"] == 60.0
+        assert [(w["name"], w["pct"]) for w in usage["scoped"]] == [("Fable", 97.0)]
+        assert usage["scoped"][0]["resets_at"]
+
+    def test_exhausted_fable_reads_100_without_rejecting_the_account(self):
+        values = {
+            **self._FABLE_HEADERS,
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "Retry-After": "600",
+        }
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._probe_429(values),
+        })
+        usage = self._fetch(fake).usage
+        assert usage["scoped"][0]["pct"] == 100.0
+        assert "rejected" not in usage
+        assert oauth.account_headroom(usage) == 40.0
+
+    @pytest.mark.parametrize("failure", [
+        pytest.param(
+            urllib.error.HTTPError(oauth.USAGE_PROBE_URL, 404, "nf", hdrs=None, fp=None),
+            id="no-access-to-model",
+        ),
+        pytest.param(urllib.error.URLError("down"), id="network"),
+    ])
+    def test_a_failed_fable_probe_keeps_the_main_reading(self, failure):
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": failure,
+        })
+        outcome = self._fetch(fake)
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert "scoped" not in outcome.usage
 
     def test_active_account_probes_too(self):
         fake, _ = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))

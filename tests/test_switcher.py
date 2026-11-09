@@ -1243,6 +1243,13 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
 
 
+def _is_scoped_probe(req) -> bool:
+    """A per-model probe riding along with the main header probe."""
+    if req.full_url != oauth.USAGE_PROBE_URL or not req.data:
+        return False
+    return json.loads(req.data)["model"] in oauth.USAGE_PROBE_SCOPED_MODELS
+
+
 class TestSetupTokenHeaderProbeWiring:
     """``usage.headerProbe`` reaches every fetch, and a probed setup-token
     account is paced by the store like any other fetch."""
@@ -1292,7 +1299,8 @@ class TestSetupTokenHeaderProbeWiring:
         urls: list[str] = []
 
         def fake_urlopen(req, timeout=None):
-            urls.append(req.full_url)
+            if not _is_scoped_probe(req):  # pacing counts the main probe
+                urls.append(req.full_url)
             if req.full_url == oauth.USAGE_PROBE_URL:
                 return probe
             raise endpoint
@@ -1321,7 +1329,8 @@ class TestSetupTokenHeaderProbeWiring:
         urls: list[str] = []
 
         def fake_urlopen(req, timeout=None):
-            urls.append(req.full_url)
+            if not _is_scoped_probe(req):  # pacing counts the main probe
+                urls.append(req.full_url)
             if isinstance(probe_result, Exception):
                 raise probe_result
             return probe_result

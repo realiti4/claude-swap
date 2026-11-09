@@ -35,6 +35,10 @@ USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+# The unified headers carry a per-model weekly bucket only on responses to
+# that model's own requests: a Haiku probe never sees Fable's ``7d_oi``. So a
+# second, best-effort 1-token probe per scoped model reads just that bucket.
+USAGE_PROBE_SCOPED_MODELS = ("claude-fable-5-1",)
 
 _logger = logging.getLogger("claude-swap")
 
@@ -619,8 +623,11 @@ def request_usage_via_probe(access_token: str) -> dict:
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
     utilization, and inference is the one thing a setup-token may do. The
-    request asks for a single Haiku output token. Returns the raw usage API
-    shape (possibly empty) from :func:`parse_unified_ratelimit_headers`.
+    request asks for a single Haiku output token. Per-model weekly buckets
+    (Fable's) are only reported on that model's own responses, so each of
+    :data:`USAGE_PROBE_SCOPED_MODELS` gets a 1-token probe too (see
+    :func:`_scoped_probe_limits`). Returns the raw usage API shape (possibly
+    empty) from :func:`parse_unified_ratelimit_headers`.
 
     A 429 carrying ``anthropic-ratelimit-unified-status: rejected`` is the
     account confirming its quota refuses inference, whatever the utilization
@@ -632,25 +639,11 @@ def request_usage_via_probe(access_token: str) -> dict:
     re-raises like any other error, so it stays an ``http-429`` failure
     with its Retry-After.
     """
-    body = json.dumps({
-        "model": USAGE_PROBE_MODEL,
-        "max_tokens": 1,
-        "system": USAGE_PROBE_SYSTEM,
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "anthropic-beta": OAUTH_BETA_HEADER,
-        "anthropic-version": USAGE_PROBE_API_VERSION,
-        "Content-Type": "application/json",
-        "User-Agent": "claude-swap/1.0",
-    }
-    req = urllib.request.Request(
-        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return parse_unified_ratelimit_headers(resp.headers)
+        with urllib.request.urlopen(
+            _probe_request(access_token, USAGE_PROBE_MODEL), timeout=10
+        ) as resp:
+            data = parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
         data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}
         if e.code != 429 or "rejected" not in data:
@@ -663,7 +656,66 @@ def request_usage_via_probe(access_token: str) -> dict:
             ).isoformat()
         rejected["retry_after_s"] = retry_after
         data["rejected"] = rejected
-        return data
+    scoped = _scoped_probe_limits(access_token, data.get("limits") or [])
+    if scoped:
+        data["limits"] = (data.get("limits") or []) + scoped
+    return data
+
+
+def _probe_request(access_token: str, model: str) -> urllib.request.Request:
+    """A 1-output-token ``/v1/messages`` request to ``model``."""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "system": USAGE_PROBE_SYSTEM,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "anthropic-version": USAGE_PROBE_API_VERSION,
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    return urllib.request.Request(
+        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
+    )
+
+
+def _scoped_probe_limits(access_token: str, have: list) -> list:
+    """Per-model weekly limits read by probing each scoped model.
+
+    Best-effort and scoped-only: a probe that fails (no access to the model,
+    network error) adds nothing, and a 429 from an exhausted model still has
+    its bucket read off the error's headers. Only the per-model ``limits``
+    are kept: the 5h/7d windows and any rejection come from the main probe,
+    since one model's limit refusing says nothing about the others.
+    A bucket ``have`` already carries is not added twice.
+    """
+    seen = {
+        ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        for lim in have if isinstance(lim, dict)
+    }
+    limits: list = []
+    for model in USAGE_PROBE_SCOPED_MODELS:
+        try:
+            with urllib.request.urlopen(
+                _probe_request(access_token, model), timeout=10
+            ) as resp:
+                headers = resp.headers
+        except urllib.error.HTTPError as e:
+            headers = e.headers
+        except Exception as e:
+            _logger.debug("Scoped usage probe (%s) failed: %r", model, e)
+            continue
+        if not headers:
+            continue
+        for lim in parse_unified_ratelimit_headers(headers).get("limits") or []:
+            name = lim["scope"]["model"]["display_name"]
+            if name not in seen:
+                seen.add(name)
+                limits.append(lim)
+    return limits
 
 
 def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
