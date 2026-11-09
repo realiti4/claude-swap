@@ -238,6 +238,8 @@ class AutoScreen(Screen):
     def _set_threshold(self, value: float) -> None:
         if value == self._settings.threshold:
             return
+        if self._switch_bar == self._settings.threshold:
+            self._switch_bar = None  # it was tracking the threshold; next poll resets
         self._settings = replace(self._settings, threshold=value)
         if self._engine is not None:
             self._engine.apply_threshold(value)

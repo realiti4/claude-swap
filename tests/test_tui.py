@@ -3218,6 +3218,17 @@ class TestAutoScreen:
             ))
             assert "99" not in summary.render().plain
             assert "threshold 97%" in summary.render().plain
+            # Non-dynamic, no override: the engine's bar IS the threshold, so a
+            # step must not leave the previous bar quoted until the next poll.
+            screen.action_cycle_strategy()
+            assert screen._settings.strategy == "best"
+            screen._on_engine_event(PollEvent(
+                active=None, headroom={}, threshold=97.0, switch_bar=97.0,
+                strategy="best",
+            ))
+            screen._set_threshold(98.0)
+            assert "threshold 98%" in summary.render().plain
+            assert "97" not in summary.render().plain, summary.render().plain
 
     async def test_strategy_cycle_starts_over_from_a_strategy_outside_it(
         self, tmp_path, fake_engine
