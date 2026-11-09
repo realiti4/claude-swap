@@ -239,7 +239,6 @@ class AutoScreen(Screen):
         if value == self._settings.threshold:
             return
         self._settings = replace(self._settings, threshold=value)
-        self._switch_bar = None
         if self._engine is not None:
             self._engine.apply_threshold(value)
         self.app.threshold_pct = proactive_switch_bar_pct(
@@ -287,10 +286,12 @@ class AutoScreen(Screen):
         bar = proactive_switch_bar_pct(
             self._settings.strategy, self._settings.threshold
         )
+        # The bar shown is the engine's (`_switch_bar`) once a poll has set it.
+        shown = bar if self._switch_bar is None else self._switch_bar
         # The field is the bar in force: it prints only when the threshold
-        # IS the bar (`bar == threshold`), plus while it is being adjusted
+        # IS the bar (`shown == threshold`), plus while it is being adjusted
         # (`t` + arrows) -- that is the number being changed.
-        show_threshold = self._adjusting or bar == self._settings.threshold
+        show_threshold = self._adjusting or shown == self._settings.threshold
         if show_threshold:
             text.append(
                 f"threshold {pct_label(self._settings.threshold)}%",
@@ -298,8 +299,7 @@ class AutoScreen(Screen):
             )
             if self._settings.threshold != self._configured_threshold:
                 text.append(" (session)", style=palette.muted)
-        if bar != self._settings.threshold:
-            shown = bar if self._switch_bar is None else self._switch_bar
+        if shown != self._settings.threshold:
             text.append(f"{' · ' if show_threshold else ''}switch at {pct_label(shown)}%")
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
@@ -367,6 +367,8 @@ class AutoScreen(Screen):
             self._switch_bar = event.switch_bar
             self._update_summary()
         if event.kind == "switch":
+            self._switch_bar = None  # the old active's bar; the next poll sets it
+            self._update_summary()
             self.app.request_refresh()
 
     def action_toggle_live(self) -> None:

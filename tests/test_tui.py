@@ -3184,7 +3184,8 @@ class TestAutoScreen:
         self, tmp_path, fake_engine
     ):
         """Under dynamic the primary is held to 99, not the flat 97: the
-        summary reads the poll's `switch_bar`, and drops it on a setting change."""
+        summary reads the poll's `switch_bar`, and drops it on a strategy change
+        or a switch."""
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1, "autoswitch": {"strategy": "dynamic"},
         }))
@@ -3193,7 +3194,7 @@ class TestAutoScreen:
         async with app.run_test(size=(100, 40)) as pilot:
             from textual.widgets import Static
 
-            from claude_swap.autoswitch import PollEvent
+            from claude_swap.autoswitch import PollEvent, SwitchEvent
             from claude_swap.tui.autoview import AutoScreen
 
             await app.push_screen(AutoScreen())
@@ -3206,8 +3207,17 @@ class TestAutoScreen:
             ))
             assert "switch at 99%" in summary.render().plain
             screen.action_adjust_threshold()
-            screen.action_threshold_step(1)  # a stale 99 is never shown
-            assert "switch at 97%" in summary.render().plain
+            screen.action_threshold_step(1)  # dynamic's bar ignores the threshold
+            assert "switch at 99%" in summary.render().plain
+            # threshold 97 equals the recomputed bar, not the engine's 99
+            screen._set_threshold(97.0)
+            screen.action_adjust_done()
+            assert "switch at 99%" in summary.render().plain
+            screen._on_engine_event(SwitchEvent(
+                trigger="proactive", from_ref=None, to_ref=None,
+            ))
+            assert "99" not in summary.render().plain
+            assert "threshold 97%" in summary.render().plain
 
     async def test_strategy_cycle_starts_over_from_a_strategy_outside_it(
         self, tmp_path, fake_engine
