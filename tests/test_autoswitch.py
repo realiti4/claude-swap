@@ -17721,6 +17721,89 @@ class TestThePrimaryIsSpentToItsWall:
         assert _xw_tick(h, fleet) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (4, "expiring-window")
 
+    @staticmethod
+    def _primary_active(h, partners: dict) -> dict:
+        """1 is the primary (7d 40%, resets in 3 h); ``partners``: number -> (7d %, reset)."""
+        fleet = {"1": _xw(h, 10.0, 40.0, 3 * _H), "4": _xw(h, 100.0, 100.0, 6.9 * _D)}
+        fleet.update({n: _xw(h, 10.0, pct, left) for n, (pct, left) in partners.items()})
+        return fleet
+
+    def test_a_due_partner_that_cannot_be_landed_on_does_not_pass_its_turn_on(self, temp_home):
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"2": 3100.0, "3": 100.0})  # 2 is due; 3 was warmed 100 s ago
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (25.0, 5.5 * _D)})
+        with patch.object(
+            h.switcher, "live_session_pids_for",
+            side_effect=lambda num, email: [4242] if num == "2" else [],
+        ):
+            assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not [e for e in h.events if isinstance(e, (SwitchEvent, ErrorEvent))]
+        assert _xw_hold(h).detail == (
+            "active account is healthy (60% headroom, not about to wall); "
+            "1 warming account(s) could not be landed on"
+        )
+
+    def test_a_partner_at_97_leaves_for_the_primary_at_98_and_it_holds_there(self, temp_home):
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"3": 120.0})  # the third account is warm: no turn is due on it later
+        usage = {
+            "1": _xw(h, 97.0, 10.0, 6 * _D),  # headroom 3: its line
+            "2": _xw(h, 10.0, 98.0, 4 * _H),  # headroom 2: the primary, under the 3-point cut
+            "3": _xw(h, 10.0, 10.0, 5 * _D),
+            "4": _xw(h, 100.0, 100.0, 6.9 * _D),
+        }
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "expiring-window")
+        h.events.clear()
+        h.clock.advance(400.0)
+        later = {**usage, "2": _xw(h, 10.0, 98.0, 4 * _H - 400.0)}
+        assert _xw_tick(h, later) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_one_partner_is_warmed_the_one_already_warm(self, temp_home):
+        """2 left 3000 s ago (its cache lapses in 600 s, its turn is due); 3 has a little more
+        room and no stamp (cold, so ranked first and due at once). A's turn comes again."""
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"2": 3000.0})
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (2, "alternation")
+
+    def test_a_cold_partner_is_taken_when_none_is_warm(self, temp_home):
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"2": 4000.0})  # past the TTL: cold, like 3
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
+        assert _xw_tick(h, usage) is TickOutcome.SWITCHED
+        assert (h.active_number(), _xw_switch(h).trigger) == (3, "alternation")
+
+    @pytest.mark.parametrize(
+        ("bars", "active", "bar"),
+        [({}, 1, 99.0), ({"1": 95.0}, 1, 95.0), ({}, 2, 97.0)],
+        ids=["primary", "primary-own-bar", "partner"],
+    )
+    def test_the_poll_line_quotes_the_bar_the_active_leaves_at(self, temp_home, bars, active, bar):
+        h = _xw_harness(temp_home)
+        _xw_stamp(h, **{"2": 120.0, "3": 120.0})
+        data = h.switcher._get_sequence_data()
+        for n, own in bars.items():
+            data["accounts"][n]["threshold"] = own
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        if active == 2:
+            h.make_live("acct2@example.invalid", 2)
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (25.0, 5.5 * _D)})
+        _xw_tick(h, usage)
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.switch_bar == bar
+
+    def test_a_ttl_under_the_chunk_does_not_make_the_partner_always_due(self, temp_home):
+        h = _xw_harness(temp_home, cache_ttl_seconds=600.0, alternation_chunk_seconds=600.0)
+        _xw_stamp(h, **{"2": 100.0, "3": 100.0})
+        usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (25.0, 5.5 * _D)})
+        assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _xw_hold(h).detail.endswith("warming #2 every 10 min")
+
 
 def _xw_unit(now: float, **accounts: tuple[float, float]) -> dict:
     """Usage for a direct `expiring_order` call: number -> (7d %, seconds to reset)."""

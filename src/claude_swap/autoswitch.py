@@ -577,8 +577,7 @@ def _plan_note(
     if rate:
         note += f", ~{min(room / (rate * (reset - now)), 1.0) * 100:.0f}% of turns"
     if warming:
-        minutes = (settings.cache_ttl_seconds - settings.alternation_chunk_seconds) / 60
-        note += f"; warming #{warming} every {minutes:g} min"
+        note += f"; warming #{warming} every {_warming_interval(settings) / 60:g} min"
     return note
 
 
@@ -761,6 +760,24 @@ def _expiring_ahead(
     return [] if walled or current in expiring else expiring
 
 
+def _warming_interval(settings: AutoSwitchSettings) -> float:
+    """Seconds between a partner's warm turns: its cache TTL less the turn itself (one
+    chunk). Never under one chunk, or a TTL at or under it would make the partner always due."""
+    chunk = settings.alternation_chunk_seconds
+    return max(settings.cache_ttl_seconds - chunk, chunk)
+
+
+def _warming_partner(
+    ranked: Sequence[str], last_active_at: dict, now: float, settings: AutoSwitchSettings
+) -> str | None:
+    """The ONE partner the primary keeps warm (T3400): the first of ``ranked`` whose cache
+    is still inside the TTL, else (none is) the top of the rotation."""
+    return next(
+        (n for n in ranked if _is_warm(n, last_active_at, now, settings.cache_ttl_seconds)),
+        next(iter(ranked), None),
+    )
+
+
 def _rotation_order(
     warm: Sequence[str],
     cold: Sequence[str],
@@ -928,8 +945,9 @@ def dynamic_candidate_order(
             if settings.alternation_chunk_pct > 0:
                 axis = _ROOM_AXIS
     # The tick lands on the primary a healthy active yields to whatever the rotation's
-    # floor says; the `proactive` list keeps the candidates the pass admitted.
-    front = front if not proactive else [n for n in front if n in ordered]
+    # floor says. On `proactive` the walk's own 1-point wall admits it, not the 3-point cut
+    # above (a headroom in (1, 3] is healthy for a primary); one barred from `pool` stays out.
+    front = front if not proactive else [n for n in front if n in pool]
     ordered = [*front, *(n for n in ordered if n not in front)]
     return ordered, (f"expiring window, then {axis}" if front else axis)
 
@@ -2878,13 +2896,49 @@ class AutoSwitchEngine:
                 thresholds[current],
             ),
         )
+
+        def _capped(num: str) -> tuple[str, float] | None:
+            """(window, pct) past the account's weekly cap in the CURRENT
+            `usage`, else None. A veto, applied to the active (must leave) and
+            to the candidate set before any ranking or escape reads it."""
+            return weekly_capped(
+                policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
+            )
+
+        # -- candidate selection ------------------------------------------
+        switchable = self.switcher.switchable_account_numbers()
+        candidates = [
+            num
+            for num in switchable
+            if num != current and num not in quarantined and _capped(num) is None
+        ]
+        oauth_candidates = [
+            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+        ]
+        last_active_at = state.get("lastActiveAt")
+        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
+        # T3400: the primary, the soonest-resetting usable account, is spent to
+        # `PRIMARY_WALL_PCT` and `_active_wall` is that wall while it is the active, so
+        # the classification below leaves it at a 99% reading. `_bars` stays the owner's
+        # thresholds (it also feeds the poll cadence).
+        expiring: list[str] = []
+        walk: tuple[float, _WalkRows] = (0.0, [])
+        if settings.strategy == "dynamic":
+            now = self.clock()
+            walk = dynamic_expiring_walk(
+                current, oauth_candidates, usage, headroom, self._bars, policies,
+                entries, last_active_at, settings, now,
+            )
+            expiring = [n for n, _, _ in walk[1]]
+            self._active_wall = _departure_wall(current, expiring, self._bars)
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
                 threshold=thresholds[current],
-                switch_bar=self._bars.get(current, bar),
+                switch_bar=100.0 - self._active_wall if current in expiring
+                else self._bars.get(current, bar),
                 landing_bars={num: self._bars.get(num, bar) for num in headroom},
                 strategy=settings.strategy,
                 weekly_threshold=settings.weekly_threshold,
@@ -2928,14 +2982,6 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-
-        def _capped(num: str) -> tuple[str, float] | None:
-            """(window, pct) past the account's weekly cap in the CURRENT
-            `usage`, else None. A veto, applied to the active (must leave) and
-            to the candidate set before any ranking or escape reads it."""
-            return weekly_capped(
-                policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
-            )
 
         active_capped = _capped(current)
         active_headroom = headroom.get(current)
@@ -2982,32 +3028,6 @@ class AutoSwitchEngine:
             and active_headroom is not None
             and active_headroom <= 2 * SPENT_HEADROOM_PCT
         )
-        # -- candidate selection ------------------------------------------
-        switchable = self.switcher.switchable_account_numbers()
-        candidates = [
-            num
-            for num in switchable
-            if num != current and num not in quarantined and _capped(num) is None
-        ]
-        oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
-        ]
-        last_active_at = state.get("lastActiveAt")
-        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
-        # T3400: the primary, the soonest-resetting usable account, is spent to
-        # `PRIMARY_WALL_PCT` and `_active_wall` is that wall while it is the active, so
-        # the classification below leaves it at a 99% reading. `_bars` stays the owner's
-        # thresholds (it also feeds the poll cadence).
-        expiring: list[str] = []
-        walk: tuple[float, _WalkRows] = (0.0, [])
-        if settings.strategy == "dynamic":
-            now = self.clock()
-            walk = dynamic_expiring_walk(
-                current, oauth_candidates, usage, headroom, self._bars, policies,
-                entries, last_active_at, settings, now,
-            )
-            expiring = [n for n, _, _ in walk[1]]
-            self._active_wall = _departure_wall(current, expiring, self._bars)
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -3486,16 +3506,18 @@ class AutoSwitchEngine:
                 )
             partner = next(iter(alternation_admissible), None)
             # T3400: the active is the primary. The step and the dwell no longer move it:
-            # its first partner takes a turn when that partner's cache would lapse before
-            # the next one (a cold one, never warmed or past the TTL, is due now);
-            # `partner` (unfiltered) still labels a hold.
+            # ONE partner (`_warming_partner`) takes a turn when its cache would lapse
+            # before the next one (a cold one, never warmed or past the TTL, is due now),
+            # and no other is tried in its place; `partner` still labels a hold.
             if spend_first:
                 rotation_due = True
-                if partner is not None and _is_warm(
-                    partner, last_active_at, now,
-                    settings.cache_ttl_seconds - settings.alternation_chunk_seconds,
-                ):
-                    alternation_admissible = []
+                partner = _warming_partner(alternation_admissible, last_active_at, now, settings)
+                alternation_admissible = (
+                    [partner]
+                    if partner is not None
+                    and not _is_warm(partner, last_active_at, now, _warming_interval(settings))
+                    else []
+                )
             # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
             # NEVER-widened model-gated reading — the widen above can call
             # this active "healthy" (dynamic-healthy, not at-limit) purely
@@ -3591,7 +3613,8 @@ class AutoSwitchEngine:
                 trigger = "alternation"
                 # I1: the full admissible warm list, not just `partner`
                 # — an untrustworthy top pick must not strand the tick when
-                # a lower-ranked warm candidate is admissible.
+                # a lower-ranked warm candidate is admissible. Not the primary's
+                # warm turn (`spend_first`): that is the one partner or none.
                 dynamic_ordered = alternation_admissible
 
         if (
@@ -4096,14 +4119,16 @@ class AutoSwitchEngine:
                 continue
             return self._perform(num, email, trigger, left_snapshot, label)
 
-        if logged_trigger:
-            # A discretionary pull never blocks or fails a healthy active.
+        if logged_trigger or spend_first:
+            # A discretionary pull, or the primary's partner turn, never blocks or fails a
+            # healthy active.
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
                     detail=(
                         f"active account is healthy ({pct_label(active_headroom)}% headroom, "
-                        f"not about to wall); {len(ordered)} expiring account(s) "
+                        f"not about to wall); {len(ordered)} "
+                        f"{'expiring' if logged_trigger else 'warming'} account(s) "
                         "could not be landed on"
                         + (f"; {_SYSTEMIC_MESSAGES[systemic]}" if systemic else "")
                     ),

@@ -2120,7 +2120,7 @@ class TestRankSwitchOwnBars:
         the strategy's 90: the engine refuses #2 (it would leave again next
         tick) and lands on #3, so #2 must not head the list."""
         settings = AutoSwitchSettings(strategy="best", threshold=90.0)
-        snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+        snap, (ordered, _axis, trigger, _unmodeled, *_) = self._rank(
             settings,
             make_account(1, active=True, entry=make_entry(95.0, 10.0)),
             make_account(2, entry=make_entry(70.0, 10.0), policy=AccountPolicy(threshold=60.0)),
@@ -2135,7 +2135,7 @@ class TestRankSwitchOwnBars:
         departs it (`departure_pct`), so the panel must not read it as
         below the threshold and show nothing."""
         settings = AutoSwitchSettings(strategy="best", threshold=90.0)
-        _snap, (ordered, _axis, trigger, unmodeled) = self._rank(
+        _snap, (ordered, _axis, trigger, unmodeled, *_) = self._rank(
             settings,
             make_account(
                 1, active=True, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)
@@ -2176,7 +2176,7 @@ class TestRankSwitchOwnBars:
         20 (`_active_wall`), not 3: "proactive" there, and #2 (85%, past its
         own bar of 80) is as unlandable as a spent peer."""
         settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
-        _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+        _snap, (ordered, _axis, trigger, _unmodeled, *_) = self._rank(
             settings,
             make_account(
                 1, active=True, entry=make_entry(80.0, 10.0), policy=AccountPolicy(threshold=80.0)
@@ -2192,7 +2192,7 @@ class TestRankSwitchOwnBars:
         (headroom 2 <= 3): the engine re-ranks without the bars rather than
         ride to the limit (`_dynamic_rank`), and so does the panel."""
         settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
-        _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+        _snap, (ordered, _axis, trigger, _unmodeled, *_) = self._rank(
             settings,
             make_account(
                 1, active=True, entry=make_entry(98.0, 10.0), policy=AccountPolicy(threshold=80.0)
@@ -2456,6 +2456,54 @@ class TestPanelOrderIsTheEnginesOrder:
         settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
         got = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
         assert got[2] == trigger, got
+
+    @staticmethod
+    def _plan_snap(active_resets_in):
+        def entry(five, seven, secs):
+            return UsageEntry(
+                last_good={
+                    "five_hour": {"pct": five},
+                    "seven_day": {"pct": seven, "resets_at": _iso_in(secs)},
+                },
+                fetched_at=time.time(), age_s=0.0,
+            )
+
+        return AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=entry(10.0, 40.0, active_resets_in)),
+                make_account(2, entry=entry(10.0, 20.0, 2 * 86400)),
+                make_account(3, entry=entry(10.0, 25.0, 3 * 86400)),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+
+    @pytest.mark.parametrize(
+        "active_resets_in, plan",
+        [
+            (20 * 3600, r"#1: \d+ pts to 99% by .+Z(, ~\d+% of turns)?; warming #2 every 50 min"),
+            (6 * 86400, r"#2: \d+ pts to 99% by .+Z(, ~\d+% of turns)?"),
+        ],
+        ids=["the-active-is-the-primary", "a-partner-is-the-primary"],
+    )
+    def test_dynamic_states_the_plan_under_the_next_best_heading(self, active_resets_in, plan):
+        """T3400: the hold line's `_plan_note`, under the heading: the primary's room to 99%
+        by its reset and its share of turns, and the partner it keeps warm (the first of
+        the list inside the cache TTL) when it is the active."""
+        now = time.time()
+        rendered = _autoview_text(
+            self._plan_snap(active_resets_in), "1",
+            AutoSwitchSettings(strategy="dynamic", threshold=90.0),
+            {"2": now - 3000, "3": now - 100},
+        )
+        heading, line = rendered.splitlines()[:2]
+        assert heading.startswith("Next best")
+        assert re.fullmatch(rf"  {plan}", line), line
+
+    def test_another_strategy_states_no_plan(self):
+        rendered = _autoview_text(
+            self._plan_snap(20 * 3600), "1", AutoSwitchSettings(strategy="best", threshold=90.0)
+        )
+        assert "pts to" not in rendered, rendered
 
     def test_a_capped_api_key_peer_is_not_the_last_resort(self):
         """The engine drops a capped peer before it splits the rest by kind,
