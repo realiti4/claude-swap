@@ -212,6 +212,40 @@ class TestIssue305:
         assert _switches(h) == [("failover", 2)]
 
 
+class TestIssue305MixedCase:
+    """The 0.30.0 report on #305 (``--strategy consume-first --threshold 95
+    --weekly-threshold 90``): the active account hit 100% on its 5h window, one
+    candidate was at 7d 98% with the soonest weekly reset, another at 7d 4% with a
+    later reset and a low 5h. The at-limit escape took the 98% account, past its 90
+    weekly line, and moved again two minutes later. The report gives no other
+    readings; the 5h and the active's 7d values below are this test's.
+    """
+
+    def test_escapes_to_the_account_under_every_line(self, temp_home):
+        # 2 plays the report's account 1 (98%, soonest), 3 plays its account 5 (4%).
+        h = _fleet(temp_home, 3, threshold=95.0, weekly_threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(0, 98, _R_SOON),
+            "3": _usage7(10, 4, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert _switches(h) == [("at-limit", 3)]
+
+    def test_half_a_point_under_the_weekly_line_is_not_room(self, temp_home):
+        # The same fleet with the soonest account just under its weekly line instead
+        # of past it. Under its lines and resetting first, it would still win a ranking
+        # that only puts under-line accounts ahead, and it crosses 90 within minutes.
+        h = _fleet(temp_home, 3, threshold=95.0, weekly_threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(0, 89.5, _R_SOON),
+            "3": _usage7(10, 4, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert _switches(h) == [("at-limit", 3)]
+
+
 class TestASecondLogSamePattern:
     """A second log (``threshold 98``, consume-first, no weekly line)::
 
