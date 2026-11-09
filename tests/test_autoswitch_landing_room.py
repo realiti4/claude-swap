@@ -148,6 +148,18 @@ class TestForcedMovePrefersRoom:
         assert h.active_number() == 2
 
 
+    def test_a_weekly_first_forced_move_prefers_room_too(self, temp_home):
+        # weekly-first also lands a forced move on the soonest weekly reset (#541),
+        # so the same trap applies: #2 resets first but sits 5 points under its line.
+        h = _fleet(temp_home, 3, strategy="weekly-first", threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(85, 40, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
 class TestAtLimitEscapePrefersHealthy:
     def test_escapes_to_the_account_with_room_not_the_one_over_its_line(self, temp_home):
         # The log's 21:28: active at 100%; #2 resets soonest but is at 7d 91% (over its
