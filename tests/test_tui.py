@@ -3179,6 +3179,36 @@ class TestAutoScreen:
             await app.push_screen(AutoScreen())
             assert app.screen._settings.strategy == "consume-first"
 
+    @pytest.mark.usefixtures("quick_pilot")
+    async def test_summary_quotes_the_bar_the_engine_leaves_the_active_at(
+        self, tmp_path, fake_engine
+    ):
+        """Under dynamic the primary is held to 99, not the flat 97: the
+        summary reads the poll's `switch_bar`, and drops it on a setting change."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "dynamic"},
+        }))
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            from textual.widgets import Static
+
+            from claude_swap.autoswitch import PollEvent
+            from claude_swap.tui.autoview import AutoScreen
+
+            await app.push_screen(AutoScreen())
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            assert "switch at 97%" in summary.render().plain  # before any poll
+            screen._on_engine_event(PollEvent(
+                active=None, headroom={}, threshold=90.0, switch_bar=99.0,
+                strategy="dynamic",
+            ))
+            assert "switch at 99%" in summary.render().plain
+            screen.action_adjust_threshold()
+            screen.action_threshold_step(1)  # a stale 99 is never shown
+            assert "switch at 97%" in summary.render().plain
+
     async def test_strategy_cycle_starts_over_from_a_strategy_outside_it(
         self, tmp_path, fake_engine
     ):

@@ -29,6 +29,7 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    PollEvent,
     _binding_at,
     classify_candidate_block,
     model_block_label,
@@ -124,6 +125,9 @@ class AutoScreen(Screen):
         # settings.json. ``_configured_strategy`` is the mount-time file
         # value the screen reverts to on exit.
         self._configured_strategy: str | None = None
+        # The bar the engine's last poll leaves the ACTIVE at (the primary's 99
+        # under `dynamic`, not 97); dropped on a session setting change.
+        self._switch_bar: float | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -235,6 +239,7 @@ class AutoScreen(Screen):
         if value == self._settings.threshold:
             return
         self._settings = replace(self._settings, threshold=value)
+        self._switch_bar = None
         if self._engine is not None:
             self._engine.apply_threshold(value)
         self.app.threshold_pct = proactive_switch_bar_pct(
@@ -256,6 +261,7 @@ class AutoScreen(Screen):
         current = _STRATEGY_CYCLE.index(strategy) if strategy in _STRATEGY_CYCLE else -1
         value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
         self._settings = replace(self._settings, strategy=value)
+        self._switch_bar = None
         # A binding may be gated on strategy; the footer reads check_action
         # only on refresh.
         self.refresh_bindings()
@@ -293,7 +299,8 @@ class AutoScreen(Screen):
             if self._settings.threshold != self._configured_threshold:
                 text.append(" (session)", style=palette.muted)
         if bar != self._settings.threshold:
-            text.append(f"{' · ' if show_threshold else ''}switch at {pct_label(bar)}%")
+            shown = bar if self._switch_bar is None else self._switch_bar
+            text.append(f"{' · ' if show_threshold else ''}switch at {pct_label(shown)}%")
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
@@ -356,6 +363,9 @@ class AutoScreen(Screen):
         # live engine — worse than the stuck-dry-run it fixes, because now the
         # display disagrees with what is actually switching accounts.
         self._update_badge()
+        if isinstance(event, PollEvent) and event.strategy == self._settings.strategy:
+            self._switch_bar = event.switch_bar
+            self._update_summary()
         if event.kind == "switch":
             self.app.request_refresh()
 
