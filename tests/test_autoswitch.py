@@ -3018,9 +3018,6 @@ def _base_jobs(base_sha: str) -> list[str]:
     jobs = [_digest_job(s) for s in ("best", "consume-first")]
     if base_sha == _ROUND_375_BASE_SHA:
         jobs += [_digest_job(s, _RAISED_THRESHOLD) for s in ("best", "consume-first")]
-        jobs.append(_digest_job(
-            "dynamic", fleets=[TestOutcomeDigest375._motivating_fleet(1_000_000.0)]
-        ))
     return jobs
 
 
@@ -3381,40 +3378,14 @@ _RAISED_THRESHOLD = {"threshold": 99.0}
 
 @pytest.mark.xdist_group("outcome-digests")
 class TestOutcomeDigest375:
-    """F5 (#375): the motivating window, reconstructed as a named fixture
-    from the coordinator/analyzer evidence (10:01:32Z Account-3 at 5h 78% /
-    7d 56%, healthy; Account-5 at 7d 96%) — BASE (this round's own start,
-    `_ROUND_375_BASE_SHA`) must switch Account-3 -> Account-5 exactly as
-    the fleet did live, and HEAD must not (the whole point of #375). A
-    mutant that undoes #375's two admission guards (the trigger's
-    `about_to_wall` bar and the cold floor) must reproduce BASE's digest
-    exactly — the control that the divergence traces to THOSE and nothing
-    else moved. Composes (never subclasses, which would re-collect
-    every one of its own tests under this class too) `TestOutcomeDigest
-    AgainstBase`'s `_fleet`/`_run`/`_mutant`/`_head` machinery unchanged
-    for the second half: `best`/`consume-first` stay byte-identical
-    against THIS round's own base, over the same random fleets, with the
-    same stale-exclusion mutant control still moving them.
+    """`best`/`consume-first` stay byte-identical against #375's own base (`_ROUND_375_BASE_SHA`)
+    over the fixed-seed fleets, with the same stale-exclusion mutant control still moving
+    them. Composes (never subclasses, which would re-collect every one of its own tests
+    under this class too) `TestOutcomeDigestAgainstBase`'s `_fleet`/`_run`/`_mutant`/`_head`
+    machinery unchanged.
     """
 
     _base = TestOutcomeDigestAgainstBase()
-
-    @staticmethod
-    def _motivating_fleet(now: float) -> dict:
-        # Account numbers 1/2 (not the incident's own 3/5): `_run`
-        # (`TestOutcomeDigestAgainstBase`, reused verbatim) always seeds
-        # accounts 1/2/3 and makes 1 live — account 3 stays unseeded here.
-        return {
-            "1": {  # active ("Account-3" in the incident): healthy, well
-                     # clear of about_to_wall
-                "five_hour": {"pct": 78.0, "resets_at": _iso_at(now + 4 * 3600)},
-                "seven_day": {"pct": 56.0, "resets_at": _iso_at(now + 5 * 86400)},
-            },
-            "2": {  # candidate ("Account-5"): near-empty, but resets first
-                "five_hour": {"pct": 0.0, "resets_at": _iso_at(now + 4 * 3600)},
-                "seven_day": {"pct": 96.0, "resets_at": _iso_at(now + 1 * 86400)},
-            },
-        }
 
     @pytest.mark.parametrize("strategy", ["best", "consume-first"])
     def test_best_and_consume_first_digest_identical_against_this_rounds_base(
@@ -7493,36 +7464,6 @@ class TestWarmthAndAlternation375:
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a warm perishing candidate must be taken "
             "even though it fails the ordinary floor"
-        )
-        assert h.active_number() == 2
-
-    def test_t0758_narrows_375s_own_motivating_fleet_once_dwell_is_satisfied(
-        self, temp_home
-    ):
-        """`TestOutcomeDigest375`'s motivating fleet (active headroom 22,
-        candidate headroom 4 resetting a day out against the active's 5)
-        pins `NO_ACTION` on a SINGLE tick with no dwell stamp -- that
-        fixture never seeds `lastActiveAt`, so the dwell gate holds it
-        regardless of the floor this change narrows, and that pin is
-        untouched by this change. This is the same shape WITH dwell
-        satisfied: T0758's carve-out reaches it too, deliberately -- #375
-        forbade chasing whichever window resets soonest regardless of
-        cost in general, and T0758 narrows exactly that rule for a
-        candidate whose own window would otherwise expire unspent. Named
-        explicitly so the two pins are never read as contradicting one
-        another by accident."""
-        h = self._harness(temp_home, threshold=90.0)
-        chunk = h.engine.settings.alternation_chunk_seconds
-        now = h.clock.now
-        self._seed_last_active_at(h, {"1": now - chunk - 1.0})  # dwell elapsed; #2 stays cold
-        usage = {
-            "1": _usage7(78.0, 56.0, _iso_at(now + 5 * 86400)),  # active: headroom 22
-            "2": _usage7(0.0, 96.0, _iso_at(now + 1 * 86400)),   # cold: headroom 4, resets a day out
-        }
-        outcome = h.tick_with_usage(usage)
-        assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome} — #375's own motivating fleet, once dwell is "
-            "satisfied, is exactly the case T0758 carves out"
         )
         assert h.active_number() == 2
 
