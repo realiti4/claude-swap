@@ -113,6 +113,12 @@ CONFIRM_BUSY_MAX_S = 30 * 60.0
 BUSY_STATUSES = ("busy", "waiting")
 CONFIRM_POLL_S = 2.0
 CONFIRM_SKEW_S = 5.0
+# After the message is recorded, how long to watch for the session's answer.
+# A refused account answers within seconds (403 in 6 s, 2026-11-09); past
+# this, no answer yet means a long first step, and the continue stands.
+REPLY_TIMEOUT_S = 120.0
+# `Waiter._deliver`: the continue failed and the record is waiting again.
+RETRY = "retry"
 
 MARKER = "[claude-swap auto-continue]"
 # Written so that continuing a session nobody wanted continued costs one short
@@ -180,12 +186,22 @@ class ResumeRecord:
     # stop, and delivery is confirmed in the session's real transcript.
     rehearsal: bool = False
     confirm_path: str | None = None
+    # The account that refused our last continue (401/403): wait until the
+    # live login is a different one before trying again.
+    refused_email: str | None = None
+    refused_org: str | None = None
 
     @property
     def identity(self) -> tuple[str, str] | None:
         if not self.identity_email:
             return None
         return (self.identity_email, self.identity_org or "")
+
+    @property
+    def refused_identity(self) -> tuple[str, str] | None:
+        if not self.refused_email:
+            return None
+        return (self.refused_email, self.refused_org or "")
 
     def to_json(self) -> dict:
         return {_camel(f.name): getattr(self, f.name) for f in fields(self)}
@@ -573,6 +589,10 @@ def evaluate(
         return Readiness(False, "held", HELD_POLL_S)
     if not settings.enabled:
         return Readiness(False, "paused", HELD_POLL_S)
+    refused = record.refused_identity
+    if refused is not None and live.identity == refused:
+        # Continuing on it again would only be refused again, reset or not.
+        return Readiness(False, f"waiting-for-another-account ({refused[0]} refused the continue)")
     reset_due = record.resets_at + settings.slack_seconds if record.resets_at else None
     if reset_due is not None and now >= reset_due:
         return Readiness(True, "limit-reset", 0.0)
@@ -627,6 +647,8 @@ def note_stall(
         identity_org=identity[1] if identity else record.identity_org,
         consecutive=consecutive,
         updated_at=now,
+        refused_email=None,  # a new stop is a new situation
+        refused_org=None,
     )
     if consecutive >= settings.max_consecutive:
         return replace(
@@ -706,6 +728,8 @@ def arm(
             last_resume_at=prev.last_resume_at if prev else None,
             resumed_stall_uuid=prev.resumed_stall_uuid if prev else None,
             updated_at=now,
+            refused_email=base.refused_email if base else None,
+            refused_org=base.refused_org if base else None,
         )
         if stall is not None and stall.uuid != record.stall_uuid:
             record = note_stall(record, stall, state, settings, identity, now)
@@ -986,6 +1010,11 @@ class Waiter:
             deliverable = session.status in DELIVERABLE_STATUSES
             if readiness.ready and stall is not None and deliverable:
                 outcome = self._deliver(record, session, state, readiness.reason, forced)
+                if outcome == RETRY:
+                    # The record says why; look again after a pause.
+                    last_detail = RETRY
+                    self._sleep_watching_flag(POLL_S)
+                    continue
                 if outcome is not None:
                     return outcome
                 readiness = Readiness(False, "delivery-failed", POLL_S)
@@ -1112,15 +1141,113 @@ class Waiter:
                 updated_at=now,
             )
 
+        # Resumed as soon as it is recorded, so a stop the continue runs into
+        # is counted by the hook's loop guard; corrected below if it failed.
         mutate_record(self.backup_root, self.session_id, mutator)
         try:
             force_flag(self.backup_root, self.session_id).unlink()
         except OSError:
             pass
+        reply = self._await_reply(confirm_path, posted_at)
+        if reply is not None and not reply.ok:
+            return self._continue_failed(record, session, reply)
         _logger.info("auto-continue: resumed session %s (%s)", self.session_id[:8], why)
         if self.on_resumed and self.settings.notify:
             self.on_resumed(_session_label(record, session), why)
+        current = load_record(self.backup_root, self.session_id)
+        if current is not None and current.state == WAITING:
+            # It ran into a new limit stop meanwhile, and the hook re-armed
+            # it; this waiter holds the lock, so it is the one to carry on.
+            return RETRY
         return RESUMED
+
+    def _await_reply(self, path: str, since: float) -> tx.ReplyOutcome | None:
+        """The session's answer to the continue, or ``None`` if none came
+        within ``REPLY_TIMEOUT_S``."""
+        deadline = self.clock() + REPLY_TIMEOUT_S
+        while True:
+            reply = tx.reply_outcome(path, MARKER, since - CONFIRM_SKEW_S)
+            if reply is not None or self.clock() >= deadline:
+                return reply
+            self.sleep(CONFIRM_POLL_S)
+
+    def _continue_failed(
+        self, record: ResumeRecord, session: ClaudeSession, reply: tx.ReplyOutcome
+    ) -> str:
+        """The continue reached the session, but the API answered it with an
+        error instead of work (found 2026-11-10: every continue since Nov 3
+        landed on a slot whose subscription had lapsed, got 403, and was
+        logged as resumed while the session sat stopped).
+
+        The session is still stopped, so the record waits again: after an
+        account refusal, until the live login is a different account; after
+        anything else, for another try. Each failure counts toward
+        ``resume.maxConsecutive``. A rehearsal just reports it."""
+        identity = read_identity(record.global_config_path) if reply.account_refused else None
+        if identity and reply.org_uuid and identity[1] and identity[1] != reply.org_uuid:
+            # The refused request ran under another organization: an old
+            # token still in flight right after cswap auto left that account.
+            # The live login is untried, so don't hold the session off it.
+            identity = None
+        where = f" on {identity[0]}" if identity else ""
+        if identity:
+            detail = (
+                f"the continue was refused{where} ({reply.error}); waiting for "
+                "cswap auto to switch to a working account"
+            )
+        elif reply.account_refused:
+            detail = f"the continue was refused ({reply.error}); trying again"
+        else:
+            detail = f"the continue failed ({reply.error}); trying again"
+        now = self.clock()
+        max_consecutive = self.settings.max_consecutive
+
+        def mutator(prev: ResumeRecord | None) -> ResumeRecord | None:
+            if prev is None or prev.state not in (RESUMED, WAITING):
+                return None  # cancelled or finished meanwhile
+            consecutive = prev.consecutive + 1
+            updated = replace(
+                prev,
+                state=WAITING,
+                detail=detail,
+                consecutive=consecutive,
+                resumed_stall_uuid=None,  # the stop was not handled after all
+                refused_email=identity[0] if identity else None,
+                refused_org=identity[1] if identity else None,
+                updated_at=now,
+            )
+            if record.rehearsal:
+                return replace(
+                    updated,
+                    state=GAVE_UP,
+                    detail=f"the test reached the session, but the API answered "
+                    f"{reply.error}{where}: {reply.text}",
+                )
+            if consecutive >= max_consecutive:
+                return replace(
+                    updated,
+                    state=GAVE_UP,
+                    detail=f"{reply.error}{where} after {consecutive} automatic "
+                    "continues in a row; type 'continue' there",
+                )
+            return updated
+
+        updated = mutate_record(self.backup_root, self.session_id, mutator)
+        if updated is None:
+            current = load_record(self.backup_root, self.session_id)
+            return current.state if current else "no-record"
+        _logger.warning(
+            "auto-continue: session %s continue failed: %s%s (%s)",
+            self.session_id[:8],
+            reply.error,
+            where,
+            updated.state,
+        )
+        # A plain retry is quiet; holding off an account, or giving up, is news.
+        needs_you = updated.state != WAITING or identity is not None
+        if needs_you and self.on_gave_up and self.settings.notify:
+            self.on_gave_up(_session_label(record, session), updated.detail)
+        return RETRY if updated.state == WAITING else updated.state
 
     def _token_for(
         self, address: str, record: ResumeRecord, session: ClaudeSession

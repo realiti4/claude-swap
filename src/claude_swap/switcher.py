@@ -1828,6 +1828,21 @@ class ClaudeAccountSwitcher:
                 plans[str(num)] = record
         return plans
 
+    def lapsed_subscription_numbers(self) -> set[str]:
+        """Slots whose stored plan shows a lapsed subscription
+        (``subscription.is_expired``). Store-only: no credential, no network."""
+        data = self._get_sequence_data() or {}
+        records = self._subscription_store().load()
+        lapsed: set[str] = set()
+        for num, info in data.get("accounts", {}).items():
+            if not isinstance(info, dict):
+                continue
+            key = subscription.identity_key(info.get("email", ""), info.get("organizationUuid"))
+            record = records.get(key)
+            if subscription.valid_record(record) and subscription.is_expired(record["plan"]):
+                lapsed.add(str(num))
+        return lapsed
+
     def _plans_for_pass(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],

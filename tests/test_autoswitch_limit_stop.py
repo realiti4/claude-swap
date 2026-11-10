@@ -181,6 +181,37 @@ class TestWhenNothingIsMeasurable:
         # Slot 4 on the machine this was built for: a 403 on every fetch.
         assert self._land(h, {"2": _unreadable(5, error=error), "3": _unreadable(60)}) == 3
 
+    @staticmethod
+    def _old_reading(h: EngineHarness, *, days: float, error: str) -> UsageEntry:
+        """Slot 4 on 2026-11-10: a reading from long ago whose windows have
+        both reset since (so it reads 0%), its fetch error cycling."""
+        now = h.clock.now
+        return UsageEntry(
+            last_good={
+                "five_hour": {"pct": 98.0, "resets_at": _iso_at(now - (days - 0.1) * 86400)},
+                "seven_day": {"pct": 53.0, "resets_at": _iso_at(now - (days - 6) * 86400)},
+            },
+            fetched_at=now - days * 86400,
+            age_s=days * 86400,
+            last_error=error,
+        )
+
+    @pytest.mark.parametrize("error", ["http-429", "invalid_grant", "network"])
+    def test_never_lands_on_a_reading_older_than_a_weekly_window(self, h, error):
+        old = self._old_reading(h, days=10, error=error)
+        assert self._land(h, {"2": old, "3": _unreadable(60)}) == 3
+
+    def test_a_reading_older_than_a_weekly_window_alone_is_no_target(self, h):
+        _stop(h, "a@example.com")
+        fleet = {"1": None, "2": self._old_reading(h, days=10, error="http-429"), "3": UsageEntry()}
+        assert _tick_stored_only(h, fleet) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_the_same_reading_inside_the_weekly_window_still_counts(self, h):
+        # Control for the two above: only the reading's age changed.
+        old = self._old_reading(h, days=6.5, error="http-429")
+        assert self._land(h, {"2": old, "3": _unreadable(60)}) == 2
+
     def test_skips_an_account_another_session_reported_limited(self, h):
         _stop(h, "b@example.com", sid=SID2, ago=600.0)
         assert self._land(h, {"2": _unreadable(5), "3": _unreadable(60)}) == 3
@@ -198,6 +229,54 @@ class TestWhenNothingIsMeasurable:
         # keeps the ordinary failover counting.
         assert h.tick_with_usage({"1": None, "2": None, "3": None}) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+
+def _lapse(h: EngineHarness, email: str) -> None:
+    """Store the plan a lapsed subscription reports (canceled, back on free)."""
+    from claude_swap import subscription
+
+    plan = {"tier": subscription.FREE_TIER, "subscriptionStatus": "canceled"}
+    path = h.switcher.backup_dir / "cache" / subscription.PLAN_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = subscription.identity_key(email, "")
+    path.write_text(json.dumps({key: {"plan": plan, "fetchedAt": h.clock.now}}), encoding="utf-8")
+
+
+class TestALapsedSubscriptionIsNeverATarget:
+    """Claude Code refuses a lapsed subscription outright (403
+    ``oauth_org_not_allowed``), so it is no target, whatever its usage says."""
+
+    def test_the_lapsed_slot_is_read_from_the_plan_store(self, h):
+        _lapse(h, "b@example.com")
+        assert h.switcher.lapsed_subscription_numbers() == {"2"}
+
+    def test_a_stop_never_lands_blind_on_it(self, h):
+        _lapse(h, "b@example.com")
+        _stop(h, "a@example.com")
+        assert _tick_stored_only(h, {"1": None, "2": _unreadable(0), "3": _unreadable(60)}) is (
+            TickOutcome.SWITCHED
+        )
+        assert h.active_number() == 3
+
+    def test_even_a_readable_emptier_one_loses(self, h):
+        _lapse(h, "b@example.com")
+        _stop(h, "a@example.com")
+        assert _tick_stored_only(h, {"1": None, "2": _usage(0), "3": _usage(70)}) is (
+            TickOutcome.SWITCHED
+        )
+        assert h.active_number() == 3
+
+    def test_with_only_lapsed_slots_left_it_stays(self, h):
+        _lapse(h, "b@example.com")
+        _stop(h, "a@example.com")
+        fleet = {"1": None, "2": _unreadable(0), "3": UsageEntry()}
+        assert _tick_stored_only(h, fleet) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_an_unreadable_plan_store_never_breaks_a_tick(self, h):
+        _stop(h, "a@example.com")
+        with patch.object(h.switcher, "lapsed_subscription_numbers", side_effect=OSError("x")):
+            assert _tick_stored_only(h, {"1": None, "2": _usage(30)}) is TickOutcome.SWITCHED
 
 
 class TestALandingOnASpentAccountCorrectsItself:

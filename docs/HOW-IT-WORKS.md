@@ -213,6 +213,16 @@ sequenceDiagram
   count as progress.
 - Peer messages are meta user turns, so they're skipped too. Only the reply
   they provoke moves the state.
+- Background-task notices (`origin.kind: "task-notification"`) are skipped
+  the same way. One often lands right after a stop, because the stop ends the
+  turn its task ran under, and it stays unanswered. Counted as a prompt, it
+  made the stop read `pending`. That happened to 7 of 17 real stops from
+  2026-11-04 to 11-09, and their waiters stood down with "no usage-limit stop
+  showed up".
+- `reply_outcome()` reads how the session answered a delivered message: the
+  first main-chain assistant record after it. The answer is real output (or a
+  new limit stop, which the hook re-arms), or an API error, flagged
+  `account_refused` on 401/403.
 
 **`inbox.py` — delivery**
 - Writes newline-delimited JSON to the session's `messagingSocketPath`: a
@@ -236,7 +246,8 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> waiting: arm (StopFailure hook)
-    waiting --> resumed: ready + idle → posted → confirmed in transcript
+    waiting --> resumed: ready + idle → posted → confirmed in transcript → answered without an API error
+    resumed --> waiting: the answer was an API error (account refused: wait for another login)
     waiting --> undelivered: posted but never recorded (held/refused), or peer-only to a bypass session
     waiting --> gave_up: loop guard (maxConsecutive continues hit the limit again)
     waiting --> moved_on: session produced output after the stop (user / built-in continued it)
@@ -362,7 +373,17 @@ at most one extra cycle. Given a stop that counts:
 - If ranking finds nothing (no candidate readable), `_unmeasured_escape`
   lands blind. This comes before API-key fallback, since those cost money.
   - **Who qualifies:** unreadable candidates that have a `last_good` reading
-    and no `http-401`/`http-403` `last_error`.
+    from within one weekly window (`BLIND_READING_MAX_AGE_S`) and no
+    `http-401`/`http-403` `last_error`. The age rule exists because both of a
+    stale reading's windows have reset by then, so it reads 0% and wins. On
+    2026-11-10, slot 4's reading from Oct 19 won every blind landing. Its
+    subscription had lapsed, so every continue onto it got 403
+    (13 of 13 from Nov 3 to Nov 9). `last_error` alone can't catch that: a
+    refused slot's error cycles through 403, 429 and invalid_grant.
+  - **Never a target at all:** a slot whose stored plan shows a lapsed
+    subscription (`subscription.is_expired`: `canceled` and back on the free
+    tier, read from the plan cache by `lapsed_subscription_numbers()`). This
+    holds for every trigger, not only blind landings.
   - **Who is skipped:** accounts in `_known_spent`. That covers every account
     a live stop names, plus `lastSwitchFrom` when it was left at
     `leftHeadroom ≤ 0` before its `leftRecoveryAt`. A stop's own record stops
@@ -429,6 +450,34 @@ the session is `busy` or `waiting`, for up to 30 minutes. Once the session is
 idle again with no match, the state becomes `undelivered` and you're notified.
 (Found live: a message queued behind a typed "carry on" was recorded after
 ~70 s and was wrongly flagged `undelivered`.)
+
+**The answer.** Recorded is not the same as continued. The record is marked
+`resumed` once the message is recorded, so a stop the continue runs into
+counts for the loop guard. Then the waiter keeps its lock and watches the
+answer for up to `REPLY_TIMEOUT_S` (120 s) with `transcript.reply_outcome`:
+
+- **Real output, or no answer within 120 s** (a long first step): resumed,
+  and the notification fires.
+- **A new limit stop:** the hook re-arms the record. It finds this waiter's
+  lock and spawns nobody, so the waiter sees the record back in `waiting`
+  and carries on with it instead of exiting.
+- **An API error with 401/403** (lapsed subscription:
+  `oauth_org_not_allowed`): the record goes back to `waiting` with
+  `refusedEmail`/`refusedOrg`. `evaluate` holds while the live login is that
+  account, even past the limit's reset. You get one notification. The refused
+  account is the live login, unless the `credential_org` attachment before
+  the refused request names a different organization. That means an old
+  token was still in flight after `cswap auto` left the account, so the
+  waiter retries on the new login instead of blaming it. All 13 real
+  refusals named slot 4's organization.
+- **Any other API error:** back to `waiting`, retried after `POLL_S`
+  without a notification.
+
+Each failure counts toward `resume.maxConsecutive`. A new stop clears the
+refusal. Before this (until 2026-11-10), every continue from Nov 3 to Nov 9
+answered 403 on a lapsed slot and was logged `resumed`. None of those errors
+is a `rate_limit` StopFailure, so nothing re-armed the session, and it sat
+there until the user typed "carry on".
 
 ### 4.9 Idempotency and concurrency
 
@@ -591,7 +640,9 @@ Not detectable and therefore not modelled:
 | Row stuck in `waiting-for-reset` | Expected while no account is free. `cswap auto` must be running for the account-switch trigger to fire. |
 | Row `waiting-for-idle (busy)` | The session is mid-turn. It continues once the session goes idle. |
 | Row `undelivered` | The session held or refused the message: check `crossSessionInbound`, or it was the peer fallback against a bypass session. Type "continue" there. |
-| Row `gave-up` | The loop guard tripped: continues kept hitting the limit. Wait for a real reset, or raise `resume.maxConsecutive`. |
+| Row `gave-up` | The loop guard tripped: continues kept hitting the limit, or the API kept answering them with an error (the detail names it). Wait for a real reset, or raise `resume.maxConsecutive`. |
+| Row `waiting-for-another-account (<email> refused the continue)` | That account answered 401/403, typically a lapsed subscription. It continues once `cswap auto` switches away. If the account is dead for good, `cswap disable <n>` keeps it out of rotation. |
+| `resumed`, but the session sits on "Claude Code can't use your Claude subscription" | Fixed 2026-11-10 (see 4.8 "The answer"). A waiter from older code may still report it this way. |
 | Row `waiting` · `held` | Stopped longer ago than `resume.maxWaitHours`. `cswap resume now <name>` continues it, `cswap resume cancel <name>` drops it. |
 | Row `waiting` · `paused` / header says paused | `cswap resume off` is in effect; `cswap resume on` re-enables. |
 | Row `cancelled` | You cancelled it; it won't continue by itself. Type in the session as usual. |

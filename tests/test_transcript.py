@@ -82,6 +82,47 @@ def peer_message(uuid: str, at: float) -> dict:
     }
 
 
+def task_notification(uuid: str, at: float) -> dict:
+    """A background task's completion notice, as 2.1.319 records it."""
+    return {
+        "type": "user",
+        "uuid": uuid,
+        "timestamp": _ts(at),
+        "isSidechain": False,
+        "origin": {"kind": "task-notification"},
+        "message": {
+            "role": "user",
+            "content": "<task-notification> <task-id>b77aj3r4j</task-id> ...",
+        },
+    }
+
+
+def refused(uuid: str, at: float) -> dict:
+    """What a continue onto a lapsed subscription gets back (2.1.319)."""
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "timestamp": _ts(at),
+        "isSidechain": False,
+        "isApiErrorMessage": True,
+        "error": "oauth_org_not_allowed",
+        "apiErrorStatus": 403,
+        "apiErrorCode": "oauth_not_allowed_for_organization",
+        "message": {
+            "content": [{"type": "text", "text": "Claude Code can't use your Claude subscription"}]
+        },
+    }
+
+
+def credential_org(org_uuid: str, at: float) -> dict:
+    """The attachment Claude Code records before a request: its organization."""
+    return {
+        "type": "attachment",
+        "timestamp": _ts(at),
+        "attachment": {"type": "credential_org", "organizationUuid": org_uuid},
+    }
+
+
 def write(path: Path, *records: dict) -> Path:
     lines = [json.dumps(r) for r in records]
     lines.insert(1, json.dumps({"type": "queue-operation", "operation": "enqueue"}))
@@ -157,6 +198,32 @@ class TestReadTranscriptState:
         state = tx.read_transcript_state(path)
         assert state.status == tx.STALLED and state.stall.uuid == "s1"
         assert not state.prompted_since(30)
+
+    def test_a_task_notification_after_the_stop_keeps_it_stalled(self, tmp_path: Path):
+        # 7 of 17 real stops (2026-11-04..09) had one land right after them;
+        # read as a prompt in flight, the stop vanished and its waiter left.
+        path = write(tmp_path / "t.jsonl", limit_stop("s1", 30), task_notification("n1", 30.5))
+        state = tx.read_transcript_state(path)
+        assert state.status == tx.STALLED and state.stall.uuid == "s1"
+        assert not state.prompted_since(0)
+
+    def test_a_task_notification_that_got_an_answer_is_progress(self, tmp_path: Path):
+        path = write(
+            tmp_path / "t.jsonl",
+            limit_stop("s1", 30),
+            task_notification("n1", 40),
+            assistant("a2", 50),
+        )
+        assert tx.read_transcript_state(path).status == tx.PROGRESSED
+
+    def test_a_task_notification_hitting_the_limit_again_is_the_new_stop(self, tmp_path: Path):
+        path = write(
+            tmp_path / "t.jsonl",
+            limit_stop("s1", 30),
+            task_notification("n1", 40),
+            limit_stop("s2", 41),
+        )
+        assert tx.read_transcript_state(path).stall.uuid == "s2"
 
     def test_non_limit_error_after_a_stop_does_not_lift_it(self, tmp_path: Path):
         overload = {
@@ -243,3 +310,83 @@ def test_queued_prompt_stored_as_content_blocks_is_recognized(tmp_path: Path):
     }
     path = write(tmp_path / "t.jsonl", record)
     assert tx.recorded_since(path, "[claude-swap auto-continue]", 400.0)
+
+
+class TestReplyOutcome:
+    NEEDLE = "[claude-swap auto-continue]"
+
+    def _continue(self, uuid: str, at: float) -> dict:
+        record = human(uuid, at, text=f"{self.NEEDLE} continue please")
+        record["isMeta"] = True
+        record["origin"] = {"kind": "peer", "selfSent": True}
+        return record
+
+    def test_no_answer_yet(self, tmp_path: Path):
+        path = write(tmp_path / "t.jsonl", limit_stop("s1", 30), self._continue("m1", 40))
+        assert tx.reply_outcome(path, self.NEEDLE, 35) is None
+
+    def test_real_output_is_ok(self, tmp_path: Path):
+        path = write(
+            tmp_path / "t.jsonl",
+            limit_stop("s1", 30),
+            self._continue("m1", 40),
+            assistant("a1", 45),
+        )
+        assert tx.reply_outcome(path, self.NEEDLE, 35) == tx.ReplyOutcome(ok=True)
+
+    def test_a_refused_account_is_reported(self, tmp_path: Path):
+        # Every continue from Nov 3 to Nov 9 ended like this, logged "resumed".
+        path = write(
+            tmp_path / "t.jsonl",
+            limit_stop("s1", 30),
+            self._continue("m1", 40),
+            refused("e1", 46),
+        )
+        outcome = tx.reply_outcome(path, self.NEEDLE, 35)
+        assert outcome is not None and not outcome.ok and outcome.account_refused
+        assert outcome.error == "oauth_org_not_allowed"
+        assert "can't use your Claude subscription" in outcome.text
+        assert outcome.org_uuid == ""  # no credential_org recorded
+
+    def test_the_refused_requests_organization_is_read(self, tmp_path: Path):
+        path = write(
+            tmp_path / "t.jsonl",
+            self._continue("m1", 40),
+            credential_org("org-old", 45),
+            credential_org("org-4", 45.5),
+            refused("e1", 46),
+        )
+        assert tx.reply_outcome(path, self.NEEDLE, 35).org_uuid == "org-4"
+
+    def test_a_transient_error_is_no_account_refusal(self, tmp_path: Path):
+        overload = {
+            "type": "assistant",
+            "timestamp": _ts(46),
+            "isApiErrorMessage": True,
+            "error": "overloaded",
+            "apiErrorStatus": 529,
+            "message": {"content": []},
+        }
+        path = write(tmp_path / "t.jsonl", self._continue("m1", 40), overload)
+        outcome = tx.reply_outcome(path, self.NEEDLE, 35)
+        assert outcome is not None and not outcome.ok and not outcome.account_refused
+
+    def test_a_new_limit_stop_is_left_to_the_hook(self, tmp_path: Path):
+        path = write(tmp_path / "t.jsonl", self._continue("m1", 40), limit_stop("s2", 46))
+        assert tx.reply_outcome(path, self.NEEDLE, 35).ok
+
+    def test_only_the_latest_continue_counts(self, tmp_path: Path):
+        path = write(
+            tmp_path / "t.jsonl",
+            self._continue("m1", 40),
+            refused("e1", 46),
+            self._continue("m2", 100),
+        )
+        assert tx.reply_outcome(path, self.NEEDLE, 35) is None
+        assert tx.reply_outcome(path, self.NEEDLE, 200) is None  # older than `since`
+
+    def test_sidechain_output_is_not_the_answer(self, tmp_path: Path):
+        side = assistant("x1", 45)
+        side["isSidechain"] = True
+        path = write(tmp_path / "t.jsonl", self._continue("m1", 40), side, refused("e1", 46))
+        assert not tx.reply_outcome(path, self.NEEDLE, 35).ok

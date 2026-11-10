@@ -17,7 +17,16 @@ from claude_swap import transcript as tx
 from claude_swap.process_detection import ClaudeSession
 from claude_swap.resume import LiveContext, ResumeRecord, Waiter, arm, evaluate, note_stall
 from claude_swap.settings import ResumeSettings
-from tests.test_transcript import RESETS_AT, assistant, human, limit_stop, write
+from tests.test_transcript import (
+    RESETS_AT,
+    assistant,
+    credential_org,
+    human,
+    limit_stop,
+    refused,
+    task_notification,
+    write,
+)
 from tests.test_transcript import _ts as iso_ts
 
 SID = "41fad98a-27b8-499d-bf23-4588962b72a3"
@@ -25,6 +34,7 @@ SOCKET = r"\\.\pipe\LOCAL\cc-msg-test"
 CHILD_TOKEN = "c" * 32
 A = ("a@example.com", "")
 B = ("b@example.com", "")
+C = ("c@example.com", "")
 
 
 class FakeClock:
@@ -337,6 +347,9 @@ class WaiterHarness:
         self.post_error: Exception | None = None
         self.records_delivery = True
         self.delivery_log = transcript  # where Claude Code records an accepted message
+        # How the session answers each continue (the last one repeats); None
+        # writes no answer. Default: real output, as a working account gives.
+        self.answers: list = [lambda uuid, at: assistant(uuid, at + 1.0, "on it")]
         rs.mutate_record(backup, SID, lambda _: replace(record, transcript_path=str(transcript)))
         self.waiter = Waiter(
             backup,
@@ -360,13 +373,21 @@ class WaiterHarness:
         if self.records_delivery:
             # What Claude Code writes when it accepts the message: a meta user
             # turn carrying the text (nothing at all when it holds it).
+            n = len(self.posted)
+            answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+            records = [peer_turn(f"m{n}", self.clock.now, text)]
+            if answer is not None:
+                out = answer(f"r{n}", self.clock.now)
+                records.extend(out if isinstance(out, list) else [out])
             with self.delivery_log.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(peer_turn(f"m{len(self.posted)}", self.clock.now, text)) + "\n")
+                fh.writelines(json.dumps(r) + "\n" for r in records)
 
     def run(self) -> str:
         with (
             patch.object(rs, "find_session", side_effect=self._find),
             patch.object(rs, "post_message", side_effect=self._post),
+            # The live login, as the faked live context sees it.
+            patch.object(rs, "read_identity", side_effect=lambda _path: self.live.identity),
         ):
             return self.waiter.run()
 
@@ -505,6 +526,213 @@ class TestWaiter:
             assert h.run() == "already-waiting"
         finally:
             lock.release()
+
+
+def _overloaded(uuid: str, at: float) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "timestamp": iso_ts(at),
+        "isApiErrorMessage": True,
+        "error": "overloaded",
+        "apiErrorStatus": 529,
+        "message": {"content": [{"type": "text", "text": "Overloaded"}]},
+    }
+
+
+class TestAContinueTheApiRejects:
+    """2026-11-03..09: 13 of 13 continues landed on a slot whose subscription
+    had lapsed. Each got 403 ``oauth_org_not_allowed``, no hook re-armed it
+    (that's no usage-limit stop), and each was logged "resumed" while the
+    session sat stopped until the user typed "carry on" hours later."""
+
+    def test_a_refused_account_is_never_retried_until_the_login_changes(
+        self, backup, stalled_transcript
+    ):
+        # The limit itself resets at 1390 (with slack): that alone must not
+        # send it back onto the account that refused it.
+        h = WaiterHarness(backup, stalled_transcript, _record(resets_at=1300.0), LiveContext(B))
+        h.answers = [lambda u, t: refused(u, t + 6.0), lambda u, t: assistant(u, t + 1.0)]
+        original = h.clock.sleep
+
+        def sleep_then_switch(seconds: float) -> None:
+            original(seconds)
+            if h.clock.now > 1000.0 + 3600 and h.live.identity == B:
+                assert len(h.posted) == 1  # an hour on B, past the reset: no retry
+                assert h.record().state == rs.WAITING
+                assert h.record().refused_identity == B
+                h.live = LiveContext(identity=C)  # cswap auto moves on
+
+        h.waiter.sleep = sleep_then_switch
+        assert h.run() == rs.RESUMED
+        assert len(h.posted) == 2
+        record = h.record()
+        assert record.state == rs.RESUMED and record.consecutive == 1
+        [(_name, detail)] = h.gave_up  # the user hears about the refusal once
+        assert "refused on b@example.com" in detail and "oauth_org_not_allowed" in detail
+        assert len(h.resumed) == 1  # "continued" only for the one that worked
+
+    def test_a_refusal_under_the_account_just_left_never_blames_the_new_one(
+        self, backup, stalled_transcript
+    ):
+        # The request went out on the old token (credential_org names the old
+        # org) while the live login is already the new account: retry there.
+        new = ("b@example.com", "org-b")
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=new))
+        h.answers = [
+            lambda u, t: [credential_org("org-a", t + 5.0), refused(u, t + 6.0)],
+            lambda u, t: assistant(u, t + 1.0),
+        ]
+        assert h.run() == rs.RESUMED
+        assert len(h.posted) == 2
+        assert h.clock.now < 1000.0 + 2 * (rs.JITTER_S + rs.POLL_S + rs.REPLY_TIMEOUT_S)
+        assert h.record().refused_identity is None
+        assert h.gave_up == []  # a quiet retry, no "refused" notification
+
+    def test_the_failed_continue_is_never_reported_resumed(self, backup, stalled_transcript):
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+        h.answers = [lambda u, t: refused(u, t + 6.0)]
+        original = h.clock.sleep
+        seen: list[ResumeRecord] = []
+
+        def sleep_and_look(seconds: float) -> None:
+            original(seconds)
+            if h.posted and not seen:
+                seen.append(h.record())
+                rs.mutate_record(backup, SID, lambda prev: replace(prev, state=rs.CANCELLED))
+
+        h.waiter.sleep = sleep_and_look
+        assert h.run() == rs.CANCELLED
+        assert seen[0].state == rs.WAITING and seen[0].resumed_stall_uuid is None
+        assert "waiting for cswap auto to switch" in seen[0].detail
+        assert h.resumed == []
+
+    def test_transient_errors_are_retried_then_given_up(self, backup, stalled_transcript):
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+        h.answers = [_overloaded]
+        assert h.run() == rs.GAVE_UP
+        assert len(h.posted) == SETTINGS.max_consecutive
+        record = h.record()
+        assert record.consecutive == SETTINGS.max_consecutive
+        assert record.refused_identity is None  # not the account's fault
+        assert "overloaded" in record.detail and "type 'continue' there" in record.detail
+        assert len(h.gave_up) == 1  # retries are quiet; only the give-up notifies
+        assert h.resumed == []
+
+    def test_no_answer_within_the_watch_still_counts_as_resumed(self, backup, stalled_transcript):
+        # A long first step writes nothing for minutes; that is not a failure.
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+        h.answers = [None]
+        assert h.run() == rs.RESUMED
+        assert h.record().resumed_stall_uuid == "s1"
+
+    def test_a_new_stop_armed_during_the_watch_keeps_this_waiter_going(
+        self, env_home, backup, stalled_transcript
+    ):
+        # The hook sees this waiter's lock and spawns nobody, so this waiter
+        # must carry the new stop itself instead of exiting "resumed".
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+        h.answers = [None, lambda u, t: assistant(u, t + 1.0)]
+        original = h.clock.sleep
+        rearmed: list[str] = []
+
+        def sleep_then_hook(seconds: float) -> None:
+            original(seconds)
+            if len(h.posted) == 1 and not rearmed:
+                write(
+                    stalled_transcript,
+                    human("h1", 900.0),
+                    limit_stop("s1", 1000.0),
+                    peer_turn("m1", h.clock.now - 1, rs.MARKER),
+                    limit_stop("s2", h.clock.now),
+                )
+
+                def no_spawn(_sid: str) -> None:
+                    raise AssertionError("the hook spawned a second waiter")
+
+                with patch.object(rs, "read_identity", return_value=B):
+                    rearmed.append(
+                        arm(
+                            backup,
+                            _hook_input(stalled_transcript),
+                            ENV,
+                            clock=h.clock,
+                            spawn=no_spawn,
+                        )
+                    )
+            elif rearmed and len(h.posted) == 1 and h.live.identity == B:
+                h.live = LiveContext(identity=C)
+
+        h.waiter.sleep = sleep_then_hook
+        assert h.run() == rs.RESUMED
+        assert rearmed == ["already-waiting"]
+        assert len(h.posted) == 2
+        assert h.record().resumed_stall_uuid == "s2"
+
+    def test_a_rehearsal_reports_the_refusal(self, env_home, backup):
+        real = env_home / ".claude" / "projects" / "p" / f"{SID}.jsonl"
+        real.parent.mkdir(parents=True)
+        write(real, human("h1", 900.0))
+        with patch.object(rs, "list_sessions", return_value=[_session()]):
+            _s, record = rs.rehearse(backup, ENV, clock=lambda: 1000.0, spawn=lambda _: None)
+        h = WaiterHarness(backup, Path(record.transcript_path), record, LiveContext(identity=B))
+        h.delivery_log = real
+        h.answers = [lambda u, t: refused(u, t + 2.0)]
+        assert h.run() == rs.GAVE_UP
+        assert len(h.posted) == 1
+        assert "the test reached the session" in h.record().detail
+        assert "oauth_org_not_allowed" in h.record().detail
+
+
+class TestARefusedAccountInThePolicy:
+    def test_it_holds_while_the_live_login_is_the_refused_one(self):
+        record = _record(resets_at=1300.0, refused_email=B[0], refused_org="")
+        r = evaluate(record, 5000.0, LiveContext(identity=B, last_switch_at=4000.0), SETTINGS)
+        assert not r.ready and r.reason.startswith("waiting-for-another-account")
+
+    def test_any_other_login_is_fair_game(self):
+        record = _record(resets_at=1300.0, refused_email=B[0], refused_org="")
+        assert evaluate(record, 5000.0, LiveContext(identity=C), SETTINGS).ready
+
+    def test_a_new_stop_forgets_the_refusal(self):
+        record = _record(refused_email=B[0], refused_org="")
+        stall = tx.Stall(uuid="s2", at=2000.0, resets_at=9000.0, limit_type="five_hour", text="")
+        noted = note_stall(record, stall, tx.TranscriptState(tx.STALLED), SETTINGS, None, 2000.0)
+        assert noted.refused_identity is None
+
+    def test_a_repeat_hook_event_keeps_it(self, env_home, backup, stalled_transcript):
+        held = _record(transcript_path=str(stalled_transcript), refused_email=B[0], refused_org="")
+        rs.mutate_record(backup, SID, lambda _: held)
+        with patch.object(rs, "find_session", return_value=_session()):
+            arm(
+                backup,
+                _hook_input(stalled_transcript),
+                ENV,
+                clock=lambda: 1001.0,
+                spawn=lambda _: None,
+            )
+        record = rs.load_record(backup, SID)
+        assert record.state == rs.WAITING and record.refused_identity == B
+
+
+class TestATaskNotificationAfterTheStop:
+    def test_the_waiter_still_sees_the_stop_and_continues_it(self, backup, tmp_path):
+        # 2026-11-09 23:44: the stop, then a background task's notice 0.2 s
+        # later; the waiter read "no usage-limit stop showed up" and left.
+        transcript = write(
+            tmp_path / "t.jsonl",
+            human("h1", 900.0),
+            limit_stop("s1", 1000.0),
+            task_notification("n1", 1000.2),
+        )
+        h = WaiterHarness(
+            backup,
+            transcript,
+            _record(stall_uuid=None, stalled_at=None, resets_at=None),
+            LiveContext(identity=B, last_switch_at=1010.0),
+        )
+        assert h.run() == rs.RESUMED
+        assert h.record().resumed_stall_uuid == "s1"
 
 
 def test_finished_records_are_pruned_after_the_retention_window(backup):

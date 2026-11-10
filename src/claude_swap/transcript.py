@@ -147,20 +147,28 @@ def _tail_records(path: Path, tail_bytes: int) -> list[dict]:
     return records
 
 
+def _origin_kind(record: dict) -> str | None:
+    origin = record.get("origin")
+    return origin.get("kind") if isinstance(origin, dict) else None
+
+
 def _is_turn_record(record: dict) -> bool:
     # Peer (cross-session) messages are recorded as meta user turns, so they
-    # are skipped here; only the reply they provoke moves the state.
+    # are skipped here; only the reply they provoke moves the state. The same
+    # goes for a background task's completion notice: one usually lands right
+    # after a limit stop (the stop ends the turn its task was running under)
+    # and sits there unanswered, so counting it as a prompt hid 7 of 17 real
+    # stops (2026-11-04 to 11-09) and their waiters stood down.
     return (
         record.get("type") in ("user", "assistant")
         and not record.get("isSidechain")
         and not record.get("isMeta")
+        and _origin_kind(record) != "task-notification"
     )
 
 
 def _is_human_prompt(record: dict) -> bool:
-    origin = record.get("origin")
-    kind = origin.get("kind") if isinstance(origin, dict) else None
-    return kind == "human" or record.get("turnOrigin") == "human"
+    return _origin_kind(record) == "human" or record.get("turnOrigin") == "human"
 
 
 def _inbound_text(record: dict) -> str:
@@ -204,6 +212,72 @@ def recorded_since(
         if ts is not None and ts >= since:
             return True
     return False
+
+
+@dataclass(frozen=True)
+class ReplyOutcome:
+    """How the session answered a delivered message: the first main-chain
+    assistant record after it."""
+
+    ok: bool  # real output (or a new usage-limit stop, which re-arms itself)
+    error: str = ""  # the API error that answered it instead, when not ok
+    text: str = ""
+    # The account itself was refused (401/403: lapsed subscription, revoked
+    # login), as opposed to a transient error such as an overload.
+    account_refused: bool = False
+    # The organization the refused request ran under, from the
+    # ``credential_org`` attachment Claude Code records before a request;
+    # "" when none was recorded.
+    org_uuid: str = ""
+
+
+def reply_outcome(
+    path: Path | str, needle: str, since: float, tail_bytes: int = TAIL_BYTES
+) -> ReplyOutcome | None:
+    """The answer to the latest inbound message containing ``needle``
+    recorded at or after ``since``; ``None`` while there is none yet.
+
+    A continue that lands on an account Claude Code can't use (a lapsed
+    subscription answers 403 ``oauth_org_not_allowed``) ends in an API error
+    that is no usage-limit stop, so no hook re-arms it: the session just sits
+    there. Telling that apart from real output is what keeps a failed
+    continue from being reported as "resumed".
+    """
+    try:
+        records = _tail_records(Path(path), tail_bytes)
+    except OSError:
+        return None
+    start = None
+    for index, record in enumerate(records):
+        ts = _epoch(record.get("timestamp"))
+        if needle in _inbound_text(record) and ts is not None and ts >= since:
+            start = index
+    if start is None:
+        return None
+    org_uuid = ""
+    for record in records[start + 1 :]:
+        attachment = record.get("attachment")
+        if (
+            record.get("type") == "attachment"
+            and isinstance(attachment, dict)
+            and attachment.get("type") == "credential_org"
+            and isinstance(attachment.get("organizationUuid"), str)
+        ):
+            org_uuid = attachment["organizationUuid"]
+            continue
+        if record.get("type") != "assistant" or record.get("isSidechain"):
+            continue
+        if not record.get("isApiErrorMessage") or usage_limit_stall(record) is not None:
+            return ReplyOutcome(ok=True)
+        error = record.get("error") or record.get("apiError") or "api-error"
+        return ReplyOutcome(
+            ok=False,
+            error=str(error),
+            text=_text_of(record).strip(),
+            account_refused=record.get("apiErrorStatus") in (401, 403),
+            org_uuid=org_uuid,
+        )
+    return None
 
 
 def read_transcript_state(path: Path | str, tail_bytes: int = TAIL_BYTES) -> TranscriptState:

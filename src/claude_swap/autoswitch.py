@@ -128,6 +128,14 @@ SLOW_TICK_S = 120.0
 # `_active_limit_stop`.
 SAME_RESET_TOLERANCE_S = 120.0
 
+# A blind landing (`_unmeasured_escape`) trusts an old reading only this long:
+# one weekly window. Older, both windows have reset since, so the reading
+# shows 0% and says nothing about whether the slot still works at all. Found
+# 2026-11-10: slot 4's last reading was from Oct 19, its subscription had
+# lapsed, and it won every blind landing as the "emptiest" account. Each
+# continue onto it was refused (403), 13 of 13 from Nov 3 to Nov 9.
+BLIND_READING_MAX_AGE_S = 7 * 24 * 3600.0
+
 # Margin on the reset axis for the no-return bar's release
 # (`_left_account_recovered`): the account we left counts as recovered only
 # once its binding reset has moved at least this much nearer. Five minutes is
@@ -1377,10 +1385,11 @@ class AutoSwitchEngine:
 
         # -- candidate selection ------------------------------------------
         switchable = self.switcher.switchable_account_numbers()
+        lapsed = self._lapsed_subscriptions()
         candidates = [
             num
             for num in switchable
-            if num != current and num not in quarantined
+            if num != current and num not in quarantined and num not in lapsed
         ]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
@@ -2761,6 +2770,17 @@ class AutoSwitchEngine:
 
                 self._mutate_state(record_failure)
 
+    def _lapsed_subscriptions(self) -> set[str]:
+        """Slots whose stored plan shows the subscription lapsed: Claude Code
+        refuses them outright (403 ``oauth_org_not_allowed``), so they are no
+        target, whatever their usage reads. A store read; never fails a
+        tick."""
+        try:
+            return self.switcher.lapsed_subscription_numbers()
+        except Exception as e:
+            _logger.debug("Reading subscription plans failed (%s): %s", type(e).__name__, e)
+            return set()
+
     def _limit_stops(self) -> list[LimitStop]:
         """Limits Claude Code reported (``resume.limit_stops``); never fails
         a tick."""
@@ -2838,7 +2858,12 @@ class AutoSwitchEngine:
         auth refusal (a 401/403 slot may not work at all). Usage only rises
         within a window, so that reading is a floor until the window resets:
         one already at a limit is skipped, and the lowest floor goes first. A
-        wrong guess costs one more stop, which names that account in turn."""
+        wrong guess costs one more stop, which names that account in turn.
+
+        "Worked before" expires: a reading older than a weekly window is no
+        evidence (``BLIND_READING_MAX_AGE_S``). ``last_error`` alone can't
+        tell, since a refused slot's error cycles through 403, 429 and
+        invalid_grant."""
         now = self.clock()
         floors: list[tuple[float, str]] = []
         for num in candidates:
@@ -2846,6 +2871,8 @@ class AutoSwitchEngine:
             if headroom.get(num) is not None or num in spent or entry is None:
                 continue
             if entry.last_good is None or entry.last_error in ("http-401", "http-403"):
+                continue
+            if entry.fetched_at is None or now - entry.fetched_at > BLIND_READING_MAX_AGE_S:
                 continue
             floor = window_pct(entry.last_good, None, now)
             if floor is not None and floor >= 100.0:

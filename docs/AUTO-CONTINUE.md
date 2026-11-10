@@ -124,6 +124,12 @@ That's why the design is:
    typed something at the same moment, so the message is queued behind your
    prompt), it keeps checking until the session goes idle, for up to 30
    minutes.
+6. Then it reads the session's answer. If the API answered with an error
+   instead of work (for example "Claude Code can't use your Claude
+   subscription" from an account whose subscription lapsed), the session is
+   still stopped, so it waits again. After a refused account, it waits until
+   `cswap auto` has moved to a different one. You get one notification
+   naming the account.
 
 The waiter stops by itself when:
 
@@ -157,14 +163,20 @@ the account:
 - It picks the best account it can measure. If none is measurable, it lands
   "blind" on the account whose last reading was lowest. Usage only rises
   within a window, so an old reading is a floor. It skips accounts:
-  - that never had a reading;
+  - that never had a reading, or whose last reading is more than a week
+    old (by then both windows have reset, so it reads 0% and proves
+    nothing);
   - that the usage endpoint refuses (401/403, like a broken slot);
   - whose last reading is already at a limit that hasn't reset;
   - that a stopped session, or the account it just left, shows is spent.
+- It never picks an account whose subscription has lapsed (canceled and
+  back on the free plan), for any reason. Claude Code refuses those outright.
 - If it guesses wrong, the session stops again when the waiter continues it
   on that account. That stop names the account, and `cswap auto` moves on
   again without going back. It can tell that stop from a late one on the old
   account because Claude Code reports a different reset time for it.
+- If the account refuses the continue instead (an error, not a limit), the
+  waiter holds the session until `cswap auto` is on another account.
 - Then the waiters continue the stopped sessions as usual (`account-switched`).
 
 It ignores stops from sessions that already carried on, from `cswap run`
@@ -264,6 +276,14 @@ Tested on Windows 11 with Claude Code 2.1.314:
   The session starts a new turn and records the message as `selfSent`. The
   stop in that test was synthetic, since a real limit can't be triggered on
   demand.
+
+- The 2026-11-10 fixes, on this machine's real history (Nov 3 to Nov 9). The
+  answer check classifies all 15 delivered continues correctly: 2 worked, 13
+  were refused with 403 on a lapsed slot. The stop reader now finds all 7
+  stops that a background-task notice used to hide. And the engine rules,
+  run against the live usage store, exclude that slot. This is a replay of
+  recorded data plus unit tests. No real limit has hit the new code yet, and
+  `cswap resume test` doesn't exercise these paths.
 
 Not tested yet: the interactive terminal UI's limit dialog, macOS and Linux.
 The unit tests cover the policy, the loop guard and the waiter.
