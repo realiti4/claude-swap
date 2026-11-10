@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -949,6 +950,25 @@ class TestClassifyUsageError:
         assert oauth._classify_usage_error(
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
+
+    @pytest.mark.parametrize("reason, kind", [
+        (ssl.SSLCertVerificationError(1, "certificate verify failed"), "tls-cert"),
+        (ssl.SSLEOFError("EOF occurred in violation of protocol"), "network"),
+        (ssl.SSLError("wrong version number"), "network"),
+    ])
+    def test_refused_certificate_is_told_apart(self, reason, kind):
+        """Only a certificate the client refused is ``tls-cert``; a TLS failure
+        of any other class stays ``network``, since no CA repairs it."""
+        err = urllib.error.URLError(reason)
+        assert oauth._classify_usage_error(err) == (kind, None)
+
+    def test_refused_certificate_shows_its_remedy(self):
+        """The unavailable line names the fix, not the bare kind."""
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.usage_store import UsageEntry
+
+        (line,) = _usage_entry_lines(UsageEntry(last_error="tls-cert"))
+        assert "SSL_CERT_FILE" in line and "tls-cert" not in line
 
     def test_bad_response(self):
         try:

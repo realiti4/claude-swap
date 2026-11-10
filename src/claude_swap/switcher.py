@@ -272,6 +272,12 @@ ERROR_NOTES = {
         "plan or an org policy), so its usage cannot be read — renewing the "
         "plan restores it"
     ),
+    "tls-cert": (
+        "the TLS certificate was refused — if a proxy re-signs traffic, "
+        "trust its CA in the OS certificate store or via SSL_CERT_FILE "
+        "(NODE_EXTRA_CA_CERTS is not read); otherwise check for a captive "
+        "portal or a wrong system clock"
+    ),
     "setup-token": (
         "setup-tokens cannot read the usage endpoint — "
         "`cswap config set usage.headerProbe true` reads it from a 1-token request"

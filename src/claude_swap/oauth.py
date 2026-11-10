@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -771,11 +772,11 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``,
-    ``"oauth_not_allowed_for_organization"`` (a 403 whose body says so), or the
-    exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
-    HTTP-date form is rare enough to ignore).
+    (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
+    ``"bad-response"``, ``"oauth_not_allowed_for_organization"`` (a 403 whose
+    body says so), or the exception type name as a fallback).
+    ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
+    one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
@@ -801,6 +802,15 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
+        # A certificate the client refused (an untrusted chain, a name that
+        # does not match, an expired one) is not an unreachable host: the
+        # repair is trust or the clock, so it gets its own kind. Measured on
+        # macOS against a local server, with truststore 0.10.4 and with stdlib
+        # ssl: all three raise this class, SSL_CERT_FILE adds a CA on both
+        # paths, and NODE_EXTRA_CA_CERTS, which Claude Code 2.1.322 honours,
+        # does not. Other TLS failures (a plaintext port) stay "network".
+        if isinstance(e.reason, ssl.SSLCertVerificationError):
+            return "tls-cert", None
         return "network", None
     if isinstance(e, (json.JSONDecodeError, _InvalidUsageResponse)):
         return "bad-response", None
