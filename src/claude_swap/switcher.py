@@ -7449,7 +7449,8 @@ class ClaudeAccountSwitcher:
         - ``"own-rotated"``    — full rotation, but the profile endpoint
           resolved the live token to this slot's identity; back up normally
           (the live→backup re-sync that keeps slots alive across Claude
-          Code's routine refresh-token rotations).
+          Code's routine refresh-token rotations). Also a rotated API key
+          live in an API-key slot, which has no OAuth lineage to resolve.
         - ``"foreign"``        — uuid-positively resolved to *another* managed
           slot (``foreign_slot``) holding a different lineage; backing it up
           here would destroy this slot's only refresh token (issue #117's
@@ -7516,9 +7517,13 @@ class ClaudeAccountSwitcher:
             kind in ("own-family", "own-rotated", "unresolved")
             and data.get("accounts", {}).get(current_account, {}).get("kind")
             == "api_key"
-            and not looks_like_api_key(original_creds)
         ):
-            return ("api-key-mismatch", None)
+            if not looks_like_api_key(original_creds):
+                return ("api-key-mismatch", None)
+            if kind == "unresolved":
+                # A key carries no OAuth lineage for the oracle to verify, so
+                # the roster's own record of the slot is the whole attribution.
+                return ("own-rotated", None)
         return (kind, foreign_slot)
 
     def _attribute_live_credential(
@@ -8488,10 +8493,11 @@ class ClaudeAccountSwitcher:
                 else:  # own-family / own-rotated
                     # attributed only for "own-rotated": that kind is
                     # established either by `_classify_outgoing_credential`'s
-                    # uuid-verified oracle match or by its stamp-only rescue
+                    # uuid-verified oracle match, by its stamp-only rescue
                     # (`_live_is_own_newer_generation`, for an oracle-silent
-                    # rotation), so its fingerprint legitimately differs from
-                    # the stored backup and needs the attestation.
+                    # rotation) or by a key live in an API-key slot, so its
+                    # fingerprint legitimately differs from the stored
+                    # backup and needs the attestation.
                     # "own-family" is a stored-backup
                     # fingerprint match already, which the store's own
                     # attribution guard re-derives independently below — left
