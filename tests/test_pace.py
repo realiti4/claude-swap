@@ -167,3 +167,31 @@ class TestAheadVsWillLastRelationship:
         assert result is not None
         assert result.ahead is False
         assert pace.will_last_to_reset(result) is False
+
+
+class TestExpectedPct:
+    def test_seven_work_days_is_linear(self):
+        assert pace.expected_pct(NOW + 3.5 * DAY, NOW) == 50.0
+
+    def test_six_work_days_skips_sunday(self):
+        resets_at = datetime(2026, 10, 21, 16, 59).timestamp()
+        sunday_evening = datetime(2026, 10, 18, 21, 22).timestamp()
+        sunday_morning = datetime(2026, 10, 18, 9, 0).timestamp()
+        expected = pace.expected_pct(resets_at, sunday_evening, work_days=6)
+        assert abs(expected - (7 + 1 / 60 + 72) / 144 * 100) < 0.01
+        assert pace.expected_pct(resets_at, sunday_morning, work_days=6) == expected
+
+
+class TestWeeklyDeficit:
+    def test_used_minus_expected(self):
+        usage = {"seven_day": _window(60.0, NOW + 3.5 * DAY)}
+        assert pace.weekly_deficit(usage, NOW) == 10.0
+
+    def test_unused_account_is_in_reserve(self):
+        usage = {"seven_day": _window(0.0, NOW + 6 * DAY)}
+        assert pace.weekly_deficit(usage, NOW) < 0
+
+    def test_unknown_without_a_future_reset(self):
+        assert pace.weekly_deficit({"seven_day": _window(10.0, None)}, NOW) is None
+        assert pace.weekly_deficit({"seven_day": _window(10.0, NOW - 1)}, NOW) is None
+        assert pace.weekly_deficit(None, NOW) is None
