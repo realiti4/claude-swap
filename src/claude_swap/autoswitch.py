@@ -4799,10 +4799,11 @@ class AutoSwitchEngine:
                 #
                 # "NOTHING CAN SERVE" IS `best_candidate_headroom`, never
                 # `all_above`: over the THRESHOLD still leaves a peer holding
-                # real quota. The escape key below ranks on the window that
-                # blocked the ACTIVE, and `headroom_on_window` is only safe
-                # there because usability was already decided -- so admitting a
-                # spent candidate while a usable peer exists is what breaks it.
+                # real quota. `dynamic`'s escape key below ranks on the window
+                # that blocked the ACTIVE, and `headroom_on_window` is only
+                # safe there because usability was already decided -- so
+                # admitting a spent candidate while a usable peer exists is
+                # what breaks it.
                 #
                 # BOTH RETURNS MUST BE PROVABLE. `_binding_recovery_ts` answers
                 # `inf` for unknown AND for already past, which are opposite

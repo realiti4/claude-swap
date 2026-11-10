@@ -8851,10 +8851,11 @@ class ClaudeAccountSwitcher:
         The rescue orders GENERATIONS by access expiry, so it cannot see what
         ``_adopt_into_dead_slot`` refused on principle: a spent refresh token
         (the stash sweeps its own copy, so "the safety copy is kept" would be
-        false) and a login OLDER than the slot's. ``_refresh_expiry`` is
-        re-minted on every refresh with sub-second jitter, so only a gap past
-        ``LINEAGE_STAMP_JITTER_MS`` (``newer_login``) is a different login;
-        equal, jittered or undated stamps order nothing: #489's rotation.
+        false) and a login OLDER than the slot's. ``refreshTokenExpiresAt``
+        (``_refresh_expiry``) is re-minted on every refresh with sub-second
+        jitter, so only a gap past ``LINEAGE_STAMP_JITTER_MS``
+        (``newer_login``) is a different login; equal, jittered or undated
+        stamps order nothing: #489's rotation.
         """
         if oauth.refresh_token_spent(original_creds):
             return False
