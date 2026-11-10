@@ -4953,6 +4953,29 @@ class TestUnswitchableRowsAreListed:
         assert "not a candidate" not in out[:out.index("close@x.com")], out
         assert "not a candidate (headroom margin too small)" in out, out
 
+    def test_the_consume_first_landing_room_bar_names_its_reason(self):
+        """The pass's landing-room bar (#504) drops a peer with a sooner weekly
+        reset but under the hysteresis margin of room below its line, and the
+        row says so rather than a bare `not a candidate`. `consume-first`,
+        threshold 90, hysteresis 10: the 85% peer has 5 points of room."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        def windows(pct, reset_in):
+            return {
+                "five_hour": {"pct": pct},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_in(reset_in)},
+            }
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=windows(50.0, 86400 * 5)),
+            self._acct("2", "open@x.com", switchable=True, last_good=windows(20.0, 86400 * 2)),
+            self._acct("3", "tight@x.com", switchable=True, last_good=windows(85.0, 86400)),
+        ), active="1", settings=AutoSwitchSettings(
+            threshold=90.0, hysteresis_pct=10.0, strategy="consume-first",
+        ))
+        assert "not a candidate" not in out[:out.index("tight@x.com")], out
+        assert "not a candidate (too little room under its line)" in out, out
+
     def test_a_no_plan_row_names_why_and_sorts_after_every_other_row(self):
         """A slot whose usage poll answered `oauth_not_allowed_for_
         organization` (subscription inactive) renders that reason INSTEAD

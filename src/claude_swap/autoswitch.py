@@ -5325,6 +5325,7 @@ class AutoSwitchEngine:
                     # and runs out (measured: 5h 85% under a 90 line, landed on,
                     # 92/93/99% held by cooldown, the session limit hit at 100%).
                     if trigger == "consume-first" and room < settings.hysteresis_pct:
+                        reasons[num] = "too little room under its line"
                         continue
                 elif active_headroom is not None:
                     # best, and also dynamic's `proactive` trigger (over
