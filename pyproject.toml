@@ -1,15 +1,10 @@
 [project]
 name = "claude-swap"
-version = "0.28.0b1"
+version = "1.1.0b1"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    # Windows-only: needed solely by the one-time keyring -> files migration
-    # (migrations.py) for users upgrading from <=0.10.x. macOS/Linux never
-    # import it on the hot path; the macOS migration has a security-CLI
-    # fallback and the legacy purge sweep no-ops when it's absent.
-    "keyring>=25.0.0; sys_platform == 'win32'",
     "textual>=8.2.8,<9",
     "truststore>=0.10.4",
 ]
@@ -17,7 +12,7 @@ authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
 license = {text = "MIT"}
 keywords = ["claude", "claude-code", "account-switcher", "cli"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",

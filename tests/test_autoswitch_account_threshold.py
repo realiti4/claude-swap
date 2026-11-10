@@ -230,7 +230,7 @@ class TestLandingGateIsPerCandidate:
         `_left_account_recovered`): if the gate rejects every measured
         candidate while the active account is over its own line, then by
         definition every account is at/over its line, `all_above` is True, and
-        the landing gate is bypassed by the soonest-recovery escape. So the
+        the landing gate is bypassed by the all-above room ranking. So the
         per-account rewrite must feed **both** sides the same map - a version
         that made the landing gate per-account but left the all-above census on
         the global scalar would disagree with itself here and hold.
@@ -587,7 +587,8 @@ class TestRawHeadroomGuardsDoNotMove:
     def test_an_override_does_not_move_the_ratio_gate(self, temp_home):
         """`_no_return_account`'s ratio leg reads a *readable* active, so the
         threshold never enters it - an override on the barred account must not
-        change which side of `left >= active * RATIO` it lands on."""
+        change which side of the release margin (`_all_above_margin_met`) it
+        lands on."""
         h = _fleet(temp_home)
         state = {
             "lastSwitchFrom": 2,
@@ -596,19 +597,21 @@ class TestRawHeadroomGuardsDoNotMove:
             "leftRecoveryAt": None,
             "leftTrigger": "proactive",
         }
-        # left 12.0 vs active 5.0: 12 >= 5 * 2.0 -> beats us outright.
+        # left 12.0 vs active 5.0: 12 >= min(5 * 2.0, 5 + 3.0) == 8 -> clears
+        # the release margin.
         for override in ({}, {"2": 50.0}, {"2": 99.0}):
             assert h.engine._no_return_account(
                 "proactive", dict(state), {"2": 12.0}, 5.0, True,
                 h.settings, "1", thresholds=ThresholdMap(override, GLOBAL),
                 usage={"2": _usage(88.0)},
             ) is None
-        # left 9.0 vs active 5.0: 9 < 10 -> the ratio does not release.
+        # left 7.0 vs active 5.0: 7 < min(5 * 2.0, 5 + 3.0) == 8 -> the
+        # capped margin does not release.
         for override in ({}, {"2": 50.0}, {"2": 99.0}):
             assert h.engine._no_return_account(
-                "proactive", dict(state), {"2": 9.0}, 5.0, True,
+                "proactive", dict(state), {"2": 7.0}, 5.0, True,
                 h.settings, "1", thresholds=ThresholdMap(override, GLOBAL),
-                usage={"2": _usage(91.0)},
+                usage={"2": _usage(93.0)},
             ) == "2"
 
     def test_an_override_does_not_move_the_spent_gate(self, temp_home):

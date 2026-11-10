@@ -7,14 +7,16 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
 CACHE_PATH = CACHE_DIR / "update_check.json"
-CACHE_TTL = 24 * 3600  # 24 hours
+CACHE_TTL = 24 * 3600  # A successful lookup is kept for a day.
+FAILURE_TTL = 3600  # A failed one is retried after an hour.
 PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
 
 _VERSION_RE = re.compile(
@@ -92,30 +94,198 @@ def _detect_install_method() -> str | None:
     return None
 
 
+class _Cooldown(NamedTuple):
+    """An exclude-newer setting as uv spells it, and where the user set it."""
+
+    value: str  # "P14D", "14 days", "2026-10-11T00:36:21Z"
+    source: str  # 'uv-receipt.toml: exclude-newer-span = "P14D"'
+    from_env: bool  # Set through UV_EXCLUDE_NEWER rather than the receipt.
+
+
+def _read_receipt() -> dict[str, Any]:
+    """The ``[tool]`` table of this install's uv tool receipt, or ``{}``."""
+    try:
+        with (Path(sys.prefix) / "uv-receipt.toml").open("rb") as fh:
+            tool = tomllib.load(fh).get("tool", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return tool if isinstance(tool, dict) else {}
+
+
+def _uv_cooldown(receipt: dict[str, Any]) -> _Cooldown | None:
+    """The release cooldown ``uv tool upgrade`` applies to this install.
+
+    uv records ``--exclude-newer`` in the tool receipt and reapplies it on
+    every upgrade. A relative setting ("14 days") is stored as
+    ``exclude-newer-span`` next to the absolute cutoff of install time, and
+    the span is what uv recomputes from. ``UV_EXCLUDE_NEWER`` in the
+    environment overrides the receipt, as it does for uv itself.
+    """
+    env_value = os.environ.get("UV_EXCLUDE_NEWER", "").strip()
+    if env_value:
+        return _Cooldown(env_value, f"UV_EXCLUDE_NEWER={env_value}", from_env=True)
+    options = receipt.get("options", {})
+    if not isinstance(options, dict):
+        return None
+    for key in ("exclude-newer-span", "exclude-newer"):
+        value = options.get(key)
+        if isinstance(value, str):
+            return _Cooldown(value, f'uv-receipt.toml: {key} = "{value}"', from_env=False)
+    return None
+
+
+# A receipt value is pasted into a shell line unquoted, so only an ISO
+# duration ("P14D") or an RFC 3339 timestamp may pass.
+_CUTOFF_RE = re.compile(r"^[A-Za-z0-9.:+-]+$")
+
+
+def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str | None:
+    """The newest claude-swap release uv would install into this environment.
+
+    ``uv pip list --outdated`` resolves against the index the way ``uv tool
+    upgrade`` does once it is handed the same exclude-newer setting, so the
+    version it reports is one uv can actually install. Returns the current
+    version when nothing newer is visible and None when uv fails. A uv that
+    is not on PATH raises FileNotFoundError, since the caller treats that
+    differently from a failed resolve. The environment variable is dropped so that the cooldown passed
+    here is the only one uv sees, and the command runs from the tool's own
+    directory because uv reads the ``uv.toml`` or ``pyproject.toml`` of
+    whatever project the shell happens to be in. ``uv tool upgrade`` does
+    not, so a project's own cutoff must not hide releases from this check.
+    """
+    cmd = ["uv", "pip", "list", "--outdated", "--format", "json", "--python", sys.executable]
+    if cooldown is not None:
+        cmd += ["--exclude-newer", cooldown.value]
+    env = {k: v for k, v in os.environ.items() if k != "UV_EXCLUDE_NEWER"}
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+            check=True,
+            cwd=sys.prefix,
+        )
+        rows = json.loads(result.stdout)
+    except FileNotFoundError:
+        raise
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    for row in rows:
+        if row.get("name") == "claude-swap":
+            latest = row.get("latest_version")
+            return latest if isinstance(latest, str) else None
+    return current_version
+
+
+def _pypi_latest_version() -> str | None:
+    """PyPI's latest release, for installs that uv does not manage."""
+    try:
+        req = urllib.request.Request(PYPI_URL)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+        return data["info"]["version"]
+    except Exception:
+        return None
+
+
+class _Lookup(NamedTuple):
+    """A version lookup and whether its answer is worth writing to the cache."""
+
+    latest: str | None
+    cache: bool
+
+
+def _latest_version(current_version: str, method: str | None) -> _Lookup:
+    """The newest release the user's package manager will actually install.
+
+    uv is often off PATH when cswap runs under cron or launchd. Without a
+    cooldown PyPI answers the same question, so it takes over. With one,
+    PyPI would advertise releases the cooldown hides, so the run stays quiet
+    and leaves the cache alone: the interactive run that follows has uv and
+    retries at once. Any other uv failure (a timeout, a failed resolve) is
+    cached like a PyPI failure, so a dead network costs one attempt per
+    FAILURE_TTL rather than one per command.
+    """
+    if method != "uv":
+        return _Lookup(_pypi_latest_version(), cache=True)
+    cooldown = _uv_cooldown(_read_receipt())
+    uv_missing = False
+    try:
+        latest = _uv_latest_version(current_version, cooldown)
+    except FileNotFoundError:
+        latest = None
+        uv_missing = True
+    if latest is not None:
+        return _Lookup(latest, cache=True)
+    if cooldown is None:
+        return _Lookup(_pypi_latest_version(), cache=True)
+    return _Lookup(None, cache=not uv_missing)
+
+
+def held_back_release_notice(current_version: str) -> str | None:
+    """Explain a release that uv's cooldown keeps ``uv tool upgrade`` from seeing.
+
+    uv prints "Nothing to upgrade" whether the install is current or the
+    newest release is simply younger than the cooldown, and the user cannot
+    tell the two apart. When a cooldown is set, this asks uv what it would
+    install without one and names the setting that is in the way.
+
+    The remedy is ``uv tool upgrade`` itself with a zero cooldown, which
+    takes the release and leaves the receipt's extras, ``--with`` packages,
+    Python version and index options alone. uv stores the zero as
+    ``exclude-newer-span = "PT0S"``, so a second line restores the receipt's
+    own value. The flag also wins over ``UV_EXCLUDE_NEWER`` for that one
+    run, and since the variable keeps applying afterwards there is nothing
+    to restore in that case.
+    """
+    cooldown = _uv_cooldown(_read_receipt())
+    if cooldown is None:
+        return None
+    try:
+        latest = _uv_latest_version(current_version, None)
+        if latest is None or not _is_newer(latest, current_version):
+            return None
+    except (FileNotFoundError, ValueError):
+        return None
+    take_now = 'uv tool upgrade claude-swap --exclude-newer "0 days"'
+    lines = [
+        f"claude-swap {latest} is on PyPI, but this install has a release cooldown",
+        f"  ({cooldown.source}) that hides it from uv tool upgrade.",
+    ]
+    if cooldown.from_env:
+        lines.append(f"  To take it now (the flag overrides UV_EXCLUDE_NEWER): {take_now}")
+    else:
+        lines.append(f"  To take it now:          {take_now}")
+        if _CUTOFF_RE.match(cooldown.value):
+            lines.append(
+                "  To restore the cooldown: "
+                f"uv tool upgrade claude-swap --exclude-newer {cooldown.value}"
+            )
+    return "\n".join(lines)
+
+
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
-        latest_version = None
-
-        # Try reading cache
+        method = _detect_install_method()
         cached_data = read_cache(CACHE_PATH, CACHE_TTL)
-        if cached_data is not MISSING:
+        if cached_data is None:
+            # A cached failure. Keep it for an hour, not a day.
+            cached_data = read_cache(CACHE_PATH, FAILURE_TTL)
+        if cached_data is not MISSING and isinstance(cached_data, str | None):
             latest_version = cached_data
         else:
-            # Fetch from PyPI
-            try:
-                req = urllib.request.Request(PYPI_URL)
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    data = json.loads(resp.read().decode())
-                latest_version = data["info"]["version"]
-            except Exception:
-                latest_version = None
-
-            # Write cache regardless of success/failure
-            write_cache(CACHE_PATH, latest_version)
+            lookup = _latest_version(current_version, method)
+            latest_version = lookup.latest
+            # A failure is cached as None and expires after FAILURE_TTL.
+            # The one exception is uv missing under a cooldown, see
+            # _latest_version.
+            if lookup.cache:
+                write_cache(CACHE_PATH, latest_version)
 
         if latest_version and _is_newer(latest_version, current_version):
-            method = _detect_install_method()
             direct = {
                 "uv": "uv tool upgrade claude-swap",
                 "pipx": "pipx upgrade claude-swap",
@@ -138,13 +308,139 @@ def check_for_update(current_version: str) -> str | None:
         return None
 
 
-def run_self_upgrade() -> int:
+def _installed_version_on_disk() -> str | None:
+    """The version claude-swap actually has on disk after an upgrade.
+
+    importlib.metadata resolves the running environment, so it still reports
+    the pre-upgrade version from inside this process. A fresh interpreter
+    started from sys.executable reads the tool directory uv/pipx rewrote,
+    giving an honest after-version for both install methods without parsing
+    `uv tool list` / `pipx list` output. Best effort: any failure or timeout
+    returns None so a verification hiccup never masks the upgrade's own exit
+    status.
+    """
+    code = (
+        "import importlib.metadata as m\n"
+        "print(m.version('claude-swap'))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    version = result.stdout.strip()
+    return version or None
+
+
+def install_identity() -> dict:
+    """``{"version", "source"}`` of the claude-swap this process runs.
+
+    ``source`` is the VCS commit for a git install (importlib.metadata's
+    ``direct_url.json``), else None. Two builds can share a version string and
+    differ only here — anyone installed from a branch, for instance — so a
+    "did the build change?" question compares both.
+    """
+    from importlib import metadata
+
+    from claude_swap import __version__
+
+    source = None
+    try:
+        raw = metadata.distribution("claude-swap").read_text("direct_url.json")
+        if raw:
+            source = (json.loads(raw).get("vcs_info") or {}).get("commit_id") or None
+    except (OSError, ImportError, ValueError, AttributeError, TypeError):
+        source = None  # no metadata, or not the shape pip/uv write: not a git install
+    return {"version": __version__, "source": source}
+
+
+def describe_identity(identity: dict | None) -> str:
+    """``1.0.0 (3fec656)`` for a git install, ``1.0.0`` otherwise."""
+    if not identity:
+        return "unknown"
+    source = identity.get("source")
+    version = str(identity.get("version") or "unknown")
+    return f"{version} ({str(source)[:7]})" if source else version
+
+
+def _installed_identity_on_disk() -> dict | None:
+    """:func:`install_identity` as a fresh interpreter sees it after an upgrade.
+
+    Same reasoning as :func:`_installed_version_on_disk`: this process still
+    reports the pre-upgrade build. Best effort, None on any failure.
+    """
+    code = (
+        "import json\n"
+        "from claude_swap.update_check import install_identity\n"
+        "print(json.dumps(install_identity()))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        identity = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    return identity if isinstance(identity, dict) else None
+
+
+def _restart_menubar_if_rebuilt(before: dict) -> None:
+    """Restart a RUNNING menu bar service when the upgrade changed the build.
+
+    launchd keeps the old process until something restarts it; until now the
+    README asked for a manual kickstart. Only a running service is touched — a
+    quit one stays quit, which is the user's choice to keep. "Changed" compares
+    version and commit, so a git install that keeps its version string counts.
+    Other upgrade routes (``uv tool upgrade`` by hand) are covered by the next
+    plain ``cswap menubar``, which compares the worker's build stamp.
+    """
+    from claude_swap.printer import warning
+
+    after = _installed_identity_on_disk()
+    if after is None or after == before:
+        return
+    from claude_swap import launch_agent
+    from claude_swap.exceptions import ClaudeSwitchError
+
+    try:
+        pid = launch_agent.service_pid()
+        if pid is None:
+            return
+        launch_agent.kickstart(restart=True)
+    except (ClaudeSwitchError, OSError) as exc:
+        # The upgrade itself succeeded; only the restart did not.
+        warning(f"Menu bar not restarted onto the new build: {exc}")
+        return
+    print(f"Menu bar restarted onto {describe_identity(after)} (was pid {pid}).")
+
+
+def run_self_upgrade(current_version: str | None = None) -> int:
     """Run the appropriate upgrade command for the current install method.
 
     Returns the subprocess exit code, or 1 if detection failed or the package
-    manager is missing from PATH.
+    manager is missing from PATH. After a successful run it verifies what
+    actually landed on disk and reports the before -> after, since a package
+    manager can exit 0 without changing anything (uv's "Nothing to upgrade",
+    #491). A uv install with a release cooldown also gets told about a release
+    the cooldown hides, since uv itself only reports "Nothing to upgrade".
     """
-    from claude_swap.printer import accent, error
+    from claude_swap.printer import accent, error, warning
+
+    if current_version is None:
+        from claude_swap import __version__
+
+        current_version = __version__
+    before = current_version
+    before_identity = install_identity()
 
     method = _detect_install_method()
     commands = {
@@ -171,14 +467,41 @@ def run_self_upgrade() -> int:
     # releases the lock, so the user can just run the command themselves.
     if sys.platform == "win32":
         print(f"To upgrade claude-swap on Windows, run:\n  {accent(' '.join(cmd))}")
+        if method == "uv":
+            notice = held_back_release_notice(current_version)
+            if notice:
+                warning(notice)
         return 1
 
     try:
         result = subprocess.run(cmd, check=False)
-        return result.returncode
     except FileNotFoundError:
         error(
             f"Detected {method} install but `{cmd[0]}` is not on PATH. "
             "Run the upgrade manually from a shell where it is available."
         )
         return 1
+
+    if result.returncode != 0:
+        return result.returncode
+
+    # The package manager can exit 0 without changing anything, so verify
+    # what landed on disk and say so rather than trusting its wording (#491).
+    # importlib.metadata in a fresh interpreter reads the directory uv/pipx
+    # rewrote, so the report is honest for both install methods. Verification
+    # is best effort: a failure or timeout returns None and we stay silent,
+    # never masking the upgrade's own exit status.
+    after = _installed_version_on_disk()
+    if before and after and after != before:
+        print(accent(f"claude-swap upgraded: {before} -> {after}"))
+    elif before and after:
+        print(f"claude-swap is still at {after}.")
+
+    if sys.platform == "darwin":
+        _restart_menubar_if_rebuilt(before_identity)
+
+    if method == "uv":
+        notice = held_back_release_notice(current_version)
+        if notice:
+            warning(notice)
+    return result.returncode
