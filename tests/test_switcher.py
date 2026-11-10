@@ -40,6 +40,7 @@ from claude_swap.switcher import (
     _format_usage_lines,
     _usage_entry_lines,
 )
+from tests.conftest import RealStoreWriteBlocked
 
 
 def _raise_locked(*args, **kwargs):
@@ -7847,19 +7848,25 @@ class TestProvenanceGuard:
         ), patch.object(switcher, "_write_account_credentials", **write):
             return switcher._rescue_foreign_successor("2", data, live)
 
-    def test_the_rescue_does_not_absorb_the_suites_real_store_guard(
-        self, temp_home,
+    @pytest.mark.parametrize(
+        "refusal", [RealStoreWriteBlocked, ValueError, TypeError],
+    )
+    def test_the_rescue_contains_only_store_and_lock_faults_on_its_write(
+        self, temp_home, refusal,
     ):
         """A write-time refusal is not a fault the rescue may contain:
         `except Exception` turned `RealStoreWriteBlocked` (deliberately not an
-        `OSError`) into a quiet False."""
-        from tests import conftest
-
-        with pytest.raises(conftest.RealStoreWriteBlocked):
+        `OSError`) into a quiet False, and the expiry guard's ValueError and
+        TypeError arms must not reach the write either."""
+        with pytest.raises(refusal):
             self._rescue_newer_live(
-                ClaudeAccountSwitcher(), 2_000,
-                side_effect=conftest.RealStoreWriteBlocked("refused"),
+                ClaudeAccountSwitcher(), 2_000, side_effect=refusal("refused"),
             )
+
+    def test_the_rescue_contains_a_failed_backup_write(self, temp_home):
+        assert self._rescue_newer_live(
+            ClaudeAccountSwitcher(), 2_000, side_effect=OSError("disk full"),
+        ) is False
 
     @pytest.mark.parametrize(
         "live_exp", ["2026-11-10T00:00:00Z", [2_000], 10**400],
