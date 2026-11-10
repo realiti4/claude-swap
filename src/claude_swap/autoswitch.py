@@ -5090,6 +5090,7 @@ class AutoSwitchEngine:
 
         qualifying: list[tuple[tuple, str]] = []
         key_axis: dict[str, str] = {}  # per candidate, set alongside its key
+        tight_seen: set[bool] = set()  # `tight` of every candidate that qualified
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -5523,10 +5524,14 @@ class AutoSwitchEngine:
                     key = (1, over, *most_room(num, h))
                     key_axis[num] = "most headroom"
             qualifying.append((key, num))
+            tight_seen.add(tight)
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
         axis = key_axis.get(ordered[0]) if ordered else None  # winner's own axis
+        if axis == "soonest reset" and len(tight_seen) > 1:
+            # `tight` leads the reset key, so a roomy winner beat a sooner tight one on room.
+            axis = "room under its line, then soonest reset"
         # EVERY CANDIDATE READABLE, not merely one of them holding room. A
         # row we could not read may be a healthy account, and announcing a
         # reset over it claims a fleet nobody measured.

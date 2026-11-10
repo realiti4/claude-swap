@@ -2329,6 +2329,38 @@ class TestPanelOrderIsTheEnginesOrder:
         assert ordered == ["2", "3"], ordered
         assert "Next best (most headroom)" in rendered, rendered
 
+    @pytest.mark.parametrize("strategy", ["consume-first", "weekly-first"])
+    @pytest.mark.parametrize(
+        "cand_five, legend",
+        [
+            ({"2": 85.0, "3": 10.0}, "Next best (room under its line, then soonest reset)"),
+            ({"2": 85.0, "3": 85.0}, "Next best (soonest reset)"),
+        ],
+        ids=["tight-sooner-loses-to-room", "uniform-tight-keeps-reset"],
+    )
+    def test_a_forced_move_names_room_when_room_decided_the_winner(
+        self, temp_home, strategy, cand_five, legend
+    ):
+        """The active is over its 90 line, so the move prefers targets with the
+        10-point margin of room (#504) ahead of the reset. #2 resets soonest but
+        holds 5 points (tight). Beside a roomy #3 the tick lands on #3 and the
+        legend says room decided it; with #3 tight too only the reset is left to
+        order them, and the legend says that."""
+        def w(five, days):
+            return {
+                "five_hour": {"pct": five},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_in(days * 86400)},
+            }
+
+        fleet = {"1": w(96.0, 9), "2": w(cand_five["2"], 1), "3": w(cand_five["3"], 5)}
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, fleet, strategy=strategy, threshold=90.0, cooldown_seconds=0.0,
+            now=time.time(),
+        )
+        assert ordered[0] == engine_pick, (ordered, engine_pick)
+        assert engine_pick == ("3" if cand_five["3"] < 85.0 else "2")
+        assert legend in rendered, rendered
+
     @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
     def test_a_capped_peer_with_the_most_room_is_not_the_top_pick(
         self, temp_home, strategy
