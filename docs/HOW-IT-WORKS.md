@@ -698,6 +698,26 @@ same shape. Both sides added a settings section (upstream `usage`, the fork
 plus the key counts in `test_config_cli.py` (now 22) and the tail of
 `test_autoswitch.py`. Expect the same the next time upstream adds a section.
 
+The third sync (2026-11-10) took 103 commits, up to `5ac68bf` (past v1.0.0).
+It brought Pro plans labeled by name, login-expiry notes, Windows history
+sharing through junctions, and the `keyring` dependency dropped. No `src/`
+file conflicted. The four conflicts were all keep-both:
+
+- `.gitignore`: upstream's `*.cswap` rule;
+- `README.md`: upstream's auto-switch rules link, placed before the fork's
+  pre-warm and auto-continue sections;
+- an import in `tests/test_settings.py`;
+- `uv.lock`: taken from upstream, then regenerated with `uv lock` so it
+  includes the fork's dev tools. This machine's uv writes `revision = 3`.
+
+Two upstream TUI timing tests (`test_login_expiry.py` card width,
+`test_tui.py` refresh counts) failed once in 2 parallel full runs under load.
+They passed in every serial run.
+
+After a sync, `cswap --version` still shows the old version and suggests
+`pipx upgrade claude-swap`. Never run that on this fork: it replaces the
+editable install with upstream's PyPI release, which has no auto-continue.
+
 **Keep the fork small.** The fork's own code is the files listed under
 `[tool.ruff] include` in `pyproject.toml` (auto-continue, notifications, their
 tests), plus small, well-marked insertions in upstream files:

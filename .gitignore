@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# macOS Finder folder metadata
+.DS_Store
+
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
 
@@ -32,3 +35,6 @@ CLAUDE.local.md
 .serena/
 .taskmaster/
 # <<< MASTER AI (managed by: masterai git) <<<
+
+# cswap export files: they hold account logins in plain text
+*.cswap
