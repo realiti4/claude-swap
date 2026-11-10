@@ -932,21 +932,33 @@ class SessionManager:
     def _default_login_signed_out(self) -> bool:
         """True only when the default login certainly holds no usable token.
 
-        The same-account fast path runs plain claude on the default login. A
-        login Claude Code has signed out (``/logout``, or its reaction to a
-        refresh that fails with invalid_grant, which empties both tokens in
-        place) then stops every launch at "Not logged in" or "Login expired",
-        while the slot's stored login may still be good.
+        The same-account fast path runs plain claude on the default login.
+        When a refresh is rejected with invalid_grant, Claude Code (2.1.322)
+        empties both tokens in the credential store and leaves
+        ``oauthAccount`` in ``.claude.json``. The login then still names the
+        account, and every launch on it stops at "Not logged in" or "Login
+        expired", while the slot's stored login may still be good.
+        ``/logout`` does not lead here: it removes ``oauthAccount``, so the
+        account is no longer the default login.
 
         Read as the fast path's claude would read it: the default profile,
         whatever ``CLAUDE_CONFIG_DIR`` says. An unreadable Keychain, a file
         read error, a managed API key or a blob of unknown shape cannot be
         told apart from a working login, so they answer False and keep the
         fast path.
+
+        A non-empty ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` answers False too.
+        Claude Code (2.1.322) then resolves its credential store from that
+        value, and the plaintext half of this read does not follow it, so
+        an empty result would say nothing about the login claude uses. A
+        session launched instead would inherit the override and read that
+        same store, not its own profile.
         """
         from claude_swap import oauth as _oauth
         from claude_swap.credentials import looks_like_api_key
 
+        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+            return False
         preset = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         try:
             active = self.switcher._read_active_credentials()

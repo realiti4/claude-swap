@@ -1703,6 +1703,29 @@ class TestRun:
 
         assert "CLAUDE_CONFIG_DIR" in exc.value.env
 
+    def test_working_default_login_keeps_the_fast_path(
+        self,
+        manager,
+        temp_home,
+        capture_exec,
+        monkeypatch,
+        capsys,
+        real_default_login_check,
+    ):
+        # The check itself runs here: a login that still holds a refresh
+        # token must never be copied into a session profile.
+        (temp_home / ".claude" / ".credentials.json").write_text(CREDS)
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "already the active default login" in capsys.readouterr().out
+
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
         manager,
@@ -5480,3 +5503,25 @@ class TestDefaultLoginSignedOut:
             lambda: ActiveCredentials(None, True, True),
         )
         assert manager._default_login_signed_out() is False
+
+    def test_a_redirected_credential_store_keeps_the_fast_path(
+        self, manager, tmp_path, monkeypatch, real_default_login_check
+    ):
+        # claude reads its plaintext credential from the override directory.
+        # The default profile holds none, and that must not read as signed
+        # out while the login claude would use works.
+        redirected = tmp_path / "redirected-store"
+        redirected.mkdir()
+        (redirected / ".credentials.json").write_text(CREDS)
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(redirected))
+
+        assert manager._default_login_signed_out() is False
+
+    def test_an_empty_override_still_reads_the_default_store(
+        self, manager, monkeypatch, real_default_login_check
+    ):
+        # Defined but empty selects the default credential store, which is
+        # the one this check reads, so its answer stands.
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+        assert manager._default_login_signed_out() is True
