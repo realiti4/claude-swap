@@ -1752,6 +1752,7 @@ COLD_PARTITION_KEY = (
     "each by 7d reset within 24h, then most room"
 )
 ESCAPE_KEY = "soonest to recover, warm on a tie"
+ROOM_THEN_RESET = "Next best (room under its line, then soonest reset)"
 
 
 def _autoview_text(snap, active, settings, last_active_at=None):
@@ -2329,36 +2330,41 @@ class TestPanelOrderIsTheEnginesOrder:
         assert ordered == ["2", "3"], ordered
         assert "Next best (most headroom)" in rendered, rendered
 
-    @pytest.mark.parametrize("strategy", ["consume-first", "weekly-first"])
     @pytest.mark.parametrize(
-        "cand_five, legend",
+        "strategy, active_five, cand_five, legend",
         [
-            ({"2": 85.0, "3": 10.0}, "Next best (room under its line, then soonest reset)"),
-            ({"2": 85.0, "3": 85.0}, "Next best (soonest reset)"),
+            ("consume-first", 96.0, (85.0, 10.0), ROOM_THEN_RESET),
+            ("weekly-first", 96.0, (85.0, 10.0), ROOM_THEN_RESET),
+            ("consume-first", 100.0, (85.0, 10.0), ROOM_THEN_RESET),
+            ("consume-first", 96.0, (85.0, 85.0), "Next best (soonest reset)"),
+            ("weekly-first", 96.0, (85.0, 85.0), "Next best (soonest reset)"),
         ],
-        ids=["tight-sooner-loses-to-room", "uniform-tight-keeps-reset"],
+        ids=[
+            "consume-first-forced", "weekly-first-forced", "consume-first-at-limit",
+            "consume-first-uniform-tight", "weekly-first-uniform-tight",
+        ],
     )
-    def test_a_forced_move_names_room_when_room_decided_the_winner(
-        self, temp_home, strategy, cand_five, legend
+    def test_the_legend_names_room_when_room_decided_the_winner(
+        self, temp_home, strategy, active_five, cand_five, legend
     ):
-        """The active is over its 90 line, so the move prefers targets with the
-        10-point margin of room (#504) ahead of the reset. #2 resets soonest but
-        holds 5 points (tight). Beside a roomy #3 the tick lands on #3 and the
-        legend says room decided it; with #3 tight too only the reset is left to
-        order them, and the legend says that."""
+        """#2 resets soonest but holds 5 points under its 90 line, under the
+        10-point margin; #3 resets later and holds room. A move forced by the
+        active's line (96%, or 100% for the at-limit escape) puts room ahead of
+        the reset, so the tick lands on #3 and the legend must not claim the
+        reset ordered them. With #3 tight too only the reset is left, and the
+        legend says that."""
         def w(five, days):
             return {
                 "five_hour": {"pct": five},
                 "seven_day": {"pct": 10.0, "resets_at": _iso_in(days * 86400)},
             }
 
-        fleet = {"1": w(96.0, 9), "2": w(cand_five["2"], 1), "3": w(cand_five["3"], 5)}
+        fleet = {"1": w(active_five, 9), "2": w(cand_five[0], 1), "3": w(cand_five[1], 5)}
         engine_pick, ordered, rendered = self._tick_and_panel(
             temp_home, fleet, strategy=strategy, threshold=90.0, cooldown_seconds=0.0,
             now=time.time(),
         )
         assert ordered[0] == engine_pick, (ordered, engine_pick)
-        assert engine_pick == ("3" if cand_five["3"] < 85.0 else "2")
         assert legend in rendered, rendered
 
     @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
