@@ -799,7 +799,23 @@ class SessionManager:
             current = self._default_login_identity()
         else:
             current = self.switcher._get_current_account()
-        if current is not None and current == (email, org_uuid):
+        # A default login with no usable token cannot run claude, and holds no
+        # refresh token a session could spend twice, so the account's session
+        # profile is the launch that works.
+        signed_out = (
+            current is not None
+            and current == (email, org_uuid)
+            and self._default_login_signed_out()
+        )
+        if signed_out:
+            print(
+                dimmed(
+                    f"Account-{account_num} ({email}) is the default login, "
+                    "but that login holds no usable token; launching from "
+                    "the stored login in a session profile."
+                )
+            )
+        if current is not None and current == (email, org_uuid) and not signed_out:
             if require_session:
                 raise SessionError(
                     f"Account-{account_num} ({email}) is the active default "
@@ -912,6 +928,63 @@ class SessionManager:
         if not isinstance(oauth, dict) or not oauth.get("emailAddress"):
             return None
         return oauth["emailAddress"], oauth.get("organizationUuid", "") or ""
+
+    def _default_login_signed_out(self) -> bool:
+        """True only when the default login certainly holds no usable token.
+
+        The same-account fast path runs plain claude on the default login.
+        When a refresh is rejected with invalid_grant, Claude Code (2.1.322)
+        empties both tokens in the credential store and leaves
+        ``oauthAccount`` in ``.claude.json``. The login then still names the
+        account, and every launch on it stops at "Not logged in" or "Login
+        expired", while the slot's stored login may still be good.
+        ``/logout`` does not lead here: it removes ``oauthAccount``, so the
+        account is no longer the default login.
+
+        Read as the fast path's claude would read it: the default profile,
+        whatever ``CLAUDE_CONFIG_DIR`` says. An unreadable Keychain, a file
+        read error, a managed API key or a blob of unknown shape cannot be
+        told apart from a working login, so they answer False and keep the
+        fast path.
+
+        A non-empty ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` answers False too.
+        Claude Code (2.1.322) then resolves its credential store from that
+        value, and the plaintext half of this read does not follow it, so
+        an empty result would say nothing about the login claude uses. A
+        session launched instead would inherit the override and read that
+        same store, not its own profile.
+        """
+        from claude_swap import oauth as _oauth
+        from claude_swap.credentials import looks_like_api_key
+
+        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+            return False
+        preset = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        try:
+            active = self.switcher._read_active_credentials()
+        finally:
+            if preset is not None:
+                os.environ["CLAUDE_CONFIG_DIR"] = preset
+        if active.value is None or active.keychain_unavailable or active.degraded:
+            return False
+        if not active.value.strip():
+            return True
+        if looks_like_api_key(active.value):
+            return False
+        data = _oauth.extract_oauth_data(active.value)
+        if data is None:
+            return False
+        if data.get("refreshToken"):
+            return False
+        if not data.get("accessToken"):
+            return True
+        # An access token without a refresh token works until it expires.
+        expires_at = data.get("expiresAt")
+        return (
+            isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and expires_at <= time.time() * 1000
+        )
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.

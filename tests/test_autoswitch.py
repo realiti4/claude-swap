@@ -9112,7 +9112,18 @@ class TestEveryAccountAboveThreshold:
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
 
-    def test_at_limit_ranks_on_the_window_that_actually_blocked(self, harness):
+    @staticmethod
+    def _best_fleet(temp_home) -> EngineHarness:
+        """`best`, where this fork's escape axis still orders targets: the
+        consume-first strategy's at-limit escape is upstream's (#305, an
+        under-line target first, then the weekly reset among those with room)."""
+        h = EngineHarness(temp_home, strategy="best")
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_at_limit_ranks_on_the_window_that_actually_blocked(self, temp_home):
         """Escaping a 5h limit must rank candidates by their 5h room.
 
         `account_headroom` is `100 - max(5h, 7d, scoped...)` — the BINDING
@@ -9125,12 +9136,15 @@ class TestEveryAccountAboveThreshold:
         weekly; candidate 3 has most of its 5h spent and a fresh weekly. Both
         are usable, so neither is filtered — only the ORDER is at issue. For
         the next five hours candidate 2 is worth 100 points of the axis that
-        blocked us and candidate 3 is worth 15, but max() scores them 10 and
+        blocked us and candidate 3 is worth 15, but max() scores them 13 and
         15 and the old key took the one with almost no room where it counts.
+        Both sit under their lines (an escape takes an under-line target
+        first, #305), so the axis is what orders them.
         """
+        harness = self._best_fleet(temp_home)
         outcome = harness.tick_with_usage({
             "1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}},
-            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 90.0}},
+            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 87.0}},
             "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
         })
         assert outcome is TickOutcome.SWITCHED
@@ -9139,50 +9153,53 @@ class TestEveryAccountAboveThreshold:
         assert harness.active_number() == 2, (
             "a 5h limit fired, so the escape must go to the account with the "
             "most 5h room (2: 100 free) rather than the best worst-case "
-            "window (3: max(85,10)=85 -> headroom 15 beats 2's 10)"
+            "window (3: max(85,10)=85 -> headroom 15 beats 2's 13)"
         )
 
-    def test_the_escape_axis_is_not_cancelled_by_the_consume_first_strategy(
+    def test_the_escape_axis_is_not_cancelled_by_dynamics_consume_first_arm(
         self, temp_home
     ):
-        """Same case, `strategy=consume-first` — the answer must not change.
+        """Same case, `strategy=dynamic` — the answer must not change.
 
-        `consume_first` is the configured STRATEGY, not the trigger, and its
+        `consume_first` is true for the whole consume-first family, and its
         arm sat ahead of the escape arm. So an at-limit escape for a
-        consume-first user ranked on the soonest weekly reset and never
-        reached the window that had actually blocked it: the feature applied
-        to half the users. The same shape the recovery-hysteresis fix
-        already closed one branch above — filtering on one axis while
-        sorting on another.
+        `dynamic` user ranked on the soonest weekly reset and never reached
+        the window that had actually blocked it: the feature applied to half
+        the users. The same shape the recovery-hysteresis fix already closed
+        one branch above — filtering on one axis while sorting on another.
 
         The consume-first PREFERENCE is proactive (which account to burn
         next); at-limit is not a preference, it is a session that is stopped.
+        Not asked of `consume-first` itself: upstream's #305 owns its escape,
+        an under-line target first and the weekly reset among those with room
+        (`test_autoswitch_landing_room.py`).
         """
-        h = EngineHarness(temp_home, strategy="consume-first")
+        h = EngineHarness(temp_home, strategy="dynamic")
         h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
         h.seed(3, "c@example.com"); h.make_live("a@example.com", 1)
         outcome = h.tick_with_usage({
             "1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}},
-            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 90.0}},
+            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 87.0}},
             "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
         })
         assert outcome is TickOutcome.SWITCHED
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
         assert h.active_number() == 2, (
-            "consume-first ranked the escape on the weekly reset, so a 5h "
+            "dynamic ranked the escape on the weekly reset, so a 5h "
             "limit sent the user to the account with 15 points of 5h room "
             "instead of the one with 100"
         )
 
-    def test_control_a_7d_limit_still_ranks_on_the_weekly_axis(self, harness):
+    def test_control_a_7d_limit_still_ranks_on_the_weekly_axis(self, temp_home):
         """CONTROL for the case above, and it is what makes it a fix rather
         than a preference. Flip which window blocks the active account and the
         answer must flip with it — otherwise the change is "always prefer 5h",
         which would be a different bug wearing this one's clothes."""
+        harness = self._best_fleet(temp_home)
         outcome = harness.tick_with_usage({
             "1": {"five_hour": {"pct": 20.0},  "seven_day": {"pct": 100.0}},
-            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 90.0}},
+            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 87.0}},
             "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
         })
         assert outcome is TickOutcome.SWITCHED
@@ -16620,8 +16637,10 @@ class TestPerAccountSwitchThreshold:
         return {"five_hour": {"pct": pct}, "seven_day": window}
 
     @staticmethod
-    def _harness(temp_home, strategy, threshold=98.0):
-        h = EngineHarness(temp_home, strategy=strategy, threshold=threshold)
+    def _harness(temp_home, strategy, threshold=98.0, **settings):
+        h = EngineHarness(
+            temp_home, strategy=strategy, threshold=threshold, **settings
+        )
         for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
             h.seed(n, email)
         h.make_live("a@example.com", 1)
@@ -16718,7 +16737,9 @@ class TestPerAccountSwitchThreshold:
     ):
         """The bar replaces the strategy's in BOTH directions: 2 sits over the
         strategy's 90 but under its own 98, so it still competes on reset."""
-        h = self._harness(temp_home, "consume-first", threshold=90.0)
+        h = self._harness(
+            temp_home, "consume-first", threshold=90.0, hysteresis_pct=5.0
+        )
         self._set(h, 2, 98.0)
         outcome = h.tick_with_usage({
             "1": self._use(h, 95, 9 * 86400),
@@ -17273,9 +17294,11 @@ class TestWeeklyThreshold:
         # full refetch: a candidate that crossed its weekly line since the
         # snapshot must not be landed on.
         h = self._harness(temp_home, accounts=(1, 2, 3), strategy="consume-first")
+        # 7d 80% stored: room enough under the 97 line for consume-first to
+        # pick it on the snapshot, so the refetch is what must reject it.
         stored = {
             "1": _usage7(5, 50, _R_LATER),
-            "2": _usage7(5, 90, _R_SOON),
+            "2": _usage7(5, 80, _R_SOON),
             "3": _usage7(5, 50, _R_LATEST),
         }
         fresh = {**stored, "2": _usage7(5, 97, _R_SOON)}
@@ -17971,7 +17994,9 @@ class TestAnExpiringWindowPullsTheSwitch:
         for n in (1, 2, 3, 4):
             h.seed(n, f"acct{n}@example.invalid")
         h.make_live("acct1@example.invalid", 1)
-        outcome = _xw_tick(h, self._fleet(h))
+        # 2 holds the landing room (10 points under its 90 line) that
+        # consume-first asks of a voluntary target since #504.
+        outcome = _xw_tick(h, self._fleet(h, **{"2": _xw(h, 10.0, 75.0, 2 * _H)}))
         assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == (
             ["consume-first"] if strategy == "consume-first" else []
         )

@@ -52,7 +52,13 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.lines import BindingWindow, binding_window, weekly_capped, window_line
+from claude_swap.lines import (
+    BindingWindow,
+    binding_window,
+    line_room,
+    weekly_capped,
+    window_line,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import decision_logger
 from claude_swap.models import AccountPolicy
@@ -4754,6 +4760,14 @@ class AutoSwitchEngine:
         # stuck.
         dynamic_at_limit_escape = dynamic_landing and about_to_wall and by_recovery_axis
 
+        def most_room(num: str, h: float) -> tuple:
+            # Most raw headroom, the binding window's reset breaking an exact
+            # tie: the all-above key, and a consume-first escape's below its
+            # room bar. Clamped at zero: `pct` is copied through unclamped, so
+            # a spent candidate at 100.5 would lose to one at 100.0 on half a
+            # point this module calls noise.
+            return (-max(h, 0.0), _binding_recovery_ts(usage.get(num), models, now))
+
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -4830,6 +4844,14 @@ class AutoSwitchEngine:
             # any of them is reached; raw `h` / the single line when it
             # reports no window (a readable headroom rules that out).
             lh = binding.line_headroom if binding is not None else h
+            # Points left before the candidate reaches the nearest of its own
+            # lines, each window in its own points (`lines.line_room`); the
+            # single line against raw `h` when it reports no window.
+            room = self._room(
+                usage.get(num), settings, thresholds[num], models=models
+            )
+            if room is None:
+                room = thresholds[num] - (100.0 - h)
             over = (
                 binding.over
                 if binding is not None
@@ -4839,6 +4861,15 @@ class AutoSwitchEngine:
                 _seven_day_reset_ts(usage.get(num), now)
                 if consume_first or weekly_first
                 else None
+            )
+            # A forced (proactive) move first prefers targets with the
+            # hysteresis margin of room (#504). `dynamic` keeps its own bar and
+            # keys (adr/0009), so for it this is False on every candidate and
+            # orders nothing.
+            tight = (
+                not dynamic_landing
+                and trigger == "proactive"
+                and room < settings.hysteresis_pct
             )
             if (
                 by_recovery_axis
@@ -4956,6 +4987,14 @@ class AutoSwitchEngine:
                         )
                     ):
                         continue
+                    # ...and only with room to spend it: at least the hysteresis
+                    # margin under every one of its lines. The move is
+                    # opportunistic, and the cooldown it starts would hold auto on
+                    # a target a few points short of its line while it crosses it
+                    # and runs out (measured: 5h 85% under a 90 line, landed on,
+                    # 92/93/99% held by cooldown, the session limit hit at 100%).
+                    if trigger == "consume-first" and room < settings.hysteresis_pct:
+                        continue
                 elif active_headroom is not None:
                     # best, and also dynamic's `proactive` trigger (over
                     # threshold): the candidate must beat the active account
@@ -4980,22 +5019,19 @@ class AutoSwitchEngine:
                 # sooner is plainly better than a lower slot number. It is the
                 # reset of the window the room is measured on, the fullest one
                 # (no lines passed), since its rollover is what gives the
-                # account room again. Room clamps at zero: `pct` is copied
-                # through unclamped, so a spent candidate at 100.5 would lose
-                # to one at 100.0 on half a point this module calls noise.
+                # account room again.
                 #
                 # Under the at-limit wait every peer holds a sliver at most, so
                 # who returns first leads and room breaks the tie. `dynamic`
                 # keeps its T1083 tier in front: a FULL account (h <= 0) serves
                 # nothing until it resets, one at 0 < h serves now.
-                room = -max(h, 0.0)
-                reset = _binding_recovery_ts(usage.get(num), models, now)
+                neg_room, reset = most_room(num, h)
                 key: tuple = (
-                    (dynamic_landing and h <= 0, reset, room)
+                    (dynamic_landing and h <= 0, reset, neg_room)
                     if by_recovery_axis
-                    else (room, reset)
+                    else (neg_room, reset)
                 )
-            elif consume_first and trigger != "at-limit":
+            elif consume_first and (trigger != "at-limit" or not dynamic_landing):
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order.
                 #
@@ -5019,17 +5055,20 @@ class AutoSwitchEngine:
                 # over it, so no ONE fleet can hold both; under dynamic the
                 # two floors coincide by construction (`bar == 100 -
                 # SPENT_HEADROOM_PCT`) and the tiers simply agree.
-                key = consume_first_rank_key(
-                    usage.get(num), cand_bar, now, models,
-                    weekly_threshold=settings.weekly_threshold,
-                    scale=_ruler(settings),
+                key = (
+                    tight,
+                    *consume_first_rank_key(
+                        usage.get(num), cand_bar, now, models,
+                        weekly_threshold=settings.weekly_threshold,
+                        scale=_ruler(settings),
+                    ),
                 )
             elif weekly_first and trigger == "proactive":
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order. weekly-first
                 # keeps `best`'s headroom order for the at-limit and failover
                 # escapes, which may land on accounts over their lines.
-                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+                key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
                 # back to `-lh` when the label is unknown (usage without window
@@ -5114,6 +5153,30 @@ class AutoSwitchEngine:
                     ),
                     -max(escape_h if escape_h is not None else lh, 0.0),
                 )
+            if (
+                not dynamic_landing
+                and trigger in ("at-limit", "failover")
+                and not all_above
+            ):
+                # Escapes skip the landing gate on purpose (any account with
+                # real headroom beats a dead one) but must still prefer a target
+                # that can keep working, and one below its lines first: ranking
+                # by weekly reset alone escaped onto an account at Fable 94% of
+                # a 90 line while one at 1% / 3% was free (#305), and a target
+                # over a line is left again at the next cooldown.
+                if not consume_first:
+                    # best's key is already headroom; a room bar on top would
+                    # let a tenth of a point of room outrank points of headroom.
+                    key = (over, *key)
+                elif not over and room >= settings.hysteresis_pct:
+                    # Room to spare, the hysteresis margin under every line:
+                    # safe to spend the soonest weekly reset first.
+                    key = (0, *key)
+                else:
+                    # Without it the reset order would take 7d 97.9% under a 98 line
+                    # over 44%. Most raw headroom instead, as when nothing is
+                    # under its lines (all_above, above), under-line first.
+                    key = (1, over, *most_room(num, h))
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
@@ -5528,6 +5591,26 @@ class AutoSwitchEngine:
         verdict); None when the account reports no window."""
         binding = self._binding(value, settings, threshold, models=models)
         return None if binding is None else binding.over
+
+    def _room(
+        self,
+        value: dict | str | None,
+        settings: AutoSwitchSettings,
+        line: float,
+        *,
+        models: Sequence[str] | None = None,
+    ) -> float | None:
+        """Points left before this account's nearest line under the tick's
+        lines (see ``lines.line_room``), or None when it reports no window.
+        Same inputs as ``_binding``."""
+        return line_room(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None,
+                self._models if models is None else models,
+            ),
+            line,
+            settings.weekly_threshold,
+        )
 
     def _in_cooldown(self, state: dict) -> bool:
         """Time-gate a rapid re-switch.
