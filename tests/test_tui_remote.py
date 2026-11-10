@@ -12,7 +12,7 @@ import pytest
 pytest.importorskip("textual")
 
 from claude_swap import remote as rm  # noqa: E402
-from tests.test_remote import PASS, TOKEN_A, TOKEN_B, Machine  # noqa: E402
+from tests.test_remote import PASS, TOKEN_A, TOKEN_A2, TOKEN_B, TOKEN_C, Machine  # noqa: E402
 from tests.test_tui import FakeSwitcher, make_account, make_app, menu_select, settle  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
@@ -112,12 +112,74 @@ class TestRemoteScreen:
             await open_remote(pilot, cfg)
             assert "remote" in menu_labels(app)["row:0"]
             await menu_select(pilot, "row:0")
-            assert menu_ids(app)[:3] == ["act-pull:0", "act-skip:0", "act-rm:0"]
+            assert menu_ids(app)[:4] == ["act-pull:0", "act-set-token:0", "act-skip:0", "act-rm:0"]
             await menu_select(pilot, "act-pull:0")
             await settle(pilot)
             assert "synced" in menu_labels(app)["row:0"]
         num = here.s._find_account_slot(here.s._get_sequence_data(), "spare@example.com", "")
         assert here.token_of(num) == TOKEN_B
+
+    async def test_replace_the_token_of_an_account_not_on_this_machine(
+        self, here, other, bare, tmp_path
+    ):
+        from claude_swap.tui.remote import ReplaceTokenModal
+
+        other.r.add("team", bare.as_uri(), passphrase=PASS)
+        num_other = other.token_account(TOKEN_B, "spare@example.com")
+        other.r.push("team", PASS)
+        cfg, _, _ = here.r.add("team", bare.as_uri(), passphrase=PASS)
+        app = app_for(here, tmp_path)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await settle(pilot)
+            await open_remote(pilot, cfg)
+            await menu_select(pilot, "row:0")
+            await menu_select(pilot, "act-set-token:0")
+            modal = app.screen
+            assert isinstance(modal, ReplaceTokenModal)
+            modal.query_one("#token").value = "not a token"
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, ReplaceTokenModal)  # stays open on a bad token
+            modal.query_one("#token").value = TOKEN_A
+            await pilot.press("enter")
+            await settle(pilot)
+            assert "remote" in menu_labels(app)["row:0"]  # still not on this machine
+        assert here.s._find_account_slot(here.s._get_sequence_data(), "spare@example.com", "") is None
+        # the machine that has it sees the new token as a change to take
+        assert other.rows("team")["spare@example.com"].state == rm.DIFFERS
+        other.r.pull("team", PASS, confirm=lambda r: True)
+        assert other.token_of(num_other) == TOKEN_A
+
+    async def test_replace_token_on_local_and_synced_accounts(self, here, other, bare, tmp_path):
+        """'Replace … account token…' is on every shareable account: a local one
+        updates this machine, a synced one this machine and the repository."""
+        cfg, _, _ = here.r.add("team", bare.as_uri(), passphrase=PASS)
+        other.r.add("team", bare.as_uri(), passphrase=PASS)
+        shared = here.token_account(TOKEN_A, "shared@example.com")
+        here.r.push("team", PASS)
+        solo = here.token_account(TOKEN_B, "solo@example.com")
+        app = app_for(here, tmp_path)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await settle(pilot)
+            await open_remote(pilot, cfg)
+            for email, token, expect in (
+                ("solo@example.com", TOKEN_C, "on this machine"),
+                ("shared@example.com", TOKEN_A2, "both local and remote"),
+            ):
+                rows = {label.split()[-1]: action for action, label in menu_labels(app).items()
+                        if action.startswith("row:")}
+                await menu_select(pilot, rows[email])
+                i = rows[email].split(":")[1]
+                assert expect in menu_labels(app)[f"act-set-token:{i}"]
+                await menu_select(pilot, f"act-set-token:{i}")
+                app.screen.query_one("#token").value = token
+                await pilot.press("enter")
+                await settle(pilot)
+        assert here.token_of(solo) == TOKEN_C
+        assert here.token_of(shared) == TOKEN_A2
+        assert here.rows("team")["shared@example.com"].state == rm.IN_SYNC
+        assert here.rows("team")["solo@example.com"].state == rm.HERE_ONLY
+        assert other.rows("team")["shared@example.com"].state == rm.REPO_ONLY
 
     async def test_asks_for_the_passphrase_when_none_is_saved(self, here, bare, tmp_path):
         from claude_swap.tui.remote import PassphraseModal, RemoteScreen

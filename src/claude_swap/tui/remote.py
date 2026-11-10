@@ -194,6 +194,58 @@ class RemoteTokenModal(_FormModal):
         ))
 
 
+#: What "Replace … account token…" updates, by row state: the repository, this
+#: machine, or both.
+_REPLACE_SCOPE = {
+    rm.REPO_ONLY: "repo", rm.SKIPPED: "repo",
+    rm.HERE_ONLY: "local",
+    rm.IN_SYNC: "both", rm.DIFFERS: "both",
+}
+
+_REPLACE_LABEL = {
+    "repo": "Replace account token in the repository…",
+    "local": "Replace account token on this machine…",
+    "both": "Replace both local and remote account token…",
+}
+
+_REPLACE_BODY = {
+    "repo": "It isn't on this machine, so only the repository is updated. "
+            "Machines that have it see it as differs; a pull there takes the new token.",
+    "local": "It isn't in the repository, so only this machine is updated.",
+    "both": "This machine and the repository are both updated. Other machines that "
+            "have it see it as differs; a pull there takes the new token.",
+}
+
+
+class ReplaceTokenModal(_FormModal):
+    """A new setup-token for one account: the repository's copy, this
+    machine's, or both (see ``_REPLACE_SCOPE``)."""
+
+    def __init__(self, label: str, scope: str) -> None:
+        super().__init__()
+        self._label = label
+        self._scope = scope
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-box"):
+            yield Label("Replace the token", classes="modal-title")
+            yield Static(
+                f"{self._label}: paste its new token from `claude setup-token` "
+                f"(sk-ant-oat…). {_REPLACE_BODY[self._scope]}",
+                classes="modal-body",
+            )
+            yield Input(password=True, placeholder="new setup-token", id="token")
+            yield from self._buttons("Replace")
+
+    def _submit(self) -> None:
+        try:
+            token = rm.validate_setup_token(self._value("token"))
+        except ClaudeSwitchError as e:
+            self._error(str(e).split(". ")[0] + ".")
+            return
+        self.dismiss(token)
+
+
 @dataclass
 class RemoteForm:
     name: str
@@ -439,6 +491,10 @@ class RemoteScreen(Screen):
             entries.append(("Take the repository's token: update this machine", f"act-pull:{i}"))
         elif row.state in (rm.REPO_ONLY, rm.SKIPPED):
             entries.append(("Add on this machine", f"act-pull:{i}"))
+        scope = _REPLACE_SCOPE.get(row.state)
+        if scope is not None:
+            entries.append((_REPLACE_LABEL[scope], f"act-set-token:{i}"))
+        if row.state in (rm.REPO_ONLY, rm.SKIPPED):
             if row.state == rm.REPO_ONLY:
                 entries.append(("Not on this machine (a pull leaves it alone)", f"act-skip:{i}"))
             else:
@@ -605,6 +661,12 @@ class RemoteScreen(Screen):
             self._run("Push", lambda p: sync.push(rid, p, [row.local_num], confirm=lambda r: True))
         elif action_id.startswith("act-pull:"):
             self._pull_one(self._row(action_id))
+        elif action_id.startswith("act-set-token:"):
+            row = self._row(action_id)
+            self.app.push_screen(
+                ReplaceTokenModal(row.label, _REPLACE_SCOPE[row.state]),
+                partial(self._new_token_entered, row),
+            )
         elif action_id.startswith(("act-skip:", "act-unskip:")):
             row = self._row(action_id)
             skip = action_id.startswith("act-skip:")
@@ -669,6 +731,28 @@ class RemoteScreen(Screen):
             )
         else:
             run(False)
+
+    def _new_token_entered(self, row: rm.Row, token: str | None) -> None:
+        if token is None:
+            return
+        sync, rid = self.sync, self.remote_id
+
+        def op(p: str) -> str:
+            if row.state == rm.HERE_ONLY:
+                changed = sync.set_local_token(row.local_num, token)
+                where = "on this machine" if changed else None
+            else:
+                done = sync.set_token(rid, p, row.entry_id, token)
+                where = {
+                    (True, True): "here and in the repository",
+                    (True, False): "in the repository",
+                    (False, True): "on this machine",
+                }.get((done.changed, done.local_changed))
+            if where is None:
+                return f"{row.label} already has that token"
+            return f"Replaced the token of {row.label} {where}"
+
+        self._run("Replace token", op)
 
     def _token_entered(self, form: RemoteTokenForm | None) -> None:
         if form is None:

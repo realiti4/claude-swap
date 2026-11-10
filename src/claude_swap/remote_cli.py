@@ -27,6 +27,7 @@ Commands:
   push NAME [ACCOUNT...]  copy accounts from here to the repository
   pull NAME [ENTRY...]    copy accounts from the repository to here
   add-token NAME [TOKEN|-]  put a setup-token in the repository only
+  set-token NAME ENTRY [TOKEN|-]  replace an account's token (repository, and here if it's here)
   rm-entry NAME ENTRY     delete an account from the repository
   skip NAME ENTRY         don't pull this account on this machine (--undo)
   passwd NAME             change the repository's passphrase
@@ -42,6 +43,7 @@ Examples:
   cswap remote push team            # every local account, asks about changes
   cswap remote pull team --yes      # every remote account, takes all changes
   cswap remote add-token team - --email spare@example.com < token.txt
+  cswap remote set-token team spare@example.com - < new-token.txt
 
 The passphrase is remembered on this machine unless --no-remember is given
 (Keychain on macOS, otherwise a 0600 file in the cswap data folder). It can
@@ -108,6 +110,17 @@ def _ask(question: str, assume: bool | None) -> bool:
     if not _interactive():
         return False
     return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def _read_token(arg: str, prompt: str) -> str:
+    """A token from the argument, stdin ('-'), or a hidden prompt."""
+    if arg == "-":
+        return sys.stdin.readline().rstrip("\n")
+    if arg:
+        return arg
+    if not _interactive():
+        raise ValidationError("No terminal to ask for the token on; pass '-' and pipe it in.")
+    return getpass.getpass(prompt)
 
 
 def _print_report(report) -> None:
@@ -214,6 +227,14 @@ def remote_command(argv: list[str]) -> None:
     p.add_argument("--email", help="label it (default: a placeholder)")
     p.add_argument("--alias")
 
+    p = sub.add_parser(
+        "set-token",
+        help="replace an account's token in the repository (it need not be on this machine)",
+    )
+    p.add_argument("name")
+    p.add_argument("entry", metavar="ENTRY")
+    p.add_argument("token", nargs="?", default="", metavar="TOKEN|-")
+
     p = sub.add_parser("rm-entry", help="delete an account from the repository")
     p.add_argument("name")
     p.add_argument("entry", metavar="ENTRY")
@@ -307,14 +328,25 @@ def remote_command(argv: list[str]) -> None:
             _print_report(report)
             return
 
+        if cmd == "set-token":
+            token = _read_token(args.token, "New setup-token: ")
+            done = _with_passphrase(
+                sync, args.name, lambda p: sync.set_token(args.name, p, args.entry, token))
+            entry = done.entry
+            if not done.changed and not done.local_changed:
+                print(dimmed(f"{entry.label} already has that token."))
+                return
+            if done.changed:
+                print(f"{accent('Replaced')} the token of {entry.label} in '{args.name}' "
+                      f"{muted(f'(entry {entry.id[:8]})')}.")
+            if done.local_changed:
+                print(f"{accent('Replaced')} the token of Account-{done.local_num} on this machine.")
+            if done.changed:
+                print(dimmed("Other machines that have it see it as differs; a pull there takes the new token."))
+            return
+
         if cmd == "add-token":
-            token = args.token
-            if token == "-":
-                token = sys.stdin.readline().rstrip("\n")
-            elif not token:
-                if not _interactive():
-                    raise ValidationError("No terminal to ask for the token on; pass '-' and pipe it in.")
-                token = getpass.getpass("Setup-token: ")
+            token = _read_token(args.token, "Setup-token: ")
             entry = _with_passphrase(
                 sync, args.name,
                 lambda p: sync.add_token(args.name, p, token, email=args.email, alias=args.alias))

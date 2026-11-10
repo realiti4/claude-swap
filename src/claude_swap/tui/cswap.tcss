@@ -124,7 +124,7 @@ MenuItem Static.menu-item-muted { color: $secondary; }
 /* -- modals ----------------------------------------------------------------- */
 
 ConfirmModal, AddTokenModal, OutputModal,
-PassphraseModal, NewPassphraseModal, RemoteTokenModal, AddRemoteModal,
+PassphraseModal, NewPassphraseModal, RemoteTokenModal, ReplaceTokenModal, AddRemoteModal,
 ValueModal {
     align: center middle;
     background: $background 60%;
@@ -202,7 +202,7 @@ ValueModal {
     color: $error;
 }
 
-AddTokenModal Input, NewPassphraseModal Input, RemoteTokenModal Input,
+AddTokenModal Input, NewPassphraseModal Input, RemoteTokenModal Input, ReplaceTokenModal Input,
 ValueModal Input {
     margin-bottom: 1;
 }

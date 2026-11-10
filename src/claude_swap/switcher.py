@@ -4695,6 +4695,7 @@ class ClaudeAccountSwitcher:
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
                 f"({email} {muted('[personal]')})."
             )
+            self._activate_if_live(account_num, credentials)
             return
 
         displace_slot = None
@@ -4811,6 +4812,40 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+        self._activate_if_live(account_num, credentials)
+
+    def _activate_if_live(self, account_num: str, credentials: str) -> bool:
+        """After a slot's stored token was replaced: when that slot is the live
+        login, put the new token into Claude Code's store as well.
+
+        Otherwise the live store keeps the old token, and the next switch away
+        saves it back over the slot (when the live token can't be attributed,
+        the switch-time backup copies it as before), silently undoing the
+        replacement. Returns whether the live store was written.
+        """
+        if self.current_account_number() != account_num:
+            return False
+        try:
+            # The switch's own locks, in its order: a switch (or auto-switch)
+            # can't change the live login between the check and the write.
+            with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+                if self.current_account_number() != account_num:
+                    return False
+                live = self._read_credentials()
+                write = (
+                    self._prepare_credentials_for_activation(credentials, live)
+                    if live else credentials
+                )
+                self._write_credentials(write)
+        except Exception as e:  # noqa: BLE001 -- the stored copy is already updated
+            warning(
+                f"Account {account_num} is the active login, but Claude Code's copy "
+                f"could not be updated ({e}). Until it is, switching away would put "
+                "the old token back into this account: run this again first."
+            )
+            return False
+        print(dimmed("  It is the active login: Claude Code's copy was updated too."))
+        return True
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.

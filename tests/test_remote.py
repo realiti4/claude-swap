@@ -447,6 +447,84 @@ class TestSync:
         with pytest.raises(RemoteError, match="Nothing"):
             a.r._resolve_entry(rows, "nobody")
 
+    def test_set_token_replaces_an_account_not_on_this_machine(self, joined):
+        a, b = joined
+        entry = a.r.add_token("shared", PASS, TOKEN_A, email="spare@example.com", alias="spare")
+        b.r.pull("shared", PASS)
+        num_b = b.rows()["spare@example.com"].local_num
+
+        done = a.r.set_token("shared", PASS, "spare", TOKEN_B)
+        assert done.changed and done.local_num is None
+        assert (done.entry.id, done.entry.email, done.entry.alias) == (entry.id, "spare@example.com", "spare")
+        assert done.entry.token == TOKEN_B and done.entry.updated_by == "host-a"
+        assert a.rows()["spare@example.com"].state == rm.REPO_ONLY  # still not added on a
+
+        row = b.rows()["spare@example.com"]
+        assert row.state == rm.DIFFERS and row.entry_id == entry.id
+        b.r.pull("shared", PASS, confirm=lambda r: True)
+        assert b.token_of(num_b) == TOKEN_B
+        assert b.rows()["spare@example.com"].state == rm.IN_SYNC
+
+    def test_set_token_on_an_account_this_machine_has_updates_both(self, joined):
+        a, b = joined
+        num = a.token_account(TOKEN_A, "team@example.com", alias="team")
+        a.r.push("shared", PASS)
+        b.r.pull("shared", PASS)
+        done = a.r.set_token("shared", PASS, num, TOKEN_B)  # by local slot
+        assert done.changed and done.local_changed and done.local_num == num
+        assert a.token_of(num) == TOKEN_B
+        assert a.record(num).get("alias") == "team"  # settings stay
+        assert a.r.get("shared").id in a.record(num)["remotes"]  # and the link
+        assert a.rows()["team@example.com"].state == rm.IN_SYNC
+        assert b.rows()["team@example.com"].state == rm.DIFFERS
+
+    def test_set_token_when_only_this_machine_is_behind(self, joined):
+        a, b = joined
+        num_a = a.token_account(TOKEN_A, "team@example.com")
+        a.r.push("shared", PASS)
+        b.r.pull("shared", PASS)
+        num_b = b.rows()["team@example.com"].local_num
+        a.r.set_token("shared", PASS, "team@example.com", TOKEN_B)
+        done = b.r.set_token("shared", PASS, "team@example.com", TOKEN_B)
+        assert not done.changed and done.local_changed  # the repository had it already
+        assert b.token_of(num_b) == TOKEN_B and a.token_of(num_a) == TOKEN_B
+
+    def test_set_token_refuses_a_token_another_local_account_holds(self, joined, bare):
+        a, _ = joined
+        num = a.token_account(TOKEN_A, "team@example.com")
+        a.token_account(TOKEN_B, "other@example.com")
+        a.r.push("shared", PASS, [num])
+        before = repo_files(bare)
+        with pytest.raises(RemoteError, match="already Account-"):
+            a.r.set_token("shared", PASS, num, TOKEN_B)
+        assert repo_files(bare) == before and a.token_of(num) == TOKEN_A
+
+    def test_set_local_token_for_an_account_only_on_this_machine(self, joined):
+        a, _ = joined
+        num = a.token_account(TOKEN_A, "solo@example.com", alias="solo")
+        other = a.token_account(TOKEN_C, "other@example.com")
+        assert a.r.set_local_token(num, TOKEN_B) is True
+        assert a.token_of(num) == TOKEN_B and a.record(num).get("alias") == "solo"
+        assert a.r.set_local_token(num, TOKEN_B) is False
+        with pytest.raises(RemoteError, match=f"already Account-{other}"):
+            a.r.set_local_token(num, TOKEN_C)
+        login = a.login_account(7, "real@example.com")
+        with pytest.raises(RemoteError, match="not a setup-token account"):
+            a.r.set_local_token(login, TOKEN_A2)
+
+    def test_set_token_refusals(self, joined):
+        a, _ = joined
+        a.r.add_token("shared", PASS, TOKEN_A, email="one@example.com")
+        a.r.add_token("shared", PASS, TOKEN_B, email="two@example.com")
+        same = a.r.set_token("shared", PASS, "one@example.com", TOKEN_A)
+        assert not same.changed  # nothing to commit
+        with pytest.raises(RemoteError, match="already in the repository as two@example.com"):
+            a.r.set_token("shared", PASS, "one@example.com", TOKEN_B)
+        with pytest.raises(ValidationError):
+            a.r.set_token("shared", PASS, "one@example.com", "sk-ant-api03-" + "x" * 30)
+        with pytest.raises(RemoteError, match="Nothing"):
+            a.r.set_token("shared", PASS, "nobody", TOKEN_C)
+
     def test_add_token_without_a_label_gets_a_placeholder(self, joined):
         a, _ = joined
         entry = a.r.add_token("shared", PASS, TOKEN_C)

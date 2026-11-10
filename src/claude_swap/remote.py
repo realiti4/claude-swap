@@ -644,6 +644,19 @@ class Row:
 
 
 @dataclass
+class TokenReplaced:
+    """What ``set_token`` did: the entry as it now is, the local slot holding
+    the account (None when it isn't on this machine), whether the
+    repository's token changed (False: it already had it) and whether this
+    machine's did."""
+
+    entry: Entry
+    local_num: str | None
+    changed: bool
+    local_changed: bool = False
+
+
+@dataclass
 class RemoteStatus:
     remote: RemoteConfig
     rows: list[Row]
@@ -1410,6 +1423,96 @@ class RemoteSync:
             self._transaction(cfg, passphrase, change)
             self._remember(cfg, passphrase)
         return made["entry"]
+
+    def set_token(self, name: str, passphrase: str, ref: str, token: str) -> TokenReplaced:
+        """Replace the token of one repository entry, whether or not this
+        machine has the account, and this machine's copy when it has one.
+
+        The entry keeps its id, label and alias, so every other machine that
+        has it sees it as *differs* and a pull there takes the new token. The
+        repository is written first: when this machine's copy then fails, a
+        pull retries it. ``ref`` as for ``pull``: label, alias, entry id
+        prefix or local slot."""
+        token = validate_setup_token(token)
+        cfg = self.get(name)
+        done: dict = {}
+        with self._locked(cfg):
+            def change(workdir, key, entries, errors):
+                rows = self._compare(cfg, self._locals(cfg.id), entries, errors)
+                row = self._resolve_entry(rows, ref)
+                entry = entries.get(row.entry_id or "")
+                if entry is None:
+                    reason = errors.get(row.entry_id or "", "it can't be read")
+                    raise RemoteError(
+                        f"Entry {(row.entry_id or ref)[:8]} can't be updated: {reason}. "
+                        "Delete it and add the token again."
+                    )
+                fp = token_fingerprint(token)
+                if row.local_num:
+                    self._check_local_token(row.local_num, token)
+                done["label"] = row.email
+                if entry.fingerprint == fp:
+                    done["result"] = TokenReplaced(entry, row.local_num, changed=False)
+                    return None
+                for other in entries.values():
+                    if other.id != entry.id and other.fingerprint == fp:
+                        raise RemoteError(f"That token is already in the repository as {other.label}.")
+                updated = replace(entry, token=token, updated_at=get_timestamp(),
+                                  updated_by=self.hostname)
+                self._write_entry(workdir, key, updated)
+                done["result"] = TokenReplaced(updated, row.local_num, changed=True)
+                return "claude-swap: add 0, update 1"
+
+            self._transaction(cfg, passphrase, change)
+            self._remember(cfg, passphrase)
+            result: TokenReplaced = done["result"]
+            if result.local_num:
+                try:
+                    result.local_changed = self._store_local_token(
+                        result.local_num, done["label"], token)
+                except ClaudeSwitchError as e:
+                    raise RemoteError(
+                        f"The repository has the new token, but Account-{result.local_num} "
+                        f"here could not be updated: {e} `cswap remote pull {cfg.name} "
+                        f"{result.entry.id[:8]}` tries again."
+                    ) from e
+        return result
+
+    def set_local_token(self, num: str, token: str) -> bool:
+        """Replace the token of a setup-token account on this machine only
+        (no repository involved). Its settings, alias and links stay. Returns
+        False when it already had that token."""
+        token = validate_setup_token(token)
+        loc = next((x for x in self._locals("") if x.num == str(num)), None)
+        if loc is None or loc.token is None:
+            raise RemoteError(f"Account-{num} is not a setup-token account on this machine.")
+        return self._store_local_token(loc.num, loc.email, token)
+
+    def _check_local_token(self, num: str, token: str) -> None:
+        """Refuse a token another local account already holds."""
+        fp = token_fingerprint(token)
+        for loc in self._locals(""):
+            if loc.num != num and loc.token and token_fingerprint(loc.token) == fp:
+                raise RemoteError(f"That token is already Account-{loc.num}'s on this machine.")
+
+    def _store_local_token(self, num: str, label: str, token: str) -> bool:
+        """Replace local token account ``num``'s token in place, through
+        ``add_account_from_token``'s refresh path (which also updates Claude
+        Code's copy when it is the live login). False: it already had it."""
+        data = self.switcher._get_sequence_data() or {}
+        if self.switcher._find_account_slot(data, label, "") != num:
+            raise RemoteError(
+                f"Account-{num} is not stored as a plain token account, so its token "
+                "cannot be replaced in place."
+            )
+        self._check_local_token(num, token)
+        current = next((x for x in self._locals("") if x.num == num), None)
+        if current is not None and current.token == token:
+            return False
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            self.switcher.add_account_from_token(token, email=label)
+        return True
 
     def remove_entry(self, name: str, passphrase: str, ref: str) -> str:
         """Delete one account from the repository (local accounts stay)."""

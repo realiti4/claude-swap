@@ -15,6 +15,7 @@ cswap remote show NAME                  # fetch and compare
 cswap remote push NAME [ACCOUNT...] [--yes]
 cswap remote pull NAME [ENTRY...] [--yes] [--replace]
 cswap remote add-token NAME [TOKEN|-] [--email E] [--alias A]
+cswap remote set-token NAME ENTRY [TOKEN|-]   # replace an account's token
 cswap remote rm-entry NAME ENTRY [--yes]
 cswap remote skip NAME ENTRY [--undo]
 cswap remote passwd NAME
@@ -55,6 +56,12 @@ For every *differs* account it asks whether to replace the repository's copy. `-
 `pull NAME` with no entries named adds every *remote* entry, except skipped ones and any whose email label a local account already uses (cswap keeps one token account per label). Naming an entry pulls it even when skipped, and clears the skip. `--replace` lets a named entry overwrite the token of the local account with its label. For every *differs* account it asks whether to replace this machine's token.
 
 `add-token` puts a token in the repository without adding an account on this machine. Without `--email` the entry gets a placeholder label.
+
+`set-token` replaces the token of an account in the repository, for example one renewed with `claude setup-token`. The account doesn't have to be on this machine; when it is, this machine's copy is replaced too (the repository first, so a failure here leaves a pull to finish it). The entry keeps its id, label and alias, so every other machine that has the account sees it as *differs*, and a pull there takes the new token. For an account only on this machine, `cswap add-token NEW --email LABEL` replaces it in place.
+
+In the dashboard every shareable account has a replace item: *Replace account token in the repository…* for a *remote* account, *Replace account token on this machine…* for a *local* one, and *Replace both local and remote account token…* for a *synced* or *differs* one.
+
+When the account being updated is the active login, Claude Code's copy is updated as well. Otherwise the next switch away could save the old token back over the new one.
 
 ## Git login
 

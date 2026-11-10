@@ -13374,3 +13374,63 @@ class TestSalvageCopyMode:
         assert salvage.read_bytes() == config_path.read_bytes()
         assert salvage.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob("*.tmp"))
+
+
+class TestReplacingTheActiveAccountsToken:
+    """Replacing the stored token of the live login also updates Claude
+    Code's copy. Before, the next switch away saved the live (old) token
+    back over the slot whenever it couldn't be attributed (offline, or a
+    setup-token the profile endpoint won't answer), undoing the update."""
+
+    OLD = "sk-ant-oat01-" + "A" * 30
+    NEW = "sk-ant-oat01-" + "Z" * 30
+    OTHER = "sk-ant-oat01-" + "B" * 30
+
+    def _switcher(self, temp_home, monkeypatch):
+        import contextlib
+        import io
+        import socket
+
+        monkeypatch.setenv("XDG_DATA_HOME", str(temp_home / ".local" / "share"))
+
+        def no_network(*_a, **_k):
+            raise OSError("no network in this test")
+
+        monkeypatch.setattr(socket.socket, "connect", no_network)
+        s = ClaudeAccountSwitcher()
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.add_account_from_token(self.OLD, email="one@example.com")
+            s.add_account_from_token(self.OTHER, email="two@example.com")
+        return s
+
+    @staticmethod
+    def _token(blob: str) -> str:
+        return json.loads(blob)["claudeAiOauth"]["accessToken"]
+
+    def _live(self, temp_home) -> str:
+        return self._token((temp_home / ".claude" / ".credentials.json").read_text())
+
+    def test_active_account_live_copy_follows_and_survives_a_switch(
+        self, temp_home, monkeypatch, capsys
+    ):
+        s = self._switcher(temp_home, monkeypatch)
+        s.switch_to("1")
+        assert self._live(temp_home) == self.OLD
+        capsys.readouterr()
+
+        s.add_account_from_token(self.NEW, email="one@example.com")
+        assert "Claude Code's copy was updated too" in capsys.readouterr().out
+        assert self._live(temp_home) == self.NEW
+        assert self._token(s._read_account_credentials("1", "one@example.com")) == self.NEW
+
+        s.switch_to("2")
+        assert self._token(s._read_account_credentials("1", "one@example.com")) == self.NEW
+
+    def test_inactive_account_leaves_the_live_login_alone(self, temp_home, monkeypatch, capsys):
+        s = self._switcher(temp_home, monkeypatch)
+        s.switch_to("2")
+        capsys.readouterr()
+        s.add_account_from_token(self.NEW, email="one@example.com")
+        assert "Claude Code's copy" not in capsys.readouterr().out
+        assert self._live(temp_home) == self.OTHER
+        assert self._token(s._read_account_credentials("1", "one@example.com")) == self.NEW

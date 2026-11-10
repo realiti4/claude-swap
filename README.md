@@ -437,7 +437,7 @@ cswap remote show team                                       # local / remote / 
 cswap remote pull team                                       # add them here
 ```
 
-Nothing runs in the background: each command fetches first. A token that differs between the two sides is only replaced after you confirm (`--yes` accepts them all). `cswap remote add-token team -` puts a token in the repository without adding it on this machine. In the dashboard it is under *Remote sync…*. HTTPS tokens, SSH key files, skipping an account on one machine, and how the repository is encrypted are covered in [docs/remote-sync.md](https://github.com/realiti4/claude-swap/blob/main/docs/remote-sync.md).
+Nothing runs in the background: each command fetches first. A token that differs between the two sides is only replaced after you confirm (`--yes` accepts them all). `cswap remote add-token team -` puts a token in the repository without adding it on this machine, and `cswap remote set-token team ENTRY -` replaces an account's token there (and here, if this machine has it), even when this machine doesn't have the account. In the dashboard it is under *Remote sync…*. HTTPS tokens, SSH key files, skipping an account on one machine, and how the repository is encrypted are covered in [docs/remote-sync.md](https://github.com/realiti4/claude-swap/blob/main/docs/remote-sync.md).
 
 **Note:** Third-party providers configured through `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` are not managed or switched; those exported variables stay in effect after a switch, so unset them to use the swapped account.
 
