@@ -8264,58 +8264,147 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == "sk-ant-api03-new"
 
-    def test_mcp_only_live_never_overwrites_an_api_key_backup(
-        self, temp_home, mock_claude_config, sample_sequence_data,
-    ):
-        """An API-key slot's live read becomes an mcpOAuth-only blob once
-        Claude Code re-auths an MCP server; backing that up destroyed the
-        slot's only copy of the key."""
-        switcher, creds_store, configs_store = self._setup_two_accounts(
-            temp_home, sample_sequence_data,
-        )
-        creds_store[("1", "test@example.com")] = "sk-ant-api03-key"
-        live_state = {"creds": json.dumps({"mcpOAuth": {
-            "some-server|abc123": {"serverName": "some-server"},
-        }})}
-        patches = self._install_store_patches(
-            switcher, creds_store, configs_store, live_state,
-        )
-        try:
-            self._run_switch(switcher, resolver=None)
-        finally:
-            for p in patches:
-                p.stop()
-        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+    _STALE_LOGIN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-other", "refreshToken": "rt-other",
+    }})
+    _MCP_ONLY = json.dumps({"mcpOAuth": {
+        "some-server|abc123": {"serverName": "some-server",
+                               "accessToken": "mcp-token"},
+    }})
 
-    @pytest.mark.parametrize("live", [
-        json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-other", "refreshToken": "rt-other",
-        }}),
-        json.dumps({"mcpOAuth": {"some-server": {"accessToken": "mcp-token"}}}),
-    ])
-    def test_api_key_slot_never_captures_a_live_oauth_store(
-        self, temp_home, mock_claude_config, sample_sequence_data, live,
-    ):
-        """#384: a best-effort OAuth clear can leave a stale login over a key."""
+    def _api_key_slot_one(self, temp_home, sample_sequence_data, live):
+        """Slot 1 is an API-key slot holding its key; ``live`` is what the
+        active store reads as when the switch away from it starts."""
+        sample_sequence_data["accounts"]["1"]["kind"] = "api_key"
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
-        data = switcher._get_sequence_data()
-        data["accounts"]["1"]["kind"] = "api_key"
-        switcher._write_json(switcher.sequence_file, data)
         creds_store[("1", "test@example.com")] = "sk-ant-api03-key"
         live_state = {"creds": live}
         patches = self._install_store_patches(
             switcher, creds_store, configs_store, live_state,
         )
+        return switcher, creds_store, live_state, patches
+
+    def test_mcp_only_live_never_overwrites_an_api_key_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Claude Code keeps MCP sign-ins in the OAuth credentials item while
+        a key is active, so an API-key slot's live read is that item, not
+        the key. Backing it up destroyed the slot's only copy of the key.
+        It is the ordinary state, so nothing is preserved and nothing warns."""
+        switcher, creds_store, live_state, patches = self._api_key_slot_one(
+            temp_home, sample_sequence_data, self._MCP_ONLY,
+        )
         try:
-            self._run_switch(switcher, resolver=None)
+            op = self._run_switch(switcher, resolver=None)
         finally:
             for p in patches:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+        # The MCP sign-ins still travel to the account being activated.
+        live = json.loads(live_state["creds"])
+        assert live["claudeAiOauth"]["accessToken"] == "sk-stale-2"
+        assert "some-server|abc123" in live["mcpOAuth"]
+
+    def test_api_key_slot_never_captures_an_unresolved_login(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """#384: the OAuth clear is best effort, so a login can outlive the
+        switch onto the key. Unresolved (offline) it used to be written over
+        the key; now the key is kept and the login is preserved, since it
+        may be the only copy of its account's current generation."""
+        switcher, creds_store, live_state, patches = self._api_key_slot_one(
+            temp_home, sample_sequence_data, self._STALE_LOGIN,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+        (entry_id,) = switcher.list_unclaimed_credentials()
+        assert _read_safety_copy(switcher, entry_id) == self._STALE_LOGIN
+        assert any("instead of Account-1's API key" in w for w in op["warnings"])
         assert json.loads(live_state["creds"])["claudeAiOauth"][
             "accessToken"] == "sk-stale-2"
+
+    def test_api_key_slot_keeps_the_ownership_verdict_for_a_resolved_login(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The slot's kind only vetoes a write into it. A login resolved to
+        another managed account is still handled as foreign: preserved, and
+        named in the warning, exactly as under an OAuth slot."""
+        switcher, creds_store, live_state, patches = self._api_key_slot_one(
+            temp_home, sample_sequence_data, self._STALE_LOGIN,
+        )
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+        (entry_id,) = switcher.list_unclaimed_credentials()
+        assert _read_safety_copy(switcher, entry_id) == self._STALE_LOGIN
+        assert any("ownership mismatch" in w for w in op["warnings"])
+
+    def test_api_key_slot_still_lets_a_newer_foreign_login_reach_its_owner(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The same holds for the repair that follows a foreign verdict: a
+        login that is the owning slot's newer generation still advances that
+        slot's backup when the slot being left stores a key."""
+        successor = self._oauth("sk-2-new", "rt-2-new", 2_000)
+        switcher, creds_store, live_state, patches = self._api_key_slot_one(
+            temp_home, sample_sequence_data, successor,
+        )
+        creds_store[("2", "account2@example.com")] = self._oauth(
+            "sk-2-old", "rt-2-old", 1_000,
+        )
+        try:
+            self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+        assert creds_store[("2", "account2@example.com")] == successor
+        (entry_id,) = switcher.list_unclaimed_credentials()
+        assert _read_safety_copy(switcher, entry_id) == successor
+
+    def test_oauth_slot_holding_a_key_still_captures_its_own_login(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """What a slot stores is decided by its recorded kind, not by its
+        bytes: an OAuth slot the pre-#383 backup overwrote with a bare key
+        must still take its own fresh login on the next switch."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = "sk-ant-api03-key"
+        relogin = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-new-1", "refreshToken": "rt-new-1",
+        }})
+        live_state = {"creds": relogin}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver={
+                "uuid": "uuid-1", "email": "test@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == relogin
 
     def test_moved_bytes_between_prefetch_and_lock_fall_to_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
