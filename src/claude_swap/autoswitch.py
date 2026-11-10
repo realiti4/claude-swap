@@ -3335,8 +3335,8 @@ class AutoSwitchEngine:
                 #
                 # "NOTHING CAN SERVE" IS `best_candidate_headroom`, never
                 # `all_above`: over the THRESHOLD still leaves a peer holding
-                # real quota. The escape key below ranks on the window that
-                # blocked the ACTIVE, and `headroom_on_window` is only safe
+                # real quota. `dynamic`'s escape key below ranks on the window
+                # that blocked the ACTIVE, and `headroom_on_window` is only safe
                 # there because usability was already decided -- so admitting a
                 # spent candidate while a usable peer exists is what breaks it.
                 #
@@ -3674,14 +3674,19 @@ class AutoSwitchEngine:
         )
         if probe_num is not None:
             qualifying.append((
-                consume_first_rank_key(
-                    usage.get(probe_num),
-                    thresholds[probe_num],
-                    now,
-                    models,
-                    weekly_threshold=settings.weekly_threshold,
-                    probe=True,
-                    scale=settings.threshold,
+                # The loop's key shape: `tight` needs a forced move, which
+                # never probes.
+                (
+                    False,
+                    *consume_first_rank_key(
+                        usage.get(probe_num),
+                        thresholds[probe_num],
+                        now,
+                        models,
+                        weekly_threshold=settings.weekly_threshold,
+                        probe=True,
+                        scale=settings.threshold,
+                    ),
                 ),
                 probe_num,
             ))

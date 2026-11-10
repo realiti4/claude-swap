@@ -5909,6 +5909,30 @@ class TestConsumeFirstProbesAnUnknownReset:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
 
+    def test_the_probe_key_has_the_loops_shape_among_unservable_peers(
+        self, temp_home
+    ):
+        # Both peers hold 2 points (under the servable floor, over no line
+        # at 99). The probe's key must be the loop's, tight slot included:
+        # one slot short, its servability tier is read against `tight` and
+        # the known soon reset wins.
+        h = EngineHarness(
+            temp_home, strategy="consume-first", threshold=99.0,
+            hysteresis_pct=0.0,  # no room bar: not measured here
+        )
+        for num, email in ((1, "a"), (2, "b"), (3, "c")):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(98, 10),            # UNKNOWN reset
+            "3": _usage7(98, 10, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "probe"
+
     def test_an_elapsed_reset_is_treated_as_a_probe_candidate(
         self, temp_home
     ):
