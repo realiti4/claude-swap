@@ -20,7 +20,7 @@ from claude_swap import menubar, oauth
 from claude_swap.autoswitch import ErrorEvent
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.menubar import ENGINE_ERROR_REPEAT_S, should_surface_engine_error
-from claude_swap.switcher import USAGE_API_KEY
+from claude_swap.switcher import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
 
 
 # --- notification identity -----------------------------------------------------
@@ -267,6 +267,53 @@ def test_format_account_label_disabled_marker():
     assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_format_account_label_login_due():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 5 * 86400 + 12 * 3600
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · re-login in 5d 12h"
+
+
+def test_format_account_label_login_not_due_yet_says_nothing():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 23 * 86400
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_login_unknown_says_nothing():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, login_expires_at=None)
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_login_past():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now - 60
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · re-login needed"
+
+
+def test_format_account_label_quarantined_row_already_says_it():
+    # The sentinel text is the row's usage summary; no second "re-login".
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED],
+        now=now, login_expires_at=now - 60, quarantined=True,
+    )
+    assert label == "2  loc@papaya.asia  re-login needed"
+
+
+def test_format_account_label_usage_unavailable_still_carries_the_note():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", None, now=now, login_expires_at=now + 5 * 3600 + 7 * 60
+    )
+    assert label == "2  loc@papaya.asia  usage unavailable · re-login in 5h 7m"
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -492,13 +539,16 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
+    def __init__(
+        self, number, email, is_active, usage, alias="", disabled=False, login_expires_at=None
+    ):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
         self.alias = alias
         self.disabled = disabled
+        self.login_expires_at = login_expires_at
 
 
 class _FakeSnap:
@@ -520,19 +570,28 @@ def test_adapt_snapshot_shape_and_active_selection():
     # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
-        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0)),
-        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
+        _FakeAcct(
+            "1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0), login_expires_at=456.0
+        ),
+        _FakeAcct(
+            "2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True
+        ),
+        _FakeAcct(
+            "3", "c@x.com", False, _FakeEntry(sentinel=USAGE_RELOGIN_REQUIRED)
+        ),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
+    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, login_expires_at, quarantined)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0, 456.0, False)
     # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None, None, False,
     )
+    # the re-login sentinel is the one that marks the account quarantined
+    assert snap["accounts"][2][9] is True
 
 
 def test_adapt_snapshot_empty():
