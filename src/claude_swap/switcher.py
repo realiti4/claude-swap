@@ -8163,15 +8163,18 @@ class ClaudeAccountSwitcher:
         - ``"own-rotated"``    — full rotation, but the profile endpoint
           resolved the live token to this slot's identity; back up normally
           (the live→backup re-sync that keeps slots alive across Claude
-          Code's routine refresh-token rotations).
+          Code's routine refresh-token rotations). Also a rotated API key
+          live in an API-key slot, which has no OAuth lineage to resolve,
+          when no other slot stores it.
         - ``"foreign"``        — uuid-positively resolved to *another* managed
           slot (``foreign_slot``) holding a different lineage; backing it up
           here would destroy this slot's only refresh token (issue #117's
           poisoning). Preserved in a safety copy, never written into any
           slot: identity proves ownership, not generation freshness.
         - ``"foreign-synced"`` — resolved to another managed slot whose
-          stored backup already holds this exact lineage; nothing needs
-          preserving, nothing may be written.
+          stored backup already holds this exact lineage (for a bare API
+          key, these exact bytes); nothing needs preserving, nothing may be
+          written.
         - ``"wiped"``          — an OAuth blob whose token fields are all
           empty: Claude Code's ``invalid_grant`` reaction empties
           ``accessToken``/``refreshToken`` in place, keeping the wrapper and
@@ -8230,9 +8233,24 @@ class ClaudeAccountSwitcher:
             kind in ("own-family", "own-rotated", "unresolved")
             and data.get("accounts", {}).get(current_account, {}).get("kind")
             == "api_key"
-            and not looks_like_api_key(original_creds)
         ):
-            return ("api-key-mismatch", None)
+            if not looks_like_api_key(original_creds):
+                return ("api-key-mismatch", None)
+            if kind == "unresolved":
+                # A key has no lineage for the oracle to verify, so the
+                # roster's record of the slot attributes it, unless another
+                # slot stores these bytes or cannot be read to say it does not.
+                for num, acct in data.get("accounts", {}).items():
+                    if num == current_account:
+                        continue
+                    other, unreadable = self._read_account_credentials_ex(
+                        num, acct.get("email", "")
+                    )
+                    if unreadable:
+                        return ("unresolved", None)
+                    if other == original_creds:
+                        return ("foreign-synced", num)
+                return ("own-rotated", None)
         return (kind, foreign_slot)
 
     def _attribute_live_credential(
@@ -8529,7 +8547,12 @@ class ClaudeAccountSwitcher:
                 return False
             if float(live.get("expiresAt") or 0) <= float(stored_exp or 0):
                 return False
-            self._write_account_credentials(foreign_slot, email, original_creds)
+            # attributed=True: the "foreign" verdict is a uuid-positive
+            # oracle match of these exact bytes to `foreign_slot`, and the
+            # newer-generation check above is the ordering half.
+            self._write_account_credentials(
+                foreign_slot, email, original_creds, attributed=True
+            )
             self._logger.info(
                 "Resynced account %s's backup to its newer live credential "
                 "(found under another account's config label; the safety "
@@ -9288,10 +9311,11 @@ class ClaudeAccountSwitcher:
                 else:  # own-family / own-rotated
                     # attributed only for "own-rotated": that kind is
                     # established either by `_classify_outgoing_credential`'s
-                    # uuid-verified oracle match or by its stamp-only rescue
+                    # uuid-verified oracle match, by its stamp-only rescue
                     # (`_live_is_own_newer_generation`, for an oracle-silent
-                    # rotation), so its fingerprint legitimately differs from
-                    # the stored backup and needs the attestation.
+                    # rotation) or by a key live in an API-key slot, so its
+                    # fingerprint legitimately differs from the stored
+                    # backup and needs the attestation.
                     # "own-family" is a stored-backup
                     # fingerprint match already, which the store's own
                     # attribution guard re-derives independently below — left
