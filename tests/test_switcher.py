@@ -9121,6 +9121,57 @@ class TestProvenanceGuard:
         assert json.loads(live_state["creds"])["claudeAiOauth"][
             "accessToken"] == "sk-stale-2"
 
+    def test_api_key_slot_never_captures_another_slots_key(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The label names key slot 1 while the live store holds slot 2's key
+        (the two have separate writers, or a switch died between them). A key
+        has no lineage to verify, but slot 2 already stores these exact bytes,
+        so they are not slot 1's rotation: slot 1 keeps its own key and
+        nothing is written or stashed."""
+        sample_sequence_data["accounts"]["2"]["kind"] = "api_key"
+        switcher, creds_store, live_state, patches = self._api_key_slot_one(
+            temp_home, sample_sequence_data, "sk-ant-api03-two",
+        )
+        creds_store[("2", "account2@example.com")] = "sk-ant-api03-two"
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+        assert switcher.list_unclaimed_credentials() == {}
+        assert any(
+            "already matches Account-2's stored backup" in w
+            for w in op["warnings"]
+        )
+
+    def test_api_key_slot_does_not_capture_a_key_while_a_peer_is_unreadable(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A peer whose backup cannot be read cannot be shown not to hold the
+        live key, so the key stays unresolved (stashed), as under an OAuth
+        slot, rather than being captured into slot 1."""
+        switcher, creds_store, live_state, patches = self._api_key_slot_one(
+            temp_home, sample_sequence_data, "sk-ant-api03-new",
+        )
+        try:
+            with patch.object(
+                switcher, "_read_account_credentials_ex",
+                side_effect=lambda num, email, **_kw: (
+                    ("", True) if str(num) == "2"
+                    else (creds_store.get((str(num), email), ""), False)
+                ),
+            ):
+                verdict = switcher._classify_outgoing_credential(
+                    "1", "test@example.com", "sk-ant-api03-new", {},
+                    switcher._get_sequence_data(),
+                )
+        finally:
+            for p in patches:
+                p.stop()
+        assert verdict == ("unresolved", None)
+
     def test_api_key_slot_keeps_the_ownership_verdict_for_a_resolved_login(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):

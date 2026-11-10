@@ -7450,15 +7450,17 @@ class ClaudeAccountSwitcher:
           resolved the live token to this slot's identity; back up normally
           (the live→backup re-sync that keeps slots alive across Claude
           Code's routine refresh-token rotations). Also a rotated API key
-          live in an API-key slot, which has no OAuth lineage to resolve.
+          live in an API-key slot, which has no OAuth lineage to resolve,
+          when no other slot stores it.
         - ``"foreign"``        — uuid-positively resolved to *another* managed
           slot (``foreign_slot``) holding a different lineage; backing it up
           here would destroy this slot's only refresh token (issue #117's
           poisoning). Preserved in a safety copy, never written into any
           slot: identity proves ownership, not generation freshness.
         - ``"foreign-synced"`` — resolved to another managed slot whose
-          stored backup already holds this exact lineage; nothing needs
-          preserving, nothing may be written.
+          stored backup already holds this exact lineage (for a bare API
+          key, these exact bytes); nothing needs preserving, nothing may be
+          written.
         - ``"wiped"``          — an OAuth blob whose token fields are all
           empty: Claude Code's ``invalid_grant`` reaction empties
           ``accessToken``/``refreshToken`` in place, keeping the wrapper and
@@ -7521,8 +7523,19 @@ class ClaudeAccountSwitcher:
             if not looks_like_api_key(original_creds):
                 return ("api-key-mismatch", None)
             if kind == "unresolved":
-                # A key carries no OAuth lineage for the oracle to verify, so
-                # the roster's own record of the slot is the whole attribution.
+                # A key has no lineage for the oracle to verify, so the
+                # roster's record of the slot attributes it, unless another
+                # slot stores these bytes or cannot be read to say it does not.
+                for num, acct in data.get("accounts", {}).items():
+                    if num == current_account:
+                        continue
+                    other, unreadable = self._read_account_credentials_ex(
+                        num, acct.get("email", "")
+                    )
+                    if unreadable:
+                        return ("unresolved", None)
+                    if other == original_creds:
+                        return ("foreign-synced", num)
                 return ("own-rotated", None)
         return (kind, foreign_slot)
 
