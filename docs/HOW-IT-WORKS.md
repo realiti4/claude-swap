@@ -748,6 +748,19 @@ uv sync && uv run pytest && uv run ruff check . && uv run ruff format --check .
 Resolve any conflict by keeping upstream's code and re-applying the fork
 insertion from the table above.
 
+**Then restart every long-running cswap process: the "Claude Swap Auto" task
+and each open `cswap watch` window.** The install is editable, so Python reads
+`src/` live, and many imports are lazy. A process started before the merge
+holds the old version of the modules it has already loaded and gets the new
+version of any it imports later. On 2026-11-10 that made `cswap watch` show
+`Refresh failed: cannot import name 'can_junction' from 'claude_swap.fsutil'`.
+The new `session.py` asked the old in-memory `fsutil` for a function that
+didn't exist yet. The same mismatch inside the daemon turned a successful
+credential backup into "Backup write failed after a consumed refresh", because
+`_post_backup_write` imports `session` lazily and that `except Exception`
+doesn't log what it caught. Waiters and hook runs are fresh processes, so
+they're unaffected.
+
 **Windows quirk (confirmed 2026-11-03).** On this machine, every *new* copy
 of `scripts/windows/install-autostart.ps1` (a fresh worktree, a temp copy, a
 rewrite) is blocked right after it is written, and can't even be deleted
