@@ -2331,13 +2331,13 @@ class TestPanelOrderIsTheEnginesOrder:
         assert "Next best (most headroom)" in rendered, rendered
 
     @pytest.mark.parametrize(
-        "strategy, active_five, cand_five, legend",
+        "strategy, active_five, cand_five, pick, legend",
         [
-            ("consume-first", 96.0, (85.0, 10.0), ROOM_THEN_RESET),
-            ("weekly-first", 96.0, (85.0, 10.0), ROOM_THEN_RESET),
-            ("consume-first", 100.0, (85.0, 10.0), ROOM_THEN_RESET),
-            ("consume-first", 96.0, (85.0, 85.0), "Next best (soonest reset)"),
-            ("weekly-first", 96.0, (85.0, 85.0), "Next best (soonest reset)"),
+            ("consume-first", 96.0, (85.0, 10.0), "3", ROOM_THEN_RESET),
+            ("weekly-first", 96.0, (85.0, 10.0), "3", ROOM_THEN_RESET),
+            ("consume-first", 100.0, (85.0, 10.0), "3", ROOM_THEN_RESET),
+            ("consume-first", 96.0, (85.0, 85.0), "2", "Next best (soonest reset)"),
+            ("weekly-first", 96.0, (85.0, 85.0), "2", "Next best (soonest reset)"),
         ],
         ids=[
             "consume-first-forced", "weekly-first-forced", "consume-first-at-limit",
@@ -2345,7 +2345,7 @@ class TestPanelOrderIsTheEnginesOrder:
         ],
     )
     def test_the_legend_names_room_when_room_decided_the_winner(
-        self, temp_home, strategy, active_five, cand_five, legend
+        self, temp_home, strategy, active_five, cand_five, pick, legend
     ):
         """#2 resets soonest but holds 5 points under its 90 line, under the
         10-point margin; #3 resets later and holds room. A move forced by the
@@ -2364,6 +2364,7 @@ class TestPanelOrderIsTheEnginesOrder:
             temp_home, fleet, strategy=strategy, threshold=90.0, cooldown_seconds=0.0,
             now=time.time(),
         )
+        assert engine_pick == pick, engine_pick
         assert ordered[0] == engine_pick, (ordered, engine_pick)
         assert legend in rendered, rendered
 
