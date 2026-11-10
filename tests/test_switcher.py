@@ -8291,8 +8291,9 @@ class TestProvenanceGuard:
     ):
         """Claude Code keeps MCP sign-ins in the OAuth credentials item while
         a key is active, so an API-key slot's live read is that item, not
-        the key. Backing it up destroyed the slot's only copy of the key.
-        It is the ordinary state, so nothing is preserved and nothing warns."""
+        the key. It is never the slot's backup, which is the only copy of
+        the key. It is the ordinary state, so nothing is preserved and
+        nothing warns."""
         switcher, creds_store, live_state, patches = self._api_key_slot_one(
             temp_home, sample_sequence_data, self._MCP_ONLY,
         )
@@ -8312,10 +8313,10 @@ class TestProvenanceGuard:
     def test_api_key_slot_never_captures_an_unresolved_login(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """#384: the OAuth clear is best effort, so a login can outlive the
-        switch onto the key. Unresolved (offline) it used to be written over
-        the key; now the key is kept and the login is preserved, since it
-        may be the only copy of its account's current generation."""
+        """The OAuth clear is best effort, so a login can outlive the switch
+        onto the key. Unresolved (offline), it is still never written over
+        the key: the key is kept and the login is preserved, since it may be
+        the only copy of its account's current generation."""
         switcher, creds_store, live_state, patches = self._api_key_slot_one(
             temp_home, sample_sequence_data, self._STALE_LOGIN,
         )
@@ -8383,8 +8384,8 @@ class TestProvenanceGuard:
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
         """What a slot stores is decided by its recorded kind, not by its
-        bytes: an OAuth slot the pre-#383 backup overwrote with a bare key
-        must still take its own fresh login on the next switch."""
+        bytes: an OAuth slot whose backup holds a bare key (the damage issue
+        #383 describes) still takes its own fresh login on the next switch."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
