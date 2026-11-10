@@ -37,6 +37,8 @@ Do not add planning, investigation or handoff documents to the repository.
 
 ## Pull requests
 
-- One concern per pull request. Split unrelated fixes.
-- The person opening the pull request has read the whole diff and can explain it.
-- Report only the checks you actually ran.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request; it says what one should look like. Three things apply to you as an agent in particular:
+
+- Stay on the one problem you were asked to solve. Mention unrelated things you notice instead of fixing them in the same change.
+- The person you are working for has to read the whole diff and be able to explain it. Ask them to; do not vouch for it yourself.
+- Report only the checks you actually ran, and say what you left unverified.

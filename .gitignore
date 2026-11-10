@@ -14,3 +14,6 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# cswap export files: they hold account logins in plain text
+*.cswap
