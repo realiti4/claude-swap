@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# macOS Finder folder metadata
+.DS_Store
+
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/

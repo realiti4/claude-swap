@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import sys
-import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -33,7 +33,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -117,7 +117,7 @@ SECURITY_SERVICE = "claude-swap"
 CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 # Service name of Claude Code's *active* managed API key (``/login`` with an
-# ``sk-ant-api…`` key) in the macOS Keychain. Distinct from the OAuth service above
+# ``sk-ant-…`` key) in the macOS Keychain. Distinct from the OAuth service above
 # (no ``-credentials`` suffix); Claude Code resolves it on a separate auth axis
 # (``getApiKeyFromConfigOrMacOSKeychain``). On non-macOS the managed key instead
 # lives in ``~/.claude.json`` as ``primaryApiKey`` (see below).
@@ -139,6 +139,29 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 # short enough that a transient `security` timeout self-heals within a minute
 # instead of disabling the Keychain for the whole process lifetime.
 KEYCHAIN_RECHECK_COOLDOWN_S = 60.0
+
+# Display/eligibility reads of per-account BACKUP credentials may be served
+# from a short-lived per-slot cache (`_kc_read_backup(cached=True)`): a
+# dashboard repainting every few seconds must not spawn `security` for every
+# slot on every pass (#496: ~8 spawns/s at 11 accounts, and a stream of killed
+# unlock dialogs once the login keychain locks). Below the usage store's fetch
+# floor (poll_policy.SERVE_TTL_S, 180 s), so a slot's next fetch always
+# re-reads after a rotation that happened inside another process's fetch —
+# and the consume gate re-reads under its lock regardless. Bounds the
+# display's lag behind an external rotation to a minute.
+BACKUP_READ_CACHE_TTL_S = 60.0
+
+
+class KeychainBackedOff(macos_keychain.KeychainError):
+    """A backup read skipped inside the failure cooldown — not a new failure.
+
+    Raised by ``_kc_read_backup`` instead of spawning ``security``. Still a
+    ``KeychainError``, so every existing handler keeps treating it as
+    "unreadable" (the verdict must not change); distinct, so the normal reader
+    can stay quiet about it — logging each skip as a failure meant 31 warnings
+    per snapshot at 11 accounts, ~600 a minute on the TUI's 3 s tick. The
+    cooldown announces itself once, when the first read skips.
+    """
 
 
 class ActiveCredentials(NamedTuple):
@@ -163,18 +186,33 @@ class ActiveCredentials(NamedTuple):
     degraded: bool = False
 
 
+# Prefixes of Anthropic OAuth tokens: the access/setup-token and the refresh token.
+# A bare value carrying one is OAuth material, never a managed API key, however it
+# arrived. Mirrors Claude Code's own ``isAnthropicOAuthToken`` (``sk-ant-oat`` is
+# the only prefix it ever tests for; its API-key validation is charset-only).
+_OAUTH_TOKEN_PREFIXES = ("sk-ant-oat", "sk-ant-ort")
+
+
 def looks_like_api_key(credentials: str | None) -> bool:
     """Whether a stored active credential is a raw managed API key vs OAuth JSON.
 
-    Strict on purpose: a managed key is a bare ``sk-ant-api…`` string, while every
-    OAuth/setup-token credential is a JSON object (``{"claudeAiOauth": …}``). Requiring
-    the ``sk-ant-api`` prefix (and that it isn't JSON) keeps a raw/garbled
-    ``sk-ant-oat…`` setup token from ever being misclassified as an API key.
+    A managed key is a bare ``sk-ant-…`` string, while every OAuth/setup-token
+    credential is a JSON object (``{"claudeAiOauth": …}``). The Console issues
+    several key families — legacy workspace keys (``sk-ant-api03-…``), personal
+    keys (``sk-ant-usr-…``) and service-account keys — and Claude Code never
+    inspects the prefix of a key it stores, so neither does this: any bare
+    ``sk-ant-`` value is a key UNLESS it carries an OAuth token prefix. That
+    exclusion (rather than an allowlist of key prefixes) is what keeps a raw or
+    garbled ``sk-ant-oat…`` setup token from ever being misclassified — and
+    activated — as an API key; an allowlist instead wrapped every newer key family
+    as a setup-token, which is the #465 failure.
     """
     if not credentials:
         return False
     text = credentials.strip()
-    return text.startswith("sk-ant-api") and not text.startswith("{")
+    if text.startswith("{"):
+        return False
+    return text.startswith("sk-ant-") and not text.startswith(_OAUTH_TOKEN_PREFIXES)
 
 
 def _credential_object(credentials: str | None) -> dict | None:
@@ -287,6 +325,9 @@ class _StoreHost(Protocol):
 
     platform: Platform
     credentials_dir: Path
+    # The account registry (``sequence.json``): its stat is the "did the
+    # account set change?" signal the backup read cache is keyed on.
+    sequence_file: Path
     _logger: logging.Logger
 
 
@@ -334,7 +375,29 @@ class CredentialStore:
         # superseded generation. A fact about THIS item, which is why neither
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
+        # Whether the current pin came from the OAuth write fallback, i.e. it
+        # points at ``.credentials.json``. The managed-key fallback pins too,
+        # but onto ``primaryApiKey`` — a different file, and no reason to
+        # expect the OAuth one. See _lift_pin_if_oauth_file_gone.
+        self._pinned_to_oauth_file: bool = False
+        # The menu bar's display worker and its engine thread share one store;
+        # the lift's check-then-reset must not interleave with a fresh pin.
+        # Held around every pin and every flag change outside __init__; never
+        # taken inside _pin_file_mode itself, so callers can hold it across it.
+        self._pin_lock = threading.Lock()
         self._last_active_credentials_backend: str | None = None
+        # Per-slot cache for DISPLAY reads of backup Keychain items (see
+        # `_kc_read_backup`): (num, email) -> (value or "", monotonic read_at).
+        # The lock guards dict and epoch; the epoch voids fills that raced a
+        # drop; the generation is sequence.json's (inode, mtime_ns, size) the
+        # entries were read under.
+        self._backup_read_cache: dict[tuple[str, str], tuple[str, float]] = {}
+        self._backup_read_cache_lock = threading.Lock()
+        self._backup_read_cache_epoch = 0
+        self._backup_read_cache_gen: tuple[int, int, int] | None = None
+        # The cooldown deadline already announced in the log (see
+        # KeychainBackedOff): one line per cooldown, not one per skipped read.
+        self._backoff_announced_until: float = 0.0
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -432,6 +495,11 @@ class CredentialStore:
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
         self._residual_verdict = residual_cleared
+        # Only the OAuth write fallback may mark a pin as liftable, and it does
+        # so right after this call. Every other pin (the managed-key fallback,
+        # whose residual is the "Claude Code" item) resets it here, so a stale
+        # True can never lift a pin it does not describe.
+        self._pinned_to_oauth_file = False
         if residual_cleared:
             # Settle what happened before; later failures are the flags'
             # question again. `_kc_call` re-arms the cooldown on any failure
@@ -441,6 +509,50 @@ class CredentialStore:
             # degraded=False and disarmed the capture guard.
             self._keychain_op_failed = False
             self._active_read_failed = False
+
+    def _lift_pin_if_oauth_file_gone(self) -> None:
+        """End a pinned file mode once the file it points at no longer exists.
+
+        The pin is a claim about ``.credentials.json``: our fallback write put
+        the credential there, and a residual Keychain item might shadow it, so
+        this process keeps reading the file. With the file gone there is
+        nothing left to protect — and nothing left to read. Claude Code removes
+        the plaintext file when it stores a rotation in the Keychain, so on a
+        long-running process (menu bar, ``cswap auto``, TUI) the pin outlives
+        its file within hours, and from then on every active read returns ""
+        for the life of the process: usage is unknown, auto-switch fails over
+        into a switch that refuses ("credential is empty"), and only a fresh
+        process recovers.
+
+        A residual is not a reason to stay pinned here either. Claude Code
+        reads Keychain-first, so with our file gone a surviving item is what
+        Claude Code itself is using — the live credential by definition.
+
+        This only RE-ASKS the Keychain. It records no verdict: the read that
+        follows goes through ``_kc_call`` like any other and reports its own
+        outcome, including a Keychain that is still unreadable.
+        """
+        if not self._pinned_to_oauth_file:
+            return
+        with self._pin_lock:
+            if not self._pinned_to_oauth_file or self._use_keychain():
+                return
+            if self._keychain_disabled_until:
+                return  # a later failure re-armed the cooldown; let it run
+            try:
+                cred_file = get_credentials_path()
+                if cred_file.exists() and cred_file.stat().st_size > 0:
+                    return
+            except OSError:
+                return  # cannot tell; the pin is the conservative answer
+            self._keychain_usable_cache = None
+            self._file_mode_is_ours = False
+            self._pinned_to_oauth_file = False
+            self._residual_verdict = None
+        self._host._logger.info(
+            "Active credentials file is gone; reading the Keychain again "
+            "(file mode had been pinned by a failed Keychain write)."
+        )
 
     @property
     def _keychain_unreadable(self) -> bool:
@@ -573,7 +685,7 @@ class CredentialStore:
         Keychain "Claude Code", then ``~/.claude.json`` ``primaryApiKey``). Trying
         OAuth fully first means a macOS OAuth login that only has a file fallback
         (Keychain empty) is never misread as an API key. A returned managed key is a
-        raw ``sk-ant-api…`` string — callers distinguish it via ``looks_like_api_key``.
+        raw ``sk-ant-…`` string — callers distinguish it via ``looks_like_api_key``.
         Non-mutating.
 
         Reports ``keychain_unavailable`` when the OAuth Keychain read failed and
@@ -603,6 +715,7 @@ class CredentialStore:
         # codebase either: session.keychain_service_name codifies claude's
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
+        self._lift_pin_if_oauth_file_gone()
         if self._use_keychain():
             val, keychain_failed = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
@@ -731,45 +844,13 @@ class CredentialStore:
         data = data or {}
         mutator(data)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        try:
-            os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            replace_with_retry(tmp_path, str(path))
-            if sys.platform != "win32":
-                os.chmod(str(path), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(path, json.dumps(data, indent=2))
 
     def _write_active_credentials_file(self, credentials: str) -> None:
         """Atomically write Claude Code's plaintext active-credentials file."""
         cred_dir = get_claude_config_home()
         cred_dir.mkdir(parents=True, exist_ok=True)
-        cred_file = cred_dir / ".credentials.json"
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
-        try:
-            os.write(fd, credentials.encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            replace_with_retry(tmp_path, str(cred_file))
-            if sys.platform != "win32":
-                os.chmod(str(cred_file), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(cred_dir / ".credentials.json", credentials)
 
     def _delete_active_keychain_entry(self) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
@@ -797,7 +878,7 @@ class CredentialStore:
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
 
-        Detects the kind from the payload (raw ``sk-ant-api…`` key vs OAuth JSON) and
+        Detects the kind from the payload (raw ``sk-ant-…`` key vs OAuth JSON) and
         mirrors Claude Code's own ``saveApiKey``/``removeApiKey``: activating one axis
         clears the other so a stale credential can't shadow the switch.
 
@@ -886,7 +967,8 @@ class CredentialStore:
             # MANAGED one, and nothing deleted it — ``_clear_oauth_credential``
             # above removes the OAuth item, a different service. Unverified, so
             # the conservative verdict is the true one.
-            self._pin_file_mode(residual_cleared=False)
+            with self._pin_lock:
+                self._pin_file_mode(residual_cleared=False)
         self._last_active_credentials_backend = (
             "keychain" if wrote_to_keychain else "file"
         )
@@ -942,7 +1024,13 @@ class CredentialStore:
         Best-effort: a down Keychain or missing file is fine. Removing
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
+
+        WE remove the file here, so its absence says nothing about Claude Code
+        having moved the credential to the Keychain — the premise
+        ``_lift_pin_if_oauth_file_gone`` rests on. Disarm the lift first.
         """
+        with self._pin_lock:
+            self._pinned_to_oauth_file = False
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
@@ -1006,7 +1094,9 @@ class CredentialStore:
             # that residual and resurrect the wrong account (see _pin_file_mode).
             # Its outcome is also the answer to whether the file is now the
             # authority, so hand it over rather than re-deriving it from flags.
-            self._pin_file_mode(residual_cleared=cleared)
+            with self._pin_lock:
+                self._pin_file_mode(residual_cleared=cleared)
+                self._pinned_to_oauth_file = True
         self._last_active_credentials_backend = "file"
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
@@ -1064,36 +1154,136 @@ class CredentialStore:
     def _backup_username(self, account_num: str, email: str) -> str:
         return f"account-{account_num}-{email}"
 
-    def _kc_read_backup(self, account_num: str, email: str) -> str:
+    def _registry_generation(self) -> tuple[int, int, int] | None:
+        """``sequence.json``'s (inode, mtime_ns, size), or ``None`` when it
+        cannot be stat'ed.
+
+        The cheap "did the account set change?" signal: every registry write
+        (add/remove/swap/move/switch/import, from any process) replaces the
+        file. The display read cache is keyed on it — the same device as the
+        switcher's ``_poll_policy_inputs`` settings stat. The mtime alone can
+        repeat across two writes in one coarse timestamp tick; the atomic
+        write's new inode and the size tell those apart.
+        """
+        try:
+            st = self._host.sequence_file.stat()
+            return st.st_ino, st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def _drop_backup_read_cache(self) -> None:
+        """Forget every cached backup read (see ``_kc_read_backup``).
+
+        Runs after each own backup write/delete. The epoch bump also voids a
+        fill that was mid-``security`` when the drop landed: its value may
+        predate the mutation, so it must not be stored.
+        """
+        with self._backup_read_cache_lock:
+            self._backup_read_cache.clear()
+            self._backup_read_cache_epoch += 1
+
+    def _kc_read_backup(
+        self, account_num: str, email: str, *, cached: bool = False
+    ) -> str:
         """Read a per-account backup from the Keychain only (no file fallback).
 
         Routes through ``_kc_call`` (so a failure flips the capability cache).
         Returns ``""`` when the item is absent; raises on a Keychain failure so
         the caller decides (normal reads swallow it; the migration defers).
+
+        Honours the failure cooldown: within ``KEYCHAIN_RECHECK_COOLDOWN_S`` of
+        the last Keychain failure it raises WITHOUT spawning ``security``. The
+        active read and writes already stay off the Keychain then
+        (``_use_keychain``); backup reads were the one path that kept probing
+        — 31 spawns per 3 s TUI tick against a locked login keychain, each a
+        killed unlock dialog (#496). A pinned file mode zeroes the deadline,
+        so it never blocks backup reads (the backup is Keychain-only by
+        design; see ``_pin_file_mode`` and ``_read_account_credentials_ex``).
+        Several workers may pass the deadline together, so a recovery is a
+        bounded burst, not exactly one probe.
+
+        ``cached=True`` serves the value from a per-slot cache for up to
+        ``BACKUP_READ_CACHE_TTL_S``. For DISPLAY and ELIGIBILITY reads only —
+        sentinels, the snapshot's ``switchable`` flag, token-status lines.
+        Anything whose bytes are POSTed, written, activated or compared to
+        decide a write reads fresh (the default): the consume gate, the switch
+        path, resync/adopt, session bootstrap, export, migrations, and the
+        strike binding before a heal. Successes only (an absent item caches as
+        ``""``); a failure is never cached — the cooldown is what stops
+        re-probing it. Dropped after every own write/delete of a backup item
+        and whenever ``sequence.json`` changes (any process). A rotation
+        another process performs without touching the registry is the one
+        event only the TTL bounds; ≤TTL staleness there only lags the display
+        — the fetch path re-reads (``_consume_backup_grant_locked`` adopts a
+        moved generation rather than consuming a stale snapshot).
         """
+        key = (str(account_num), email)
+        if cached:
+            generation = self._registry_generation()
+            now = time.monotonic()
+            with self._backup_read_cache_lock:
+                if generation != self._backup_read_cache_gen:
+                    # The account registry changed: any entry may describe a
+                    # slot that moved or was re-added. Drop them all.
+                    self._backup_read_cache.clear()
+                    self._backup_read_cache_epoch += 1
+                    self._backup_read_cache_gen = generation
+                hit = self._backup_read_cache.get(key)
+                if hit is not None and now - hit[1] < BACKUP_READ_CACHE_TTL_S:
+                    return hit[0]
+                epoch = self._backup_read_cache_epoch
+        deadline = self._keychain_disabled_until
+        if deadline and time.monotonic() < deadline:
+            if self._backoff_announced_until != deadline:
+                self._backoff_announced_until = deadline
+                self._host._logger.info(
+                    "Keychain backed off after a failure: backup reads report "
+                    "unreadable for up to %.0f s instead of probing",
+                    deadline - time.monotonic(),
+                )
+            raise KeychainBackedOff(
+                "backup read skipped: the Keychain is backed off after a "
+                "recent failure"
+            )
         creds = self._kc_call(
             macos_keychain.get_password,
             SECURITY_SERVICE,
             self._backup_username(account_num, email),
         )
-        return creds or ""
+        value = creds or ""
+        if cached:
+            with self._backup_read_cache_lock:
+                # Store only if nothing was dropped while `security` ran.
+                if epoch == self._backup_read_cache_epoch:
+                    self._backup_read_cache[key] = (value, now)
+        return value
 
     def _kc_write_backup(self, account_num: str, email: str, credentials: str) -> None:
         """Write a per-account backup to the Keychain only. Raises on failure."""
-        self._kc_call(
-            macos_keychain.set_password,
-            SECURITY_SERVICE,
-            self._backup_username(account_num, email),
-            credentials,
-        )
+        try:
+            self._kc_call(
+                macos_keychain.set_password,
+                SECURITY_SERVICE,
+                self._backup_username(account_num, email),
+                credentials,
+            )
+        finally:
+            # AFTER the op, never before: dropping first leaves "drop -> a
+            # cached miss reads the old item and stores it -> the write
+            # lands", which the epoch cannot see. `finally`: a failed op may
+            # still have changed the item.
+            self._drop_backup_read_cache()
 
     def _kc_delete_backup(self, account_num: str, email: str) -> None:
         """Delete a per-account backup Keychain item only. Raises on failure."""
-        self._kc_call(
-            macos_keychain.delete_password,
-            SECURITY_SERVICE,
-            self._backup_username(account_num, email),
-        )
+        try:
+            self._kc_call(
+                macos_keychain.delete_password,
+                SECURITY_SERVICE,
+                self._backup_username(account_num, email),
+            )
+        finally:
+            self._drop_backup_read_cache()  # after, not before — see the write
 
     def _kc_delete_backup_prev(self, account_num: str, email: str) -> None:
         """Delete a slot's retained ``.prev`` Keychain item. Raises on failure."""
@@ -1117,25 +1307,8 @@ class CredentialStore:
     def _atomic_b64_write(self, target: Path, credentials: str) -> None:
         """Atomically write a base64-encoded credential file (0600)."""
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
-        enc_file = target
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(self._host.credentials_dir), suffix=".tmp")
-        try:
-            os.write(fd, encoded.encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            replace_with_retry(tmp_path, str(enc_file))
-            if sys.platform != "win32":
-                os.chmod(str(enc_file), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(target, encoded)
 
     def _reconcile_enc_after_keychain_write(
         self, account_num: str, email: str, credentials: str
@@ -1160,13 +1333,20 @@ class CredentialStore:
         self._write_backup_enc(account_num, email, credentials)
 
     def _read_account_credentials(
-        self, account_num: str, email: str, failed: list | None = None
+        self,
+        account_num: str,
+        email: str,
+        failed: list | None = None,
+        *,
+        cached: bool = False,
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
 
         macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
         copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
-        Linux/WSL/Windows read the ``.enc`` only.
+        Linux/WSL/Windows read the ``.enc`` only. ``cached`` lets the Keychain
+        half be served from the display read cache (see ``_kc_read_backup``:
+        display/eligibility sites only); the ``.enc`` half is always live.
         """
         enc_file = self._backup_enc_path(account_num, email)
         try:
@@ -1196,7 +1376,13 @@ class CredentialStore:
             enc_present = True
         if enc_present:
             try:
-                encoded = enc_file.read_text(encoding="utf-8").strip()
+                # BYTES, not text: `read_text` decodes inside the read and
+                # `UnicodeDecodeError` is a `ValueError`, so a .enc of garbled
+                # bytes escaped this arm AND the corrupt-content arm below, and
+                # raised out of a reader whose contract is `""`. Garbled bytes
+                # are what that second arm exists for, and `b64decode` rejects
+                # them there. Same split as `_read_stash_manifest_ex`.
+                encoded = enc_file.read_bytes().strip()
             except OSError as e:
                 # The .enc EXISTS but could not be read (permissions, a
                 # mid-unmount, ...) — a real read failure, not "no backup".
@@ -1224,7 +1410,13 @@ class CredentialStore:
                     # Empty/whitespace .enc is not a real backup → try the Keychain.
         if self._host.platform == Platform.MACOS:
             try:
-                return self._kc_read_backup(account_num, email)
+                return self._kc_read_backup(account_num, email, cached=cached)
+            except KeychainBackedOff:
+                # An expected skip inside the cooldown, announced once when
+                # it began — unreadable, but not a new failure to warn about
+                # on every lookup.
+                if failed is not None:
+                    failed.append(True)
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # Reported through the caller's list, not an instance flag:
                 # that flag was shared by every thread and its window spans a
@@ -1237,7 +1429,7 @@ class CredentialStore:
         return ""
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self, account_num: str, email: str, *, cached: bool = False
     ) -> tuple[str, bool]:
         """Backup read with an unreadable-vs-absent verdict.
 
@@ -1254,7 +1446,9 @@ class CredentialStore:
         there too, not only on macOS.
         """
         failed: list = []
-        value = self._read_account_credentials(account_num, email, failed)
+        value = self._read_account_credentials(
+            account_num, email, failed, cached=cached
+        )
         if value:
             return value, False
         if self._host.platform != Platform.MACOS:
@@ -1495,10 +1689,14 @@ class CredentialStore:
             #
             # The honest position is that the true previous generation is
             # unrecoverable here, and a checkpoint that can silently outrank a
-            # real one is worse than the absence it was meant to fill. Warn and
+            # real one is worse than the absence it was meant to fill. Log and
             # decline. `upstream/main` has no `.prev` at all, so this is no
             # worse there; what it is not is a cushion that lies.
-            self._host._logger.warning(
+            #
+            # INFO, not WARNING: the reader already reported the read failure
+            # (or the Keychain cooldown announced it once), the write proceeds
+            # and the slot's existing `.prev` is left untouched.
+            self._host._logger.info(
                 f"Could not retain previous credential generation for "
                 f"account {account_num}: the current backup exists but "
                 "could not be read (not absent) — no .prev recovery copy "
@@ -1822,7 +2020,11 @@ class CredentialStore:
         """
         path = self._stash_entry_path(entry_id)
         try:
-            encoded = path.read_text(encoding="utf-8").strip()
+            # BYTES for the same reason as the backup read above: undecodable
+            # bytes are a CORRUPT entry, the verdict the base64 arm below
+            # already gives, not an exception out of the reader the adopt path
+            # relies on to answer.
+            encoded = path.read_bytes().strip()
         except FileNotFoundError:
             return "", False
         except OSError as e:
