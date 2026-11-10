@@ -7752,7 +7752,12 @@ class ClaudeAccountSwitcher:
                 return False
             if float(live.get("expiresAt") or 0) <= float(stored_exp or 0):
                 return False
-            self._write_account_credentials(foreign_slot, email, original_creds)
+            # attributed=True: the "foreign" verdict is a uuid-positive
+            # oracle match of these exact bytes to `foreign_slot`, and the
+            # newer-generation check above is the ordering half.
+            self._write_account_credentials(
+                foreign_slot, email, original_creds, attributed=True
+            )
             self._logger.info(
                 "Resynced account %s's backup to its newer live credential "
                 "(found under another account's config label; the safety "

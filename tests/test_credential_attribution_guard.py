@@ -430,6 +430,7 @@ EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
     ("switcher.py", "_fetch_active_usage"): 2,
     ("switcher.py", "_resync_rotated_backup"): 1,
     ("switcher.py", "_perform_switch"): 1,
+    ("switcher.py", "_rescue_foreign_successor"): 1,
     ("transfer.py", "import_accounts"): 1,
 }
 

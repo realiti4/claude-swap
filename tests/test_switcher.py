@@ -8317,6 +8317,25 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("2", "account2@example.com")] == live
 
+    def test_rescue_write_is_not_refused_by_the_real_attribution_guard(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The store doubles ignore ``attributed``: only the real store shows
+        that the rescue's cross-lineage write is attested, not refused (and
+        swallowed by the rescue's own ``except``)."""
+        self._add_third_slot(sample_sequence_data)
+        switcher, _, _ = self._setup_two_accounts(temp_home, sample_sequence_data)
+        switcher.platform = Platform.LINUX
+        email = "account3@example.com"
+        successor = self._oauth("sk-3-new", "rt-3-new", 2_000)
+        switcher._write_account_credentials(
+            "3", email, self._oauth("sk-3-old", "rt-3-old", 1_000),
+        )
+        assert switcher._rescue_foreign_successor(
+            "3", sample_sequence_data, successor,
+        )
+        assert switcher._read_account_credentials("3", email) == successor
+
     def test_alien_credential_preserved_and_skipped(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
