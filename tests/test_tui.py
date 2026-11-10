@@ -2597,6 +2597,8 @@ class TestUnswitchableRowsAreListed:
         a.login_expires_at = None  # the re-login note reads it; a MagicMock is not a time
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
+        a.usage.decision_value.return_value = sentinel or last_good  # what the pass reads
+        a.disabled = False
         return a
 
     def _render(self, snap, active, *, settings=None):
@@ -3074,6 +3076,108 @@ class TestUnswitchableRowsAreListed:
             f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
             f"panel out:\n{rendered}"
         )
+
+
+def _window(five_h, reset_h):
+    """A usage payload: 5h at `five_h`, the 7d window empty and resetting in `reset_h`."""
+    return {
+        "five_hour": {"pct": five_h},
+        "seven_day": {"pct": 0.0, "resets_at": _iso_in(reset_h * 3600)},
+    }
+
+
+def _harness_and_panel_snapshot(temp_home, settings, fleet):
+    """The engine harness and the panel's snapshot of ONE fleet (`{number: usage
+    payload or sentinel}`, account 1 the active one). The harness clock is the wall clock: the panel
+    reads `time.time()`, and a reset in the harness's 1970 is already past."""
+    from tests.test_autoswitch import EngineHarness
+
+    h = EngineHarness(temp_home, **settings)
+    h.clock.now = time.time()
+    for number in fleet:
+        h.seed(int(number), f"u{number}@x.invalid")
+    h.make_live("u1@x.invalid", 1)
+    snap = AccountsSnapshot(
+        active_number="1",
+        accounts=tuple(
+            make_account(n, active=n == "1", entry=(
+                make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(
+                    last_good=usage, fetched_at=time.time() - 5.0, age_s=5.0,
+                )
+            ))
+            for n, usage in fleet.items()
+        ),
+        taken_at=0.0,
+    )
+    return h, snap
+
+
+class TestNextBestFollowsTheTick:
+    """The first Next best row is the account the engine's own tick switches to,
+    each case built so that the strategy's bare reset or headroom key names
+    another one: the panel ranks through the engine's pass, never a key of its
+    own."""
+
+    @pytest.mark.parametrize(
+        "strategy, fleet, designed",
+        [
+            # Proactive: 2 resets soonest but sits 5 points under its line, short
+            # of the hysteresis room (`tight`), so 3 leads.
+            ("consume-first", {"1": (95, 100), "2": (85, 10), "3": (10, 50)}, "3"),
+            # Weekly-first: soonest reset among the roomy ones, not the most
+            # headroom; the tight 4 resets sooner still and goes last.
+            ("weekly-first",
+             {"1": (95, 100), "2": (75, 10), "3": (5, 50), "4": (84, 5)}, "2"),
+            # CONTROL: best's key is the bare headroom on both sides.
+            ("best", {"1": (95, 100), "2": (70, 10), "3": (20, 50)}, "3"),
+            # At-limit: #305's escape tier puts the roomy 3 before 2, which has
+            # a sooner reset and 5 points of room.
+            ("consume-first", {"1": (100, 100), "2": (85, 10), "3": (10, 50)}, "3"),
+            # Below the line: consume-first's room bar bars 2 outright.
+            ("consume-first", {"1": (40, 100), "2": (85, 10), "3": (10, 50)}, "3"),
+        ],
+        ids=[
+            "consume-first-proactive", "weekly-first-proactive", "best-proactive",
+            "consume-first-at-limit", "consume-first-below-the-line",
+        ],
+    )
+    def test_the_first_row_is_the_account_the_tick_switches_to(
+        self, temp_home, strategy, fleet, designed
+    ):
+        from claude_swap.autoswitch import TickOutcome
+
+        fleet = {n: _window(*w) for n, w in fleet.items()}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        picked = str(h.active_number())
+        assert picked == designed, "the case no longer builds the pick it is named for"
+        assert _next_best_order(snap, "1", h.settings)[0] == picked
+
+    @pytest.mark.parametrize(
+        "strategy, active, claim",
+        [
+            ("consume-first", USAGE_TOKEN_EXPIRED, "not previewed (active status unknown)"),
+            ("best", _window(40, 100), "not previewed (active below threshold)"),
+        ],
+        ids=["unreadable-active", "best-below-the-line"],
+    )
+    def test_a_state_the_panel_cannot_model_claims_no_order(
+        self, temp_home, strategy, active, claim
+    ):
+        fleet = {"1": active, "2": _window(85, 10), "3": _window(10, 50)}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
+        assert claim in _next_best_text(snap, "1", h.settings)
+
+    def test_a_pass_that_admits_nobody_says_so(self, temp_home):
+        """Best needs a hysteresis margin over the active's headroom, and neither
+        peer has it: the engine holds, so no row may read as its next pick."""
+        from claude_swap.autoswitch import TickOutcome
+
+        fleet = {"1": _window(95, 100), "2": _window(88, 10), "3": _window(87, 50)}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "best"}, fleet)
+        assert h.tick_with_usage(fleet) is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert "no candidate qualifies" in _next_best_text(snap, "1", h.settings)
 
 
 # Pairwise model of the slot guard below (pict `/o:2 /r:3328`, 9 cases, CAPPED

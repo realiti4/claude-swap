@@ -148,6 +148,41 @@ HORIZON_HEADROOM_RATIO = 2.0
 # this much.
 SPENT_HEADROOM_PCT = 3.0
 
+
+def _binding_at(
+    value: dict | str | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    line: float,
+) -> BindingWindow | None:
+    """The window binding one account under ``settings``' lines on the window
+    set ``models`` (see ``lines.binding_window``), or None when it reports no
+    window. ``line`` is the account's effective threshold. A module function,
+    so the static ranking pass (and the "Next best" panel through it) needs no
+    engine instance."""
+    return binding_window(
+        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
+        line,
+        settings.weekly_threshold,
+        scale=settings.threshold,
+    )
+
+
+def _room_at(
+    value: dict | str | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    line: float,
+) -> float | None:
+    """Points left before one account's nearest line (see ``lines.line_room``),
+    or None when it reports no window. Same inputs as ``_binding_at``."""
+    return line_room(
+        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
+        line,
+        settings.weekly_threshold,
+    )
+
+
 # Strategies that rank by soonest weekly reset rather than most headroom.
 # `dynamic` shares consume-first's ranking key (and every gate keyed on the
 # below-threshold "consume-first" trigger, which this literal also drives —
@@ -2864,8 +2899,8 @@ class AutoSwitchEngine:
         # while the caller still reads the model-gated headroom/self._models.
         return fb if fb[0] else (ordered, any_known, active_reset_ts, waiting)
 
+    @staticmethod
     def _rank_candidates_pass(
-        self,
         *,
         models: Sequence[str],
         trigger: str,
@@ -2888,7 +2923,9 @@ class AutoSwitchEngine:
         commit can run it twice per tick: on the stored snapshot to decide
         provisionally, then on the escalated refetch to re-verify before
         switching. ``_rank_candidates`` (above) is the entry point every
-        caller uses; it calls this twice at most (see its docstring).
+        tick caller uses; it calls this twice at most (see its docstring). A
+        static method, so the "Next best" panel reaches it through the
+        module-level ``rank_candidates_pass`` with no engine instance.
 
         ``waiting_for_recovery`` is the one thing the caller cannot re-derive
         without restating four conditions this method already evaluated: an
@@ -2923,7 +2960,7 @@ class AutoSwitchEngine:
         # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
         # trigger computed is reused here.
         bindings = {
-            num: self._binding(usage.get(num), settings, thresholds[num], models=models)
+            num: _binding_at(usage.get(num), settings, models, thresholds[num])
             for num in (*oauth_candidates, current)
         }
         active_binding = bindings[current]
@@ -3135,9 +3172,7 @@ class AutoSwitchEngine:
             # Points left before the candidate reaches the nearest of its own
             # lines, each window in its own points (`lines.line_room`); the
             # single line against raw `h` when it reports no window.
-            room = self._room(
-                usage.get(num), settings, thresholds[num], models=models
-            )
+            room = _room_at(usage.get(num), settings, models, thresholds[num])
             if room is None:
                 room = thresholds[num] - (100.0 - h)
             over = (
@@ -3741,14 +3776,8 @@ class AutoSwitchEngine:
         and the ranking helpers are exercised directly on bare engines. A
         caller ranking on another window set (dynamic's 5h/7d retry) passes
         it, so the binding and the headroom beside it read ONE set."""
-        return binding_window(
-            oauth.relevant_windows(
-                value if isinstance(value, dict) else None,
-                self._models if models is None else models,
-            ),
-            line,
-            settings.weekly_threshold,
-            scale=settings.threshold,
+        return _binding_at(
+            value, settings, self._models if models is None else models, line
         )
 
     def _room(
@@ -3762,13 +3791,8 @@ class AutoSwitchEngine:
         """Points left before this account's nearest line under the tick's
         lines (see ``lines.line_room``), or None when it reports no window.
         Same inputs as ``_binding``."""
-        return line_room(
-            oauth.relevant_windows(
-                value if isinstance(value, dict) else None,
-                self._models if models is None else models,
-            ),
-            line,
-            settings.weekly_threshold,
+        return _room_at(
+            value, settings, self._models if models is None else models, line
         )
 
     def _in_cooldown(self, state: dict) -> bool:
@@ -4130,3 +4154,9 @@ class AutoSwitchEngine:
                     )
                 )
             self._wake.wait(delay)
+
+
+# A direct module-level name, not `AutoSwitchEngine._rank_candidates_pass`: a
+# caller that only wants the (pure, static) ranking -- the "Next best" panel --
+# needs no engine instance to reach it.
+rank_candidates_pass = AutoSwitchEngine._rank_candidates_pass

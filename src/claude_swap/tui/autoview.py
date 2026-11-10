@@ -31,10 +31,15 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    ThresholdMap,
+    _binding_at,
+    _dynamic_active_headroom,
+    _headroom_by_account,
     binding_pct,
     classify_candidate_block,
     consume_first_rank_key,
     pct_label,
+    rank_candidates_pass,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.lines import BindingWindow, binding_window
@@ -76,6 +81,87 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
+
+# Triggers whose pass the panel never runs, each with WHY: a state the tick
+# acts on out of sight of a snapshot (an unreadable active counts ticks toward
+# failover) or ranks through a pass of its own. Never "no candidate qualifies",
+# the claim only a real, empty pass earns.
+_UNMODELED_TEXT = {
+    "below-threshold": "not previewed (active below threshold)",
+    "unreadable-active": "not previewed (active status unknown)",
+    "priority": "not previewed (priority strategy)",
+}
+
+
+def _engine_order(
+    snap: AccountsSnapshot, settings, active_number: str | None, now: float
+) -> tuple[list[str], tuple[str, ...], str]:
+    """(ordered, the window set it ranked on, trigger): the order the engine's
+    own pass (`rank_candidates_pass`) gives this snapshot, never a key of the
+    panel's own. The trigger comes from the active's reading as `_tick_inner`
+    classifies it, and a trigger in `_UNMODELED_TEXT` runs no pass. Under
+    `dynamic`, an empty model-gated pass is retried on 5h/7d alone, as
+    `_rank_candidates` does. State a snapshot lacks (cooldown, the no-return
+    bar, quarantine, the failover count) is not modeled."""
+    models = parse_model_names(settings.model)
+    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+    bars = ThresholdMap(
+        {a.number: a.policy.threshold for a in snap.accounts if a.policy.threshold is not None},
+        settings.threshold,
+    )
+    headroom = _headroom_by_account(usage, models)
+    active_h = _dynamic_active_headroom(
+        settings, models, usage, active_number, headroom.get(active_number)
+    )
+    if settings.strategy == "priority-consume-first":
+        trigger = "priority"
+    elif any(a.number == active_number and a.disabled for a in snap.accounts):
+        trigger = "disabled-active"
+    elif active_h is None:
+        trigger = "unreadable-active"
+    else:
+        # Each window against its own line, on the set `active_h` was read on.
+        binding = _binding_at(
+            usage.get(active_number), settings,
+            () if settings.strategy == "dynamic" and models else models,
+            bars[active_number],
+        )
+        below = (
+            not binding.over
+            if binding is not None
+            else (100.0 - active_h) < bars[active_number]
+        )
+        if below:
+            trigger = (
+                settings.strategy
+                if settings.strategy in CONSUME_FIRST_STRATEGIES
+                else "below-threshold"
+            )
+        else:
+            trigger = "at-limit" if active_h <= 0 else "proactive"
+    if trigger in _UNMODELED_TEXT:
+        return [], models, trigger
+
+    def rank(axis: tuple[str, ...]) -> list[str]:
+        h = _headroom_by_account(usage, axis)
+        return rank_candidates_pass(
+            models=axis, trigger=trigger,
+            consume_first=settings.strategy in CONSUME_FIRST_STRATEGIES,
+            oauth_candidates=[
+                a.number for a in snap.accounts
+                if a.number != active_number and a.switchable and not a.disabled
+                and a.kind != "api_key"
+            ],
+            no_return=None, usage=usage, headroom=h, current=active_number,
+            active_headroom=h.get(active_number), settings=settings, now=now,
+            thresholds=bars,
+        )[0]
+
+    ordered = rank(models)
+    if not ordered and models and settings.strategy == "dynamic":
+        if retry := rank(()):
+            return retry, (), trigger
+    return ordered, models, trigger
 
 
 def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
@@ -579,51 +665,20 @@ class AutoScreen(Screen):
         def noted(acc) -> bool:
             return weekly is not None or acc.policy.threshold is not None
 
-        # Same strategy the engine ticks on, so the panel's order can never
-        # disagree with the account a tick would actually switch to.
+        # The strategy's bare key, for the rows the engine's pass refuses.
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
-        # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
-        # `models`: `_rank_candidates` (autoswitch.py) drops the model set
-        # and retries on 5h/7d alone when the model-gated pass finds no
-        # healthy candidate — so a panel that always ranks on `models` can
-        # name a top row the engine would never pick (still model-gated
-        # ranking a fleet the engine has already dropped it for). But the
-        # engine only runs that retry under `strategy == "dynamic"`
-        # (autoswitch.py's `_rank_candidates`) — gated the same way here, or
-        # `best`/`consume-first` rank on an axis the engine is forbidden to
-        # use. Same predicate as the model-gated pass's own health filter
-        # (`classify_candidate_block` — "open" is exactly what that filter
-        # lets through): any candidate reading "open" means the model-gated
-        # pass has something to work with, so keep `models`; none reading
-        # "open" means it would come back empty, so rank on the retry's
-        # axis instead — a "model"-only block clears once `models` drops,
-        # and a "full" block stays blocked either way.
-        rank_models = models
-        if models and self._settings and self._settings.strategy == "dynamic":
-            for acc in snap.accounts:
-                if (
-                    acc.number == active_number
-                    or not acc.switchable
-                    or acc.usage.sentinel is not None
-                    or binding_pct(acc.usage.last_good, models) is None
-                ):
-                    continue
-                windows = (
-                    (label, p)
-                    for label, p, _ in oauth.relevant_windows(
-                        acc.usage.last_good, models
-                    )
-                )
-                kind, _ = classify_candidate_block(windows, line_of(acc), weekly)
-                if kind == "open":
-                    break
-            else:
-                rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         rows: dict[str, CandidateRow] = {}
         now = time.time()
+        # THE ENGINE'S OWN ADMISSION AND ORDER decide the rows it admits and
+        # their window set; a refused row keeps the strategy's bare key below,
+        # behind every admitted one.
+        ordered, rank_models, trigger = (
+            _engine_order(snap, settings, active_number, now)
+            if settings else ([], models, "")
+        )
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
         # own payload (`relevant_windows`), so "chip 1" is not the same
@@ -825,6 +880,11 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
+        if trigger in _UNMODELED_TEXT:
+            text.append(f"\n  {_UNMODELED_TEXT[trigger]}", style=palette.muted)
+        elif settings and not ordered:
+            # Rows are still listed, but none is something a tick would switch to.
+            text.append("\n  no candidate qualifies", style=palette.muted)
         # The box has no width before its first layout (the app's less its
         # padding), and a screen built with `__new__` has no `_nodes` to query.
         try:
@@ -833,7 +893,13 @@ class AutoScreen(Screen):
             width = None
         else:
             width = box.size.width or self.app.size.width - 4
+        place = {number: i for i, number in enumerate(ordered)}
         text.append_text(render_candidate_rows(
-            [rows[number] for _key, number in sorted(ranked)], palette, width
+            [rows[number] for _key, number in sorted(
+                ranked,
+                key=lambda kn: (
+                    (0, place[kn[1]]) if kn[1] in place else (1, *kn[0]), kn[1]
+                ),
+            )], palette, width
         ))
         return text
