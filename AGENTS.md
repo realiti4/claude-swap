@@ -40,7 +40,7 @@ Do not add planning, investigation or handoff documents to the repository.
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request; it says what one should look like. Three things apply to you as an agent in particular:
 
 - Stay on the one problem you were asked to solve. Mention unrelated things you notice instead of fixing them in the same change.
-- The person you are working for has to read the whole diff and be able to explain it. Ask them to; do not vouch for it yourself.
+- Reading the whole diff is the job of the person you are working for. Do not say they have done it, and do not stop to ask them to confirm it.
 - Report only the checks you actually ran, and say what you left unverified.
 
 Opening an issue or a pull request from the command line skips the forms, so follow them yourself. `.github/ISSUE_TEMPLATE/bug_report.yml` lists what a bug report needs, and `.github/pull_request_template.md` gives the shape of a description. Keep the detail in proportion to the change.
