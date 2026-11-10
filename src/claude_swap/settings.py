@@ -114,6 +114,16 @@ class UsageSettings:
     """
 
     header_probe: bool = False
+    # Also read Fable's weekly window on each header probe: a second
+    # 1-output-token request, to Fable, since that bucket only shows on its
+    # own responses. Needs ``header_probe``; the manual check (``u``) always
+    # includes it.
+    header_probe_fable: bool = False
+    # Longest gap between polls of an account whose usage isn't moving (the
+    # active one / every other one). Moving usage still polls sooner, down to
+    # poll_policy.MIN_INTERVAL_S (and URGENT_INTERVAL_S near the switch line).
+    active_poll_minutes: int = 5
+    inactive_poll_minutes: int = 10
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -209,6 +219,18 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "usage", "headerProbe", "header_probe", "bool",
             help="Read setup-token usage from a 1-token Haiku request's rate-limit headers (opt-in: uses quota)",
+        ),
+        SettingSpec(
+            "usage", "headerProbeFable", "header_probe_fable", "bool",
+            help="Also read Fable's weekly window with a second 1-token request on each probe (needs usage.headerProbe)",
+        ),
+        SettingSpec(
+            "usage", "activePollMinutes", "active_poll_minutes", "int", 3, 60,
+            help="Longest gap between usage polls of the active account while its usage isn't changing, in minutes",
+        ),
+        SettingSpec(
+            "usage", "inactivePollMinutes", "inactive_poll_minutes", "int", 3, 240,
+            help="Longest gap between usage polls of every other account while its usage isn't changing, in minutes",
         ),
     )
 }
@@ -381,20 +403,38 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
 
 
 def load_usage_settings(backup_root: Path) -> UsageSettings:
-    """Load the usage section; missing/corrupt file or non-bool → default."""
+    """Load the usage section; missing/corrupt file → defaults. Each key is
+    read on its own: a bad value reverts only that key (a number out of range
+    is clamped into it)."""
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("usage")
-    default = UsageSettings()
     if not isinstance(section, dict):
-        return default
-    header_probe = section.get("headerProbe", default.header_probe)
-    if not isinstance(header_probe, bool):
-        _logger.warning(
-            "settings.json: usage.headerProbe must be true or false, got %r; "
-            "using %r", header_probe, default.header_probe,
-        )
-        return default
-    return UsageSettings(header_probe=header_probe)
+        return UsageSettings()
+    kwargs = {}
+    for spec in SETTING_SPECS.values():
+        if spec.section != "usage" or spec.json_key not in section:
+            continue
+        value = section[spec.json_key]
+        if spec.kind == "bool":
+            if isinstance(value, bool):
+                kwargs[spec.field] = value
+                continue
+            _logger.warning(
+                "settings.json: %s must be true or false, got %r; using %r",
+                spec.dotted, value, spec.default,
+            )
+        elif spec.kind == "int":
+            # bool is an int subclass; a non-finite float has no int value.
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or (
+                isinstance(value, float) and not math.isfinite(value)
+            ):
+                _logger.warning(
+                    "settings.json: %s must be a whole number, got %r; using %r",
+                    spec.dotted, value, spec.default,
+                )
+                continue
+            kwargs[spec.field] = int(min(max(value, spec.lo), spec.hi))
+    return UsageSettings(**kwargs)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

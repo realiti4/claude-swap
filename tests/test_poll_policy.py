@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 import pytest
 
@@ -37,6 +37,79 @@ def _plan(**overrides):
     )
     kwargs.update(overrides)
     return poll_policy.plan_after_fetch(**kwargs)
+
+
+class TestConfiguredCeilings:
+    """``usage.activePollMinutes`` / ``usage.inactivePollMinutes`` arrive as
+    ``active_max_s`` / ``candidate_max_s``: the idle ceilings. Movement,
+    urgent mode, the exhausted floor and reset pull-forward still apply."""
+
+    def _idle(self, rounds: int = 20, **kw) -> list[float]:
+        prev, traj = None, []
+        for _ in range(rounds):
+            _, prev = _plan(prev_interval_s=prev, prev_usage=_usage(10), **kw)
+            traj.append(prev)
+        return traj
+
+    def test_an_idle_account_backs_off_to_the_configured_ceiling(self):
+        traj = self._idle(candidate_max_s=3600.0)
+        # The usual ×1.5 steps, from the default, all the way to the hour.
+        assert traj[0] == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S * 1.5
+        assert traj == sorted(traj)
+        assert max(traj) == traj[-1] == 3600.0
+        active = self._idle(is_active=True, active_max_s=600.0)
+        assert max(active) == active[-1] == 600.0
+
+    def test_a_short_ceiling_caps_the_default_too(self):
+        _, interval = _plan(candidate_max_s=poll_policy.MIN_INTERVAL_S)
+        assert interval == poll_policy.MIN_INTERVAL_S
+
+    def test_a_ceiling_below_the_floor_is_the_floor(self):
+        assert max(self._idle(candidate_max_s=10.0)) == poll_policy.MIN_INTERVAL_S
+
+    def test_movement_still_tightens_under_a_long_ceiling(self):
+        _, interval = _plan(
+            prev_interval_s=3600.0, prev_usage=_usage(10), new_usage=_usage(20),
+            candidate_max_s=3600.0,
+        )
+        assert interval == 1800.0
+
+    def test_a_lowered_ceiling_applies_at_once(self):
+        # Planned under a 1h setting, then lowered to 10 min: a moving account
+        # must not keep halving down from the old hour.
+        _, interval = _plan(
+            prev_interval_s=3600.0, prev_usage=_usage(10), new_usage=_usage(20),
+        )
+        assert interval == poll_policy.CANDIDATE_MAX_INTERVAL_S
+
+    def test_urgent_mode_ignores_a_long_active_ceiling(self):
+        _, interval = _plan(
+            is_active=True, prev_interval_s=600.0, active_max_s=3600.0,
+            prev_usage=_usage(70), new_usage=_usage(80),
+        )
+        assert interval == poll_policy.URGENT_INTERVAL_S
+
+    def test_a_429_never_shortens_a_wider_ceiling(self):
+        _, interval = _plan(
+            recent_429=True, prev_interval_s=3600.0, prev_usage=_usage(10),
+            candidate_max_s=3600.0,
+        )
+        assert interval == 3600.0
+
+    def test_exhausted_and_reset_rules_still_hold(self):
+        # A short ceiling never polls an exhausted account faster than its floor.
+        _, interval = _plan(
+            prev_usage=_usage(100), new_usage=_usage(100),
+            candidate_max_s=poll_policy.MIN_INTERVAL_S,
+        )
+        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
+        # A long one still polls right after a window resets.
+        reset = datetime.fromtimestamp(NOW + 900, tz=UTC).isoformat()
+        next_poll, _ = _plan(
+            prev_interval_s=3600.0, prev_usage=_usage(10),
+            new_usage=_usage(10, resets_at=reset), candidate_max_s=3600.0,
+        )
+        assert next_poll == NOW + 900 + poll_policy.RESET_SLACK_S
 
 
 class TestIntervalAdaptation:

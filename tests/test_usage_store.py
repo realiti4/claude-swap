@@ -155,6 +155,31 @@ class TestExtendedTrust:
         clock.advance(250)
         assert store.entries(IDENT)["1"].decision_value() is None
 
+    def test_a_planned_cadence_past_the_ceiling_stays_trusted(self, store, clock):
+        # A long ``usage.inactivePollMinutes`` plans past TRUST_MAX_AGE_S: the
+        # reading must not turn unknown in the minutes before its own poll.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        planned = 3600.0 * (1.0 + usage_store.JITTER_FRAC)  # jittered all the way up
+        store.set_poll_plan({"1": (clock.now + planned, 3600.0)}, IDENT)
+        clock.advance(planned - 10)
+        entry = store.entries(IDENT)["1"]
+        assert entry.age_s > TRUST_MAX_AGE_S
+        assert entry.decision_value() == USAGE
+        # A poll that then fails keeps it only for the fetch's slack, as before.
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        clock.advance(10 + usage_store.SCHEDULE_TRUST_SLACK_S + 1)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_the_planned_trust_is_capped(self):
+        # A plan the planner can't make (pollIntervalS from a damaged row)
+        # never stretches trust past the widest setting.
+        assert usage_store._trust_ceiling_s(None) == TRUST_MAX_AGE_S
+        assert usage_store._trust_ceiling_s(600.0) == TRUST_MAX_AGE_S
+        assert usage_store._trust_ceiling_s(10**9) == usage_store.SCHEDULE_TRUST_MAX_AGE_S
+        from claude_swap.settings import SETTING_SPECS
+        widest = SETTING_SPECS["usage.inactivePollMinutes"].hi * 60.0
+        assert usage_store._trust_ceiling_s(widest) == usage_store.SCHEDULE_TRUST_MAX_AGE_S
+
     def test_trust_ceiling_wins_over_non_429_failure_state(self, store, clock):
         # A non-429 failure (timeout/network) past the general ceiling reads as
         # unknown: such an error is no evidence the last_good still holds, so

@@ -34,6 +34,12 @@ USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+# The unified headers report a per-model weekly bucket only on responses to
+# that model's own requests: a Haiku probe never carries Fable's ``7d_oi``. So
+# reading it takes a second 1-output-token request, to Fable (the approach of
+# realiti4/claude-swap#568). Opt-in on its own (``usage.headerProbeFable``,
+# see :class:`HeaderProbe`): it is one more real request per probe.
+USAGE_PROBE_FABLE_MODEL = "claude-fable-5-1"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -451,6 +457,23 @@ _UNIFIED_WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
 # usage API's ``weekly_scoped`` limits use, so ``autoswitch.model`` matches
 # them the same way. ``7d_oi`` is Fable's weekly window.
 _UNIFIED_SCOPED_WINDOWS = (("7d_oi", "Fable"),)
+#: The scoped window name of Fable's weekly bucket (``7d_oi`` above).
+FABLE_WINDOW = "Fable"
+
+
+@dataclass(frozen=True)
+class HeaderProbe:
+    """Options for one setup-token header probe (:func:`request_usage_via_probe`).
+
+    ``fable``: also read Fable's weekly window, with a second 1-token request
+    to Fable. ``fable_if_refused``: send it even when the main probe is
+    refused for quota. A refused account is at its limit whatever Fable says,
+    so the second request is normally skipped, unless nothing is known about
+    the account's Fable window yet.
+    """
+
+    fable: bool = False
+    fable_if_refused: bool = False
 
 
 def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
@@ -534,13 +557,17 @@ def parse_unified_ratelimit_headers(headers) -> dict:
     return data
 
 
-def request_usage_via_probe(access_token: str) -> dict:
+def request_usage_via_probe(
+    access_token: str, probe: HeaderProbe | None = None
+) -> dict:
     """Read utilization from the rate-limit headers of a minimal model request.
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
     utilization, and inference is the one thing a setup-token may do. The
     request asks for a single Haiku output token. Returns the raw usage API
     shape (possibly empty) from :func:`parse_unified_ratelimit_headers`.
+    With ``probe.fable``, Fable's weekly window is added from a second
+    request (see :class:`HeaderProbe` and :func:`_fable_limits`).
 
     A 429 carrying ``anthropic-ratelimit-unified-status: rejected`` is the
     account confirming its quota refuses inference, whatever the utilization
@@ -552,25 +579,11 @@ def request_usage_via_probe(access_token: str) -> dict:
     re-raises like any other error, so it stays an ``http-429`` failure
     with its Retry-After.
     """
-    body = json.dumps({
-        "model": USAGE_PROBE_MODEL,
-        "max_tokens": 1,
-        "system": USAGE_PROBE_SYSTEM,
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "anthropic-beta": OAUTH_BETA_HEADER,
-        "anthropic-version": USAGE_PROBE_API_VERSION,
-        "Content-Type": "application/json",
-        "User-Agent": "claude-swap/1.0",
-    }
-    req = urllib.request.Request(
-        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return parse_unified_ratelimit_headers(resp.headers)
+        with urllib.request.urlopen(
+            _probe_request(access_token, USAGE_PROBE_MODEL), timeout=10
+        ) as resp:
+            data = parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
         data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}
         if e.code != 429 or "rejected" not in data:
@@ -583,10 +596,125 @@ def request_usage_via_probe(access_token: str) -> dict:
             ).isoformat()
         rejected["retry_after_s"] = retry_after
         data["rejected"] = rejected
-        return data
+    if probe is not None and probe.fable and (
+        "rejected" not in data or probe.fable_if_refused
+    ):
+        have = {_limit_name(lim) for lim in data.get("limits") or []}
+        fable = [lim for lim in _fable_limits(access_token) if _limit_name(lim) not in have]
+        if fable:
+            data["limits"] = (data.get("limits") or []) + fable
+    return data
 
 
-def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
+def _probe_request(access_token: str, model: str) -> urllib.request.Request:
+    """A 1-output-token ``/v1/messages`` request to ``model``."""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "system": USAGE_PROBE_SYSTEM,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "anthropic-version": USAGE_PROBE_API_VERSION,
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    return urllib.request.Request(
+        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
+    )
+
+
+def _limit_name(limit: dict) -> str | None:
+    """The model display name of a raw ``limits`` entry."""
+    model = (limit.get("scope") or {}).get("model") if isinstance(limit, dict) else None
+    return model.get("display_name") if isinstance(model, dict) else None
+
+
+def _fable_limits(access_token: str) -> list[dict]:
+    """Fable's weekly limit read off a 1-token Fable request's headers, as raw
+    ``limits`` entries (``[]`` when it can't be read).
+
+    Best-effort: a refused Fable request still carries its bucket on the
+    error's headers, so Fable at its limit reads 100% without the account
+    being refused, and any other failure (no access to the model, a network
+    error) adds nothing. Only the Fable limit is taken: the 5h/7d windows and
+    any rejection come from the main probe, since Fable refusing says nothing
+    about the account's other models.
+    """
+    try:
+        with urllib.request.urlopen(
+            _probe_request(access_token, USAGE_PROBE_FABLE_MODEL), timeout=10
+        ) as resp:
+            headers = resp.headers
+    except urllib.error.HTTPError as e:
+        headers = e.headers
+    except Exception as e:  # noqa: BLE001 — best-effort: never fails the main reading
+        _logger.debug("Fable usage probe failed: %r", e)
+        return []
+    if not headers:
+        return []
+    return [
+        lim for lim in parse_unified_ratelimit_headers(headers).get("limits") or []
+        if _limit_name(lim) == FABLE_WINDOW
+    ]
+
+
+def scoped_window(usage: dict | None, name: str) -> dict | None:
+    """The ``scoped`` window named ``name`` (case-insensitive) in a usage
+    dict, or None."""
+    if not isinstance(usage, dict):
+        return None
+    for window in usage.get("scoped") or []:
+        if (
+            isinstance(window, dict)
+            and isinstance(window.get("name"), str)
+            and window["name"].lower() == name.lower()
+        ):
+            return window
+    return None
+
+
+def carry_scoped_window(
+    usage: dict, previous: dict | None, previous_at: float | None, name: str, now: float
+) -> dict:
+    """``usage`` with ``previous``'s ``name`` window added when ``usage`` has
+    none and that window's reset is still ahead (usage only rises inside a
+    window, so until then the old figure is a floor, not a guess).
+
+    The carried window keeps when it was read as ``read_at`` (epoch seconds;
+    ``previous_at``, the previous reading's own time, when it had none), so
+    callers can tell how old that part of the reading is. Returns ``usage``
+    itself when there is nothing to carry, else a copy.
+    """
+    if scoped_window(usage, name) is not None:
+        return usage
+    window = scoped_window(previous, name)
+    if window is None:
+        return usage
+    resets_at = window.get("resets_at")
+    try:
+        reset_ts = datetime.fromisoformat(str(resets_at)).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return usage
+    if reset_ts <= now:
+        return usage
+    carried = dict(window)
+    read_at = window.get("read_at")
+    if not isinstance(read_at, (int, float)):
+        read_at = previous_at
+    if isinstance(read_at, (int, float)):
+        carried["read_at"] = float(read_at)
+    carried["countdown"], carried["clock"] = format_reset(resets_at)
+    out = dict(usage)
+    out["scoped"] = [*(usage.get("scoped") or []), carried]
+    return out
+
+
+def _usage_from_probe(
+    access_token: str, context: str, probe: HeaderProbe | None = None
+) -> "UsageOutcome":
     """Usage from the header probe, classified like an endpoint fetch.
 
     The result is marked ``source: headers`` and keeps the probe's
@@ -597,7 +725,7 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
     one) instead of failing as ``bad-response``.
     """
     try:
-        data = request_usage_via_probe(access_token)
+        data = request_usage_via_probe(access_token, probe)
     except Exception as e:
         kind, retry_after = _classify_usage_error(e)
         cause = kind if retry_after is None else f"{kind}, retry-after {retry_after:.0f}s"
@@ -972,7 +1100,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
-    header_probe: bool = False,
+    header_probe: bool | HeaderProbe = False,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -988,7 +1116,8 @@ def try_fetch_usage_for_account(
     ``header_probe`` its usage comes from :func:`request_usage_via_probe`
     instead, in place of the endpoint request, so the caller's poll plan and
     backoff pace it exactly like an endpoint fetch; without it the outcome is
-    the ``"setup-token"`` error and no request is sent.
+    the ``"setup-token"`` error and no request is sent. A :class:`HeaderProbe`
+    turns the probe on with its options (``True``: the defaults, no Fable).
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -998,7 +1127,8 @@ def try_fetch_usage_for_account(
 
     if is_setup_token(oauth):
         if header_probe:
-            return _usage_from_probe(access_token, context)
+            probe = header_probe if isinstance(header_probe, HeaderProbe) else HeaderProbe()
+            return _usage_from_probe(access_token, context, probe)
         return UsageOutcome(None, error="setup-token")
 
     working_credentials = credentials

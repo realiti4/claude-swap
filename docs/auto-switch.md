@@ -47,6 +47,8 @@ When the usage API reports no `five_hour` window for an account (verified Ultra 
 
 Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 
+Two settings cap how far apart polls drift for an account whose usage isn't changing: `usage.activePollMinutes` for the active account (default 5, 3 to 60) and `usage.inactivePollMinutes` for every other one (default 10, 3 to 240). An idle account backs off ×1.5 per poll up to that time. Usage that moves is still polled sooner (down to 3 minutes, and every minute for the active account rising near its switch line), an account is polled right after one of its windows resets, and once the active account nears its switch line every candidate is read again before a switch. So a long inactive time saves requests (and, for setup-token probes, quota) without switching on old numbers. Changes apply from each account's next poll, without restarting the loop.
+
 ## When something fails
 
 It fails safe: if a usage check errors it keeps trusting the last-known numbers, for a bounded time, while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).

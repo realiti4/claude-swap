@@ -92,7 +92,11 @@ MIN_INTERVAL_S = 180.0
 URGENT_INTERVAL_S = 60.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
-# stays reasonably fresh, an idle alternate drifts out to ten minutes.
+# stays reasonably fresh, an idle alternate drifts out to ten minutes. These
+# are the defaults of ``usage.activePollMinutes`` / ``usage.inactivePollMinutes``,
+# which callers pass to ``plan_after_fetch`` as ``active_max_s`` /
+# ``candidate_max_s``. A longer ceiling stays inside the budget by
+# construction (fewer requests); the floor is MIN_INTERVAL_S either way.
 ACTIVE_MAX_INTERVAL_S = 300.0
 CANDIDATE_DEFAULT_INTERVAL_S = 300.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
@@ -209,6 +213,8 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     weekly_threshold: float | None = None,
+    active_max_s: float = ACTIVE_MAX_INTERVAL_S,
+    candidate_max_s: float = CANDIDATE_MAX_INTERVAL_S,
     rng: Callable[[], float] = random.random,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
@@ -218,17 +224,19 @@ def plan_after_fetch(
     ``URGENT_INTERVAL_S`` when one of the active account's windows rose by
     that much into the escalation band under its own line (``threshold`` for
     the 5h window, ``weekly_threshold`` when set for the weekly ones). No
-    movement backs off ×1.5 toward the account's ceiling;
+    movement backs off ×1.5 toward the account's ceiling (``active_max_s``
+    or ``candidate_max_s``, never below ``MIN_INTERVAL_S``);
     unknown utilization uses the default. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
-    until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
+    until ``RECENT_429_WINDOW_S`` has passed; its backoff never shortens the
+    account's own ceiling. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
     reset (+ ``RESET_SLACK_S``). An at-limit account keeps a bounded slow
     poll instead of sleeping until that reset, so an early provider-side
     quota grant is observed and its decision-grade status stays current.
     """
-    default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
-    ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
+    ceiling = max(MIN_INTERVAL_S, active_max_s if is_active else candidate_max_s)
+    default = MIN_INTERVAL_S if is_active else min(CANDIDATE_DEFAULT_INTERVAL_S, ceiling)
     base = prev_interval_s or default
     prev_pct = binding_pct(prev_usage, models)
     new_pct = binding_pct(new_usage, models)
@@ -237,7 +245,9 @@ def plan_after_fetch(
         interval = default
     elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
         moving = True
-        interval = max(MIN_INTERVAL_S, base / 2)
+        # Capped too: a ceiling lowered since the last plan applies at once
+        # (an idle account is already capped by the branch below).
+        interval = min(ceiling, max(MIN_INTERVAL_S, base / 2))
     else:
         # Floored so a sub-floor base (urgent mode's 60s) snaps straight back
         # to the normal cadence once movement stops, instead of decaying
@@ -263,8 +273,12 @@ def plan_after_fetch(
         # last one toward the wider 429 ceiling, so machines sharing a
         # contended token each retreat until their combined rate fits the
         # budget. Floored at POST_429_MIN_INTERVAL_S for the first 429.
+        # A configured ceiling wider than the 429 one stays the cap: backing
+        # off must never poll a contended token faster than it already was.
         increased = max(base * POST_429_BACKOFF_MULT, POST_429_MIN_INTERVAL_S)
-        interval = min(POST_429_MAX_INTERVAL_S, max(interval, increased))
+        interval = min(
+            max(POST_429_MAX_INTERVAL_S, ceiling), max(interval, increased)
+        )
 
     headroom = oauth.account_headroom(new_usage, models)
     if headroom is not None and headroom <= 0:

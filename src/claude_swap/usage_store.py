@@ -90,6 +90,25 @@ def _live_claim(
 # trust must never be server-controlled and unbounded.
 TRUST_MAX_AGE_S = 3600.0
 
+# A cadence the scheduler itself chose longer than that (a long
+# ``usage.inactivePollMinutes``) stretches the ceiling to cover it: the
+# jittered interval plus SCHEDULE_TRUST_SLACK_S for the fetch to land, so a
+# reading does not read as unknown in the minutes before its own planned poll.
+# Still bounded and still client-controlled: the interval is the planner's,
+# and the planner's widest is the setting's range, so this cap is never lifted
+# by anything the server says.
+SCHEDULE_TRUST_SLACK_S = 300.0
+SCHEDULE_TRUST_MAX_AGE_S = 240 * 60.0 * (1.0 + JITTER_FRAC) + SCHEDULE_TRUST_SLACK_S
+
+
+def _trust_ceiling_s(poll_interval_s: float | None) -> float:
+    """The non-429 decision-trust age ceiling for a row planned at
+    ``poll_interval_s`` (see SCHEDULE_TRUST_SLACK_S)."""
+    if poll_interval_s is None or poll_interval_s <= 0:
+        return TRUST_MAX_AGE_S
+    planned = poll_interval_s * (1.0 + JITTER_FRAC) + SCHEDULE_TRUST_SLACK_S
+    return min(max(TRUST_MAX_AGE_S, planned), SCHEDULE_TRUST_MAX_AGE_S)
+
 # A usage-endpoint 429 is a polling throttle, not a change in the account's
 # real model quota: the endpoint budgets *usage requests* (scope is
 # regime-dependent; see poll_policy), independent of the 5h/7d limits it
@@ -305,7 +324,8 @@ class UsageEntry:
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
-    # TRUST_MAX_AGE_S. Computed by UsageStore.entries().
+    # TRUST_MAX_AGE_S, or a longer planned cadence (``_trust_ceiling_s``).
+    # Computed by UsageStore.entries().
     trust_extended: bool = False
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
@@ -956,6 +976,7 @@ class UsageStore:
             age_s = (now - fetched_at) if fetched_at is not None else None
             consecutive_failures = int(row.get("consecutiveFailures") or 0)
             next_poll_at = _num_or_none(row.get("nextPollAt"))
+            poll_interval_s = _num_or_none(row.get("pollIntervalS"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
             held_until = _num_or_none(row.get("heldUntil"))
@@ -979,7 +1000,9 @@ class UsageStore:
                     models,
                 )
             else:
-                within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
+                within_ceiling = age_s is not None and age_s <= _trust_ceiling_s(
+                    poll_interval_s
+                )
             live_claim = _live_claim(claim_until, last_attempt_at, now)
             # A live hold is deliberate staleness as well: another machine
             # polls this account and hands its readings over, so between two
@@ -1003,7 +1026,7 @@ class UsageStore:
                 last_error=row.get("lastError"),
                 backoff_until=_num_or_none(row.get("backoffUntil")),
                 next_poll_at=next_poll_at,
-                poll_interval_s=_num_or_none(row.get("pollIntervalS")),
+                poll_interval_s=poll_interval_s,
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),

@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import inspect
 import io
+import json
 import time
 import urllib.error
 from pathlib import Path
@@ -85,12 +86,19 @@ def switcher(temp_home: Path) -> ClaudeAccountSwitcher:
     return s
 
 
+#: One manual read of one account: the Haiku probe and, always for `u`, Fable's.
+ONE_READ = [oauth.USAGE_PROBE_MODEL, oauth.USAGE_PROBE_FABLE_MODEL]
+
+
 def run_check(switcher, answer):
-    """check_setup_token_usage with every probe answered by ``answer``."""
+    """check_setup_token_usage with every probe answered by ``answer``;
+    returns the results and the model each request asked for, sorted (the
+    accounts are read in parallel)."""
     urls: list[str] = []
 
     def fake_urlopen(req, timeout=None):
-        urls.append(req.full_url)
+        assert req.full_url == oauth.USAGE_PROBE_URL
+        urls.append(json.loads(req.data)["model"])
         result = answer(req) if inspect.isfunction(answer) else answer
         if isinstance(result, Exception):
             raise result
@@ -98,7 +106,7 @@ def run_check(switcher, answer):
 
     with patch.object(switcher, "_live_session_pids", return_value=[]), \
          patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
-        return switcher.check_setup_token_usage(), urls
+        return switcher.check_setup_token_usage(), sorted(urls)
 
 
 def entries(switcher) -> dict:
@@ -110,7 +118,7 @@ def entries(switcher) -> dict:
 class TestCheckSetupTokenUsage:
     def test_reads_every_setup_token_account_with_the_probe_off(self, switcher):
         results, urls = run_check(switcher, probe_response())
-        assert urls == [oauth.USAGE_PROBE_URL] * 2
+        assert urls == sorted(ONE_READ * 2)
         assert [(r.number, r.outcome) for r in results] == [("1", "updated"), ("2", "updated")]
         stored = entries(switcher)
         assert stored["1"].last_good["five_hour"]["pct"] == 25.0
@@ -119,7 +127,7 @@ class TestCheckSetupTokenUsage:
     def test_a_second_press_reads_again_however_fresh(self, switcher):
         run_check(switcher, probe_response(five=0.25))
         results, urls = run_check(switcher, probe_response(five=0.40))
-        assert len(urls) == 2 and all(r.outcome == "updated" for r in results)
+        assert urls == sorted(ONE_READ * 2) and all(r.outcome == "updated" for r in results)
         assert entries(switcher)["1"].last_good["five_hour"]["pct"] == 40.0
 
     def test_the_probe_off_backoff_from_a_normal_pass_does_not_block_it(self, switcher):
@@ -131,7 +139,7 @@ class TestCheckSetupTokenUsage:
         assert entries(switcher)["1"].in_backoff(switcher._usage_store.clock())
 
         results, urls = run_check(switcher, probe_response())
-        assert len(urls) == 2 and all(r.outcome == "updated" for r in results)
+        assert urls == sorted(ONE_READ * 2) and all(r.outcome == "updated" for r in results)
 
     def test_a_429_is_reported_and_then_respected(self, switcher):
         def answer(req):
@@ -184,7 +192,7 @@ class TestCheckSetupTokenUsage:
 
         results, urls = run_check(switcher, probe_response())
         assert sorted(r.number for r in results) == ["1", "2"]
-        assert urls == [oauth.USAGE_PROBE_URL] * 2
+        assert urls == sorted(ONE_READ * 2)
 
     def test_no_setup_token_accounts_means_no_requests(self, temp_home):
         s = ClaudeAccountSwitcher()

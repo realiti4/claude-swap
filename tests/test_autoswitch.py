@@ -956,6 +956,28 @@ class TestAdaptiveScheduler:
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
+    def test_a_longer_active_poll_setting_is_not_a_stale_plan(
+        self, temp_home, monkeypatch
+    ):
+        # usage.activePollMinutes 10: a 600s active plan is the user's own
+        # cadence, so the age cap moves with it instead of fetching at 300s.
+        from claude_swap.settings import set_setting
+
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        set_setting(h.switcher.backup_dir, "usage.activePollMinutes", "10")
+        usage = {"1": _usage(50), "2": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.switcher._usage_store.set_poll_plan(
+            {"1": (h.clock.now + 600.0, 600.0)}, {"1": ("a@example.com", "")}
+        )
+        h.clock.advance(360)  # past the default cap, inside the setting
+        self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        h.clock.advance(250)  # the plan itself comes due
+        self._tick(h, counts, usage)
+        assert counts["1"] == 2
+
     def test_exhausted_active_is_rechecked_before_its_reset(
         self, temp_home, monkeypatch
     ):

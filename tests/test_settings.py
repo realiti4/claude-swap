@@ -266,6 +266,49 @@ class TestUsageSettings:
         assert load_usage_settings(tmp_path).header_probe is False
 
 
+class TestUsagePollAndFableSettings:
+    def test_defaults(self, tmp_path: Path):
+        loaded = load_usage_settings(tmp_path)
+        assert loaded.header_probe_fable is False
+        assert (loaded.active_poll_minutes, loaded.inactive_poll_minutes) == (5, 10)
+
+    def test_reads_values(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"usage": {
+            "headerProbe": True, "headerProbeFable": True,
+            "activePollMinutes": 10, "inactivePollMinutes": 60,
+        }}))
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, header_probe_fable=True,
+            active_poll_minutes=10, inactive_poll_minutes=60,
+        )
+
+    def test_a_bad_key_reverts_only_itself(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"usage": {
+            "headerProbe": True, "headerProbeFable": "yes",
+            "activePollMinutes": "ten", "inactivePollMinutes": 60,
+        }}))
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, inactive_poll_minutes=60,
+        )
+
+    @pytest.mark.parametrize("raw, expected", [
+        (1, 3), (999, 240), (90.7, 90), (True, 10), (float("nan"), 10),
+    ])
+    def test_minutes_are_clamped_on_load(self, tmp_path: Path, raw, expected):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"inactivePollMinutes": raw}})
+        )
+        assert load_usage_settings(tmp_path).inactive_poll_minutes == expected
+
+    def test_set_validates_minutes(self, tmp_path: Path):
+        assert set_setting(tmp_path, "usage.inactivePollMinutes", "60") == 60
+        assert set_setting(tmp_path, "usage.activePollMinutes", "10") == 10
+        for bad in ("2", "241", "1.5", "soon"):
+            with pytest.raises(ConfigError):
+                set_setting(tmp_path, "usage.inactivePollMinutes", bad)
+        assert load_usage_settings(tmp_path).inactive_poll_minutes == 60
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}

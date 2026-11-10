@@ -97,6 +97,7 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import (
+    UsageSettings,
     load_settings,
     load_usage_settings,
     parse_model_names,
@@ -418,8 +419,8 @@ class ClaudeAccountSwitcher:
             float | None, tuple[float, float | None, tuple[str, ...]]
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
-        # (settings mtime, usage.headerProbe) — see _header_probe_enabled.
-        self._header_probe_cache: tuple[float | None, bool] | None = None
+        # (settings mtime, usage section) — see _usage_settings.
+        self._usage_settings_cache: tuple[float | None, UsageSettings] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -2142,25 +2143,45 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
-    def _probe_on(self, override: bool | None) -> bool:
-        """The header-probe switch for one fetch: an explicit override (the
-        manual check), else ``usage.headerProbe``."""
-        return self._header_probe_enabled() if override is None else override
+    def _probe_on(
+        self, override: bool | oauth.HeaderProbe | None
+    ) -> bool | oauth.HeaderProbe:
+        """The header probe for one fetch: False (off) or its options.
 
-    def _header_probe_enabled(self) -> bool:
-        """``usage.headerProbe`` from the settings file (reloaded only when it
-        changes — one stat per fetch)."""
+        ``override`` None follows ``usage.headerProbe`` and
+        ``usage.headerProbeFable``; True is the manual check, one full read
+        with Fable included whatever the settings say; False is off; a
+        :class:`oauth.HeaderProbe` is used as given."""
+        if isinstance(override, oauth.HeaderProbe):
+            return override
+        if override is None:
+            usage = self._usage_settings()
+            if not usage.header_probe:
+                return False
+            return oauth.HeaderProbe(fable=usage.header_probe_fable)
+        return oauth.HeaderProbe(fable=True) if override else False
+
+    def _usage_settings(self) -> UsageSettings:
+        """The ``usage`` settings section (reloaded only when the file
+        changes — one stat per call), so a change made in the Settings screen
+        or with ``cswap config set`` applies from the next poll."""
         path = settings_path(self.backup_dir)
         try:
             mtime: float | None = path.stat().st_mtime
         except OSError:
             mtime = None
-        cache = getattr(self, "_header_probe_cache", None)
+        cache = getattr(self, "_usage_settings_cache", None)
         if cache is not None and cache[0] == mtime:
             return cache[1]
-        enabled = load_usage_settings(self.backup_dir).header_probe
-        self._header_probe_cache = (mtime, enabled)
-        return enabled
+        loaded = load_usage_settings(self.backup_dir)
+        self._usage_settings_cache = (mtime, loaded)
+        return loaded
+
+    def poll_ceilings(self) -> tuple[float, float]:
+        """``(active, inactive)`` longest poll gaps in seconds, from
+        ``usage.activePollMinutes`` / ``usage.inactivePollMinutes``."""
+        usage = self._usage_settings()
+        return usage.active_poll_minutes * 60.0, usage.inactive_poll_minutes * 60.0
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -4991,7 +5012,7 @@ class ClaudeAccountSwitcher:
 
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = "",
-        header_probe: bool | None = None,
+        header_probe: bool | oauth.HeaderProbe | None = None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -5743,7 +5764,7 @@ class ClaudeAccountSwitcher:
         self,
         account_info: tuple[int, str, str, str, bool, str, str],
         rejected_fp: str | None = None,
-        header_probe: bool | None = None,
+        header_probe: bool | oauth.HeaderProbe | None = None,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises. ``rejected_fp``
         is the row's refused-credential stamp, if any. ``header_probe``
@@ -5860,7 +5881,7 @@ class ClaudeAccountSwitcher:
 
     def _read_only_fetch(
         self, num: str, email: str, creds: str, rejected_fp: str | None,
-        header_probe: bool | None = None,
+        header_probe: bool | oauth.HeaderProbe | None = None,
     ) -> FetchRecord:
         """A fetch with a live session's credential, which cswap must never
         refresh. A 401 is the live claude having rotated past the copy we
@@ -5906,14 +5927,38 @@ class ClaudeAccountSwitcher:
             # The override rides only when set, so a normal pass calls with
             # the same shape as before.
             override = {} if header_probe is None else {"header_probe": header_probe}
-            return num, self._fetch_account_usage(
+            probe = self._probe_on(header_probe)
+            fable = isinstance(probe, oauth.HeaderProbe) and probe.fable
+            if fable and oauth.scoped_window(
+                entry.last_good if entry else None, oauth.FABLE_WINDOW
+            ) is None:
+                # Nothing known about Fable's window yet: read it even if the
+                # account's main probe is refused.
+                override = {"header_probe": dataclasses.replace(probe, fable_if_refused=True)}
+            record = self._fetch_account_usage(
                 info, entry.rejected_fingerprint if entry else None, **override
             )
+            if fable and entry is not None:
+                record = self._keep_fable_window(record, entry)
+            return num, record
 
         with ThreadPoolExecutor() as executor:
             return dict(
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
+
+    def _keep_fable_window(self, record: FetchRecord, entry: UsageEntry) -> FetchRecord:
+        """A header reading without Fable's window (its Fable request skipped
+        on a refusal, or failed) keeps the stored one until it resets, so a
+        known Fable figure isn't dropped for one that was never read."""
+        usage = record.usage
+        if not isinstance(usage, dict) or usage.get("source") != oauth.USAGE_SOURCE_HEADERS:
+            return record
+        kept = oauth.carry_scoped_window(
+            usage, entry.last_good, entry.fetched_at, oauth.FABLE_WINDOW,
+            self._usage_store.clock(),
+        )
+        return record if kept is usage else dataclasses.replace(record, usage=kept)
 
     def _ingest_statusline(
         self,
@@ -5937,9 +5982,47 @@ class ClaudeAccountSwitcher:
         if not matchers["eligible"]:
             return set()
         readings = statusline.readings(records, now=time.time(), **matchers)
+        readings = self._statusline_fable(readings, identities) if readings else readings
         if not readings:
             return set()
         return self._usage_store.adopt(readings, {num: identities[num] for num in readings})
+
+    def _statusline_fable(
+        self,
+        readings: dict[str, tuple[dict, float]],
+        identities: dict[str, tuple[str, str]],
+    ) -> dict[str, tuple[dict, float]]:
+        """Status line readings with Fable's window, when it is probed.
+
+        A status line reading has the 5h/7d windows only, and while they keep
+        arriving the slot stays fresh and is never probed, so with
+        ``usage.headerProbeFable`` on a reading keeps the stored Fable window
+        while that window is younger than ``usage.activePollMinutes``. A slot
+        with no Fable window yet, or an older one, takes no status line
+        reading: it then comes due and its own probe reads Fable on schedule.
+        """
+        usage_settings = self._usage_settings()
+        if not (usage_settings.header_probe and usage_settings.header_probe_fable):
+            return readings
+        now = self._usage_store.clock()
+        max_age_s = usage_settings.active_poll_minutes * 60.0
+        entries = self._usage_store.entries({num: identities[num] for num in readings})
+        kept: dict[str, tuple[dict, float]] = {}
+        for num, (usage, age_s) in readings.items():
+            entry = entries.get(num)
+            stored = oauth.scoped_window(entry.last_good if entry else None, oauth.FABLE_WINDOW)
+            if entry is None or stored is None:
+                continue
+            read_at = stored.get("read_at")
+            if not isinstance(read_at, (int, float)):
+                read_at = entry.fetched_at
+            if read_at is None or now - read_at > max_age_s:
+                continue
+            usage = oauth.carry_scoped_window(
+                usage, entry.last_good, entry.fetched_at, oauth.FABLE_WINDOW, now
+            )
+            kept[num] = (usage, age_s)
+        return kept
 
     def _statusline_matchers(
         self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
@@ -6255,6 +6338,7 @@ class ClaudeAccountSwitcher:
         """
         now = self._usage_store.clock()
         threshold, weekly_threshold, models = self._poll_policy_inputs()
+        active_max_s, candidate_max_s = self.poll_ceilings()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -6271,6 +6355,8 @@ class ClaudeAccountSwitcher:
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                active_max_s=active_max_s,
+                candidate_max_s=candidate_max_s,
             )
         return plans
 

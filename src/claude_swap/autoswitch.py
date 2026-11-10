@@ -2426,14 +2426,15 @@ class AutoSwitchEngine:
         # an urgent plan (60s while burning near the band) actually fetches.
         # A candidate-style plan (slower than any active plan can be) left
         # over from a role change the switcher never saw (e.g. a manual
-        # login) is overridden past the active age cap. Exhausted accounts
-        # carry their own bounded plan and become due normally.
+        # login) is overridden past the active age cap (the configured
+        # ``usage.activePollMinutes``). Exhausted accounts carry their own
+        # bounded plan and become due normally.
+        active_cap_s = max(poll_policy.MIN_INTERVAL_S, self.switcher.poll_ceilings()[0])
         stale_candidate_plan = (
             active_pre is not None
             and active_pre.age_s is not None
-            and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
-            and (active_pre.poll_interval_s or 0.0)
-            > poll_policy.ACTIVE_MAX_INTERVAL_S
+            and active_pre.age_s >= active_cap_s
+            and (active_pre.poll_interval_s or 0.0) > active_cap_s
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
         )
         overslept_plan = (

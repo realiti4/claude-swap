@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1332,6 +1332,178 @@ class TestSetupTokenHeaderProbe:
         outcome = self._fetch(fake, creds=creds)
         assert outcome.error == "http-429"
         assert [c.full_url for c in calls] == [self.USAGE_URL]
+
+
+_FABLE_HEADERS = {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-7d_oi-utilization": "0.42",
+    "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
+    # A Fable response carries the 5h/7d too; only the Fable bucket is taken.
+    "anthropic-ratelimit-unified-5h-utilization": "0.99",
+    "anthropic-ratelimit-unified-7d-utilization": "0.99",
+}
+
+
+class TestFableHeaderProbe:
+    """Fable's weekly bucket only shows on Fable's own responses, so it takes
+    a second 1-token request, opt-in through ``HeaderProbe(fable=True)``."""
+
+    TOKEN = "sk-ant-oat01-secret-token"
+
+    def _creds(self) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": self.TOKEN, "scopes": ["user:inference"],
+        }})
+
+    @staticmethod
+    def _ok(headers: dict):
+        resp = MagicMock()
+        resp.headers = _headers(headers)
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    @staticmethod
+    def _429(headers: dict, code: int = 429):
+        return urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, code, "Too Many", hdrs=_headers(headers), fp=None,
+        )
+
+    def _fetch(self, by_model: dict, probe):
+        """Probe with every request answered by the response (or exception)
+        ``by_model`` gives its model; returns the outcome and the models
+        asked, in order."""
+        models: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            model = json.loads(req.data)["model"]
+            models.append(model)
+            result = by_model[model]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            outcome = oauth.try_fetch_usage_for_account(
+                "3", "a@b.c", self._creds(), is_active=False, header_probe=probe,
+            )
+        return outcome, models
+
+    def _answers(self, main=None, fable=None) -> dict:
+        return {
+            oauth.USAGE_PROBE_MODEL: main or self._ok(_UNIFIED_HEADERS),
+            oauth.USAGE_PROBE_FABLE_MODEL: fable or self._ok(_FABLE_HEADERS),
+        }
+
+    @pytest.mark.parametrize("probe", [True, oauth.HeaderProbe()])
+    def test_off_by_default_sends_one_request(self, probe):
+        outcome, models = self._fetch(self._answers(), probe)
+        assert models == [oauth.USAGE_PROBE_MODEL]
+        assert "scoped" not in outcome.usage
+
+    def test_fable_window_comes_from_its_own_request(self):
+        outcome, models = self._fetch(self._answers(), oauth.HeaderProbe(fable=True))
+        assert models == [oauth.USAGE_PROBE_MODEL, oauth.USAGE_PROBE_FABLE_MODEL]
+        assert outcome.error is None
+        # 5h/7d from the main probe, never from the Fable response.
+        assert outcome.usage["five_hour"]["pct"] == 34.0
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert oauth.scoped_window(outcome.usage, "fable")["pct"] == 42.0
+        # The reading is complete for a Fable-gated decision.
+        assert oauth.account_headroom(outcome.usage, ("Fable",)) == 40.0
+
+    def test_fable_at_its_limit_reads_100_without_refusing_the_account(self):
+        exhausted = {
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
+        }
+        outcome, _ = self._fetch(
+            self._answers(fable=self._429(exhausted)), oauth.HeaderProbe(fable=True)
+        )
+        assert outcome.error is None
+        assert "rejected" not in outcome.usage
+        assert oauth.scoped_window(outcome.usage, "Fable")["pct"] == 100.0
+        assert oauth.account_headroom(outcome.usage) == 40.0
+        assert oauth.account_headroom(outcome.usage, ("Fable",)) == 0.0
+
+    @pytest.mark.parametrize("failure", [
+        urllib.error.URLError("network down"),
+        TimeoutError("timed out"),
+        "no-access",
+    ])
+    def test_a_failed_fable_request_leaves_the_reading_alone(self, failure):
+        if failure == "no-access":
+            failure = self._429({"x-error": "model not available"}, code=404)
+        outcome, models = self._fetch(
+            self._answers(fable=failure), oauth.HeaderProbe(fable=True)
+        )
+        assert len(models) == 2
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert "scoped" not in outcome.usage
+
+    def _refused(self):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-status"] = "rejected"
+        values["anthropic-ratelimit-unified-5h-utilization"] = "1.0"
+        values["Retry-After"] = "600"
+        return self._429(values)
+
+    def test_a_refused_account_skips_the_fable_request(self):
+        outcome, models = self._fetch(
+            self._answers(main=self._refused()), oauth.HeaderProbe(fable=True)
+        )
+        assert models == [oauth.USAGE_PROBE_MODEL]
+        assert "rejected" in outcome.usage
+        assert "scoped" not in outcome.usage
+
+    def test_a_refused_account_with_nothing_known_reads_fable_once(self):
+        outcome, models = self._fetch(
+            self._answers(main=self._refused()),
+            oauth.HeaderProbe(fable=True, fable_if_refused=True),
+        )
+        assert models == [oauth.USAGE_PROBE_MODEL, oauth.USAGE_PROBE_FABLE_MODEL]
+        assert "rejected" in outcome.usage
+        assert oauth.scoped_window(outcome.usage, "Fable")["pct"] == 42.0
+
+
+class TestCarryScopedWindow:
+    NOW = 1_790_000_000.0
+
+    def _window(self, reset_in: float, **extra) -> dict:
+        resets_at = datetime.fromtimestamp(self.NOW + reset_in, tz=UTC).isoformat()
+        return {"name": "Fable", "pct": 42.0, "resets_at": resets_at, **extra}
+
+    def test_carries_a_window_the_new_reading_lacks(self):
+        previous = {"seven_day": {"pct": 50.0}, "scoped": [self._window(3600)]}
+        new = {"seven_day": {"pct": 55.0}}
+        out = oauth.carry_scoped_window(new, previous, self.NOW - 60, "Fable", self.NOW)
+        assert out is not new and "scoped" not in new
+        carried = oauth.scoped_window(out, "Fable")
+        assert carried["pct"] == 42.0
+        # Stamped with when it was read: the previous reading's own time...
+        assert carried["read_at"] == self.NOW - 60
+        # ...and a window carried again keeps that first stamp.
+        again = oauth.carry_scoped_window(
+            {"seven_day": {"pct": 56.0}}, out, self.NOW, "Fable", self.NOW + 30
+        )
+        assert oauth.scoped_window(again, "Fable")["read_at"] == self.NOW - 60
+
+    def test_a_passed_reset_is_not_carried(self):
+        previous = {"scoped": [self._window(-1)]}
+        new = {"seven_day": {"pct": 55.0}}
+        assert oauth.carry_scoped_window(new, previous, self.NOW, "Fable", self.NOW) is new
+
+    @pytest.mark.parametrize("previous", [None, {}, {"scoped": [{"name": "Fable", "pct": 1.0}]}])
+    def test_nothing_to_carry(self, previous):
+        new = {"seven_day": {"pct": 55.0}}
+        assert oauth.carry_scoped_window(new, previous, self.NOW, "Fable", self.NOW) is new
+
+    def test_a_fresh_window_is_never_replaced(self):
+        previous = {"scoped": [self._window(3600)]}
+        new = {"scoped": [dict(self._window(3600), pct=60.0)]}
+        assert oauth.carry_scoped_window(new, previous, self.NOW, "Fable", self.NOW) is new
 
 
 class TestHeaderReadingDecisions:

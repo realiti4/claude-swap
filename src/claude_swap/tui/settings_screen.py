@@ -65,6 +65,9 @@ LABELS = {
     "run.shareHistory": "share chat history",
     "updates.check": "daily update check",
     "usage.headerProbe": "setup-token usage probe",
+    "usage.headerProbeFable": "Fable weekly limit probe",
+    "usage.activePollMinutes": "active account poll time",
+    "usage.inactivePollMinutes": "inactive account poll time",
 }
 
 #: What an unset optional setting means.
@@ -104,6 +107,11 @@ def value_text(spec: SettingSpec, value: object) -> str:
         return text
     if key == "autoswitch.unhealthyTicks":
         return f"{value} failed poll" + ("" if value == 1 else "s")
+    if key in ("usage.activePollMinutes", "usage.inactivePollMinutes"):
+        text = f"{format_setting_value(value)} min"
+        if isinstance(value, (int, float)) and value >= 60:
+            text += f" ({format_duration(value * 60)})"
+        return text
     return format_setting_value(value)
 
 
@@ -184,8 +192,13 @@ def change_notice(
                 "warning",
             )
         return Notice("Saved", f"{saved}. The next cswap run uses it.", "information")
-    if key == "usage.headerProbe":
+    if key in ("usage.headerProbe", "usage.headerProbeFable"):
         return Notice("Saved", f"{saved}. Applies from the next usage poll.", "information")
+    if key in ("usage.activePollMinutes", "usage.inactivePollMinutes"):
+        return Notice(
+            "Saved", f"{saved}. Each account takes it up from its next usage poll.",
+            "information",
+        )
     if key == "updates.check":
         return Notice("Saved", f"{saved}. Applies from the next cswap command.", "information")
     if key == "ui.theme":

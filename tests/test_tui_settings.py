@@ -153,6 +153,26 @@ class TestScreen:
         assert message.startswith("Threshold (5h): 85%. No auto-switch is running")
         assert kw["title"] == "Saved"
 
+    async def test_poll_time_is_set_in_minutes(self, tmp_path):
+        app = app_for(tmp_path)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await open_settings(pilot)
+            notes = capture(app)
+            assert "10 min" in row_text(app, "usage.inactivePollMinutes")
+            await select_setting(pilot, "usage.inactivePollMinutes")
+            modal = app.screen
+            assert isinstance(modal, SettingValueModal)
+            modal.query_one("#value").value = "60"
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, SettingsScreen)
+            assert "60 min (1h)" in row_text(app, "usage.inactivePollMinutes")
+        assert settings_file(tmp_path)["usage"]["inactivePollMinutes"] == 60
+        assert notes[-1][0] == (
+            "Inactive account poll time: 60 min (1h). "
+            "Each account takes it up from its next usage poll."
+        )
+
     async def test_empty_optional_value_goes_back_to_its_default(self, tmp_path):
         (tmp_path / "settings.json").write_text(json.dumps({"autoswitch": {"weeklyThreshold": 97}}))
         app = app_for(tmp_path)
@@ -286,6 +306,14 @@ class TestNotice:
         engines = [{"pid": 1, "host": "cswap auto", "dryRun": False, "overrides": []}]
         assert change_notice("usage.headerProbe", "x", engines=engines).title == "Saved"
 
+    @pytest.mark.parametrize("key", [
+        "usage.headerProbeFable", "usage.activePollMinutes", "usage.inactivePollMinutes",
+    ])
+    def test_usage_settings_apply_without_a_restart(self, key):
+        engines = [{"pid": 1, "host": "cswap auto", "dryRun": False, "overrides": []}]
+        notice = change_notice(key, "x", engines=engines)
+        assert notice.title == "Saved" and "next usage poll" in notice.message
+
     def test_share_history(self):
         assert change_notice("run.shareHistory", "x").message == "x. The next cswap run uses it."
         notice = change_notice("run.shareHistory", "x", run_sessions=[("1 a@x.io", 1)])
@@ -301,6 +329,10 @@ class TestNotice:
         ("autoswitch.model", None, "off"),
         ("autoswitch.model", "Fable,Opus", "Fable,Opus"),
         ("run.shareHistory", True, "on"),
+        ("usage.headerProbeFable", False, "off"),
+        ("usage.activePollMinutes", 5, "5 min"),
+        ("usage.inactivePollMinutes", 60, "60 min (1h)"),
+        ("usage.inactivePollMinutes", 90, "90 min (1h 30m)"),
     ])
     def test_value_text(self, key, value, text):
         assert value_text(SETTING_SPECS[key], value) == text

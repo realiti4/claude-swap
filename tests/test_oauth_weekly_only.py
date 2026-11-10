@@ -159,7 +159,7 @@ def test_an_unreadable_window_from_the_header_probe_is_classified(monkeypatch):
     data = oauth.parse_unified_ratelimit_headers(
         {"anthropic-ratelimit-unified-5h-utilization": "1e308"}
     )
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, probe=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.usage is None
     assert outcome.error == "bad-response"
@@ -173,7 +173,7 @@ def test_a_probe_without_a_5h_header_reads_as_weekly_only(monkeypatch):
         "anthropic-ratelimit-unified-7d-reset": "1791154800",
         "anthropic-ratelimit-unified-representative-claim": "seven_day",
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, probe=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.error is None
     assert "five_hour" not in outcome.usage
@@ -198,7 +198,7 @@ def test_an_unusable_header_utilization_fails_the_reading(monkeypatch, window, b
         "anthropic-ratelimit-unified-7d-utilization": "0.4",
         f"anthropic-ratelimit-unified-{window}-utilization": bad,
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, probe=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.usage is None
     assert outcome.error == "bad-response"
@@ -217,7 +217,7 @@ def test_a_5h_header_without_a_utilization_fails_the_reading(
         "anthropic-ratelimit-unified-7d-utilization": "0.4",
         f"anthropic-ratelimit-unified-5h-{header}": value,
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, probe=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.usage is None
     assert outcome.error == "bad-response"
@@ -228,7 +228,7 @@ def test_a_fable_bucket_header_is_not_a_7d_window_header(monkeypatch):
         "anthropic-ratelimit-unified-5h-utilization": "0.2",
         "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, probe=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.error is None
     assert "seven_day" not in outcome.usage

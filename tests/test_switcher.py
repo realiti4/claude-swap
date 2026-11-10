@@ -1268,7 +1268,12 @@ class TestSetupTokenHeaderProbeWiring:
             path = settings_path(switcher.backup_dir)
             os.utime(path, (time.time() + 5, time.time() + 5))
             switcher._fetch_account_usage(self._info())
-            assert mock_fetch.call_args.kwargs["header_probe"] is True
+            # Fable's request is its own opt-in, off by default.
+            assert mock_fetch.call_args.kwargs["header_probe"] == oauth.HeaderProbe(fable=False)
+            set_setting(switcher.backup_dir, "usage.headerProbeFable", "true")
+            os.utime(path, (time.time() + 10, time.time() + 10))
+            switcher._fetch_account_usage(self._info())
+            assert mock_fetch.call_args.kwargs["header_probe"] == oauth.HeaderProbe(fable=True)
 
     def test_probe_is_paced_by_the_store(self, temp_home: Path):
         """One collect pass sends one probe; a second pass inside the serve
@@ -1406,6 +1411,175 @@ class TestSetupTokenHeaderProbeWiring:
             "source": oauth.USAGE_SOURCE_HEADERS,
         }
         assert _format_usage_lines(rejected)[-1] == "probe: rejected"
+
+
+class TestFableProbeAndPollSettings:
+    """``usage.headerProbeFable`` in the collect pass and the status line
+    feed, and the poll settings reaching the planner."""
+
+    CREDS = TestSetupTokenHeaderProbeWiring.CREDS
+
+    @staticmethod
+    def _ident() -> dict:
+        return {"3": ("setup-token-3@token.local", "")}
+
+    def _info(self) -> tuple:
+        return (3, "setup-token-3@token.local", "", "", False, self.CREDS, "")
+
+    @staticmethod
+    def _ok(headers: dict):
+        resp = MagicMock()
+        resp.headers = headers
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def _switcher(self, *settings: str):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        for key in settings:
+            set_setting(switcher.backup_dir, key, "true")
+        clock = {"now": time.time()}
+        switcher._usage_store.clock = lambda: clock["now"]
+        return switcher, clock
+
+    def _main(self, now: float) -> dict:
+        return {
+            "anthropic-ratelimit-unified-5h-utilization": "0.25",
+            "anthropic-ratelimit-unified-5h-reset": str(int(now) + 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.5",
+            "anthropic-ratelimit-unified-7d-reset": str(int(now) + 86400),
+        }
+
+    def _fable(self, now: float) -> dict:
+        return {
+            "anthropic-ratelimit-unified-7d_oi-utilization": "0.42",
+            "anthropic-ratelimit-unified-7d_oi-reset": str(int(now) + 3 * 86400),
+        }
+
+    def _refused(self, now: float):
+        values = dict(self._main(now))
+        values["anthropic-ratelimit-unified-status"] = "rejected"
+        values["Retry-After"] = "600"
+        return TestSetupTokenHeaderProbeWiring._probe_429(values)
+
+    def _collect(self, switcher, answers: dict) -> tuple[UsageEntry, list[str]]:
+        models: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            model = json.loads(req.data)["model"]
+            models.append(model)
+            result = answers[model]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entry = switcher._collect_usage_entries([self._info()])["3"]
+        return entry, models
+
+    def test_fable_is_read_when_on_and_only_then(self, temp_home: Path):
+        switcher, clock = self._switcher("usage.headerProbe")
+        answers = {
+            oauth.USAGE_PROBE_MODEL: self._ok(self._main(clock["now"])),
+            oauth.USAGE_PROBE_FABLE_MODEL: self._ok(self._fable(clock["now"])),
+        }
+        entry, models = self._collect(switcher, answers)
+        assert models == [oauth.USAGE_PROBE_MODEL]
+        assert oauth.scoped_window(entry.last_good, "Fable") is None
+
+        set_setting(switcher.backup_dir, "usage.headerProbeFable", "true")
+        os.utime(settings_path(switcher.backup_dir), (time.time() + 5, time.time() + 5))
+        clock["now"] += 1000  # past the plan
+        entry, models = self._collect(switcher, answers)
+        assert models == [oauth.USAGE_PROBE_MODEL, oauth.USAGE_PROBE_FABLE_MODEL]
+        assert oauth.scoped_window(entry.last_good, "Fable")["pct"] == 42.0
+
+    def test_a_refusal_skips_fable_and_keeps_the_known_window(self, temp_home: Path):
+        switcher, clock = self._switcher("usage.headerProbe", "usage.headerProbeFable")
+        first_at = clock["now"]
+        answers = {
+            oauth.USAGE_PROBE_MODEL: self._ok(self._main(first_at)),
+            oauth.USAGE_PROBE_FABLE_MODEL: self._ok(self._fable(first_at)),
+        }
+        self._collect(switcher, answers)
+        clock["now"] += 1000
+        answers[oauth.USAGE_PROBE_MODEL] = self._refused(clock["now"])
+        entry, models = self._collect(switcher, answers)
+        assert models == [oauth.USAGE_PROBE_MODEL]
+        assert "rejected" in entry.last_good
+        kept = oauth.scoped_window(entry.last_good, "Fable")
+        assert kept["pct"] == 42.0 and kept["read_at"] == first_at
+
+    def test_a_refusal_still_reads_fable_once_when_nothing_is_known(
+        self, temp_home: Path
+    ):
+        switcher, clock = self._switcher("usage.headerProbe", "usage.headerProbeFable")
+        answers = {
+            oauth.USAGE_PROBE_MODEL: self._refused(clock["now"]),
+            oauth.USAGE_PROBE_FABLE_MODEL: self._ok(self._fable(clock["now"])),
+        }
+        entry, models = self._collect(switcher, answers)
+        assert models == [oauth.USAGE_PROBE_MODEL, oauth.USAGE_PROBE_FABLE_MODEL]
+        assert "rejected" in entry.last_good
+        assert oauth.scoped_window(entry.last_good, "Fable")["pct"] == 42.0
+
+    def _seed_reading(self, switcher, clock, *, fable: bool) -> None:
+        usage = oauth.build_usage_result(oauth.parse_unified_ratelimit_headers({
+            **self._main(clock["now"]), **(self._fable(clock["now"]) if fable else {}),
+        }))
+        usage["source"] = oauth.USAGE_SOURCE_HEADERS
+        switcher._usage_store.record({"3": FetchRecord(usage=usage)}, self._ident())
+
+    def _status_reading(self) -> dict:
+        return {
+            "five_hour": {"pct": 30.0}, "seven_day": {"pct": 51.0},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+
+    def test_status_line_readings_are_untouched_with_fable_off(self, temp_home: Path):
+        switcher, clock = self._switcher("usage.headerProbe")
+        self._seed_reading(switcher, clock, fable=True)
+        readings = {"3": (self._status_reading(), 5.0)}
+        assert switcher._statusline_fable(readings, self._ident()) is readings
+
+    def test_status_line_readings_keep_a_young_fable_window(self, temp_home: Path):
+        switcher, clock = self._switcher("usage.headerProbe", "usage.headerProbeFable")
+        read_at = clock["now"]
+        self._seed_reading(switcher, clock, fable=True)
+        clock["now"] += 120
+        out = switcher._statusline_fable({"3": (self._status_reading(), 5.0)}, self._ident())
+        usage, age = out["3"]
+        assert age == 5.0 and usage["five_hour"]["pct"] == 30.0
+        kept = oauth.scoped_window(usage, "Fable")
+        assert kept["pct"] == 42.0 and kept["read_at"] == read_at
+
+    @pytest.mark.parametrize("fable, elapsed", [(True, 301), (False, 10)])
+    def test_status_line_yields_to_the_probe_for_fable(
+        self, temp_home: Path, fable, elapsed
+    ):
+        # Older than usage.activePollMinutes (5 by default), or never read:
+        # the reading is left out so the slot comes due and its probe runs.
+        switcher, clock = self._switcher("usage.headerProbe", "usage.headerProbeFable")
+        self._seed_reading(switcher, clock, fable=fable)
+        clock["now"] += elapsed
+        out = switcher._statusline_fable({"3": (self._status_reading(), 5.0)}, self._ident())
+        assert out == {}
+
+    def test_plans_use_the_poll_settings(self, temp_home: Path):
+        switcher, _clock = self._switcher()
+        usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        pre = {"3": UsageEntry(last_good=usage, poll_interval_s=3000.0)}
+        info = {"3": self._info()}
+        records = {"3": FetchRecord(usage=usage)}
+        _, interval = switcher._plans_after_fetch(records, pre, info)["3"]
+        assert interval == 600.0  # the default ten-minute ceiling
+        set_setting(switcher.backup_dir, "usage.inactivePollMinutes", "60")
+        os.utime(settings_path(switcher.backup_dir), (time.time() + 5, time.time() + 5))
+        _, interval = switcher._plans_after_fetch(records, pre, info)["3"]
+        assert interval == 3600.0
+        assert switcher.poll_ceilings() == (300.0, 3600.0)
 
 
 class TestAdoptSessionCredential:
