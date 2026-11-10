@@ -400,12 +400,19 @@ class AutoScreen(Screen):
             and self._settings.strategy in ("consume-first", "weekly-first")
         )
         # The landing-room bar REFUSES a peer (rather than ranking it last)
-        # only on consume-first's own trigger: that strategy, active under its line.
+        # only on consume-first's own trigger: that strategy, an enabled active
+        # under its line on the reading the engine decides on (`decision_value`:
+        # a sentinel, stale or walled row takes the failover path instead).
         landing_bar = False
         active = next((a for a in snap.accounts if a.number == active_number), None)
-        if consume_first and settings.strategy == "consume-first" and active is not None:
+        if (
+            consume_first
+            and settings.strategy == "consume-first"
+            and active is not None
+            and not active.disabled
+        ):
             active_binding = binding_window(
-                oauth.relevant_windows(active.usage.last_good, models),
+                oauth.relevant_windows(active.usage.decision_value(), models),
                 active.policy.threshold
                 if active.policy.threshold is not None
                 else threshold,

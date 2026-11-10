@@ -2656,8 +2656,8 @@ class TestUnswitchableRowsAreListed:
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
-        a.usage.last_good = last_good
-        a.usage.sentinel = sentinel
+        a.usage = UsageEntry(last_good=last_good, sentinel=sentinel, age_s=5.0)
+        a.disabled = False
         a.policy.threshold = None
         a.login_expires_at = login_expires_at
         return a
@@ -2887,6 +2887,44 @@ class TestUnswitchableRowsAreListed:
         assert reason not in rows["3@x.com"], refused
         assert reason not in self._panel(self._fleet(16.0), settings("weekly-first"))
         assert reason not in self._panel(self._fleet(98.0), settings("consume-first"))
+
+    @pytest.mark.parametrize(
+        "active_state, noted",
+        [
+            ({}, True),  # control: a fresh reading under its line is the trigger
+            ({"sentinel": USAGE_TOKEN_EXPIRED}, False),
+            ({"age_s": STALE_OK_S + 60.0}, False),
+            ({"walled": True, "walled_until": time.time() + 3600.0}, False),
+            ({"disabled": True}, False),
+        ],
+        ids=["fresh", "sentinel", "stale", "walled", "disabled"],
+    )
+    def test_the_landing_room_bar_is_silent_off_consume_firsts_trigger(
+        self, active_state, noted
+    ):
+        """The engine reaches the room bar only on a decision-grade reading of
+        the active under its line. An expired token (sentinel over a retained
+        last_good), a reading too old to act on, a walled row and a disabled
+        active all leave that trigger for the failover path, which ranks a
+        short-of-room peer instead of refusing it. The note is not shown."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        accts = [
+            self._acct(n, f"{n}@x.com", switchable=True, last_good=u)
+            for n, u in self._fleet(16.0).items()
+        ]
+        active_state = dict(active_state)
+        accts[0].disabled = active_state.pop("disabled", False)
+        accts[0].usage = dataclasses.replace(accts[0].usage, **active_state)
+        out = self._render(
+            self._snap(*accts),
+            active="1",
+            settings=AutoSwitchSettings(
+                threshold=90.0, hysteresis_pct=10.0, strategy="consume-first"
+            ),
+        )
+        row = next(ln for ln in out.splitlines() if "2@x.com" in ln)
+        assert ("too little room under its line" in row) is noted, out
 
 
 @pytest.mark.asyncio
