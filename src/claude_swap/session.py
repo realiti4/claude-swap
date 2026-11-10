@@ -854,12 +854,10 @@ class SessionManager:
             and self._default_login_signed_out()
         )
         if signed_out:
-            print(
-                dimmed(
-                    f"Account-{account_num} ({email}) is the default login, "
-                    "but that login holds no usable token; launching from "
-                    "the stored login in a session profile."
-                )
+            self._note(
+                f"Account-{account_num} ({email}) is the default login, "
+                "but that login holds no usable token; launching from "
+                "the stored login in a session profile."
             )
         if current is not None and current == (email, org_uuid) and not signed_out:
             if require_session:
