@@ -532,11 +532,10 @@ class TestDecisionTable:
         still take work is strictly better than one that answers nothing for
         the next ten minutes.
 
-        The two are separated on the escape ranking, where the spent peer wins
-        on a window that is not the one blocking it: `headroom_on_window` ranks
-        order only, and says so -- one clear window is not a usability test,
-        so the caller has to decide that separately. Admission is where this
-        case decides it.
+        The two are separated by the spent peer's other window: half empty, so
+        a ranking that credited it would put it first. Admission is where this
+        case decides it: a spent candidate is refused while a peer holds more
+        than `SPENT_HEADROOM_PCT`, and what is left ranks on raw headroom.
         """
         h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
         h.seed(1, "a@example.com")
@@ -544,11 +543,11 @@ class TestDecisionTable:
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
         now = h.clock.now
-        # Blocked on the WEEKLY window, days out: the escape ranks on "7d".
+        # Blocked on the WEEKLY window, days out.
         active = _usage7(50.0, 100.0, _iso_at(now + 3 * 86400))
         # Spent on its 5-hour window and back in ten minutes -- sooner than the
         # active, so the spent relaxation admits it -- but holding half a week
-        # of quota, so the "7d" escape key scores it far above the peer.
+        # of quota, so a score on that window alone would put it far above the peer.
         spent = _usage7(100.0, 50.0)
         spent["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
         # Five points on both windows: over the threshold, so `all_above`
@@ -927,14 +926,13 @@ class TestDecisionTable:
     def test_the_escape_does_not_land_on_a_peer_that_walls_immediately(
         self, temp_home
     ):
-        """The escape axis orders; it does not decide usability.
+        """An escape ranks a peer under every one of its lines first.
 
-        `headroom_on_window` is a ranking among accounts "already known
-        usable", and the bar for usable was one point of headroom. A peer with
-        fifty points on the very window that blocked us and ONE point on its
-        weekly outranks a peer holding forty on both -- then walls on the next
-        request, and the following tick pays a second credential swap to
-        correct it.
+        A peer with fifty points on the very window that blocked us and ONE
+        point on its weekly is over its weekly line, so the escape's
+        `(over, -lh)` key puts it after a peer holding forty on both. Landing
+        on it would wall on the next request, and the following tick would pay
+        a second credential swap to correct it.
         """
         h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
         for num, email in enumerate(("a", "b", "c"), 1):
@@ -942,14 +940,14 @@ class TestDecisionTable:
         h.make_live("a@example.com", 1)
         outcome = h.tick_with_usage({
             "1": _usage7(100.0, 50.0),   # at-limit on the 5h window
-            "2": _usage7(50.0, 99.0),    # 50 on the escape axis, ONE point real
+            "2": _usage7(50.0, 99.0),    # 50 on the 5h, ONE point on the 7d
             "3": _usage7(60.0, 60.0),    # 40 points on both
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3, (
-            f"landed on {h.active_number()} ({outcome}): slot 2 looks best on "
-            "the blocked window and holds one point of actual headroom, so "
-            "the escape lands somewhere that stops answering immediately"
+            f"landed on {h.active_number()} ({outcome}): slot 2 holds one "
+            "point of actual headroom on its weekly window, so the escape "
+            "lands somewhere that stops answering immediately"
         )
 
     def test_a_peer_exactly_at_the_threshold_is_not_a_healthy_landing(

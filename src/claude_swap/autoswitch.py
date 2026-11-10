@@ -776,6 +776,7 @@ def consume_first_rank_key(
     *,
     weekly_threshold: float | None = None,
     scale: float | None = None,
+    tight: bool = False,
 ) -> tuple:
     """Consume-first sort key for one candidate account.
 
@@ -785,6 +786,11 @@ def consume_first_rank_key(
     built from this key can never disagree with the account the engine would
     switch to. ``threshold`` is the account's own line and ``scale`` the global
     one it is measured against (``lines.binding_window``).
+
+    ``tight`` is the leading tier of a forced (proactive) move: a target with
+    fewer than ``hysteresis_pct`` points of room under its nearest line
+    (``lines.line_room``) would need leaving again within the cooldown the move
+    starts, so it sorts after every target with room. ``key[0]`` is the tier.
     """
     h = oauth.account_headroom(usage, models)
     if h is None:
@@ -801,6 +807,7 @@ def consume_first_rank_key(
     over = binding.over if binding is not None else (100.0 - h) >= threshold
     lh = binding.line_headroom if binding is not None else h
     return (
+        tight,
         0 if h > SPENT_HEADROOM_PCT else 1,
         1 if over else 0,
         reset_ts if reset_ts is not None else float("inf"),
@@ -3627,16 +3634,15 @@ class AutoSwitchEngine:
                 # servable-but-unhealthy requires a threshold under 97 and
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
-                key = (
-                    tight,
-                    *consume_first_rank_key(
-                        usage.get(num),
-                        thresholds[num],
-                        now,
-                        self._models,
-                        weekly_threshold=settings.weekly_threshold,
-                        scale=settings.threshold,
-                    ),
+                # `tight` leads the shared key, so the Next best panel's order is this one.
+                key = consume_first_rank_key(
+                    usage.get(num),
+                    thresholds[num],
+                    now,
+                    self._models,
+                    weekly_threshold=settings.weekly_threshold,
+                    scale=settings.threshold,
+                    tight=tight,
                 )
             else:
                 key = (-lh,)

@@ -33,7 +33,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
-from claude_swap.lines import binding_window
+from claude_swap.lines import binding_window, line_room
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -399,6 +399,20 @@ class AutoScreen(Screen):
             self._settings
             and self._settings.strategy in ("consume-first", "weekly-first")
         )
+        # The landing-room bar REFUSES a peer (rather than ranking it last)
+        # only on consume-first's own trigger: that strategy, active under its line.
+        landing_bar = False
+        active = next((a for a in snap.accounts if a.number == active_number), None)
+        if consume_first and settings.strategy == "consume-first" and active is not None:
+            active_binding = binding_window(
+                oauth.relevant_windows(active.usage.last_good, models),
+                active.policy.threshold
+                if active.policy.threshold is not None
+                else threshold,
+                weekly,
+                scale=threshold,
+            )
+            landing_bar = active_binding is not None and not active_binding.over
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         # (acc while the row can carry a re-login note, name, the rest)
         lines: dict[str, tuple[AccountSnapshot | None, Text, Text]] = {}
@@ -498,18 +512,27 @@ class AutoScreen(Screen):
                             f" (line {pct_label(binding.line)}%)",
                             style=palette.muted,
                         )
-                key = (
-                    consume_first_rank_key(
+                if consume_first:
+                    # The engine's forced-move room tier; a binding window means windows exist.
+                    room = line_room(
+                        oauth.relevant_windows(acc.usage.last_good, models), line, weekly
+                    )
+                    tight = room < settings.hysteresis_pct
+                    key = consume_first_rank_key(
                         acc.usage.last_good,
                         line,
                         now,
                         models,
                         weekly_threshold=weekly,
                         scale=threshold,
+                        tight=tight,
                     )
-                    if consume_first
-                    else (-binding.line_headroom,)
-                )
+                    if landing_bar and tight:
+                        entry.append(
+                            "  too little room under its line", style=palette.sev_warn
+                        )
+                else:
+                    key = (-binding.line_headroom,)
                 ranked.append((key, acc.number))
             lines[acc.number] = (acc, head, entry)
 

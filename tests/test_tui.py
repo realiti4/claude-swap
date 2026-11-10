@@ -2662,13 +2662,13 @@ class TestUnswitchableRowsAreListed:
         a.login_expires_at = login_expires_at
         return a
 
-    def _render(self, snap, active, width=200):
+    def _render(self, snap, active, width=200, settings=None):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
 
         v = AutoScreen.__new__(AutoScreen)
-        v._settings = AutoSwitchSettings()
+        v._settings = settings or AutoSwitchSettings()
         # The re-login note fits the "#candidates" box; an unmounted screen has
         # none, so the default leaves room for every note form.
         v.query_one = lambda *_a, **_k: MagicMock(size=MagicMock(width=width))
@@ -2821,6 +2821,72 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
         ), active="9")
         assert out.index("a@x.com") < out.index("empty@x.com")
+
+    @staticmethod
+    def _fleet(active_pct5):
+        """Active #1, #2 five points under its 90 line with the sooner weekly
+        reset, #3 with room and a later one."""
+        def usage(pct5, reset_in):
+            return {
+                "five_hour": {"pct": pct5},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_in(reset_in)},
+            }
+        return {
+            "1": usage(active_pct5, 86400 * 5),
+            "2": usage(85.0, 86400),
+            "3": usage(20.0, 86400 * 3),
+        }
+
+    def _panel(self, fleet, settings):
+        return self._render(self._snap(*(
+            self._acct(n, f"{n}@x.com", switchable=True, last_good=u)
+            for n, u in fleet.items()
+        )), active="1", settings=settings)
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "weekly-first"])
+    def test_the_panel_leads_with_the_account_the_engine_switches_to(
+        self, temp_home, strategy
+    ):
+        """A forced move prefers a target holding the hysteresis margin of room
+        over one a few points under its line (#504's `tight` tier), so the
+        engine takes #3 although #2's weekly window resets sooner. The panel
+        is the same order: it must not lead with #2."""
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(
+            temp_home, strategy=strategy, threshold=90.0, hysteresis_pct=10.0
+        )
+        for num in (1, 2, 3):
+            h.seed(num, f"{num}@x.com")
+        h.make_live("1@x.com", 1)
+        h.clock.now = time.time()  # the panel's reset math reads the wall clock
+        fleet = self._fleet(98.0)  # the active is over its line
+        h.tick_with_usage(fleet)
+        picked = h.active_number()
+        assert picked == 3, f"fixture: the engine switched to {picked}"
+        out = self._panel(fleet, h.settings)
+        first = next(ln for ln in out.splitlines() if "@x.com" in ln)
+        assert f"{picked}@x.com" in first, out
+
+    def test_the_landing_room_bar_names_its_reason_where_it_refuses(self):
+        """Under consume-first, with the active under its line, the engine
+        drops a peer short of the hysteresis margin of room and the row says
+        why. Elsewhere that peer is a legal last pick, not a refusal: another
+        strategy, or an active that is over its line, carries no note."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        def settings(strategy):
+            return AutoSwitchSettings(
+                threshold=90.0, hysteresis_pct=10.0, strategy=strategy
+            )
+
+        reason = "too little room under its line"
+        refused = self._panel(self._fleet(16.0), settings("consume-first"))
+        rows = {ln.split()[1]: ln for ln in refused.splitlines() if "@x.com" in ln}
+        assert reason in rows["2@x.com"], refused
+        assert reason not in rows["3@x.com"], refused
+        assert reason not in self._panel(self._fleet(16.0), settings("weekly-first"))
+        assert reason not in self._panel(self._fleet(98.0), settings("consume-first"))
 
 
 @pytest.mark.asyncio
