@@ -361,7 +361,9 @@ class LoginSyncResult:
 class UsageCheckResult:
     """One account's outcome in :meth:`ClaudeAccountSwitcher.check_setup_token_usage`.
 
-    ``outcome``: ``"updated"`` (a fresh reading is stored), ``"failed"`` (the
+    ``outcome``: ``"updated"`` (a fresh reading is stored), ``"at-limit"``
+    (not sent: the server refuses the account for quota until its deadline,
+    so the stored reading, at its limit, is still current), ``"failed"`` (the
     request was sent and failed; ``detail`` says how) or ``"skipped"`` (not
     sent; ``detail`` says why, e.g. the server asked to wait).
     """
@@ -2057,7 +2059,16 @@ class ClaudeAccountSwitcher:
         for num, info in targets.items():
             email = info[1]
             if num not in claims:
-                reason = self._usage_check_skip_reason(after[num], now)
+                entry = after[num]
+                if (entry.in_backoff(now) and entry.last_error is None
+                        and not entry.token_dead()):
+                    # A quota refusal's hold: nothing to read until it ends,
+                    # and the reading it left is the account at its limit.
+                    wait = _wait_text(entry.backoff_until - now)
+                    results.append(UsageCheckResult(
+                        num, email, "at-limit", f"at its limit for another {wait}"))
+                    continue
+                reason = self._usage_check_skip_reason(entry, now)
                 results.append(UsageCheckResult(num, email, "skipped", reason))
                 continue
             rec = records[num]
@@ -2083,8 +2094,6 @@ class ClaudeAccountSwitcher:
             return "its token was refused; add it again"
         if entry.in_backoff(now) and entry.last_error not in CLIENT_SIDE_ERRORS:
             wait = _wait_text(entry.backoff_until - now)
-            if entry.last_error is None:
-                return f"at its limit, the server refuses for {wait}"
             return f"the server asked to wait ({entry.last_error}), {wait} left"
         if entry.held(now):
             return "showing another machine's reading (import-usage hold)"

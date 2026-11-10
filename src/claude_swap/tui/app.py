@@ -30,15 +30,17 @@ from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
 
 def usage_check_summary(results) -> str:
-    """One line for the notification: how many were read, and why any were not."""
+    """One line for the notification: how many are up to date, and why any
+    are not. An account at its limit counts as up to date: the server
+    refuses it until its deadline, and its stored reading says so."""
     if not results:
         return "No setup-token accounts to check."
     total = len(results)
-    read = sum(r.outcome == "updated" for r in results)
+    current = sum(r.outcome in ("updated", "at-limit") for r in results)
     noun = "account" if total == 1 else "accounts"
-    count = f"{total}" if read == total else f"{read} of {total}"
+    count = f"{total}" if current == total else f"{current} of {total}"
     notes = [f"{r.number}: {r.detail}" for r in results if r.detail]
-    return " · ".join([f"Usage read for {count} setup-token {noun}", *notes])
+    return " · ".join([f"Usage up to date for {count} setup-token {noun}", *notes])
 
 
 class CswapApp(App):

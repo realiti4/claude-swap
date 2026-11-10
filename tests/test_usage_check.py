@@ -146,6 +146,27 @@ class TestCheckSetupTokenUsage:
         assert urls == []
         assert all(r.outcome == "skipped" and "server asked to wait" in r.detail for r in results)
 
+    def test_an_account_at_its_limit_is_current_not_skipped(self, switcher):
+        """A quota refusal holds the account until its deadline; the next
+        check doesn't ask again, and reports it as at its limit, not as an
+        account it failed to read."""
+        def refused(req):
+            return urllib.error.HTTPError(
+                oauth.USAGE_PROBE_URL, 429, "Too Many", fp=None, hdrs={
+                    "Retry-After": "7200",
+                    "anthropic-ratelimit-unified-status": "rejected",
+                    "anthropic-ratelimit-unified-5h-utilization": "1.0",
+                    "anthropic-ratelimit-unified-5h-reset": str(int(time.time()) + 7200),
+                })
+
+        results, _ = run_check(switcher, refused)
+        assert all(r.outcome == "updated" and r.detail == "at its limit" for r in results)
+
+        results, urls = run_check(switcher, probe_response())
+        assert urls == []
+        assert all(r.outcome == "at-limit" for r in results)
+        assert all(r.detail.startswith("at its limit for another 1h") for r in results)
+
     def test_refreshing_logins_and_api_keys_are_not_probed(self, switcher):
         import json
 
@@ -200,13 +221,16 @@ class TestDisplay:
 
         assert usage_check_summary([]) == "No setup-token accounts to check."
         ok = UsageCheckResult("1", "a@x.io", "updated")
-        assert usage_check_summary([ok]) == "Usage read for 1 setup-token account"
+        assert usage_check_summary([ok]) == "Usage up to date for 1 setup-token account"
         waited = UsageCheckResult("2", "b@x.io", "skipped", "the server asked to wait (http-429), 4m left")
         limit = UsageCheckResult("3", "c@x.io", "updated", "at its limit")
-        assert usage_check_summary([ok, waited, limit]) == (
-            "Usage read for 2 of 3 setup-token accounts · "
-            "2: the server asked to wait (http-429), 4m left · 3: at its limit"
+        held = UsageCheckResult("4", "d@x.io", "at-limit", "at its limit for another 2h 5m")
+        assert usage_check_summary([ok, waited, limit, held]) == (
+            "Usage up to date for 3 of 4 setup-token accounts · "
+            "2: the server asked to wait (http-429), 4m left · 3: at its limit · "
+            "4: at its limit for another 2h 5m"
         )
+        assert usage_check_summary([ok, held]).startswith("Usage up to date for 2 setup-token accounts")
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +259,7 @@ class TestWatchKey:
             await pilot.press("u")
             await settle(pilot)
         fake.check_setup_token_usage.assert_called_once()
-        assert "Usage read for 1 setup-token account" in notes
+        assert "Usage up to date for 1 setup-token account" in notes
 
     async def test_u_without_setup_token_accounts_sends_nothing(self, tmp_path):
         from tests.test_tui import FakeSwitcher, make_account, make_app, settle
