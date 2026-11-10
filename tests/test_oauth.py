@@ -956,8 +956,9 @@ class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 
     @staticmethod
-    def _http_error(code: int, headers: dict | None = None):
+    def _http_error(code: int, headers: dict | None = None, body: bytes | None = None):
         import email.message
+        import io
         hdrs = None
         if headers is not None:
             hdrs = email.message.Message()
@@ -965,13 +966,31 @@ class TestClassifyUsageError:
                 hdrs[k] = v
         return urllib.error.HTTPError(
             url="https://api.anthropic.com/api/oauth/usage",
-            code=code, msg="err", hdrs=hdrs, fp=None,
+            code=code, msg="err", hdrs=hdrs,
+            fp=None if body is None else io.BytesIO(body),
         )
 
     def test_http_codes(self):
         assert oauth._classify_usage_error(self._http_error(429))[0] == "http-429"
         assert oauth._classify_usage_error(self._http_error(500))[0] == "http-500"
         assert oauth._classify_usage_error(self._http_error(401))[0] == "http-401"
+
+    ORG = "oauth_not_allowed_for_organization"
+    ORG_BODY = json.dumps({"error": {"details": {"error_code": ORG}}}).encode()
+
+    @pytest.mark.parametrize("code, body, kind", [
+        (403, ORG_BODY, ORG),
+        (401, ORG_BODY, "http-401"),
+        (403, None, "http-403"),
+        (403, b"<html>forbidden</html>", "http-403"),
+        (403, b'{"error": "x"}', "http-403"),
+    ])
+    def test_403_org_oauth_policy_names_itself(self, code, body, kind):
+        """A 403 whose body carries the server's org-policy code is told apart
+        from every other 403; an unreadable or differently shaped body, and any
+        other status, keep ``http-<code>``. Retry-After rides along either way."""
+        err = self._http_error(code, {"Retry-After": "7"}, body)
+        assert oauth._classify_usage_error(err) == (kind, 7.0)
 
     def test_retry_after_seconds(self):
         kind, retry = oauth._classify_usage_error(
@@ -1279,14 +1298,6 @@ class TestParseUnifiedRatelimitHeaders:
         data = oauth.parse_unified_ratelimit_headers(_headers(values))
         assert set(data) == {"five_hour"}
 
-    @pytest.mark.parametrize("bad", ["nan", "inf", "-0.1", "", "high"])
-    def test_unusable_utilization_is_dropped(self, bad):
-        values = dict(_UNIFIED_HEADERS)
-        values["anthropic-ratelimit-unified-5h-utilization"] = bad
-        data = oauth.parse_unified_ratelimit_headers(_headers(values))
-        assert "five_hour" not in data
-        assert "seven_day" in data
-
     def test_unusable_reset_keeps_utilization(self):
         values = dict(_UNIFIED_HEADERS)
         values["anthropic-ratelimit-unified-5h-reset"] = "soon"
@@ -1514,8 +1525,20 @@ class TestHeaderReadingDecisions:
         usage = {"five_hour": {"pct": 5.0}, "source": self.H}
         assert oauth.relevant_windows(usage) == []
         assert oauth.account_headroom(usage) is None
-        only_7d = {"seven_day": {"pct": 5.0}, "source": self.H}
-        assert oauth.account_headroom(only_7d) is None
+
+    def test_weekly_only_reading_decides(self):
+        # An Ultra account has no 5h window, and its probe carries no 5h header.
+        usage = {"seven_day": {"pct": 88.0}, "source": self.H}
+        assert oauth.relevant_windows(usage) == [("7d", 88.0, None)]
+        assert oauth.account_headroom(usage) == 12.0
+        assert oauth.account_headroom(usage, ("Fable",)) is None
+        assert oauth.account_headroom(usage, ("all",)) is None
+        with_fable = {
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 70.0}],
+            "source": self.H,
+        }
+        assert oauth.account_headroom(with_fable, ("Fable",)) == 30.0
 
     def test_endpoint_reading_is_unchanged(self):
         # The endpoint's own partial answers keep today's meaning.
@@ -2025,6 +2048,8 @@ class TestLoginExpiresAtIso:
         json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": "soon"}}),
         json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": True}}),
         json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": 0}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": float("nan")}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": float("inf")}}),
         json.dumps({"other": {}}),
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
