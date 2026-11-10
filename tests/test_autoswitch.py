@@ -9112,54 +9112,19 @@ class TestEveryAccountAboveThreshold:
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
 
-    @staticmethod
-    def _best_fleet(temp_home) -> EngineHarness:
-        """`best`, where this PR's escape axis still orders targets: the
-        consume-first strategy's at-limit escape is upstream's (#305, an
-        under-line target first, then the weekly reset among those with room)."""
-        h = EngineHarness(temp_home, strategy="best")
-        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
-            h.seed(n, email)
-        h.make_live("a@example.com", 1)
-        return h
-
-    def test_at_limit_ranks_on_the_window_that_actually_blocked(self, temp_home):
-        """Escaping a 5h limit must rank candidates by their 5h room.
-
-        `account_headroom` is `100 - max(5h, 7d, scoped...)` — the BINDING
-        window. That is the right number for "is this account usable at all"
-        and the wrong one for "which account best escapes the window that just
-        blocked me". At-limit skips every proactive gate, so the only thing
-        left deciding the target is the sort key, and that key was the max.
-
-        Active is blocked on 5h. Candidate 2 has a FULL 5h window and a burnt
-        weekly; candidate 3 has most of its 5h spent and a fresh weekly. Both
-        are usable, so neither is filtered — only the ORDER is at issue. For
-        the next five hours candidate 2 is worth 100 points of the axis that
-        blocked us and candidate 3 is worth 15, but max() scores them 13 and
-        15 and the old key took the one with almost no room where it counts.
-        Both sit under their lines (an escape takes an under-line target
-        first, #305), so the axis is what orders them.
-        """
-        harness = self._best_fleet(temp_home)
-        outcome = harness.tick_with_usage({
-            "1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}},
-            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 87.0}},
-            "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
-        })
-        assert outcome is TickOutcome.SWITCHED
-        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "at-limit"
-        assert harness.active_number() == 2, (
-            "a 5h limit fired, so the escape must go to the account with the "
-            "most 5h room (2: 100 free) rather than the best worst-case "
-            "window (3: max(85,10)=85 -> headroom 15 beats 2's 13)"
-        )
-
     def test_the_escape_axis_is_not_cancelled_by_dynamics_consume_first_arm(
         self, temp_home
     ):
-        """Same case, `strategy=dynamic`: the answer must not change.
+        """Escaping a 5h limit under `dynamic` ranks candidates by 5h room.
+
+        `account_headroom` is `100 - max(5h, 7d, scoped...)`, the right number
+        for "is this account usable at all" and the wrong one for "which
+        account best escapes the window that just blocked me". Active is
+        blocked on 5h; 2 has a FULL 5h and a burnt weekly, 3 most of its 5h
+        spent and a fresh weekly. max() scores them 13 and 15 and takes the
+        one with almost no room where it counts. Only `dynamic` ranks on the
+        blocked window: `best` and `weekly-first` keep upstream's order (#305,
+        `test_autoswitch_landing_room.py`).
 
         `consume_first` is true for the whole consume-first family, and its
         arm sat ahead of the escape arm. So an at-limit escape for a
@@ -9171,8 +9136,7 @@ class TestEveryAccountAboveThreshold:
         The consume-first PREFERENCE is proactive (which account to burn
         next); at-limit is not a preference, it is a session that is stopped.
         Not asked of `consume-first` itself: upstream's #305 owns its escape,
-        an under-line target first and the weekly reset among those with room
-        (`test_autoswitch_landing_room.py`).
+        an under-line target first and the weekly reset among those with room.
         """
         h = EngineHarness(temp_home, strategy="dynamic")
         h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
@@ -9196,14 +9160,16 @@ class TestEveryAccountAboveThreshold:
         than a preference. Flip which window blocks the active account and the
         answer must flip with it — otherwise the change is "always prefer 5h",
         which would be a different bug wearing this one's clothes."""
-        harness = self._best_fleet(temp_home)
-        outcome = harness.tick_with_usage({
+        h = EngineHarness(temp_home, strategy="dynamic")
+        h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com"); h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
             "1": {"five_hour": {"pct": 20.0},  "seven_day": {"pct": 100.0}},
             "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 87.0}},
             "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
         })
         assert outcome is TickOutcome.SWITCHED
-        assert harness.active_number() == 3, (
+        assert h.active_number() == 3, (
             "a 7d limit fired, so the escape must go to the account with the "
             "most WEEKLY room (3: 90 free) — the mirror of the case above"
         )

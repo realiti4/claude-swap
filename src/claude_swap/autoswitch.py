@@ -4576,7 +4576,7 @@ class AutoSwitchEngine:
         # right for "is this account usable at all", wrong for "which account
         # best escapes the window that just blocked me". At-limit skips every
         # proactive gate, so the sort key is the only thing left choosing the
-        # target. Read once here; used only by the at-limit key.
+        # target. Read once here; used only by `dynamic`'s at-limit key.
         escape_label = (
             oauth.binding_window_label(usage.get(current), models)
             if trigger == "at-limit"
@@ -5071,12 +5071,16 @@ class AutoSwitchEngine:
                 # keeps `best`'s headroom order for the at-limit and failover
                 # escapes, which may land on accounts over their lines.
                 key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
+            elif not dynamic_landing:
+                # Upstream's escape order (#305): most line headroom, `over`
+                # prepended below. The blocked-window axis is `dynamic`'s.
+                key = (-lh,)
             else:
-                # Escape ranking, on the axis that actually blocked us. Falls
-                # back to `-lh` when the label is unknown (usage without window
-                # data) or the candidate does not report that window, so an
-                # account we cannot compare on the escape axis is ordered by
-                # the binding number rather than dropped.
+                # `dynamic`'s at-limit escape, on the axis that actually
+                # blocked us. Falls back to `-lh` when the label is unknown
+                # (usage without window data) or the candidate does not report
+                # that window, so an account we cannot compare on the escape
+                # axis is ordered by the binding number rather than dropped.
                 #
                 # THIS NUMBER ORDERS; IT DOES NOT DECIDE USABILITY. One clear
                 # window says nothing about the rest, so the servability tier
@@ -5134,7 +5138,7 @@ class AutoSwitchEngine:
                 # `h > SPENT_HEADROOM_PCT` not asked here: the tier below
                 # checks `h <= SPENT_HEADROOM_PCT` FIRST, so this is only
                 # ever consulted once that has already failed.
-                dynamic_self_walled = dynamic_landing and self._over(
+                dynamic_self_walled = self._over(
                     usage.get(num), settings, models, thresholds[num]
                 )
                 # THREE TIERS, NOT TWO. Folding "genuinely unservable" (h <=

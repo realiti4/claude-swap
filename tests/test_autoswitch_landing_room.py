@@ -417,13 +417,11 @@ class TestABestEscapeKeepsItsKey:
     def test_line_headroom_not_a_room_bar(self, temp_home):
         # best already ranks by headroom. 2 has exactly the margin (7d 88% under 98,
         # 12 raw); 3 is 9.9 under its 5h line with 19.9 raw. A room bar would take 2.
-        # The active is walled on its 7d here, not its 5h: this PR's escape ranks
-        # on the window that blocked (the 7d reads 98 points free on 3, 12 on 2).
         h = _fleet(
             temp_home, 3, threshold=90.0, weekly_threshold=98.0, strategy="best"
         )
         h.tick_with_usage({
-            "1": _usage7(50, 100, _R_LATER),
+            "1": _usage7(100, 50, _R_LATER),
             "2": _usage7(0, 88, _R_SOON),
             "3": _usage7(80.1, 2, _R_LATEST),
         })
