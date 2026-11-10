@@ -281,7 +281,9 @@ class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
     """Under consume-first the panel's key reads each account against its own
     line, as the engine's ranking does. Account 2 sits at 5h 92% under a 95%
     line of its own with the sooner weekly reset; on the global 90 it read as
-    over and fell behind account 3."""
+    over and fell behind account 3. The hysteresis is 2, so the 3 points it has
+    left under its line are room enough: at the default 10 the engine's pass
+    ranks it `tight`, behind account 3, and the panel follows."""
 
     async def test_an_account_under_its_own_line_keeps_the_soonest_reset(self):
         later = make_entry(50.0, 10.0)
@@ -297,5 +299,7 @@ class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
             ),
             taken_at=0.0,
         )
-        settings = AutoSwitchSettings(threshold=90, strategy="consume-first")
+        settings = AutoSwitchSettings(
+            threshold=90, strategy="consume-first", hysteresis_pct=2.0
+        )
         assert _next_best_order(snap, "1", settings) == ["2", "3"]
