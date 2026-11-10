@@ -501,6 +501,51 @@ Examples:
         sys.exit(130)
 
 
+def _codex_command(argv: list[str]) -> None:
+    """Handle `cswap codex [add|list|switch NUM|EMAIL|remove NUM|EMAIL]`.
+
+    OpenAI Codex CLI logins ($CODEX_HOME/auth.json, default ~/.codex).
+    Pre-dispatched before the main parser, like `swap`.
+    """
+    from claude_swap import codex_accounts
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} codex",
+        description="Store and switch OpenAI Codex CLI logins (~/.codex/auth.json, or $CODEX_HOME).",
+    )
+    parser.add_argument("action", nargs="?", default="list", choices=["add", "list", "switch", "remove"])
+    parser.add_argument("target", nargs="?", metavar="NUM|EMAIL")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if (args.action in ("switch", "remove")) != (args.target is not None):
+        parser.error(f"`codex {args.action}` {'needs' if args.target is None else 'takes no'} NUM|EMAIL")
+
+    try:
+        # Built for the root guard and the backup-dir migration it runs.
+        _guard_root(ClaudeAccountSwitcher(debug=args.debug))
+        if args.action == "add":
+            num, email, is_new = codex_accounts.add()
+            print(f"{accent('Added' if is_new else 'Updated')} Codex account {num}: {email}")
+        elif args.action == "switch":
+            num, email = codex_accounts.switch(args.target)
+            print(f"{accent('Switched')} Codex to account {num}: {email}")
+            print(muted("Restart running Codex sessions to pick up the new login."))
+        elif args.action == "remove":
+            num, email = codex_accounts.remove(args.target)
+            print(f"{accent('Removed')} Codex account {num}: {email}")
+        else:
+            lines = codex_accounts.list_lines()
+            print("\n".join(lines) if lines else dimmed(
+                "No Codex accounts stored. Log in with `codex login`, then run `cswap codex add`."
+            ))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _move_command(argv: list[str]) -> None:
     """Handle `cswap move NUM|EMAIL|ALIAS SLOT`.
 
@@ -1484,6 +1529,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "codex":
+        _codex_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1528,6 +1576,10 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s codex                      list OpenAI Codex CLI accounts
+  %(prog)s codex add                  add the current Codex login
+  %(prog)s codex switch <num|email>   switch the Codex login
+  %(prog)s codex remove <num|email>   remove a Codex account
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
@@ -1963,6 +2015,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 show_token_status=args.token_status,
                 json_output=args.json,
             )
+            if not args.json:
+                from claude_swap import codex_accounts
+
+                codex_lines = codex_accounts.list_lines()
+                if codex_lines:
+                    print("\n" + "\n".join(codex_lines))
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
 
