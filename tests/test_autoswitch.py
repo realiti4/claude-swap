@@ -9114,7 +9114,7 @@ class TestEveryAccountAboveThreshold:
 
     @staticmethod
     def _best_fleet(temp_home) -> EngineHarness:
-        """`best`, where this fork's escape axis still orders targets: the
+        """`best`, where this PR's escape axis still orders targets: the
         consume-first strategy's at-limit escape is upstream's (#305, an
         under-line target first, then the weekly reset among those with room)."""
         h = EngineHarness(temp_home, strategy="best")
@@ -9159,14 +9159,14 @@ class TestEveryAccountAboveThreshold:
     def test_the_escape_axis_is_not_cancelled_by_dynamics_consume_first_arm(
         self, temp_home
     ):
-        """Same case, `strategy=dynamic` — the answer must not change.
+        """Same case, `strategy=dynamic`: the answer must not change.
 
         `consume_first` is true for the whole consume-first family, and its
         arm sat ahead of the escape arm. So an at-limit escape for a
         `dynamic` user ranked on the soonest weekly reset and never reached
         the window that had actually blocked it: the feature applied to half
         the users. The same shape the recovery-hysteresis fix already closed
-        one branch above — filtering on one axis while sorting on another.
+        one branch above: filtering on one axis while sorting on another.
 
         The consume-first PREFERENCE is proactive (which account to burn
         next); at-limit is not a preference, it is a session that is stopped.
@@ -17994,7 +17994,7 @@ class TestAnExpiringWindowPullsTheSwitch:
         for n in (1, 2, 3, 4):
             h.seed(n, f"acct{n}@example.invalid")
         h.make_live("acct1@example.invalid", 1)
-        # 2 holds the landing room (10 points under its 90 line) that
+        # 2 holds the landing room (15 points under its 90 line) that
         # consume-first asks of a voluntary target since #504.
         outcome = _xw_tick(h, self._fleet(h, **{"2": _xw(h, 10.0, 75.0, 2 * _H)}))
         assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == (

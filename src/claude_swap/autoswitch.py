@@ -5035,8 +5035,10 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order.
                 #
-                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
-                # does not belong: `at-limit` is a stopped session. The
+                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so a `dynamic`
+                # escape does not belong: `at-limit` is a stopped session, and
+                # it ranks on the axis that blocked. The other strategies take
+                # upstream's escape tier (#305) over this key instead. The
                 # all-above states never reach this arm; they rank on room.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this

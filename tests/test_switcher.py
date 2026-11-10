@@ -9767,7 +9767,7 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("2", "account2@example.com")] == live
 
-    # -- #489 meets the fork's adopt: one foreign live login, three doors. The
+    # -- #489 meets this PR's adopt: one foreign live login, three doors. The
     # adopt (dead slot, or a later login) goes first; the rescue (a newer
     # generation of the slot's own login) second, and it never writes what the
     # adopt refuses on principle: a spent refresh token, or an older login than
@@ -9878,7 +9878,12 @@ class TestProvenanceGuard:
         assert creds_store[("2", "account2@example.com")] == rotated
         assert any("was adopted there" in w for w in op["warnings"])
         assert not any("backup was updated" in w for w in op["warnings"])
-        assert not switcher._slot_token_dead("2", "account2@example.com")
+        entry = switcher._usage_store.entries(
+            {"2": ("account2@example.com", "org-2")})["2"]
+        assert entry.auth_dead_strikes == 0, (
+            "the rescue wrote the slot and left the strike standing, which "
+            "keeps it out of every collect pass"
+        )
 
     def test_alien_credential_preserved_and_skipped(
         self, temp_home, mock_claude_config, sample_sequence_data,
