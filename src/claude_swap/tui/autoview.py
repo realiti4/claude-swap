@@ -38,6 +38,8 @@ from claude_swap.autoswitch import (
     binding_pct,
     classify_candidate_block,
     consume_first_rank_key,
+    empty_pass_refusal,
+    no_peer_refusal,
     pct_label,
     rank_candidates_pass,
 )
@@ -93,16 +95,36 @@ _UNMODELED_TEXT = {
 }
 
 
+# The panel's words for each refusal the tick reaches around its pass, one
+# key per literal `no_peer_refusal` and `empty_pass_refusal` return (the
+# engine's own reading of the state, shared with the tick). A hold the engine
+# calls healthy (NO_ACTION) is worded as a hold, never as a block. The
+# "below-threshold" here is the consume-first hold with no OAuth peer, not
+# `best` below its line (`_UNMODELED_TEXT`).
+_REFUSAL_TEXT = {
+    "below-threshold": "holding (below its line, no other OAuth account to compare)",
+    "no-candidates": "no account to switch to",
+    "no-comparison": "no candidate has readable usage",
+    "reset-unknown": "holding (the active account's weekly reset is unknown)",
+    "already-consuming-soonest":
+        "holding (no sooner-resetting account with room to spare)",
+    "no-qualifying-candidate": "no candidate qualifies",
+    "deliberate-wait": "holding for a nearer reset than any peer offers",
+    "all-exhausted": "all accounts exhausted",
+}
+
+
 def _engine_order(
     snap: AccountsSnapshot, settings, active_number: str | None, now: float
 ) -> tuple[list[str], tuple[str, ...], str]:
-    """(ordered, the window set it ranked on, trigger): the order the engine's
+    """(ordered, the window set it ranked on, note): the order the engine's
     own pass (`rank_candidates_pass`) gives this snapshot, never a key of the
     panel's own. The trigger comes from the active's reading as `_tick_inner`
     classifies it, and a trigger in `_UNMODELED_TEXT` runs no pass. Under
     `dynamic`, an empty model-gated pass is retried on 5h/7d alone, as
-    `_rank_candidates` does. State a snapshot lacks (cooldown, the no-return
-    bar, quarantine, the failover count) is not modeled."""
+    `_rank_candidates` does. The note is the panel's words for why nobody is
+    previewed, empty when somebody is. State a snapshot lacks (cooldown, the
+    no-return bar, quarantine, the failover count) is not modeled."""
     models = parse_model_names(settings.model)
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
     bars = ThresholdMap(
@@ -140,36 +162,48 @@ def _engine_order(
         else:
             trigger = "at-limit" if active_h <= 0 else "proactive"
     if trigger in _UNMODELED_TEXT:
-        return [], models, trigger
+        return [], models, _UNMODELED_TEXT[trigger]
 
     peers = [
         a for a in snap.accounts
         if a.number != active_number and a.switchable and not a.disabled
     ]
+    oauth_peers = [a.number for a in peers if a.kind != "api_key"]
+    key_peers = [
+        a.number for a in peers
+        if a.kind == "api_key" and settings.include_api_key_accounts
+    ]
+    if refusal := no_peer_refusal(
+        trigger=trigger, active_headroom=active_h,
+        oauth_candidates=oauth_peers, api_key_candidates=key_peers,
+    ):
+        return [], models, _REFUSAL_TEXT[refusal]
 
-    def rank(axis: tuple[str, ...]) -> list[str]:
+    def rank(axis: tuple[str, ...]):
         h = _headroom_by_account(usage, axis)
         return rank_candidates_pass(
             models=axis, trigger=trigger,
             consume_first=settings.strategy in CONSUME_FIRST_STRATEGIES,
-            oauth_candidates=[a.number for a in peers if a.kind != "api_key"],
+            oauth_candidates=oauth_peers,
             no_return=None, usage=usage, headroom=h, current=active_number,
             active_headroom=h.get(active_number), settings=settings, now=now,
             thresholds=bars,
-        )[0]
+        )
 
-    ordered = rank(models)
+    ordered, any_known, active_reset_ts, waiting = rank(models)
     if not ordered and models and settings.strategy == "dynamic":
-        if retry := rank(()):
-            return retry, (), trigger
-    if (
-        not ordered
-        and settings.include_api_key_accounts
-        and trigger not in CONSUME_FIRST_STRATEGIES
-    ):
+        if retry := rank(())[0]:
+            return retry, (), ""
+    if not ordered and key_peers and trigger not in CONSUME_FIRST_STRATEGIES:
         # The tick's last resort when it must move: a metered API-key slot.
-        ordered = [a.number for a in peers if a.kind == "api_key"]
-    return ordered, models, trigger
+        return key_peers, models, ""
+    if ordered:
+        return ordered, models, ""
+    return [], models, _REFUSAL_TEXT[empty_pass_refusal(
+        trigger=trigger, any_known=any_known, active_reset_ts=active_reset_ts,
+        waiting_for_recovery=waiting,
+        candidate_headrooms=[headroom.get(n) for n in oauth_peers],
+    )]
 
 
 def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
@@ -683,7 +717,7 @@ class AutoScreen(Screen):
         # THE ENGINE'S OWN ADMISSION AND ORDER decide the rows it admits and
         # their window set; a refused row keeps the strategy's bare key below,
         # behind every admitted one.
-        ordered, rank_models, trigger = (
+        ordered, rank_models, note = (
             _engine_order(snap, settings, active_number, now)
             if settings else ([], models, "")
         )
@@ -888,11 +922,9 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
-        if trigger in _UNMODELED_TEXT:
-            text.append(f"\n  {_UNMODELED_TEXT[trigger]}", style=palette.muted)
-        elif settings and not ordered:
+        if note:
             # Rows are still listed, but none is something a tick would switch to.
-            text.append("\n  no candidate qualifies", style=palette.muted)
+            text.append(f"\n  {note}", style=palette.muted)
         # The box has no width before its first layout (the app's less its
         # padding), and a screen built with `__new__` has no `_nodes` to query.
         try:

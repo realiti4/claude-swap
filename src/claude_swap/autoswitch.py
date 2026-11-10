@@ -192,6 +192,50 @@ def _room_at(
 CONSUME_FIRST_STRATEGIES = ("consume-first", "dynamic")
 
 
+def no_peer_refusal(
+    *,
+    trigger: str,
+    active_headroom: float | None,
+    oauth_candidates: Sequence[str],
+    api_key_candidates: Sequence[str],
+) -> str | None:
+    """The refusal before any pass runs, when no OAuth peer exists: a healthy
+    below-line hold for the consume-first family (API-key candidates do not
+    change it, they have no weekly window to consume), else the lack of any
+    candidate. None when a pass has someone to rank. The tick and the "Next
+    best" panel share this one reading."""
+    if (
+        trigger in (*CONSUME_FIRST_STRATEGIES, "priority")
+        and not oauth_candidates
+        and active_headroom is not None
+    ):
+        return "below-threshold"
+    if not oauth_candidates and not api_key_candidates:
+        return "no-candidates"
+    return None
+
+
+def empty_pass_refusal(
+    *,
+    trigger: str,
+    any_known: bool,
+    active_reset_ts: float | None,
+    waiting_for_recovery: bool,
+    candidate_headrooms: Sequence[float | None],
+) -> str:
+    """Why a pass that admitted nobody holds, from what the pass returned (see
+    ``_rank_candidates_pass``) and the model-gated headroom of the OAuth
+    candidates. Not the priority strategy's, which has its own pass. The tick
+    and the "Next best" panel share this one reading."""
+    if not any_known:
+        return "no-comparison"
+    if trigger in CONSUME_FIRST_STRATEGIES:
+        return "reset-unknown" if active_reset_ts is None else "already-consuming-soonest"
+    if all(h is not None and h <= 0 for h in candidate_headrooms):
+        return "all-exhausted"
+    return "deliberate-wait" if waiting_for_recovery else "no-qualifying-candidate"
+
+
 def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
     """Does a candidate beat the active by enough to move, every account over
     its own switch lines?
@@ -1924,11 +1968,13 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
-        if (
-            trigger in (*CONSUME_FIRST_STRATEGIES, "priority")
-            and not oauth_candidates
-            and active_headroom is not None
-        ):
+        no_peer = no_peer_refusal(
+            trigger=trigger,
+            active_headroom=active_headroom,
+            oauth_candidates=oauth_candidates,
+            api_key_candidates=api_key_candidates,
+        )
+        if no_peer == "below-threshold":
             # Healthy below-threshold account with no OAuth peer to compare
             # against — the same state `best` reports as below-threshold
             # NO_ACTION before ever reaching candidate selection. API-key
@@ -1946,7 +1992,7 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        if not oauth_candidates and not api_key_candidates:
+        if no_peer == "no-candidates":
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -2119,7 +2165,14 @@ class AutoSwitchEngine:
                     detail="no candidate is below every switch line with readable usage; waiting for recovery",
                 ))
                 return TickOutcome.BLOCKED
-            if not any_known:
+            refusal = empty_pass_refusal(
+                trigger=trigger,
+                any_known=any_known,
+                active_reset_ts=active_reset_ts,
+                waiting_for_recovery=waiting_for_recovery,
+                candidate_headrooms=[headroom.get(n) for n in oauth_candidates],
+            )
+            if refusal == "no-comparison":
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -2133,7 +2186,7 @@ class AutoSwitchEngine:
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
                 # so an opted-in user can see the strategy working (or inert).
-                if active_reset_ts is None:
+                if refusal == "reset-unknown":
                     # The strictly-sooner filter skips every candidate when the
                     # active account's weekly reset is unknown — without this
                     # reason the strategy would look enabled while doing
@@ -2165,11 +2218,8 @@ class AutoSwitchEngine:
             # gate, or one whose usage is unreadable this tick, can become
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
-                h is not None and h <= 0 for h in candidate_headrooms
-            )
-            if not truly_exhausted and not waiting_for_recovery:
+            truly_exhausted = refusal == "all-exhausted"
+            if refusal == "no-qualifying-candidate":
                 self._emit(
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",

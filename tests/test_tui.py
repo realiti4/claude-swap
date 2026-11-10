@@ -3086,9 +3086,21 @@ def _window(five_h, reset_h):
     }
 
 
-def _harness_and_panel_snapshot(temp_home, settings, fleet):
+def _window7(five_h, seven_d, seven_reset_h=None, five_reset_h=None):
+    """A usage payload with both windows set; a reset is optional."""
+    five = {"pct": five_h}
+    seven = {"pct": seven_d}
+    if five_reset_h is not None:
+        five["resets_at"] = _iso_in(five_reset_h * 3600)
+    if seven_reset_h is not None:
+        seven["resets_at"] = _iso_in(seven_reset_h * 3600)
+    return {"five_hour": five, "seven_day": seven}
+
+
+def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=()):
     """The engine harness and the panel's snapshot of ONE fleet (`{number: usage
-    payload or sentinel}`, account 1 the active one). The harness clock is the wall clock: the panel
+    payload or sentinel}`, account 1 the active one, `disabled` the numbers
+    held out of rotation on both sides). The harness clock is the wall clock: the panel
     reads `time.time()`, and a reset in the harness's 1970 is already past."""
     from tests.test_autoswitch import EngineHarness
 
@@ -3100,6 +3112,10 @@ def _harness_and_panel_snapshot(temp_home, settings, fleet):
             data = h.switcher._get_sequence_data()
             data["accounts"][number]["kind"] = "api_key"
             h.switcher._write_json(h.switcher.sequence_file, data)
+        if number in disabled:
+            data = h.switcher._get_sequence_data()
+            data["accounts"][number]["disabled"] = True
+            h.switcher._write_json(h.switcher.sequence_file, data)
     h.make_live("u1@x.invalid", 1)
     snap = AccountsSnapshot(
         active_number="1",
@@ -3107,6 +3123,7 @@ def _harness_and_panel_snapshot(temp_home, settings, fleet):
             make_account(
                 n, active=n == "1",
                 kind="api_key" if usage == USAGE_API_KEY else "oauth",
+                disabled=n in disabled,
                 entry=(
                     make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(
                         last_good=usage, fetched_at=time.time() - 5.0, age_s=5.0,
@@ -3180,6 +3197,110 @@ class TestNextBestFollowsTheTick:
         fleet = {"1": active, "2": _window(85, 10), "3": _window(10, 50)}
         h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
         assert claim in _next_best_text(snap, "1", h.settings)
+
+    @pytest.mark.parametrize(
+        "strategy, fleet, extra, disabled, designed",
+        [
+            # Healthy holds: the engine reports NO_ACTION, never a block.
+            ("consume-first", {"1": (40, 10), "2": (10, 50), "3": (10, 60)},
+             {}, (), "already-consuming-soonest"),
+            ("dynamic", {"1": (40, 10), "2": (10, 50), "3": (10, 60)},
+             {}, (), "already-consuming-soonest"),
+            ("consume-first",
+             {"1": _window7(40, 0), "2": (85, 10), "3": (10, 50)},
+             {}, (), "reset-unknown"),
+            ("consume-first", {"1": (40, 100), "2": USAGE_API_KEY},
+             {"include_api_key_accounts": True}, (), "below-threshold"),
+            # Blocks and waits.
+            ("best", {"1": (95, 100), "2": (88, 10), "3": (87, 50)},
+             {}, (), "no-qualifying-candidate"),
+            ("best", {"1": (95, 100), "2": USAGE_TOKEN_EXPIRED, "3": USAGE_TOKEN_EXPIRED},
+             {}, (), "no-comparison"),
+            ("best", {"1": (95, 100), "2": (10, 50)}, {}, ("2",), "no-candidates"),
+            ("best", {"1": (100, 100), "2": (100, 50), "3": (100, 60)},
+             {}, (), "all-exhausted"),
+            ("best",
+             {"1": _window7(100, 40, five_reset_h=2 / 3),
+              "2": _window7(1, 98, 96), "3": _window7(100, 100, 96)},
+             {}, (), "deliberate-wait"),
+        ],
+        ids=[
+            "consume-first-already-soonest", "dynamic-already-soonest",
+            "consume-first-reset-unknown", "consume-first-no-oauth-peer",
+            "best-no-qualifying-candidate", "best-no-comparison",
+            "best-no-candidates", "best-all-exhausted", "best-deliberate-wait",
+        ],
+    )
+    def test_an_empty_pass_says_what_the_tick_refused_with(
+        self, temp_home, strategy, fleet, extra, disabled, designed
+    ):
+        """The note is the one worded for the reason the tick emitted on the
+        same fleet, and a hold the engine calls healthy never reads as a block."""
+        from claude_swap.autoswitch import AllExhaustedEvent, TickOutcome
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        fleet = {n: w if isinstance(w, (str, dict)) else _window(*w) for n, w in fleet.items()}
+        h, snap = _harness_and_panel_snapshot(
+            temp_home, {"strategy": strategy, **extra}, fleet, disabled
+        )
+        outcome = h.tick_with_usage(fleet)
+        event = [e for e in h.events if isinstance(e, (NoSwitchEvent, AllExhaustedEvent))][-1]
+        reason = (
+            event.reason if isinstance(event, NoSwitchEvent)
+            else "deliberate-wait" if event.deliberate_wait else "all-exhausted"
+        )
+        assert reason == designed, "the case no longer builds the refusal it is named for"
+        text = _next_best_text(snap, "1", h.settings)
+        assert [t for t in _REFUSAL_TEXT.values() if t in text] == [_REFUSAL_TEXT[reason]]
+        if outcome is TickOutcome.NO_ACTION:
+            assert _REFUSAL_TEXT["no-qualifying-candidate"] not in text
+
+    def test_every_refusal_the_tick_can_emit_has_its_words_or_a_reason_not(self):
+        """A reason the tick gains cannot fall through: it is worded in the
+        panel, or listed here with why the panel does not model it."""
+        import ast
+        import inspect
+        import itertools
+        import textwrap
+
+        from claude_swap.autoswitch import (
+            AutoSwitchEngine, empty_pass_refusal, no_peer_refusal,
+        )
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        # Before the pass or beyond the snapshot (cooldown, the failover
+        # count), the priority strategy's own pass, or after a pass that admitted.
+        not_modelled = {
+            "unmanaged-active-account", "no-active-account", "active-api-key",
+            "active-idle", "active-usage-unknown", "cooldown",
+            "already-consuming-priority", "stale-usage", "no-viable-target",
+        }
+        tree = ast.parse(textwrap.dedent(inspect.getsource(AutoSwitchEngine._tick_inner)))
+        emitted = {
+            kw.value.value
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call) and getattr(call.func, "id", "") == "NoSwitchEvent"
+            for kw in call.keywords
+            if kw.arg == "reason" and isinstance(kw.value, ast.Constant)
+        }
+        assert emitted <= set(_REFUSAL_TEXT) | not_modelled, "an unclassified tick reason"
+        triggers = ("at-limit", "proactive", "consume-first", "dynamic", "disabled-active")
+        returned = {
+            no_peer_refusal(
+                trigger=t, active_headroom=h, oauth_candidates=o, api_key_candidates=a
+            )
+            for t, h, o, a in itertools.product(triggers, (None, 5.0), ([], ["2"]), ([], ["3"]))
+        } | {
+            empty_pass_refusal(
+                trigger=t, any_known=k, active_reset_ts=r, waiting_for_recovery=w,
+                candidate_headrooms=hs,
+            )
+            for t, k, r, w, hs in itertools.product(
+                triggers, (True, False), (None, 1.0), (True, False),
+                ([None], [0.0], [50.0]),
+            )
+        }
+        assert returned - {None} == set(_REFUSAL_TEXT), "a refusal without words, or words for none"
 
     def test_a_pass_that_admits_nobody_says_so(self, temp_home):
         """Best needs a hysteresis margin over the active's headroom, and neither
