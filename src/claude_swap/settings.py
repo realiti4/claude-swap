@@ -51,7 +51,9 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account by at least
     ``hysteresis_pct`` points of headroom measured against those lines, so two
     accounts hovering at the line never ping-pong while a strictly better
-    account is always taken.
+    account is always taken. Under the ``consume-first`` strategy
+    ``hysteresis_pct`` is instead the room a landing needs: that many points
+    left under each of the target's own lines (``lines.line_room``).
     """
 
     threshold: float = 90.0

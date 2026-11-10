@@ -57,7 +57,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.lines import BindingWindow, binding_window, window_line
+from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import decision_logger
 from claude_swap.models import AccountPolicy
@@ -3312,16 +3312,6 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
-        # WHICH WINDOW BLOCKED US. `headroom` is `100 - max(all windows)`:
-        # right for "is this account usable at all", wrong for "which account
-        # best escapes the window that just blocked me". At-limit skips every
-        # proactive gate, so the sort key is the only thing left choosing the
-        # target. Read once here; used only by the at-limit key.
-        escape_label = (
-            oauth.binding_window_label(usage.get(current), self._models)
-            if trigger == "at-limit"
-            else None
-        )
         # One binding window per account under THIS snapshot's lines — the
         # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
         # trigger computed is reused here.
@@ -3439,6 +3429,14 @@ class AutoSwitchEngine:
             and best_candidate_headroom <= SPENT_HEADROOM_PCT
         )
 
+        def most_room(num: str, h: float) -> tuple:
+            # Most raw headroom, the binding window's reset breaking an exact
+            # tie: the all-above key, and a consume-first escape's below its
+            # room bar. Clamped at zero: `pct` is copied through unclamped, so
+            # a spent candidate at 100.5 would lose to one at 100.0 on half a
+            # point this module calls noise.
+            return (-max(h, 0.0), _binding_recovery_ts(usage.get(num), self._models, now))
+
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -3467,10 +3465,8 @@ class AutoSwitchEngine:
                 #
                 # "NOTHING CAN SERVE" IS `best_candidate_headroom`, never
                 # `all_above`: over the THRESHOLD still leaves a peer holding
-                # real quota. The escape key below ranks on the window that
-                # blocked the ACTIVE, and `headroom_on_window` is only safe
-                # there because usability was already decided -- so admitting a
-                # spent candidate while a usable peer exists is what breaks it.
+                # real quota. Admitting a spent candidate while a usable peer
+                # exists would let the escape keys below pick it.
                 #
                 # BOTH RETURNS MUST BE PROVABLE. `_binding_recovery_ts` answers
                 # `inf` for unknown AND for already past, which are opposite
@@ -3506,6 +3502,12 @@ class AutoSwitchEngine:
             # any of them is reached; raw `h` / the single line when it
             # reports no window (a readable headroom rules that out).
             lh = binding.line_headroom if binding is not None else h
+            # Points left before the candidate reaches the nearest of its own
+            # lines, each window in its own points (`lines.line_room`); the
+            # single line against raw `h` when it reports no window.
+            room = self._room(usage.get(num), settings, thresholds[num])
+            if room is None:
+                room = thresholds[num] - (100.0 - h)
             over = (
                 binding.over
                 if binding is not None
@@ -3516,6 +3518,10 @@ class AutoSwitchEngine:
                 if consume_first or weekly_first
                 else None
             )
+            # A forced (proactive) move first prefers targets with the
+            # hysteresis margin of room: one a few points under its line would
+            # need leaving again within the cooldown it is about to start.
+            tight = trigger == "proactive" and room < settings.hysteresis_pct
             if by_recovery_axis and (
                 recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
             ):
@@ -3554,6 +3560,14 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                    # ...and only with room to spend it: at least the hysteresis
+                    # margin under every one of its lines. The move is
+                    # opportunistic, and the cooldown it starts would hold auto on
+                    # a target a few points short of its line while it crosses it
+                    # and runs out (measured: 5h 85% under a 90 line, landed on,
+                    # 92/93/99% held by cooldown, the session limit hit at 100%).
+                    if trigger == "consume-first" and room < settings.hysteresis_pct:
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
@@ -3575,18 +3589,16 @@ class AutoSwitchEngine:
                 # account room again. A spent candidate the guard above
                 # admitted scores 0, not below it: `pct` is copied through
                 # unclamped, so 100.5 would otherwise lose to 100.0 on half a
-                # point this module calls noise, and the reset decides.
+                # point this module calls noise, and the reset decides (see
+                # `most_room`).
                 #
                 # REVERSED UNDER THE AT-LIMIT WAIT (`by_recovery_axis`): every
                 # peer it admits holds a sliver at most, where a headroom edge
                 # is noise and the only question left is who returns first.
                 # Room breaks an exact tie there.
-                room = -max(h, 0.0)
-                reset = _binding_recovery_ts(usage.get(num), self._models, now)
-                key: tuple = (reset, room) if by_recovery_axis else (room, reset)
-            elif (consume_first and trigger != "at-limit") or (
-                weekly_first and trigger == "proactive"
-            ):
+                neg_room, reset = most_room(num, h)
+                key: tuple = (reset, neg_room) if by_recovery_axis else (neg_room, reset)
+            elif consume_first or (weekly_first and trigger == "proactive"):
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
@@ -3597,9 +3609,9 @@ class AutoSwitchEngine:
                 # which sorts after every servable one. So weekly-first lands
                 # on the soonest weekly reset among servable candidates.
                 #
-                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
-                # does not belong: `at-limit` is a stopped session. The
-                # all-above states never reach this arm; they rank on room.
+                # An at-limit or failover escape takes upstream's tier below
+                # over this key (#305). The all-above states never reach this
+                # arm; they rank on room.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -3615,48 +3627,39 @@ class AutoSwitchEngine:
                 # servable-but-unhealthy requires a threshold under 97 and
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
-                key = consume_first_rank_key(
-                    usage.get(num),
-                    thresholds[num],
-                    now,
-                    self._models,
-                    weekly_threshold=settings.weekly_threshold,
-                    scale=settings.threshold,
+                key = (
+                    tight,
+                    *consume_first_rank_key(
+                        usage.get(num),
+                        thresholds[num],
+                        now,
+                        self._models,
+                        weekly_threshold=settings.weekly_threshold,
+                        scale=settings.threshold,
+                    ),
                 )
             else:
-                # Escape ranking, on the axis that actually blocked us. Falls
-                # back to `-lh` when the label is unknown (usage without window
-                # data) or the candidate does not report that window, so an
-                # account we cannot compare on the escape axis is ordered by
-                # the binding number rather than dropped.
-                #
-                # THIS NUMBER ORDERS; IT DOES NOT DECIDE USABILITY. One clear
-                # window says nothing about the rest, so the servability tier
-                # goes first -- without it a peer with fifty points here and
-                # one overall wins, walls on the next request, and the tick
-                # after pays a second swap. A spent candidate never reaches
-                # this arm: the spent guard admits one only under `all_above`,
-                # which ranks above.
-                #
-                # Clamped so a window past 100 does not outrank 100.0 on half a
-                # point this module calls noise.
-                escape_h = (
-                    oauth.headroom_on_window(
-                        usage.get(num), escape_label, self._models
-                    )
-                    if escape_label
-                    else None
-                )
-                # SERVABILITY TIERS IT, because `escape_h` orders and does not
-                # decide usability: the bar it is paired with is `h > 0`, so a
-                # peer with fifty points on the blocked window and ONE on its
-                # weekly outranks one holding forty on both, walls on the next
-                # request, and the tick after pays a second swap to correct it.
-                # `SPENT_HEADROOM_PCT` is the module's own "can this serve".
-                key = (
-                    0 if h > SPENT_HEADROOM_PCT else 1,
-                    -max(escape_h if escape_h is not None else lh, 0.0),
-                )
+                key = (-lh,)
+            if trigger in ("at-limit", "failover") and not all_above:
+                # Escapes skip the landing gate on purpose (any account with
+                # real headroom beats a dead one) but must still prefer a target
+                # that can keep working, and one below its lines first: ranking
+                # by weekly reset alone escaped onto an account at Fable 94% of
+                # a 90 line while one at 1% / 3% was free (#305), and a target
+                # over a line is left again at the next cooldown.
+                if not consume_first:
+                    # best's key is already headroom; a room bar on top would
+                    # let a tenth of a point of room outrank points of headroom.
+                    key = (over, *key)
+                elif not over and room >= settings.hysteresis_pct:
+                    # Room to spare, the hysteresis margin under every line:
+                    # safe to spend the soonest weekly reset first.
+                    key = (0, *key)
+                else:
+                    # Without it the reset order would take 7d 97.9% under a 98 line
+                    # over 44%. Most raw headroom instead, as when nothing is
+                    # under its lines (all_above, above), under-line first.
+                    key = (1, over, *most_room(num, h))
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
@@ -4101,6 +4104,20 @@ class AutoSwitchEngine:
             line,
             settings.weekly_threshold,
             scale=settings.threshold,
+        )
+
+    def _room(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+    ) -> float | None:
+        """Points left before this account's nearest line under the tick's
+        lines (see ``lines.line_room``), or None when it reports no window.
+        Same inputs as ``_binding``."""
+        return line_room(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ),
+            line,
+            settings.weekly_threshold,
         )
 
     def _in_cooldown(self, state: dict) -> bool:
