@@ -88,6 +88,22 @@ def access_token_fingerprint(credentials: str) -> str | None:
     return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
 
 
+def _refresh_token_expires_at_ms(credentials: str) -> float | None:
+    """Raw ``refreshTokenExpiresAt`` (epoch milliseconds), or ``None`` when
+    absent/unreadable. Shared parse behind :func:`login_expires_at_iso` and
+    :func:`login_expires_at_epoch` so there is one reader of the field."""
+    data = extract_oauth_data(credentials)
+    value = data.get("refreshTokenExpiresAt") if data else None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        return None
+    return float(value)
+
+
 def login_expires_at_iso(credentials: str) -> str | None:
     """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
 
@@ -99,15 +115,78 @@ def login_expires_at_iso(credentials: str) -> str | None:
     is the date worth showing *before* that happens. Logins issued before Claude
     Code recorded the field carry nothing, which means "unknown", never "now".
     """
-    data = extract_oauth_data(credentials)
-    value = data.get("refreshTokenExpiresAt") if data else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    value = _refresh_token_expires_at_ms(credentials)
+    if value is None:
         return None
     return (
         datetime.fromtimestamp(value / 1000, tz=timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def login_expires_at_epoch(credentials: str) -> float | None:
+    """Epoch-seconds twin of :func:`login_expires_at_iso`: what
+    ``AccountSnapshot.login_expires_at`` and :func:`format_login_expiry` want,
+    without an ISO round-trip."""
+    value = _refresh_token_expires_at_ms(credentials)
+    return value / 1000 if value is not None else None
+
+
+# How far ahead a stored login's expiry is worth showing. Claude Code's own
+# notice fires inside the last three days; a week leaves time to plan the
+# re-logins of several accounts without every view nagging for a month.
+LOGIN_DUE_WITHIN_S = 7 * 86400
+
+
+def login_time_left(
+    expires_at: float | None, quarantined: bool, now: float | None = None
+) -> float | None:
+    """Seconds until a stored login must be redone, when that is worth saying.
+
+    ``None`` means "nothing to say": the stamp is unknown (logins older than
+    the field, API-key slots), the expiry is further out than
+    ``LOGIN_DUE_WITHIN_S``, or the slot is quarantined, whose usage sentinel
+    already reads "re-login needed". Otherwise the seconds left, ``0.0`` once
+    the stamp is past.
+    """
+    if quarantined or expires_at is None:
+        return None
+    now = now if now is not None else datetime.now(timezone.utc).timestamp()
+    remaining = expires_at - now
+    if remaining > LOGIN_DUE_WITHIN_S:
+        return None
+    return max(0.0, remaining)
+
+
+def format_login_expiry(
+    expires_at: float | None,
+    quarantined: bool,
+    now: float | None = None,
+    short: bool = False,
+) -> str | None:
+    """``"re-login in 5d 12h"`` while a stored login is due (see
+    :func:`login_time_left`), ``"re-login needed"`` once its stamp is past,
+    ``None`` when there is nothing to say. The countdown is the reset
+    counters' (:func:`format_countdown`); ``short`` keeps its first unit
+    (``"re-login in 5d"``) for rows with little room.
+    """
+    left = login_time_left(expires_at, quarantined, now)
+    if left is None:
+        return None
+    if left <= 0:
+        return "re-login needed"
+    countdown = format_countdown(left)
+    return f"re-login in {countdown.split(' ')[0] if short else countdown}"
+
+
+def login_expiry_clock(expires_at: float, now: float | None = None) -> str:
+    """The stamp as the local clock string the reset columns use."""
+    now_utc = (
+        datetime.fromtimestamp(now, tz=timezone.utc) if now is not None
+        else datetime.now(timezone.utc)
+    )
+    return reset_clock_string(datetime.fromtimestamp(expires_at, tz=timezone.utc), now_utc)
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
@@ -366,20 +445,20 @@ def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
     now = datetime.now(timezone.utc)
-    remaining = reset_utc - now
-    total_seconds = max(0, int(remaining.total_seconds()))
-    days, remainder = divmod(total_seconds, 86400)
+    return format_countdown((reset_utc - now).total_seconds()), reset_clock_string(reset_utc, now)
+
+
+def format_countdown(seconds: float) -> str:
+    """``"5d 12h"`` / ``"1h 59m"`` / ``"45m"``: the grammar of every countdown shown."""
+    total = max(0, int(seconds))
+    days, remainder = divmod(total, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
-
     if days > 0:
-        countdown = f"{days}d {hours}h"
-    elif hours > 0:
-        countdown = f"{hours}h {minutes}m"
-    else:
-        countdown = f"{minutes}m"
-
-    return countdown, reset_clock_string(reset_utc, now)
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def reset_clock_string(reset_utc: datetime, now_utc: datetime) -> str:
@@ -692,7 +771,8 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
+    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``,
+    ``"oauth_not_allowed_for_organization"`` (a 403 whose body says so), or the
     exception type name as a fallback). ``retry_after_s`` is the parsed
     ``Retry-After`` header when the server sent one (seconds form only — the
     HTTP-date form is rare enough to ignore).
@@ -705,6 +785,16 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
                 retry_after = max(0.0, float(raw.strip()))
             except ValueError:
                 pass
+        if e.code == 403:
+            # The org-policy 403 (a lapsed plan) names its cause only in the
+            # body, so it is the one status whose body is read. This runs
+            # inside `except` handlers: it must never raise.
+            try:
+                code = json.loads(e.read(4096))["error"]["details"]["error_code"]
+            except Exception:
+                code = None
+            if code == "oauth_not_allowed_for_organization":
+                return code, retry_after
         return f"http-{e.code}", retry_after
     if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
         return "timeout", None
