@@ -1356,8 +1356,10 @@ class TestConsumeFirstRanksOnEachAccountsOwnLine:
         self, temp_home
     ):
         """2 sits at 92% on a 95 line: under it, so its sooner weekly reset
-        wins. On the global 90 it read as over and fell behind 3."""
-        h = _fleet(temp_home, strategy="consume-first")
+        wins. On the global 90 it read as over and fell behind 3. The room bar
+        (#504) is set to 2 points so 2's 3 clear it: that bar is not what this
+        test asks."""
+        h = _fleet(temp_home, strategy="consume-first", hysteresis_pct=2.0)
         h.switcher.set_account_threshold("2", 95.0)
         h.engine = h._make_engine()
         outcome = h.tick_with_usage({
