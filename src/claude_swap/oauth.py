@@ -802,14 +802,13 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
-        # A TLS handshake the SERVER answered and we refused is not a
-        # transport failure, and calling it one sends you to DNS while the
-        # repair is a CA bundle. Measured: a TLS-terminating proxy
-        # presented a CA urllib does not trust, every poll raised
-        # URLError(SSLCertVerificationError), all of it stored as "network",
-        # and one account sat unpolled for ten days with that one word as the
-        # whole record. The remedy is platform-dependent and lives in
-        # ERROR_NOTES["tls-cert"], where the operator actually reads it.
+        # A certificate the client refused (an untrusted chain, a name that
+        # does not match, an expired one) is not an unreachable host: the
+        # repair is trust or the clock, so it gets its own kind. Measured on
+        # macOS against a local server, with truststore 0.10.4 and with stdlib
+        # ssl: all three raise this class, SSL_CERT_FILE adds a CA on both
+        # paths, and NODE_EXTRA_CA_CERTS, which Claude Code 2.1.322 honours,
+        # does not. Other TLS failures (a plaintext port) stay "network".
         if isinstance(e.reason, ssl.SSLCertVerificationError):
             return "tls-cert", None
         return "network", None

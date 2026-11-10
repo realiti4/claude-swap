@@ -253,18 +253,6 @@ _DEMOTING_STASH_REASONS = (
 )
 
 ERROR_NOTES = {
-    "tls-cert": (
-        "the TLS certificate check refused this connection: an untrusted "
-        "chain (a proxy re-signing traffic with a CA this machine lacks, or "
-        "an expired duplicate root shadowing a valid one), fixed in the OS "
-        "store on macOS/Windows or via SSL_CERT_FILE on Linux "
-        "(REQUESTS_CA_BUNDLE and NODE_EXTRA_CA_CERTS are not read on this "
-        "path); a certificate issued for a different host (a captive portal, "
-        "or a proxy that does not re-sign per host), fixed by signing in to "
-        "the portal or fixing the proxy; a clock far enough off that the "
-        "certificate reads as not yet valid or expired, fixed by correcting "
-        "the clock"
-    ),
     "store-unmirrored": (
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
         "normal shell"
@@ -283,6 +271,12 @@ ERROR_NOTES = {
         "this account's organization does not allow OAuth sign-in (a lapsed "
         "plan or an org policy), so its usage cannot be read — renewing the "
         "plan restores it"
+    ),
+    "tls-cert": (
+        "the TLS certificate was refused — if a proxy re-signs traffic, "
+        "trust its CA in the OS certificate store or via SSL_CERT_FILE "
+        "(NODE_EXTRA_CA_CERTS is not read); otherwise check for a captive "
+        "portal or a wrong system clock"
     ),
     "setup-token": (
         "setup-tokens cannot read the usage endpoint — "
