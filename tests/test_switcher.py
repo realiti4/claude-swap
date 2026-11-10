@@ -7832,6 +7832,46 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("2", "account2@example.com")] == live
 
+    def _rescue_newer_live(self, switcher, live_exp, **write):
+        """Run the rescue on a strictly newer live pair against an older
+        stored one, with the backup write patched by ``write``."""
+        stored = self._oauth("sk-2-old", "rt-2-old", 1_000)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-new", "refreshToken": "rt-2-new",
+            "expiresAt": live_exp,
+        }})
+        data = {"accounts": {"2": {"email": "account2@example.com"}}}
+        with patch.object(
+            switcher, "_read_account_credentials_ex",
+            return_value=(stored, False),
+        ), patch.object(switcher, "_write_account_credentials", **write):
+            return switcher._rescue_foreign_successor("2", data, live)
+
+    def test_the_rescue_does_not_absorb_the_suites_real_store_guard(
+        self, temp_home,
+    ):
+        """A write-time refusal is not a fault the rescue may contain:
+        `except Exception` turned `RealStoreWriteBlocked` (deliberately not an
+        `OSError`) into a quiet False."""
+        from tests import conftest
+
+        with pytest.raises(conftest.RealStoreWriteBlocked):
+            self._rescue_newer_live(
+                ClaudeAccountSwitcher(), 2_000,
+                side_effect=conftest.RealStoreWriteBlocked("refused"),
+            )
+
+    @pytest.mark.parametrize(
+        "live_exp", ["2026-11-10T00:00:00Z", [2_000], 10**400],
+    )
+    def test_the_rescue_keeps_an_unreadable_live_expiry_contained(
+        self, temp_home, live_exp,
+    ):
+        """An expiry `float()` cannot read (ValueError, TypeError,
+        OverflowError) leaves the backup as it was; it must not abort the
+        switch that called the rescue."""
+        assert self._rescue_newer_live(ClaudeAccountSwitcher(), live_exp) is False
+
     def test_alien_credential_preserved_and_skipped(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
