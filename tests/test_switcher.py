@@ -40,7 +40,6 @@ from claude_swap.switcher import (
     _format_usage_lines,
     _usage_entry_lines,
 )
-from tests.conftest import RealStoreWriteBlocked
 
 
 def _raise_locked(*args, **kwargs):
@@ -7833,52 +7832,6 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("2", "account2@example.com")] == live
 
-    def _rescue_newer_live(self, switcher, live_exp, **write):
-        """Run the rescue on a strictly newer live pair against an older
-        stored one, with the backup write patched by ``write``."""
-        stored = self._oauth("sk-2-old", "rt-2-old", 1_000)
-        live = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-2-new", "refreshToken": "rt-2-new",
-            "expiresAt": live_exp,
-        }})
-        data = {"accounts": {"2": {"email": "account2@example.com"}}}
-        with patch.object(
-            switcher, "_read_account_credentials_ex",
-            return_value=(stored, False),
-        ), patch.object(switcher, "_write_account_credentials", **write):
-            return switcher._rescue_foreign_successor("2", data, live)
-
-    @pytest.mark.parametrize(
-        "refusal", [RealStoreWriteBlocked, ValueError, TypeError],
-    )
-    def test_the_rescue_contains_only_store_and_lock_faults_on_its_write(
-        self, temp_home, refusal,
-    ):
-        """A write-time refusal is not a fault the rescue may contain:
-        `except Exception` turned `RealStoreWriteBlocked` (deliberately not an
-        `OSError`) into a quiet False, and the expiry guard's ValueError and
-        TypeError arms must not reach the write either."""
-        with pytest.raises(refusal):
-            self._rescue_newer_live(
-                ClaudeAccountSwitcher(), 2_000, side_effect=refusal("refused"),
-            )
-
-    def test_the_rescue_contains_a_failed_backup_write(self, temp_home):
-        assert self._rescue_newer_live(
-            ClaudeAccountSwitcher(), 2_000, side_effect=OSError("disk full"),
-        ) is False
-
-    @pytest.mark.parametrize(
-        "live_exp", ["2026-11-10T00:00:00Z", [2_000], 10**400],
-    )
-    def test_the_rescue_keeps_an_unreadable_live_expiry_contained(
-        self, temp_home, live_exp,
-    ):
-        """An expiry `float()` cannot read (ValueError, TypeError,
-        OverflowError) leaves the backup as it was; it must not abort the
-        switch that called the rescue."""
-        assert self._rescue_newer_live(ClaudeAccountSwitcher(), live_exp) is False
-
     def test_alien_credential_preserved_and_skipped(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
@@ -12706,6 +12659,64 @@ class TestGateUltraReviewFixes:
         with patch.object(type(s), "_post_backup_write", blocked):
             with pytest.raises(conftest.RealStoreWriteBlocked):
                 s._write_account_credentials("1", "test@example.com", self._NEW)
+
+    @staticmethod
+    def _rescue(live_exp, stored_exp=1_000, **write):
+        """Run the foreign-successor rescue on a live token pair against a
+        stored one, with the backup write patched by ``write``. Returns the
+        verdict and the write mock."""
+        def pair(exp):
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": "sk", "refreshToken": "rt", "expiresAt": exp,
+            }})
+
+        s = ClaudeAccountSwitcher()
+        data = {"accounts": {"2": {"email": "account2@example.com"}}}
+        with patch.object(
+            s, "_read_account_credentials_ex",
+            return_value=(pair(stored_exp), False),
+        ), patch.object(s, "_write_account_credentials", **write) as wrote:
+            return s._rescue_foreign_successor("2", data, pair(live_exp)), wrote
+
+    def test_the_rescue_writes_a_strictly_newer_live_credential(self, temp_home):
+        verdict, wrote = self._rescue(2_000)
+        assert verdict is True
+        wrote.assert_called_once()
+
+    @pytest.mark.parametrize("refusal", ["blocked", ValueError, TypeError])
+    def test_the_rescue_does_not_absorb_a_refused_backup_write(
+        self, temp_home, refusal
+    ):
+        """`RealStoreWriteBlocked` is deliberately not an `OSError`, so the
+        rescue's containment must not be `except Exception`; a ValueError or
+        TypeError raised by the write is a refusal too."""
+        from tests import conftest
+
+        if refusal == "blocked":
+            refusal = conftest.RealStoreWriteBlocked
+        with pytest.raises(refusal):
+            self._rescue(2_000, side_effect=refusal("refused"))
+
+    @pytest.mark.parametrize("fault", [OSError("disk full"), LockError("busy")])
+    def test_the_rescue_contains_a_store_or_lock_fault_on_its_write(
+        self, temp_home, fault
+    ):
+        verdict, _ = self._rescue(2_000, side_effect=fault)
+        assert verdict is False
+
+    @pytest.mark.parametrize(
+        "live_exp, stored_exp",
+        [
+            ("2026-11-10T00:00:00Z", 1_000), ([2_000], 1_000), (True, 1_000),
+            (10**400, 1_000), (2_000, 10**400), (2_000, "soon"),
+        ],
+    )
+    def test_the_rescue_leaves_the_backup_when_an_expiry_cannot_be_compared(
+        self, temp_home, live_exp, stored_exp
+    ):
+        verdict, wrote = self._rescue(live_exp, stored_exp)
+        assert verdict is False
+        wrote.assert_not_called()
 
     @pytest.mark.parametrize("row_a_readable", [True, False])
     def test_an_unreadable_non_matching_row_does_not_abort_the_scan(

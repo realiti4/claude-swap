@@ -7352,15 +7352,9 @@ class ClaudeAccountSwitcher:
         partial leaves the backup as it was, and so does a stored login with
         no expiry to compare (a setup token). The caller has already written
         the safety copy, so this never removes the only copy of anything.
-        Called inside the switch's locks. A backup that cannot be read or an
-        expiry that cannot be compared leaves the backup alone; the write
-        contains store I/O and lock faults only, so a refusal from it
-        propagates.
+        Called inside the switch's locks. Store and lock faults return
+        False; a refusal from the write propagates.
         """
-        failed = (
-            "Could not advance account %s's backup to its newer live "
-            "credential; the safety copy keeps it."
-        )
         try:
             live = oauth.extract_oauth_data(original_creds) or {}
             if not (live.get("accessToken") and live.get("refreshToken")):
@@ -7382,23 +7376,31 @@ class ClaudeAccountSwitcher:
                 # generation, so it stays. A backup holding no login at all
                 # has nothing to lose and is still advanced below.
                 return False
+            if not all(
+                isinstance(e, (int, float)) and not isinstance(e, bool)
+                and abs(e) <= sys.float_info.max
+                for e in (live.get("expiresAt") or 0, stored_exp or 0)
+            ):
+                # An expiry float() cannot read (text, a list, a bool, a
+                # number past float range) is no ordering to write on.
+                return False
             if float(live.get("expiresAt") or 0) <= float(stored_exp or 0):
                 return False
-        except (OSError, LockError, ValueError, TypeError, OverflowError):
-            self._logger.warning(failed, foreign_slot, exc_info=True)
-            return False
-        try:
             self._write_account_credentials(foreign_slot, email, original_creds)
+            self._logger.info(
+                "Resynced account %s's backup to its newer live credential "
+                "(found under another account's config label; the safety "
+                "copy is kept).",
+                foreign_slot,
+            )
+            return True
         except (OSError, LockError):
-            self._logger.warning(failed, foreign_slot, exc_info=True)
+            self._logger.warning(
+                "Could not advance account %s's backup to its newer live "
+                "credential; the safety copy keeps it.",
+                foreign_slot, exc_info=True,
+            )
             return False
-        self._logger.info(
-            "Resynced account %s's backup to its newer live credential "
-            "(found under another account's config label; the safety "
-            "copy is kept).",
-            foreign_slot,
-        )
-        return True
 
     def _read_target_credentials(self, account_num: str, email: str) -> str:
         """The switch target's stored credential, or a SwitchError naming why.
