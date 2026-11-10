@@ -7760,6 +7760,78 @@ class TestProvenanceGuard:
             for w in op["warnings"]
         )
 
+    @pytest.mark.parametrize(
+        "stored_login, why",
+        [
+            ({"accessToken": "sk-ant-oat01-setup",
+              "scopes": ["user:inference"]}, "setup token"),
+            ({"accessToken": "sk-2-stored", "refreshToken": "rt-2-stored"},
+             "token pair without an expiry"),
+            ({"accessToken": "sk-2-stored", "refreshToken": "rt-2-stored",
+              "expiresAt": "soon"}, "unreadable expiry"),
+        ],
+    )
+    def test_stored_login_without_a_comparable_expiry_is_never_replaced(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+        stored_login, why,
+    ):
+        """Newer can only be shown against a stored expiry. A setup token has
+        none, and `add-token` by email saves one into a slot that keeps its
+        uuid, so the rescue must not trade it for a rotating login."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        stored = json.dumps({"claudeAiOauth": stored_login})
+        creds_store[("2", "account2@example.com")] = stored
+        live = self._oauth("sk-2-live", "rt-2-live", 2_000)
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("2", "account2@example.com")] == stored, why
+        (entry_id,) = switcher.list_unclaimed_credentials()
+        assert _read_safety_copy(switcher, entry_id) == live
+        assert any(
+            "ownership mismatch" in w and "cswap add --slot 2" in w
+            for w in op["warnings"]
+        )
+
+    def test_backup_holding_no_login_is_still_advanced(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The other side of that rule: a backup with no login in it (the
+        MCP-only blob #383's overwrite leaves behind) has nothing to lose."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        creds_store[("2", "account2@example.com")] = json.dumps({
+            "mcpOAuth": {"some-server|abc123": {"serverName": "some-server"}},
+        })
+        live = self._oauth("sk-2-live", "rt-2-live", 2_000)
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("2", "account2@example.com")] == live
+
     def test_alien_credential_preserved_and_skipped(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):

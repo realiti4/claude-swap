@@ -7292,7 +7292,8 @@ class ClaudeAccountSwitcher:
         named another slot, so no collect pass could attribute it.
 
         Strictly newer and a full token pair only; equal, older, unreadable or
-        partial leaves the backup as it was. The caller has already written
+        partial leaves the backup as it was, and so does a stored login with
+        no expiry to compare (a setup token). The caller has already written
         the safety copy, so this never removes the only copy of anything.
         Called inside the switch's locks. Never raises.
         """
@@ -7307,9 +7308,17 @@ class ClaudeAccountSwitcher:
             if unreadable:
                 return False
             stored = oauth.extract_oauth_data(backup) or {}
-            if float(live.get("expiresAt") or 0) <= float(
-                stored.get("expiresAt") or 0
+            stored_exp = stored.get("expiresAt")
+            if (stored.get("accessToken") or stored.get("refreshToken")) and (
+                isinstance(stored_exp, bool)
+                or not isinstance(stored_exp, (int, float))
             ):
+                # A stored login with no expiry to compare against (a setup
+                # token carries none) cannot be shown to be the older
+                # generation, so it stays. A backup holding no login at all
+                # has nothing to lose and is still advanced below.
+                return False
+            if float(live.get("expiresAt") or 0) <= float(stored_exp or 0):
                 return False
             self._write_account_credentials(foreign_slot, email, original_creds)
             self._logger.info(
