@@ -46,7 +46,13 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
+    "ruff>=0.7",
+    "mypy>=1.11",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -65,3 +71,35 @@ markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
     "no_oauth_profile_fake: opt out of the autouse fetch_oauth_profile stub (test exercises fetch_oauth_profile itself against a mocked urlopen)",
 ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Fork-owned files only (see .github/workflows/ci.yml, lint job). Upstream's
+# files keep upstream's formatting so syncing with realiti4/claude-swap stays
+# a small merge instead of a whole-codebase formatting conflict.
+include = [
+    "src/claude_swap/hooks.py",
+    "src/claude_swap/inbox.py",
+    "src/claude_swap/notifications.py",
+    "src/claude_swap/resume.py",
+    "src/claude_swap/resume_cli.py",
+    "src/claude_swap/transcript.py",
+    "tests/test_autoswitch_limit_stop.py",
+    "tests/test_hooks.py",
+    "tests/test_inbox.py",
+    "tests/test_notifications.py",
+    "tests/test_resume.py",
+    "tests/test_resume_cli.py",
+    "tests/test_transcript.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_unused_ignores = true
+warn_redundant_casts = true

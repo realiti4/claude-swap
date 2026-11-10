@@ -5,6 +5,35 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
+> **This is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap)**,
+> kept in sync with upstream, with these additions:
+> - **Auto-continue** (`cswap resume`): sessions a usage limit stopped carry
+>   on by themselves as soon as an account switch lands or the limit resets
+> - **Pre-warming**: start idle accounts' 5-hour windows early, including the
+>   active account (`autoswitch.preWarmReserves` / `autoswitch.preWarmActive`)
+> - **Desktop notifications** on account switches and when every account is
+>   exhausted (`cswap auto --notify/--no-notify`)
+> - **Max-drain preset** (`cswap config apply-preset max-drain`) and
+>   `cswap add --count N` to register several accounts in a row
+> - **Windows autostart** for `cswap auto` and setup guides in [`docs/`](./docs/)
+>
+> Internals of the fork's features: [docs/HOW-IT-WORKS.md](./docs/HOW-IT-WORKS.md).
+
+## Quick start (Windows)
+
+```powershell
+pip install pipx
+pipx install claude-swap   # or: pip install -e .  from this repo
+cswap add                  # register account 1 (opens browser)
+cswap add                  # register account 2
+cswap config apply-preset max-drain
+cswap auto                 # start the loop — notifications on by default
+```
+
+Full guide: [docs/SETUP.md](./docs/SETUP.md) | Windows-specific: [docs/WINDOWS.md](./docs/WINDOWS.md) | Auto-continue: [docs/AUTO-CONTINUE.md](./docs/AUTO-CONTINUE.md) | Internals (how it all works): [docs/HOW-IT-WORKS.md](./docs/HOW-IT-WORKS.md)
+
+---
+
 ## Installation
 
 ### Using uv (recommended)
@@ -26,6 +55,14 @@ git clone https://github.com/realiti4/claude-swap.git
 cd claude-swap
 uv sync
 uv run cswap help
+```
+
+### From this fork (latest changes)
+
+```bash
+git clone https://github.com/dabirideji/claude-swap
+cd claude-swap
+pip install -e .
 ```
 
 ### Updating
@@ -140,6 +177,48 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 The exact rules (margins, landing, polling cadence, tier handling) are in [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md).
 
+<details>
+<summary>Pre-warming: start 5-hour windows early</summary>
+
+A 5-hour window only starts on your first real message, and you can't get
+the quota back until it resets. Pinging an idle account early (one 1-token
+request to the cheapest model) starts its clock while you're not using it,
+so its reset lands sooner once you finally need it.
+
+```bash
+cswap config set autoswitch.preWarmReserves true   # every idle reserve account
+cswap config set autoswitch.preWarmActive true     # the active account too
+```
+
+`cswap auto` pings an account only when it has no window running, at most
+once per window, and backs off when a ping fails. The active account's ping
+uses the live login strictly read-only: it never refreshes it (`cswap auto`'s
+usage polling keeps that token fresh under Claude Code's own lock protocol)
+and skips the ping if the token has expired.
+
+</details>
+
+### Auto-continue after usage limits
+
+When a usage limit stops a Claude Code session mid-task, claude-swap can carry
+it on by itself the moment there's capacity again. That's usually seconds
+after `cswap auto` switches accounts, or right after the limit resets. No more
+typing "carry on" in every session:
+
+```bash
+cswap resume install     # adds a StopFailure hook to Claude Code (snapshotted first)
+cswap resume status      # what's waiting, continued, or stopped
+cswap resume now --all   # continue every waiting session right away
+```
+
+To check that it works, type `run cswap resume test, then stop` in any Claude
+Code chat. About 10 seconds after Claude's reply, the chat gets a TEST
+message and answers it by itself.
+
+Needs Claude Code 2.1.234+ on Windows (2.1.224+ elsewhere). Tested on Windows
+with Claude Code 2.1.314; the terminal UI and macOS/Linux are not tested yet.
+How it works, settings and caveats: [docs/AUTO-CONTINUE.md](./docs/AUTO-CONTINUE.md).
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
@@ -208,12 +287,14 @@ If the refresh token itself has died (auto-switch quarantines and reports such a
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap resume install            # Auto-continue sessions a usage limit stopped (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
+cswap add --count 3             # Add 3 accounts in a row, pausing between each
 cswap remove 2                  # Remove an account
 cswap disable 2                 # Hold an account out of auto-rotation (keeps its login)
 cswap enable 2                  # Return a disabled account to rotation
@@ -313,6 +394,7 @@ cswap config set run.shareHistory false   # each account keeps its own chat hist
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config unset autoswitch.threshold   # back to the default
+cswap config apply-preset max-drain       # squeeze 99.9% out of each account, in one shot
 cswap config path                         # where settings.json lives
 ```
 

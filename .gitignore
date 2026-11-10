@@ -15,5 +15,26 @@ wheels/
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
 
+# >>> MASTER AI (managed by: masterai git) >>>
+# Keeps MASTER AI toolkit files out of git so it isn't obvious this project uses it.
+# Re-include with: masterai git show   |   inspect: masterai git status
+.claude/
+CLAUDE.md
+AGENTS.md
+MASTERAI.md
+.masterai
+__masterai/
+.masterai-applied.json
+.masterai-live/
+.masterai-coordinate/
+masterai/
+.mcp.json
+context/
+CLAUDE.local.md
+.playwright-mcp/
+.serena/
+.taskmaster/
+# <<< MASTER AI (managed by: masterai git) <<<
+
 # cswap export files: they hold account logins in plain text
 *.cswap

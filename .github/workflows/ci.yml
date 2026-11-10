@@ -7,6 +7,31 @@ on:
     branches: [main]
 
 jobs:
+  # Fork addition. Lints and type-checks only the files this fork owns
+  # (pyproject [tool.ruff] include); upstream's code keeps upstream's style.
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: mypy (fork-owned modules)
+        run: uv run mypy src/claude_swap/hooks.py src/claude_swap/inbox.py src/claude_swap/notifications.py src/claude_swap/resume.py src/claude_swap/resume_cli.py src/claude_swap/transcript.py
+
   test:
     runs-on: ubuntu-latest
 

@@ -1895,6 +1895,21 @@ class ClaudeAccountSwitcher:
                 plans[str(num)] = record
         return plans
 
+    def lapsed_subscription_numbers(self) -> set[str]:
+        """Slots whose stored plan shows a lapsed subscription
+        (``subscription.is_expired``). Store-only: no credential, no network."""
+        data = self._get_sequence_data() or {}
+        records = self._subscription_store().load()
+        lapsed: set[str] = set()
+        for num, info in data.get("accounts", {}).items():
+            if not isinstance(info, dict):
+                continue
+            key = subscription.identity_key(info.get("email", ""), info.get("organizationUuid"))
+            record = records.get(key)
+            if subscription.valid_record(record) and subscription.is_expired(record["plan"]):
+                lapsed.add(str(num))
+        return lapsed
+
     def _plans_for_pass(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -2390,6 +2405,29 @@ class ClaudeAccountSwitcher:
     def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
+
+    def read_live_credentials(self) -> str:
+        """The live login's credential (the store Claude Code reads), or "".
+
+        Read-only use only: this credential is owned by Claude Code, so callers
+        must never refresh-and-persist it through the backup path.
+        """
+        return self._read_credentials() or ""
+
+    def cached_usage_entry(self, account_num: str) -> UsageEntry | None:
+        """One slot's stored usage entry — a pure file read: no fetch, no
+        credential access, no process scan. ``None`` for an unknown slot."""
+        data = self._get_sequence_data() or {}
+        info = data.get("accounts", {}).get(str(account_num))
+        if not info:
+            return None
+        identity = (info.get("email", ""), info.get("organizationUuid", "") or "")
+        return self._usage_store.entries({str(account_num): identity}).get(str(account_num))
+
+    def account_number_for_identity(self, email: str, organization_uuid: str) -> str | None:
+        """Managed slot for an (email, organizationUuid) identity, if any."""
+        data = self._get_sequence_data() or {}
+        return self._find_account_slot(data, email, organization_uuid or "")
 
     def persist_backup_credentials(
         self, account_num: str, email: str, credentials: str

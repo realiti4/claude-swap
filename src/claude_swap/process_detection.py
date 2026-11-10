@@ -45,6 +45,11 @@ class ClaudeSession:
     kind: str  # "interactive", "bg", "daemon", "daemon-worker"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
     status: str | None = None  # "busy", "idle", "waiting"
+    # Cross-session messaging inbox (Unix socket / Windows named pipe), present
+    # only when the session bound one. May carry a "uds:" prefix.
+    messaging_socket_path: str | None = None
+    name: str | None = None  # the session's display name (/rename or derived)
+    proc_start: str | None = None  # process start stamp, pairs the session with its key file
 
 
 @dataclass
@@ -292,6 +297,11 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
                 kind=data.get("kind", ""),
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
+                messaging_socket_path=data.get("messagingSocketPath") or None,
+                name=data.get("name") or None,
+                proc_start=(
+                    str(data["procStart"]) if data.get("procStart") is not None else None
+                ),
             ))
         except (
             json.JSONDecodeError,   # malformed JSON
