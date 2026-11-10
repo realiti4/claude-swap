@@ -3094,17 +3094,25 @@ def _harness_and_panel_snapshot(temp_home, settings, fleet):
 
     h = EngineHarness(temp_home, **settings)
     h.clock.now = time.time()
-    for number in fleet:
+    for number, usage in fleet.items():
         h.seed(int(number), f"u{number}@x.invalid")
+        if usage == USAGE_API_KEY:
+            data = h.switcher._get_sequence_data()
+            data["accounts"][number]["kind"] = "api_key"
+            h.switcher._write_json(h.switcher.sequence_file, data)
     h.make_live("u1@x.invalid", 1)
     snap = AccountsSnapshot(
         active_number="1",
         accounts=tuple(
-            make_account(n, active=n == "1", entry=(
-                make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(
-                    last_good=usage, fetched_at=time.time() - 5.0, age_s=5.0,
-                )
-            ))
+            make_account(
+                n, active=n == "1",
+                kind="api_key" if usage == USAGE_API_KEY else "oauth",
+                entry=(
+                    make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(
+                        last_good=usage, fetched_at=time.time() - 5.0, age_s=5.0,
+                    )
+                ),
+            )
             for n, usage in fleet.items()
         ),
         taken_at=0.0,
@@ -3135,10 +3143,13 @@ class TestNextBestFollowsTheTick:
             ("consume-first", {"1": (100, 100), "2": (85, 10), "3": (10, 50)}, "3"),
             # Below the line: consume-first's room bar bars 2 outright.
             ("consume-first", {"1": (40, 100), "2": (85, 10), "3": (10, 50)}, "3"),
+            # No OAuth peer can serve (3 is spent): the metered key is the last resort.
+            ("best", {"1": (95, 100), "2": USAGE_API_KEY, "3": (100, 50)}, "2"),
         ],
         ids=[
             "consume-first-proactive", "weekly-first-proactive", "best-proactive",
             "consume-first-at-limit", "consume-first-below-the-line",
+            "api-key-last-resort",
         ],
     )
     def test_the_first_row_is_the_account_the_tick_switches_to(
@@ -3146,8 +3157,10 @@ class TestNextBestFollowsTheTick:
     ):
         from claude_swap.autoswitch import TickOutcome
 
-        fleet = {n: _window(*w) for n, w in fleet.items()}
-        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
+        fleet = {n: w if isinstance(w, str) else _window(*w) for n, w in fleet.items()}
+        h, snap = _harness_and_panel_snapshot(
+            temp_home, {"strategy": strategy, "include_api_key_accounts": True}, fleet
+        )
         assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
         picked = str(h.active_number())
         assert picked == designed, "the case no longer builds the pick it is named for"

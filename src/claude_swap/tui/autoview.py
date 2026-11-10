@@ -142,16 +142,17 @@ def _engine_order(
     if trigger in _UNMODELED_TEXT:
         return [], models, trigger
 
+    peers = [
+        a for a in snap.accounts
+        if a.number != active_number and a.switchable and not a.disabled
+    ]
+
     def rank(axis: tuple[str, ...]) -> list[str]:
         h = _headroom_by_account(usage, axis)
         return rank_candidates_pass(
             models=axis, trigger=trigger,
             consume_first=settings.strategy in CONSUME_FIRST_STRATEGIES,
-            oauth_candidates=[
-                a.number for a in snap.accounts
-                if a.number != active_number and a.switchable and not a.disabled
-                and a.kind != "api_key"
-            ],
+            oauth_candidates=[a.number for a in peers if a.kind != "api_key"],
             no_return=None, usage=usage, headroom=h, current=active_number,
             active_headroom=h.get(active_number), settings=settings, now=now,
             thresholds=bars,
@@ -161,6 +162,13 @@ def _engine_order(
     if not ordered and models and settings.strategy == "dynamic":
         if retry := rank(()):
             return retry, (), trigger
+    if (
+        not ordered
+        and settings.include_api_key_accounts
+        and trigger not in CONSUME_FIRST_STRATEGIES
+    ):
+        # The tick's last resort when it must move: a metered API-key slot.
+        ordered = [a.number for a in peers if a.kind == "api_key"]
     return ordered, models, trigger
 
 
