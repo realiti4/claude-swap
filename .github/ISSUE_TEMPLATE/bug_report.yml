@@ -15,7 +15,7 @@ body:
     attributes:
       label: cswap version and install method
       description: Output of `cswap --version`, and whether you installed with uv, pipx, or from source.
-      placeholder: cswap 0.20.0, installed with uv
+      placeholder: cswap 1.0.0, installed with uv
     validations:
       required: true
   - type: dropdown
@@ -39,6 +39,12 @@ body:
         - CLI (terminal)
         - VS Code extension
         - Desktop app
+  - type: input
+    id: claude-code-version
+    attributes:
+      label: Claude Code version
+      description: Output of `claude --version`, if you know it. cswap depends on how Claude Code stores its login, which changes between versions.
+      placeholder: 2.1.319
   - type: textarea
     id: logs
     attributes:
