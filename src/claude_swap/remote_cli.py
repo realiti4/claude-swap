@@ -29,7 +29,7 @@ Commands:
   add-token NAME [TOKEN|-]  put a setup-token in the repository only
   set-token NAME ENTRY [TOKEN|-]  replace an account's token (repository, and here if it's here)
   rm-entry NAME ENTRY     delete an account from the repository
-  skip NAME ENTRY         don't pull this account on this machine (--undo)
+  skip NAME ENTRY         exclude an account from bulk pulls on this machine (--undo)
   passwd NAME             change the repository's passphrase
   forget NAME             stop remembering the passphrase on this machine
   set NAME ...            change the URL, branch or git login
@@ -240,7 +240,7 @@ def remote_command(argv: list[str]) -> None:
     p.add_argument("entry", metavar="ENTRY")
     p.add_argument("--yes", "-y", action="store_true")
 
-    p = sub.add_parser("skip", help="don't pull this account on this machine")
+    p = sub.add_parser("skip", help="exclude an account from bulk pulls on this machine")
     p.add_argument("name")
     p.add_argument("entry", metavar="ENTRY")
     p.add_argument("--undo", action="store_true")
@@ -366,9 +366,9 @@ def remote_command(argv: list[str]) -> None:
             label = _with_passphrase(
                 sync, args.name, lambda p: sync.set_skipped(args.name, p, args.entry, not args.undo))
             if args.undo:
-                print(f"{label}: pulled again by `cswap remote pull {args.name}`.")
+                print(f"{label}: included in bulk pulls again (`cswap remote pull {args.name}`).")
             else:
-                print(f"{label}: marked not on this machine; a pull leaves it alone.")
+                print(f"{label}: excluded from bulk pulls on this machine; naming it still pulls it.")
             return
 
         if cmd == "passwd":

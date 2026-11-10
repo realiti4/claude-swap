@@ -496,9 +496,9 @@ class RemoteScreen(Screen):
             entries.append((_REPLACE_LABEL[scope], f"act-set-token:{i}"))
         if row.state in (rm.REPO_ONLY, rm.SKIPPED):
             if row.state == rm.REPO_ONLY:
-                entries.append(("Not on this machine (a pull leaves it alone)", f"act-skip:{i}"))
+                entries.append(("Enable exclusion from bulk pulls", f"act-skip:{i}"))
             else:
-                entries.append(("Undo skip (pull it like the others)", f"act-unskip:{i}"))
+                entries.append(("Disable exclusion from bulk pulls", f"act-unskip:{i}"))
         if row.entry_id:
             entries.append(("Delete from the repository…", f"act-rm:{i}"))
         entries.append(_BACK)
@@ -671,9 +671,10 @@ class RemoteScreen(Screen):
             row = self._row(action_id)
             skip = action_id.startswith("act-skip:")
             self._run(
-                "Skip" if skip else "Undo skip",
+                "Exclude from bulk pulls" if skip else "Include in bulk pulls",
                 lambda p: sync.set_skipped(rid, p, row.entry_id, skip)
-                and (f"{row.label}: not on this machine" if skip else f"{row.label}: pulled again by pull-all"),
+                and (f"{row.label}: excluded from bulk pulls on this machine" if skip
+                     else f"{row.label}: included in bulk pulls again"),
             )
         elif action_id.startswith("act-rm:"):
             row = self._row(action_id)

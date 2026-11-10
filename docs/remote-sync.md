@@ -38,7 +38,7 @@ The first time a repository and a machine meet, accounts are matched by token: a
 | differs | linked, but the tokens are different; push or pull asks which to keep |
 | local | a setup-token account on this machine that the repository doesn't have |
 | remote | a repository entry this machine doesn't have |
-| skipped | a repository entry marked *not on this machine* (`skip`) |
+| skipped | a repository entry excluded from bulk pulls on this machine (`skip`; in the dashboard *Enable exclusion from bulk pulls*) |
 | unreadable | an entry file that doesn't decrypt or validate; left alone |
 | not shareable | a refreshing login or an API key |
 
