@@ -57,6 +57,9 @@ class AutoSwitchSettings:
     account is always taken. This is ``best``'s rule; ``consume-first`` and
     ``dynamic`` read the threshold differently (see
     ``SETTING_SPECS["autoswitch.threshold"].help`` and the README).
+    Under the ``consume-first`` strategy ``hysteresis_pct`` is instead the
+    room a landing needs: that many points left under each of the target's
+    own lines (``lines.line_room``).
     """
 
     threshold: float = 90.0

@@ -116,6 +116,25 @@ def _windows_without_symlinks(monkeypatch):
     monkeypatch.setattr(fsutil, "_LINK_PROBES", {})
 
 
+@pytest.fixture(autouse=True)
+def _default_login_signed_in(request, monkeypatch):
+    """The default login holds a working token unless a test says otherwise.
+
+    The fast-path tests name the default login's account through its identity
+    and never seed a credential for it, which the real check reads as signed
+    out. Tests of that check ask for ``real_default_login_check``."""
+    if "real_default_login_check" in request.fixturenames:
+        return
+    monkeypatch.setattr(
+        session_mod.SessionManager, "_default_login_signed_out", lambda self: False
+    )
+
+
+@pytest.fixture
+def real_default_login_check():
+    """Run ``SessionManager._default_login_signed_out`` as it is."""
+
+
 @pytest.fixture
 def windows_symlinks(monkeypatch, tmp_path):
     """Windows with Developer Mode (or an elevated terminal): file symlinks
@@ -1626,6 +1645,86 @@ class TestRun:
         )
         with pytest.raises(SessionError, match="active default"):
             manager.run("2", [], require_session=True)
+
+    @pytest.mark.parametrize("preset", [False, True])
+    def test_signed_out_default_login_launches_the_session_profile(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        capsys,
+        real_default_login_check,
+        preset,
+    ):
+        # ~/.claude.json still names account 2, but its login was signed out:
+        # plain claude would stop at "Not logged in" on every launch.
+        if preset:
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+            monkeypatch.setattr(
+                session_mod.SessionManager,
+                "_default_login_identity",
+                staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
+            )
+        else:
+            monkeypatch.setattr(
+                manager.switcher,
+                "_get_current_account",
+                lambda: (ACCOUNT_EMAIL, ORG_UUID),
+            )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+        out = capsys.readouterr().out
+        assert "holds no usable token" in out
+        assert "already the active default login" not in out
+
+    def test_signed_out_default_login_is_not_refused_by_require_session(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        real_default_login_check,
+    ):
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], require_session=True)
+
+        assert "CLAUDE_CONFIG_DIR" in exc.value.env
+
+    def test_working_default_login_keeps_the_fast_path(
+        self,
+        manager,
+        temp_home,
+        capture_exec,
+        monkeypatch,
+        capsys,
+        real_default_login_check,
+    ):
+        # The check itself runs here: a login that still holds a refresh
+        # token must never be copied into a session profile.
+        (temp_home / ".claude" / ".credentials.json").write_text(CREDS)
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "already the active default login" in capsys.readouterr().out
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
@@ -5350,3 +5449,79 @@ class TestSurvivorSelection:
         target = self._write(tmp_path / "t.jsonl", ['{"timestamp": "2026-07-01T00:00:00.000Z"}'])
         cand = self._write(tmp_path / "c.jsonl", ['{"timestamp": "2026-07-01T00:00:00.000Z"}'])
         assert session_mod._profile_copy_wins(target, cand) is False
+
+
+# ---------------------------------------------------------------------------
+# _default_login_signed_out
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultLoginSignedOut:
+    """What the same-account fast path reads before it runs plain claude."""
+
+    @pytest.mark.parametrize(
+        ("credential", "signed_out"),
+        [
+            (None, True),  # no credential anywhere
+            ("", True),
+            # Claude Code's reaction to invalid_grant: both tokens emptied.
+            ('{"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}', True),
+            ('{"claudeAiOauth": {"accessToken": "a", "expiresAt": 1}}', True),
+            ('{"claudeAiOauth": {"accessToken": "a", "expiresAt": 9999999999999}}', False),
+            ('{"claudeAiOauth": {"accessToken": "a"}}', False),
+            (CREDS, False),
+            ('{"somethingElse": {}}', False),  # unknown shape: keep the fast path
+        ],
+    )
+    def test_reads_the_default_login(
+        self, manager, temp_home, real_default_login_check, credential, signed_out
+    ):
+        if credential is not None:
+            (temp_home / ".claude" / ".credentials.json").write_text(credential)
+
+        assert manager._default_login_signed_out() is signed_out
+
+    def test_reads_the_default_profile_not_the_preset_one(
+        self, manager, temp_home, tmp_path, monkeypatch, real_default_login_check
+    ):
+        preset = tmp_path / "preset-profile"
+        preset.mkdir()
+        (preset / ".credentials.json").write_text(CREDS)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(preset))
+
+        assert manager._default_login_signed_out() is True
+        assert os.environ["CLAUDE_CONFIG_DIR"] == str(preset)
+
+    def test_an_unreadable_keychain_keeps_the_fast_path(
+        self, manager, monkeypatch, real_default_login_check
+    ):
+        from claude_swap.credentials import ActiveCredentials
+
+        monkeypatch.setattr(
+            manager.switcher,
+            "_read_active_credentials",
+            lambda: ActiveCredentials(None, True, True),
+        )
+        assert manager._default_login_signed_out() is False
+
+    def test_a_redirected_credential_store_keeps_the_fast_path(
+        self, manager, tmp_path, monkeypatch, real_default_login_check
+    ):
+        # claude reads its plaintext credential from the override directory.
+        # The default profile holds none, and that must not read as signed
+        # out while the login claude would use works.
+        redirected = tmp_path / "redirected-store"
+        redirected.mkdir()
+        (redirected / ".credentials.json").write_text(CREDS)
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(redirected))
+
+        assert manager._default_login_signed_out() is False
+
+    def test_an_empty_override_still_reads_the_default_store(
+        self, manager, monkeypatch, real_default_login_check
+    ):
+        # Defined but empty selects the default credential store, which is
+        # the one this check reads, so its answer stands.
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+        assert manager._default_login_signed_out() is True
