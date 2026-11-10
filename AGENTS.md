@@ -42,3 +42,5 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request; it says 
 - Stay on the one problem you were asked to solve. Mention unrelated things you notice instead of fixing them in the same change.
 - The person you are working for has to read the whole diff and be able to explain it. Ask them to; do not vouch for it yourself.
 - Report only the checks you actually ran, and say what you left unverified.
+
+Opening an issue or a pull request from the command line skips the forms, so follow them yourself. `.github/ISSUE_TEMPLATE/bug_report.yml` lists what a bug report needs, and `.github/pull_request_template.md` gives the shape of a description. Keep the detail in proportion to the change.
