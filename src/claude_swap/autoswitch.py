@@ -52,7 +52,7 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.lines import BindingWindow, binding_window, window_line
+from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
 from claude_swap.locking import FileLock
 from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import (
@@ -2204,6 +2204,12 @@ class AutoSwitchEngine:
                 active_binding.over if active_binding is not None else None,
             )
 
+        def most_room(num: str, h: float) -> tuple:
+            # Most raw headroom, the binding window's reset breaking an exact
+            # tie: the all-above key, and a consume-first escape's below its
+            # room bar.
+            return (-h, _binding_recovery_ts(usage.get(num), self._models, now))
+
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -2220,6 +2226,12 @@ class AutoSwitchEngine:
             # any of them is reached; raw `h` / the single line when it
             # reports no window (a readable headroom rules that out).
             lh = binding.line_headroom if binding is not None else h
+            # Points left before the candidate reaches the nearest of its own
+            # lines, each window in its own points (`lines.line_room`); the
+            # single line against raw `h` when it reports no window.
+            room = self._room(usage.get(num), settings, thresholds[num])
+            if room is None:
+                room = thresholds[num] - (100.0 - h)
             over = (
                 binding.over
                 if binding is not None
@@ -2260,6 +2272,14 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                    # ...and only with room to spend it: at least the hysteresis
+                    # margin under every one of its lines. The move is
+                    # opportunistic, and the cooldown it starts would hold auto on
+                    # a target a few points short of its line while it crosses it
+                    # and runs out (measured: 5h 85% under a 90 line, landed on,
+                    # 92/93/99% held by cooldown, the session limit hit at 100%).
+                    if trigger == "consume-first" and room < settings.hysteresis_pct:
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
@@ -2279,18 +2299,39 @@ class AutoSwitchEngine:
                 # reset of the window the room is measured on, the fullest one
                 # (no lines passed), since its rollover is what gives the
                 # account room again.
-                key: tuple = (
-                    -h,
-                    _binding_recovery_ts(usage.get(num), self._models, now),
-                )
+                key: tuple = most_room(num, h)
             elif consume_first or (weekly_first and trigger == "proactive"):
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order. weekly-first
                 # keeps `best`'s headroom order for the at-limit and failover
-                # escapes, which may land on accounts over their lines.
-                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+                # escapes, which may land on accounts over their lines. A forced
+                # (proactive) move first prefers targets with the hysteresis
+                # margin of room: one a few points under its line would need
+                # leaving again within the cooldown it is about to start.
+                tight = trigger == "proactive" and room < settings.hysteresis_pct
+                key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 key = (-lh,)
+            if trigger in ("at-limit", "failover") and not all_above:
+                # Escapes skip the landing gate on purpose (any account with
+                # real headroom beats a dead one) but must still prefer a target
+                # that can keep working, and one below its lines first: ranking
+                # by weekly reset alone escaped onto an account at Fable 94% of
+                # a 90 line while one at 1% / 3% was free (#305), and a target
+                # over a line is left again at the next cooldown.
+                if not consume_first:
+                    # best's key is already headroom; a room bar on top would
+                    # let a tenth of a point of room outrank points of headroom.
+                    key = (over, *key)
+                elif not over and room >= settings.hysteresis_pct:
+                    # Room to spare, the hysteresis margin under every line:
+                    # safe to spend the soonest weekly reset first.
+                    key = (0, *key)
+                else:
+                    # Without it the reset order would take 7d 97.9% under a 98 line
+                    # over 44%. Most raw headroom instead, as when nothing is
+                    # under its lines (all_above, above), under-line first.
+                    key = (1, over, *most_room(num, h))
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
@@ -2554,6 +2595,20 @@ class AutoSwitchEngine:
             line,
             settings.weekly_threshold,
             scale=settings.threshold,
+        )
+
+    def _room(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+    ) -> float | None:
+        """Points left before this account's nearest line under the tick's
+        lines (see ``lines.line_room``), or None when it reports no window.
+        Same inputs as ``_binding``."""
+        return line_room(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ),
+            line,
+            settings.weekly_threshold,
         )
 
     def _in_cooldown(self, state: dict) -> bool:

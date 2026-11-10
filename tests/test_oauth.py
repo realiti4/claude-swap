@@ -1010,8 +1010,9 @@ class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 
     @staticmethod
-    def _http_error(code: int, headers: dict | None = None):
+    def _http_error(code: int, headers: dict | None = None, body: bytes | None = None):
         import email.message
+        import io
         hdrs = None
         if headers is not None:
             hdrs = email.message.Message()
@@ -1019,13 +1020,31 @@ class TestClassifyUsageError:
                 hdrs[k] = v
         return urllib.error.HTTPError(
             url="https://api.anthropic.com/api/oauth/usage",
-            code=code, msg="err", hdrs=hdrs, fp=None,
+            code=code, msg="err", hdrs=hdrs,
+            fp=None if body is None else io.BytesIO(body),
         )
 
     def test_http_codes(self):
         assert oauth._classify_usage_error(self._http_error(429))[0] == "http-429"
         assert oauth._classify_usage_error(self._http_error(500))[0] == "http-500"
         assert oauth._classify_usage_error(self._http_error(401))[0] == "http-401"
+
+    ORG = "oauth_not_allowed_for_organization"
+    ORG_BODY = json.dumps({"error": {"details": {"error_code": ORG}}}).encode()
+
+    @pytest.mark.parametrize("code, body, kind", [
+        (403, ORG_BODY, ORG),
+        (401, ORG_BODY, "http-401"),
+        (403, None, "http-403"),
+        (403, b"<html>forbidden</html>", "http-403"),
+        (403, b'{"error": "x"}', "http-403"),
+    ])
+    def test_403_org_oauth_policy_names_itself(self, code, body, kind):
+        """A 403 whose body carries the server's org-policy code is told apart
+        from every other 403; an unreadable or differently shaped body, and any
+        other status, keep ``http-<code>``. Retry-After rides along either way."""
+        err = self._http_error(code, {"Retry-After": "7"}, body)
+        assert oauth._classify_usage_error(err) == (kind, 7.0)
 
     def test_retry_after_seconds(self):
         kind, retry = oauth._classify_usage_error(
@@ -1063,88 +1082,24 @@ class TestClassifyUsageError:
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
 
-    def test_tls_cert_failure_is_not_flattened_to_network(self):
-        """A MITM proxy with an untrusted CA must not read as a transport error.
+    @pytest.mark.parametrize("reason, kind", [
+        (ssl.SSLCertVerificationError(1, "certificate verify failed"), "tls-cert"),
+        (ssl.SSLEOFError("EOF occurred in violation of protocol"), "network"),
+        (ssl.SSLError("wrong version number"), "network"),
+    ])
+    def test_refused_certificate_is_told_apart(self, reason, kind):
+        """Only a certificate the client refused is ``tls-cert``; a TLS failure
+        of any other class stays ``network``, since no CA repairs it."""
+        err = urllib.error.URLError(reason)
+        assert oauth._classify_usage_error(err) == (kind, None)
 
-        Measured on one host: every usage poll went through a
-        TLS-terminating proxy whose CA urllib does not trust, so each one raised
+    def test_refused_certificate_shows_its_remedy(self):
+        """The unavailable line names the fix, not the bare kind."""
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.usage_store import UsageEntry
 
-            URLError(SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED]
-            certificate verify failed: unable to get local issuer certificate"))
-
-        and was recorded as ``network``. One account sat dead for ten days and
-        "network" is the only word anyone could see; the real cause reaches
-        DEBUG alone, which nothing enables. "Cannot reach the host" and "reached
-        the host and refused its certificate" need opposite fixes, so they may
-        not share a token.
-        """
-        e = urllib.error.URLError(
-            ssl.SSLCertVerificationError(
-                1,
-                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
-                "unable to get local issuer certificate (_ssl.c:1000)",
-            )
-        )
-        assert oauth._classify_usage_error(e)[0] == "tls-cert"
-
-    def test_a_non_cert_ssl_failure_is_not_a_cert_failure(self):
-        """Pins the PREDICATE, not just the outcome.
-
-        ``ssl.SSLCertVerificationError`` is the narrow choice on purpose, and
-        the obvious loosening -- ``ssl.SSLError`` -- passes every other test in
-        this file. A non-cert TLS failure is a different condition with a
-        different repair: speaking https to a plaintext port raises
-        ``SSLError("record layer failure")``, and calling that ``tls-cert``
-        sends the operator to fix a CA bundle for a wrong-port problem.
-        """
-        assert oauth._classify_usage_error(
-            urllib.error.URLError(ssl.SSLEOFError("handshake failed"))
-        )[0] == "network"
-        assert oauth._classify_usage_error(
-            urllib.error.URLError(ssl.SSLError("record layer failure"))
-        )[0] == "network"
-
-    def test_tls_cert_carries_a_remedy_note(self):
-        """A kind with no ERROR_NOTES entry renders as the bare identifier.
-
-        The whole point of splitting this out of ``network`` is that the two
-        need different repairs, and that only reaches the operator through the
-        note. Without one the display trades one uninformative word for
-        another. ``test_every_deterministic_kind_has_a_note`` states the same
-        principle but iterates ``_DETERMINISTIC_REFRESH_ERRORS``, which is a
-        refresh-error list -- a usage-fetch kind is outside its loop, so it
-        cannot cover this.
-        """
-        from claude_swap.switcher import ERROR_NOTES
-
-        assert "tls-cert" in ERROR_NOTES
-        note = ERROR_NOTES["tls-cert"]
-        assert "SSL_CERT_FILE" in note
-
-    def test_a_hostname_mismatch_is_tls_cert_and_its_note_says_so(self):
-        """``SSLCertVerificationError`` is not only an untrusted chain.
-
-        A certificate issued for another host (a captive portal, a proxy that
-        does not re-sign per host) raises the same class with OpenSSL
-        verify_code 62. One kind covers "the certificate check refused this
-        connection", so the note has to name that cause too, or it prescribes
-        a CA fix for a problem no CA fixes.
-        """
-        from claude_swap.switcher import ERROR_NOTES
-
-        err = ssl.SSLCertVerificationError(
-            1,
-            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
-            "Hostname mismatch, certificate is not valid for 'api.example.com'. "
-            "(_ssl.c:1000)",
-        )
-        err.verify_code = 62
-        err.verify_message = (
-            "Hostname mismatch, certificate is not valid for 'api.example.com'"
-        )
-        e = urllib.error.URLError(err)
-        assert oauth._classify_usage_error(e)[0] == "tls-cert"
-        assert "different host" in ERROR_NOTES["tls-cert"]
+        (line,) = _usage_entry_lines(UsageEntry(last_error="tls-cert"))
+        assert "SSL_CERT_FILE" in line and "tls-cert" not in line
 
     def test_bad_response(self):
         try:

@@ -22,6 +22,10 @@ Three quantities per account, in the engine's vocabulary:
   its ``over`` the account's verdict. With equal lines it is today's max-pct
   window.
 
+And one margin: ``line_room``, the points left before the nearest line, each
+window counted in its own points, for asking whether a landing has room to
+spare (``autoswitch.hysteresis_pct``) before it re-triggers.
+
 Pure functions over the ``(label, pct, resets_at)`` triples
 ``oauth.relevant_windows`` yields: no settings reads, no I/O, and no restated
 percentages — the raw numbers flow to logs and screens untouched, and the
@@ -62,6 +66,29 @@ def line_headroom(pct: float, line: float, threshold: float) -> float:
     if pct <= line:
         return (100.0 - threshold) + threshold * (line - pct) / line
     return (100.0 - threshold) * (100.0 - pct) / (100.0 - line)
+
+
+def line_room(
+    windows: Iterable[tuple[str, float, str | None]],
+    threshold: float,
+    weekly_threshold: float | None = None,
+) -> float | None:
+    """Points left before the nearest switch line, each window counted in its
+    own points: the least ``line - pct`` over the windows, negative once one
+    is over. ``None`` when the account reports no window.
+
+    Not ``line_headroom - (100 - threshold)``: that is the room on the 5h
+    scale, ``threshold / line`` times the real points on any line but the
+    global one, so 10 points under a 98 weekly line (global 90) read 9.2, and
+    8 points under an account's own 60 line read 12. Nor the binding window's
+    alone: it is chosen on that scale, so the window nearest its line in its
+    own points can be another one.
+    """
+    rooms = [
+        window_line(label, threshold, weekly_threshold) - pct
+        for label, pct, _ in windows
+    ]
+    return min(rooms) if rooms else None
 
 
 @dataclass(frozen=True)

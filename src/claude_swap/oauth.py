@@ -800,7 +800,8 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
 
     ``kind`` is a short stable token for logs and backoff decisions
     (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
-    ``"bad-response"``, or the exception type name as a fallback).
+    ``"bad-response"``, ``"oauth_not_allowed_for_organization"`` (a 403 whose
+    body says so), or the exception type name as a fallback).
     ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
     one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
@@ -812,20 +813,29 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
                 retry_after = max(0.0, float(raw.strip()))
             except ValueError:
                 pass
+        if e.code == 403:
+            # The org-policy 403 (a lapsed plan) names its cause only in the
+            # body, so it is the one status whose body is read. This runs
+            # inside `except` handlers: it must never raise.
+            try:
+                code = json.loads(e.read(4096))["error"]["details"]["error_code"]
+            except Exception:
+                code = None
+            if code == "oauth_not_allowed_for_organization":
+                return code, retry_after
         return f"http-{e.code}", retry_after
     if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
         return "timeout", None
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
-        # A TLS handshake the SERVER answered and we refused is not a
-        # transport failure, and calling it one sends you to DNS while the
-        # repair is a CA bundle. Measured: a TLS-terminating proxy
-        # presented a CA urllib does not trust, every poll raised
-        # URLError(SSLCertVerificationError), all of it stored as "network",
-        # and one account sat unpolled for ten days with that one word as the
-        # whole record. The remedy is platform-dependent and lives in
-        # ERROR_NOTES["tls-cert"], where the operator actually reads it.
+        # A certificate the client refused (an untrusted chain, a name that
+        # does not match, an expired one) is not an unreachable host: the
+        # repair is trust or the clock, so it gets its own kind. Measured on
+        # macOS against a local server, with truststore 0.10.4 and with stdlib
+        # ssl: all three raise this class, SSL_CERT_FILE adds a CA on both
+        # paths, and NODE_EXTRA_CA_CERTS, which Claude Code 2.1.322 honours,
+        # does not. Other TLS failures (a plaintext port) stay "network".
         if isinstance(e.reason, ssl.SSLCertVerificationError):
             return "tls-cert", None
         return "network", None
