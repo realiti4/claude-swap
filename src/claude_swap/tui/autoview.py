@@ -452,7 +452,7 @@ class AutoScreen(Screen):
         # built via `AutoScreen.__new__` skips `__init__`/`_on_snapshot`.
         last_active_at = getattr(self, "_last_active_at", None) or {}
         reasons: dict[str, str] = {}   # the engine's own cause per refused row
-        ordered, rank_axis, trigger, unmodeled, plan = data.rank_switch_candidates(
+        ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
             snap, settings, now, active_number, last_active_at, reasons
         )
         ordered_rank = {num: i for i, num in enumerate(ordered)}
@@ -674,8 +674,6 @@ class AutoScreen(Screen):
             text.append(f"Next best ({rank_axis})", style=palette.muted)
         else:
             text.append("Next best", style=palette.muted)
-        if plan:
-            text.append(f"\n  {plan}", style=palette.muted)
         if not ranked:
             # Reached only when this is the sole account. Slots that cannot be
             # switched to are listed above with the reason, so "no other

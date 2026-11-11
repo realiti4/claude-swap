@@ -33,11 +33,9 @@ from claude_swap.autoswitch import (
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
-    _plan_note,
     _seven_day_reset_ts,
     dynamic_candidate_order,
     dynamic_expiring_walk,
-    primary_warm_turn,
     rank_candidates_pass,
     rank_priority_candidates,
 )
@@ -263,13 +261,12 @@ def rank_switch_candidates(
     active_number: str | None,
     last_active_at: dict | None = None,
     reasons_out: dict | None = None,
-) -> tuple[list[str], str | None, str, bool, str | None]:
-    """(ordered, rank_axis, trigger, unmodeled, plan): mirrors the engine's own
+) -> tuple[list[str], str | None, str, bool]:
+    """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
     admission and order. THE shared computation -- ``ordered_accounts`` and
     the auto view's "Next best" panel both read off this, never a pass of
     their own. ``reasons_out``, when given, is filled with the engine's own
-    plain-words cause for each candidate the pass whose result is used dropped. ``plan``
-    is the hold line's own `_plan_note` under `dynamic` (T3400), else None.
+    plain-words cause for each candidate the pass whose result is used dropped.
     """
     reasons = {} if reasons_out is None else reasons_out
     models = parse_model_names(settings.model)
@@ -454,23 +451,7 @@ def rank_switch_candidates(
         and trigger not in (*CONSUME_FIRST_STRATEGIES, "priority")
     ):
         ordered, rank_axis = api_key_candidates, None
-    plan = None
-    if settings.strategy == "dynamic":
-        # The partner the primary keeps warm is named only while it is the healthy active
-        # (the engine's `spend_first`; its `not walled` is implied, the walk skips an active
-        # at its wall), by the engine's own `primary_warm_turn` over the axis that ranked.
-        warming = (
-            primary_warm_turn(
-                [n for n in ordered if n in oauth_candidates],
-                floor_headroom=_headroom_by_account(usage, axis), usage=usage, entries=entries,
-                current=active_number, models=axis, settings=settings, last_active_at=last,
-                now=now,
-            )[0]
-            if active_number in expiring and trigger == "dynamic-healthy"
-            else None
-        )
-        plan = _plan_note(*walk, now, bars, warming, settings)
-    return ordered, rank_axis, trigger, unmodeled, plan
+    return ordered, rank_axis, trigger, unmodeled
 
 
 def non_candidate_key(acc, now: float) -> tuple:
