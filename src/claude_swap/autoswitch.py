@@ -3593,9 +3593,9 @@ class AutoSwitchEngine:
                             # name, so neither reaches this arm.
                             #
                             # `select_probe_target` re-applies
-                            # `_seven_day_reset_unmeasured` and the cooldown
-                            # -- membership here only needs to be fresh enough
-                            # to admit without risking the stale-usage abort
+                            # `_seven_day_reset_unmeasured` and the cooldown;
+                            # membership here only needs to be fresh enough to
+                            # admit without risking the stale-usage abort
                             # below.
                             if _probe_source_fresh(entries, num, now):
                                 probe_candidates.append(num)
