@@ -3975,7 +3975,11 @@ class AutoSwitchEngine:
             if priority_mode:
                 self._emit(NoSwitchEvent(
                     reason="no-qualifying-candidate",
-                    detail="no candidate is below every switch line with readable usage; waiting for recovery",
+                    detail=(
+                        "no candidate is below every switch line with readable "
+                        "usage; waiting for recovery"
+                        + (f"; {_vetoed_clause()}" if vetoed else "")
+                    ),
                 ))
                 return TickOutcome.BLOCKED
             if not any_known:

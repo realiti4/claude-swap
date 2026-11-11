@@ -206,6 +206,25 @@ def test_pre_switch_refresh_can_veto_the_provisional_priority_target(temp_home):
     assert h.active_number() == 1
 
 
+def test_the_refresh_pushing_the_target_over_its_own_line_is_named_in_the_hold(temp_home):
+    h = fleet(temp_home)
+    h.switcher.set_account_priority("2", 200)
+    h.switcher.set_account_threshold("2", 50.0)
+    initial = usage(h, pcts=(95, 10, 95, 95))
+    fresh = usage(h, pcts=(95, 53, 95, 95))
+    initial_entries = {n: _entry_for(v, h.clock.now) for n, v in initial.items()}
+    fresh_entries = {n: _entry_for(v, h.clock.now) for n, v in fresh.items()}
+    with patch.object(h.engine, "_collect_scheduled_usage", return_value=(
+        initial_entries, initial, {n: 100 - max(v["five_hour"]["pct"], v["seven_day"]["pct"])
+                                   for n, v in initial.items()},
+    )), patch.object(h.switcher, "usage_entries_by_account", return_value=fresh_entries):
+        assert h.engine.tick() is TickOutcome.BLOCKED
+    assert h.active_number() == 1
+    (event,) = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+    assert event.reason == "no-qualifying-candidate"
+    assert "Account-2 (line 50%)" in event.detail
+
+
 @pytest.mark.parametrize("active_pct,expected", [(10, TickOutcome.NO_ACTION), (100, TickOutcome.BLOCKED)])
 def test_stale_priority_target_never_activates(temp_home, active_pct, expected):
     h = fleet(temp_home)

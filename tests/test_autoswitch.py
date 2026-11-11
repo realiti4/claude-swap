@@ -16469,20 +16469,22 @@ class TestPerAccountSwitchThreshold:
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
 
-    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    @pytest.mark.parametrize(
+        "strategy", ["dynamic", "consume-first", "best", "priority-consume-first"]
+    )
     def test_a_spent_fleet_with_one_peer_over_its_own_line_still_names_it(
         self, temp_home, strategy
     ):
-        """The incident's shape: the active and #3 at 99 (1 point of room, so
-        not "all exhausted"), #2 with room but over its own 50. The tick is the
-        designed `no-qualifying-candidate` hold, which names #2 and its line,
-        at the ordinary cadence."""
+        """The incident's shape: the active and #3 at 99% on the 7-day window
+        (1 point of room, so not "all exhausted"), #2 with room but over its own
+        50. The tick is the designed `no-qualifying-candidate` hold, which names
+        #2 and its line, at the ordinary cadence."""
         h = self._harness(temp_home, strategy)
         self._set(h, 2, 50.0)
         outcome = h.tick_with_usage({
-            "1": self._use(h, 99, 9 * 86400),
+            "1": self._use(h, 10, 9 * 86400, 99.0),
             "2": self._use(h, 53, 1 * 86400),
-            "3": self._use(h, 99, 5 * 86400),
+            "3": self._use(h, 10, 5 * 86400, 99.0),
         })
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
