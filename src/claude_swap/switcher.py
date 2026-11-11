@@ -8522,7 +8522,8 @@ class ClaudeAccountSwitcher:
         partial leaves the backup as it was, and so does a stored login with
         no expiry to compare (a setup token). The caller has already written
         the safety copy, so this never removes the only copy of anything.
-        Called inside the switch's locks. Never raises.
+        Called inside the switch's locks. Store and lock faults return
+        False; a refusal from the write propagates.
         """
         try:
             live = oauth.extract_oauth_data(original_creds) or {}
@@ -8545,6 +8546,14 @@ class ClaudeAccountSwitcher:
                 # generation, so it stays. A backup holding no login at all
                 # has nothing to lose and is still advanced below.
                 return False
+            if not all(
+                isinstance(e, (int, float)) and not isinstance(e, bool)
+                and abs(e) <= sys.float_info.max
+                for e in (live.get("expiresAt") or 0, stored_exp or 0)
+            ):
+                # An expiry float() cannot read (text, a list, a bool, a
+                # number past float range) is no ordering to write on.
+                return False
             if float(live.get("expiresAt") or 0) <= float(stored_exp or 0):
                 return False
             # attributed=True: the "foreign" verdict is a uuid-positive
@@ -8560,7 +8569,7 @@ class ClaudeAccountSwitcher:
                 foreign_slot,
             )
             return True
-        except Exception:
+        except (OSError, LockError):
             self._logger.warning(
                 "Could not advance account %s's backup to its newer live "
                 "credential; the safety copy keeps it.",
