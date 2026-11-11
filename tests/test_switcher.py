@@ -1311,7 +1311,10 @@ class TestSetupTokenHeaderProbeWiring:
             second = switcher._collect_usage_entries([self._info()])["3"]
 
         # The usage endpoint is never asked: it cannot read a setup-token.
-        assert urls == [oauth.USAGE_PROBE_URL]
+        # One pass = the main probe plus one per scoped model (Fable).
+        assert urls == [oauth.USAGE_PROBE_URL] * (
+            1 + len(oauth.USAGE_PROBE_SCOPED_MODELS)
+        )
         assert first.last_error is None
         assert first.last_good["five_hour"]["pct"] == 25.0
         assert first.last_good["seven_day"]["pct"] == 50.0
@@ -16059,30 +16062,95 @@ class TestGateUltraReviewFixes:
                 "work, so a warning claiming it did is worse than silence"
             )
 
+    @pytest.mark.parametrize("exc_name", ["RuntimeError", "RealStoreWriteBlocked"])
     def test_the_suites_real_store_guard_is_not_absorbed_by_the_wrapper(
-        self, temp_home: Path, sample_sequence_data: dict
+        self, temp_home: Path, sample_sequence_data: dict, exc_name: str
     ):
         """I-1: the containment must be `except OSError`, not `except Exception`.
 
-        `tests/conftest.py`'s `RealStoreWriteBlocked` is deliberately NOT an
-        `OSError` subclass (its own docstring) precisely so that no
-        `except OSError` in this codebase can hide a real-store refusal. An
-        `except Exception` on the credential-persist path catches it and
-        disarms the guard for every write that routes through here.
-
         The wrapper's whole documented fault list is EACCES on the session dir
-        and a read-only mount — both `OSError`. Nothing else belongs in it.
+        and a read-only mount, both `OSError`. Anything else raised by
+        `_post_backup_write` must escape `_write_account_credentials`:
+
+        * `RuntimeError` (a plain `Exception`) is what pins the width: it
+          escapes `except OSError` and is absorbed by `except Exception`, so
+          this case goes red if the handler is widened.
+        * `RealStoreWriteBlocked` (`tests/conftest.py`, a `BaseException`) is
+          the suite's real-store refusal. It escapes either handler, so this
+          case pins only that nothing catches it on the credential-persist
+          path (an `except BaseException` would disarm the guard).
         """
         from tests import conftest
 
+        exc = (
+            RuntimeError if exc_name == "RuntimeError"
+            else conftest.RealStoreWriteBlocked
+        )
         s = self._switcher(sample_sequence_data)
 
-        def blocked(*a, **kw):
-            raise conftest.RealStoreWriteBlocked("refused: the REAL store")
-
-        with patch.object(type(s), "_post_backup_write", blocked):
-            with pytest.raises(conftest.RealStoreWriteBlocked):
+        with patch.object(
+            type(s), "_post_backup_write", side_effect=exc("refused")
+        ):
+            with pytest.raises(exc):
                 s._write_account_credentials("1", "test@example.com", self._NEW)
+
+    @staticmethod
+    def _rescue(live_exp, stored_exp=1_000, **write):
+        """Run the foreign-successor rescue on a live token pair against a
+        stored one, with the backup write patched by ``write``. Returns the
+        verdict and the write mock."""
+        def pair(exp):
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": "sk", "refreshToken": "rt", "expiresAt": exp,
+            }})
+
+        s = ClaudeAccountSwitcher()
+        data = {"accounts": {"2": {"email": "account2@example.com"}}}
+        with patch.object(
+            s, "_read_account_credentials_ex",
+            return_value=(pair(stored_exp), False),
+        ), patch.object(s, "_write_account_credentials", **write) as wrote:
+            return s._rescue_foreign_successor("2", data, pair(live_exp)), wrote
+
+    def test_the_rescue_writes_a_strictly_newer_live_credential(self, temp_home):
+        verdict, wrote = self._rescue(2_000)
+        assert verdict is True
+        wrote.assert_called_once()
+
+    @pytest.mark.parametrize("refusal", ["blocked", ValueError, TypeError])
+    def test_the_rescue_does_not_absorb_a_refused_backup_write(
+        self, temp_home, refusal
+    ):
+        """`RealStoreWriteBlocked` is deliberately not an `OSError`, so the
+        rescue's containment must not be `except Exception`; a ValueError or
+        TypeError raised by the write is a refusal too."""
+        from tests import conftest
+
+        if refusal == "blocked":
+            refusal = conftest.RealStoreWriteBlocked
+        with pytest.raises(refusal):
+            self._rescue(2_000, side_effect=refusal("refused"))
+
+    @pytest.mark.parametrize("fault", [OSError("disk full"), LockError("busy")])
+    def test_the_rescue_contains_a_store_or_lock_fault_on_its_write(
+        self, temp_home, fault
+    ):
+        verdict, _ = self._rescue(2_000, side_effect=fault)
+        assert verdict is False
+
+    @pytest.mark.parametrize(
+        "live_exp, stored_exp",
+        [
+            ("2026-11-10T00:00:00Z", 1_000), ([2_000], 1_000), (True, 1_000),
+            (10**400, 1_000), (2_000, 10**400), (2_000, "soon"),
+        ],
+    )
+    def test_the_rescue_leaves_the_backup_when_an_expiry_cannot_be_compared(
+        self, temp_home, live_exp, stored_exp
+    ):
+        verdict, wrote = self._rescue(live_exp, stored_exp)
+        assert verdict is False
+        wrote.assert_not_called()
 
     @pytest.mark.parametrize("row_a_readable", [True, False])
     def test_an_unreadable_non_matching_row_does_not_abort_the_scan(
