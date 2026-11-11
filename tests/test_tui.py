@@ -3099,6 +3099,31 @@ class TestNextBestFollowsTheTick:
         # below-line consume-first trigger, which bars 2.
         assert "too little room" in _next_best_text(snap, h.settings)
 
+    def test_an_overloaded_active_the_tick_does_not_rank_claims_no_order(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """The burst is read before the tick's own gates: an API-key active the
+        engine may not leave returns `active-api-key` whatever it read, so the
+        panel names no pick on the burst alone."""
+        from claude_swap import autoswitch
+        from claude_swap.autoswitch import TickOutcome
+        from tests.test_autoswitch import _trace_line
+
+        fleet = {"1": USAGE_API_KEY, "2": (85, 10), "3": (10, 50)}
+        h, snap, entries = _engine_and_snapshot(
+            temp_home, {"strategy": "consume-first"}, fleet
+        )
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(b"")
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION  # the baseline
+        trace.write_bytes(b"".join(_trace_line(529) for _ in range(5)))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)][-1] == "active-api-key"
+        assert h.engine.overloaded_account == "1"
+        text = _next_best_text(snap, h.settings, h.engine)
+        assert "not previewed (active status unknown)" in text, text
+
     def test_a_peer_the_tick_cannot_read_is_not_short_of_room(self, temp_home):
         """A reading too old to decide on is unreadable to the tick (it drops
         the peer), so the row must not claim the peer lacks room on that

@@ -4206,6 +4206,14 @@ class AutoSwitchEngine:
         helpers are exercised directly on bare engines."""
         return _binding_at(value, settings, self._models, line)
 
+    def _room(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+    ) -> float | None:
+        """Points left before this account's nearest line under the tick's
+        lines (see ``lines.line_room``), or None when it reports no window.
+        Same inputs as ``_binding``."""
+        return _room_at(value, settings, self._models, line)
+
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
         if not isinstance(last, (int, float)):

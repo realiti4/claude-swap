@@ -148,10 +148,13 @@ def _engine_order(
         trigger = "priority"
     elif any(a.number == active_number and a.disabled for a in snap.accounts):
         trigger = "disabled-active"
+    elif active_h is None:
+        # Before `overloaded`: the burst outranks the headroom read only on
+        # the tick's own gates (an API-key active it may not leave, a hold on
+        # the active's last reading), which a snapshot cannot see.
+        trigger = "unreadable-active"
     elif overloaded:
         trigger = "overloaded"
-    elif active_h is None:
-        trigger = "unreadable-active"
     else:
         # Each window against its own line, as the tick reads it.
         binding = _binding_at(usage.get(active_number), settings, models, bars[active_number])
@@ -527,11 +530,13 @@ class AutoScreen(Screen):
         # THE ENGINE'S OWN ADMISSION AND ORDER decide the rows it admits; a
         # refused row keeps the strategy's bare key below, behind every
         # admitted one.
+        engine = self._engine
         ordered, note, short = (
             _engine_order(
                 snap, settings, active_number, now,
-                overloaded=active_number is not None
-                and getattr(self._engine, "overloaded_account", None) == active_number,
+                overloaded=engine is not None
+                and active_number is not None
+                and engine.overloaded_account == active_number,
             )
             if settings else ([], "", set())
         )
