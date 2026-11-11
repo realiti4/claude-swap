@@ -312,6 +312,7 @@ cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fa
 cswap config set run.shareHistory false   # each account keeps its own chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
+cswap config set notify.command 'curl -s -d "$CSWAP_MESSAGE" ntfy.sh/my-topic'  # run a command on auto-switch events (see docs/auto-switch.md)
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

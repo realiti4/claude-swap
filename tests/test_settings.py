@@ -16,6 +16,7 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    NotifySettings,
     RunSettings,
     UiSettings,
     UpdateSettings,
@@ -286,6 +287,9 @@ class TestSettingSpecs:
         assert by_section["usage"] == {
             f.name for f in UsageSettings.__dataclass_fields__.values()
         }
+        assert by_section["notify"] == {
+            f.name for f in NotifySettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
         sources = {
@@ -294,6 +298,7 @@ class TestSettingSpecs:
             "run": RunSettings(),
             "updates": UpdateSettings(),
             "usage": UsageSettings(),
+            "notify": NotifySettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)

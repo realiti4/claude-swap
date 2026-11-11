@@ -55,6 +55,7 @@ from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
 from claude_swap.locking import FileLock
 from claude_swap.models import AccountPolicy
+from claude_swap.notify import EventNotifier
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -657,7 +658,9 @@ class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
     ``on_event`` receives every :class:`AutoSwitchEvent`; exceptions it raises
-    are not caught (a broken frontend should fail loudly in tests). ``clock``
+    are not caught (a broken frontend should fail loudly in tests). Events
+    are also offered to ``notify.command`` (see ``notify.py``) unless
+    ``dry_run``; that path never raises. ``clock``
     is wall time (persisted cooldown timestamps must survive processes).
     """
 
@@ -692,6 +695,9 @@ class AutoSwitchEngine:
         )
         self.on_event = on_event
         self.dry_run = dry_run
+        self._notifier = (
+            None if dry_run else EventNotifier.for_backup_dir(switcher.backup_dir)
+        )
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
@@ -2699,6 +2705,8 @@ class AutoSwitchEngine:
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
+        if self._notifier is not None:
+            self._notifier.handle(event)
 
     # -- loop -------------------------------------------------------------------
 

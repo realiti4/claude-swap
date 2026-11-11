@@ -67,6 +67,37 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
+## Notifications
+
+`cswap config set notify.command '<shell command>'` runs that command whenever auto-switch reports an event you would want to hear about away from the terminal — from `cswap auto`, the TUI's auto view and the menu bar alike. cswap ships no delivery service of its own; the command is the transport, so it can reach a phone, a chat channel or the desktop.
+
+The command runs through `/bin/sh -c` (`cmd.exe` on Windows) with:
+
+- the event's [`--json` payload](json-output.md) on stdin;
+- `CSWAP_EVENT` (the kind, e.g. `switch`), `CSWAP_TITLE` (e.g. `Auto-switched account`) and `CSWAP_MESSAGE` (the line `cswap auto` prints) in the environment.
+
+`notify.events` picks the kinds, comma-separated; the default is `switch,account-quarantined,all-exhausted,error`. `account-unquarantined` and `config-warning` can be added; `poll`, `sleep` and `no-switch` fire every tick and are best left out. A switch is always sent; any other event repeating the same message (digits ignored, so a moving reset time still counts as the same) is sent once an hour at most. A dry run sends nothing. The command runs in the background with a 30-second limit, and a failure is written to the log, never stops switching. The setting is read when auto-switch starts, so restart it after changing one.
+
+Some commands:
+
+```bash
+# Phone push via ntfy (install the ntfy app, subscribe to a hard-to-guess topic)
+cswap config set notify.command 'curl -s -H "Title: $CSWAP_TITLE" -d "$CSWAP_MESSAGE" https://ntfy.sh/<your-topic>'
+
+# Pushover
+cswap config set notify.command 'curl -s -F token=<app> -F user=<user> -F "title=$CSWAP_TITLE" -F "message=$CSWAP_MESSAGE" https://api.pushover.net/1/messages.json'
+
+# iMessage from macOS Messages (to your own handle, it reaches your other Apple devices)
+cswap config set notify.command 'osascript -e "on run {t, m}" -e "tell application \"Messages\" to send m to participant t of (1st account whose service type = iMessage)" -e "end run" you@example.com "$CSWAP_TITLE: $CSWAP_MESSAGE"'
+
+# Desktop only: macOS / Linux
+cswap config set notify.command 'osascript -e "on run {t, m}" -e "display notification m with title t" -e "end run" "$CSWAP_TITLE" "$CSWAP_MESSAGE"'
+cswap config set notify.command 'notify-send "$CSWAP_TITLE" "$CSWAP_MESSAGE"'
+
+# Everything, as JSON, to a webhook
+cswap config set notify.command 'curl -s -H "Content-Type: application/json" --data-binary @- https://example.com/hook'
+```
+
 ## Defaults
 
 Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](../README.md#configuration)).
