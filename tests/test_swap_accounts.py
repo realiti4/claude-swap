@@ -2609,11 +2609,13 @@ class TestTheRollbackDecidesPerKey:
         """The repair's comment claims the chokepoint's containment; it does
         not have it, and cannot.
 
-        The chokepoint catches `OSError` alone, so anything else — including
-        the suite's own `RealStoreWriteBlocked`, deliberately not an `OSError`
-        — propagates and can never be hidden. The repair sits inside the
-        per-key loop, whose `except Exception` counts a failure and carries on
-        so one key cannot abort the rest of the rollback. Measured: the block
+        The chokepoint catches `OSError` alone, so anything else propagates
+        out of it and can never be hidden there. The stand-in below is a plain
+        `Exception` that is not an `OSError`, which is exactly what the
+        per-key loop's `except Exception` contains: it counts a failure and
+        carries on so one key cannot abort the rest of the rollback. (The
+        suite's own real-store guard is a `BaseException` and propagates
+        through both, so it cannot stand in for this.) Measured: the failure
         does NOT propagate. Widening this arm to `Exception` is detectable and
         must not be done: measured, `failures` then stays 0, the staged copies
         are discarded and this case fails on `staged.exists()`.
@@ -2622,8 +2624,6 @@ class TestTheRollbackDecidesPerKey:
         contained failure must keep the staged copies and say so, or a refused
         write leaves no trace.
         """
-        from tests.conftest import RealStoreWriteBlocked
-
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data_with_org)
         mail_a, mail_b = "a@example.com", "b@example.com"
@@ -2641,9 +2641,7 @@ class TestTheRollbackDecidesPerKey:
         def blocking(num, email, *a, **k):
             if (num, email) == ("1", mail_b):
                 blocked["n"] += 1
-                raise RealStoreWriteBlocked(
-                    "refused: this write would land in the REAL account store"
-                )
+                raise RuntimeError("refused: the repair could not be applied")
             return real_post(num, email, *a, **k)
 
         switcher._post_backup_write = blocking
