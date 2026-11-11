@@ -1303,7 +1303,10 @@ class TestSetupTokenHeaderProbeWiring:
             second = switcher._collect_usage_entries([self._info()])["3"]
 
         # The usage endpoint is never asked: it cannot read a setup-token.
-        assert urls == [oauth.USAGE_PROBE_URL]
+        # One pass = the main probe plus one per scoped model (Fable).
+        assert urls == [oauth.USAGE_PROBE_URL] * (
+            1 + len(oauth.USAGE_PROBE_SCOPED_MODELS)
+        )
         assert first.last_error is None
         assert first.last_good["five_hour"]["pct"] == 25.0
         assert first.last_good["seven_day"]["pct"] == 50.0
