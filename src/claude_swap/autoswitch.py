@@ -4139,13 +4139,18 @@ class AutoSwitchEngine:
         its own schedule, without the active ever needing to burn down to it.
 
         THE ORDINARY PATH HAS A REAL BASELINE (`leftHeadroom` is a number,
-        not null), so it gets three legs, checked in this order, each with
+        not null), so it gets four legs, checked in this order, each with
         the margin its axis already uses. Burn cannot manufacture any of
         them: headroom rises only when a window rolls over, the ratio needs
         the active to lose more than half its remaining headroom AND clear
         an extra `SPENT_HEADROOM_PCT` on top, and the binding reset moves
         nearer only when a nearer window starts binding.
 
+          forced      the ACTIVE is at its own line and the peer has
+                      `hysteresis_pct` of room under all of its own. A
+                      crossing of the active's line is a change in the active
+                      that a ranking flip never produces, so returning is
+                      forced, not a flap.
           dominance   `> active x HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT`
                       against the ACTIVE. A peer moved AWAY from for a reason
                       other than headroom (e.g. consume-first's reset
@@ -4358,6 +4363,10 @@ class AutoSwitchEngine:
             active_headroom is not None
             and active_headroom <= 100.0 - thresholds[current]
         )
+        if active_at_threshold:
+            room = self._room(usage.get(barred), settings, thresholds[barred])
+            if room is not None and room >= settings.hysteresis_pct:
+                return True
         if h is not None:
             if active_headroom is not None:
                 if (
