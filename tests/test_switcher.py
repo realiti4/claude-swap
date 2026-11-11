@@ -19018,6 +19018,49 @@ class TestCurrentAtLimitOverridesTheFrozenPct:
         ) == ("2", "")
 
 
+class TestBestSelectionNeverEntersAnOwnThresholdPeer:
+    """The pin's wall-429 switch (and manual `best`) vetoes a peer at or over its
+    OWN threshold, as the engine does (`over_own_threshold`), beside the weekly
+    cap. A peer without an own threshold reads as before."""
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "dynamic"])
+    @pytest.mark.parametrize(
+        "pct2, own2, pct3, own3, at_limit, expected",
+        [
+            # every peer at or over its own line: all vetoed
+            (100, 90, 53, 50, True, (None, "capped")),
+            # the walled peer has no own line, so only #3 is vetoed
+            (100, None, 53, 50, True, (None, "exhausted")),
+            (100, None, 53, 50, False, (None, "stay")),
+            # under its own line (or without one) a peer wins as before
+            (100, None, 53, 60, True, ("3", "")),
+            (100, None, 53, None, True, ("3", "")),
+        ],
+    )
+    def test_the_veto_at_selection(
+        self, temp_home, strategy, pct2, own2, pct3, own3, at_limit, expected
+    ):
+        from claude_swap.settings import set_setting
+
+        helper = TestCurrentAtLimitOverridesTheFrozenPct()
+        s = helper._setup(temp_home)
+        for num in (1, 2, 3):
+            helper._seed(s, num, f"{num}@example.com")
+        set_setting(s.backup_dir, "autoswitch.strategy", strategy)
+        for num, own in (("2", own2), ("3", own3)):
+            if own is not None:
+                s.set_account_threshold(num, own)
+        usage = {
+            "1": helper._usage(95.0),
+            "2": helper._usage(pct2),
+            "3": helper._usage(pct3),
+        }
+
+        assert s._select_best_switchable(
+            "1", usage=usage, current_at_limit=at_limit
+        ) == expected
+
+
 class TestSwitchOffAtLimitAccount:
     """The seam the pin proxy calls when it sees a 429 on `/v1/messages`."""
 
