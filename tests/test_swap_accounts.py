@@ -2611,15 +2611,18 @@ class TestTheRollbackDecidesPerKey:
 
         The chokepoint catches `OSError` alone, so anything else propagates
         out of it and can never be hidden there. The stand-in below is a plain
-        `Exception` that is not an `OSError`, which is exactly what the
-        per-key loop's `except Exception` contains: it counts a failure and
-        carries on so one key cannot abort the rest of the rollback. (The
-        suite's own real-store guard is a `BaseException` and propagates
-        through both, so it cannot stand in for this.) Measured: the failure
-        does NOT propagate. Widening the chokepoint's `except OSError` to
-        `Exception` is detectable and must not be done: the repair's own
-        sentence and the summary's accounting line then go missing, so the
-        wording asserts below fail (the first is `could not invalidate slot`).
+        `Exception` that is not an `OSError`, so it passes the repair's
+        `except OSError` and is contained by the repair's own
+        `except Exception`: that counts it under `repairs`, deliberately not
+        `failures`, and carries on, so one key cannot abort the rest of the
+        rollback. The per-key loop's handler never sees it. (The suite's
+        real-store guard cannot stand in for this: it must never be
+        contained, and this failure is contained by design.) Measured: the
+        failure does NOT propagate. Widening the repair's `except OSError`
+        around the chokepoint call to `Exception` is detectable and must not
+        be done: the repair's own sentence and the summary's accounting line
+        then go missing, so the wording asserts below fail (the first is
+        `could not invalidate slot`).
 
         So the property to hold here is not propagation but ACCOUNTING: a
         contained failure is named for what failed and carried into the
@@ -2658,8 +2661,8 @@ class TestTheRollbackDecidesPerKey:
             "premise: the repair never reached the blocked call, so this says "
             "nothing about what it contains"
         )
-        # CONTAINED, BUT NEVER SILENT. The per-key loop's `except Exception`
-        # counts this as a failure and carries on, which is the rollback's
+        # CONTAINED, BUT NEVER SILENT. The repair's own `except Exception`
+        # counts this under `repairs` and carries on, which is the rollback's
         # design -- one key must not abort the rest. So the chokepoint's
         # rationale does NOT transfer here. What must hold instead is that the
         # key is COUNTED, that the failure is carried into the summary so the
