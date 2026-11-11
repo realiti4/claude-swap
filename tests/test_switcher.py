@@ -12638,29 +12638,36 @@ class TestGateUltraReviewFixes:
                 "work, so a warning claiming it did is worse than silence"
             )
 
+    @pytest.mark.parametrize("exc_name", ["RuntimeError", "RealStoreWriteBlocked"])
     def test_the_suites_real_store_guard_is_not_absorbed_by_the_wrapper(
-        self, temp_home: Path, sample_sequence_data: dict
+        self, temp_home: Path, sample_sequence_data: dict, exc_name: str
     ):
         """I-1: the containment must be `except OSError`, not `except Exception`.
 
-        `tests/conftest.py`'s `RealStoreWriteBlocked` is deliberately NOT an
-        `OSError` subclass (its own docstring) precisely so that no
-        `except OSError` in this codebase can hide a real-store refusal. An
-        `except Exception` on the credential-persist path catches it and
-        disarms the guard for every write that routes through here.
-
         The wrapper's whole documented fault list is EACCES on the session dir
-        and a read-only mount — both `OSError`. Nothing else belongs in it.
+        and a read-only mount, both `OSError`. Anything else raised by
+        `_post_backup_write` must escape `_write_account_credentials`:
+
+        * `RuntimeError` (a plain `Exception`) is what pins the width: it
+          escapes `except OSError` and is absorbed by `except Exception`, so
+          this case goes red if the handler is widened.
+        * `RealStoreWriteBlocked` (`tests/conftest.py`, a `BaseException`) is
+          the suite's real-store refusal. It escapes either handler, so this
+          case pins only that nothing catches it on the credential-persist
+          path (an `except BaseException` would disarm the guard).
         """
         from tests import conftest
 
+        exc = (
+            RuntimeError if exc_name == "RuntimeError"
+            else conftest.RealStoreWriteBlocked
+        )
         s = self._switcher(sample_sequence_data)
 
-        def blocked(*a, **kw):
-            raise conftest.RealStoreWriteBlocked("refused: the REAL store")
-
-        with patch.object(type(s), "_post_backup_write", blocked):
-            with pytest.raises(conftest.RealStoreWriteBlocked):
+        with patch.object(
+            type(s), "_post_backup_write", side_effect=exc("refused")
+        ):
+            with pytest.raises(exc):
                 s._write_account_credentials("1", "test@example.com", self._NEW)
 
     @staticmethod
