@@ -2662,8 +2662,8 @@ class TestTheRollbackDecidesPerKey:
         # counts this as a failure and carries on, which is the rollback's
         # design -- one key must not abort the rest. So the chokepoint's
         # rationale does NOT transfer here. What must hold instead is that the
-        # key is COUNTED, so the staged copy survives and the operator is told,
-        # and that the failure is named for what actually failed.
+        # key is COUNTED, that the failure is carried into the summary so the
+        # operator is told, and that it is named for what actually failed.
         said = " ".join(records)
         # THE ARM'S OWN SENTENCE. Deleting the whole `except Exception` that
         # names the repair leaves every count, the summary and the staged copy
