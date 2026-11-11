@@ -136,12 +136,14 @@ def _engine_order(
     alone, as `_rank_candidates` does. The note is the panel's words for why
     nobody is previewed, empty when somebody is. `probe_cooldown` is the
     engine's own record of it. State a snapshot lacks (cooldown, the no-return
-    bar, quarantine, the failover count) is not modeled, and neither is a
-    probe source's freshness or hold: no store entries are passed, because the
-    tick refetches a stale row before it decides, and a held one is never
-    fetched."""
+    bar, quarantine, the failover count) is not modeled. The snapshot's own
+    entries go to the pass, so a probe source older than `SERVE_TTL_S` or held
+    is refused as the tick's phase 1 refuses it. One gap is left: a known-reset
+    peer that leads phase 1 can lose to a stale probe source the phase-2
+    refetch then makes fresh."""
     models = parse_model_names(settings.model)
-    usage = {acc.number: acc.usage.decision_value(models) for acc in snap.accounts}
+    entries = {acc.number: acc.usage for acc in snap.accounts}
+    usage = {num: entry.decision_value(models) for num, entry in entries.items()}
     headroom = _headroom_by_account(usage, models)
     active_h = _dynamic_active_headroom(
         settings, models, usage, active_number, headroom.get(active_number)
@@ -198,7 +200,7 @@ def _engine_order(
             oauth_candidates=oauth_peers,
             no_return=None, usage=usage, headroom=h, current=active_number,
             active_headroom=h.get(active_number), settings=settings, now=now,
-            probe_cooldown=probe_cooldown, thresholds=bars,
+            probe_cooldown=probe_cooldown, thresholds=bars, entries=entries,
         )
 
     ordered, any_known, active_reset_ts, waiting, _ = rank(models)

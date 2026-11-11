@@ -28,6 +28,7 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
 )
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.poll_policy import SERVE_TTL_S
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
@@ -3762,12 +3763,14 @@ def _window7(five_h, seven_d, seven_reset_h=None, five_reset_h=None):
     return {"five_hour": five, "seven_day": seven}
 
 
-def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=()):
+def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=(), entry_kw=None):
     """The engine harness and the panel's snapshot of ONE fleet (`{number: usage
     payload or sentinel, `USAGE_NO_CREDENTIALS` a slot with no stored login on
     both sides), account 1 the active one, `disabled` the numbers held out of
-    rotation on both sides). The harness clock is the wall clock: the panel
-    reads `time.time()`, and a reset in the harness's 1970 is already past."""
+    rotation on both sides, `entry_kw` per-number `UsageEntry` fields that
+    replace the 5 s old default, a stale age or a hold). The harness clock is
+    the wall clock: the panel reads `time.time()`, and a reset in the harness's
+    1970 is already past."""
     from tests.test_autoswitch import EngineHarness
 
     h = EngineHarness(temp_home, **settings)
@@ -3794,9 +3797,10 @@ def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=()):
                 disabled=n in disabled,
                 switchable=usage != USAGE_NO_CREDENTIALS,
                 entry=(
-                    make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(
-                        last_good=usage, fetched_at=time.time() - 5.0, age_s=5.0,
-                    )
+                    make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(**{
+                        "last_good": usage, "fetched_at": time.time() - 5.0, "age_s": 5.0,
+                        **(entry_kw or {}).get(n, {}),
+                    })
                 ),
             )
             for n, usage in fleet.items()
@@ -4025,6 +4029,51 @@ class TestNextBestFollowsTheTick:
         assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
         assert str(h.active_number()) == "3", "the tick probed, or took no pick"
         assert _next_best_order(snap, "1", h.settings)[0] == "3"
+
+    @pytest.mark.parametrize(
+        "age_s, hold_s, switched_to",
+        [
+            (5.0, None, "2"),
+            (SERVE_TTL_S + 60.0, None, None),
+            (5.0, 600.0, None),
+        ],
+        ids=["fresh-is-the-probe", "stale-is-refused", "held-is-refused"],
+    )
+    def test_a_probe_source_the_tick_refuses_is_not_named_the_probe(
+        self, temp_home, age_s, hold_s, switched_to
+    ):
+        """Account 2's weekly reset was never reported, and it is the only peer
+        that can be admitted as a probe. A reading older than `SERVE_TTL_S`
+        (still decision-trusted, under `STALE_OK_S`) or held by an adoption is
+        no probe source: the tick refuses it in phase 1, and the phase-2 refetch
+        never runs on an empty pass. The panel follows the tick, from the same
+        entries, and a fresh one is the control that names it."""
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        now = time.time()
+        fleet = {"1": _window(40, 100), "2": _window7(10, 0)}
+        h, snap = _harness_and_panel_snapshot(
+            temp_home, {"strategy": "consume-first"}, fleet,
+            entry_kw={"2": {
+                "fetched_at": now - age_s, "age_s": age_s,
+                "held_until": now + hold_s if hold_s else None,
+            }},
+        )
+        outcome = h.tick_with_entries({a.number: a.usage for a in snap.accounts})
+        text = _next_best_text(snap, "1", h.settings)
+        if switched_to:
+            assert outcome is TickOutcome.SWITCHED
+            assert str(h.active_number()) == switched_to
+            assert _next_best_order(snap, "1", h.settings)[0] == switched_to
+            assert not [t for t in _REFUSAL_TEXT.values() if t in text]
+        else:
+            assert outcome is TickOutcome.NO_ACTION
+            event = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+            assert event.reason == "already-consuming-soonest"
+            assert [t for t in _REFUSAL_TEXT.values() if t in text] == [
+                _REFUSAL_TEXT["already-consuming-soonest"]
+            ]
 
 
 @pytest.mark.asyncio
