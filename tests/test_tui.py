@@ -26,6 +26,7 @@ from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEven
 from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
     USAGE_TOKEN_EXPIRED,
 )
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
@@ -3099,8 +3100,9 @@ def _window7(five_h, seven_d, seven_reset_h=None, five_reset_h=None):
 
 def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=()):
     """The engine harness and the panel's snapshot of ONE fleet (`{number: usage
-    payload or sentinel}`, account 1 the active one, `disabled` the numbers
-    held out of rotation on both sides). The harness clock is the wall clock: the panel
+    payload or sentinel, `USAGE_NO_CREDENTIALS` a slot with no stored login on
+    both sides), account 1 the active one, `disabled` the numbers held out of
+    rotation on both sides). The harness clock is the wall clock: the panel
     reads `time.time()`, and a reset in the harness's 1970 is already past."""
     from tests.test_autoswitch import EngineHarness
 
@@ -3108,6 +3110,8 @@ def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=()):
     h.clock.now = time.time()
     for number, usage in fleet.items():
         h.seed(int(number), f"u{number}@x.invalid")
+        if usage == USAGE_NO_CREDENTIALS:
+            h.switcher._delete_account_credentials(number, f"u{number}@x.invalid")
         if usage == USAGE_API_KEY:
             data = h.switcher._get_sequence_data()
             data["accounts"][number]["kind"] = "api_key"
@@ -3124,6 +3128,7 @@ def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=()):
                 n, active=n == "1",
                 kind="api_key" if usage == USAGE_API_KEY else "oauth",
                 disabled=n in disabled,
+                switchable=usage != USAGE_NO_CREDENTIALS,
                 entry=(
                     make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(
                         last_good=usage, fetched_at=time.time() - 5.0, age_s=5.0,
@@ -3312,6 +3317,35 @@ class TestNextBestFollowsTheTick:
         assert h.tick_with_usage(fleet) is not TickOutcome.SWITCHED
         assert h.active_number() == 1
         assert "no candidate qualifies" in _next_best_text(snap, "1", h.settings)
+
+    def test_an_unswitchable_peer_leaves_the_refusal_as_the_tick_worded_it(self, temp_home):
+        """Slot 3 has no login, so its row reads its sentinel. That text is the
+        row's own: the line under "Next best" is still the tick's refusal."""
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        fleet = {"1": _window(95, 100), "2": _window(88, 10), "3": USAGE_NO_CREDENTIALS}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "best"}, fleet)
+        assert h.tick_with_usage(fleet) is not TickOutcome.SWITCHED
+        event = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+        assert event.reason == "no-qualifying-candidate"
+        text = _next_best_text(snap, "1", h.settings)
+        assert text.splitlines()[1].strip() == _REFUSAL_TEXT[event.reason]
+        assert text.count(tui_data.sentinel_label(USAGE_NO_CREDENTIALS)) == 1
+
+    @pytest.mark.parametrize("with_settings", [True, False], ids=["tick-picks", "no-settings"])
+    def test_an_unswitchable_peer_adds_no_line_under_the_header(self, temp_home, with_settings):
+        """Nothing is refused (the tick has a pick, or the panel has no
+        settings to run the engine on), so row 1 follows the header directly."""
+        from claude_swap.autoswitch import TickOutcome
+
+        fleet = {"1": _window(95, 100), "2": _window(10, 50), "3": USAGE_NO_CREDENTIALS}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "best"}, fleet)
+        if with_settings:
+            assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+            assert str(h.active_number()) == "2"
+        text = _next_best_text(snap, "1", h.settings if with_settings else None)
+        assert "user2@example.com" in text.splitlines()[1]
 
 
 # Pairwise model of the slot guard below (pict `/o:2 /r:3328`, 9 cases, CAPPED

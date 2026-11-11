@@ -777,14 +777,14 @@ class AutoScreen(Screen):
                 # `cswap add` overwrites a working stored grant. `kind` still
                 # wins for api_key — the sentinel diverges from it behind a
                 # locked keychain.
-                note = data.sentinel_label(
+                why = data.sentinel_label(
                     USAGE_API_KEY if acc.kind == "api_key"
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
                 rows[acc.number] = CandidateRow(
                     Text(acc.number, style=palette.muted),
                     Text(acc.email, style=palette.muted),
-                    Text(note, style=palette.sev_warn),
+                    Text(why, style=palette.sev_warn),
                     note=True,
                 )
                 ranked.append(((1000.0,), acc.number))   # last: never a target
