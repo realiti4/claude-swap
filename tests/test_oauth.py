@@ -1034,6 +1034,14 @@ class TestUsageRequestLog:
         assert all(p in line for p in present)
         assert not any(a in line for a in absent)
 
+    def test_a_failing_log_line_changes_nothing(self):
+        err = self.HTTP(401)
+        with patch.object(oauth._logger, "info", side_effect=RuntimeError("boom")), \
+                patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+                pytest.raises(urllib.error.HTTPError) as raised:
+            oauth.request_usage_data(self.TOKEN)
+        assert raised.value is err
+
     @pytest.mark.parametrize("code, headers, body, error, retry_after", [
         (429, {"Retry-After": "3600"}, RATE, "http-429", 3600.0),
         (403, {}, TestClassifyUsageError.ORG_BODY, TestClassifyUsageError.ORG, None),

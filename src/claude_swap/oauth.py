@@ -514,7 +514,10 @@ def request_usage_data(access_token: str) -> dict:
         outcome = f"http-{e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
         raise
     finally:
-        _log_usage_request(access_token, outcome, resp_headers, err)
+        try:
+            _log_usage_request(access_token, outcome, resp_headers, err)
+        except Exception:  # a log line must never replace the result or the HTTPError
+            pass
 
 
 def _log_safe(value, cap: int = 64, free_text: bool = False) -> str:
@@ -533,7 +536,7 @@ def _log_usage_request(
     only as the 12-hex tag cswap-pin logs for its bearer; no email, so the line
     is paste-safe. A 429 adds its Retry-After and the cause its body states
     (the one status whose body is read here: ``_classify_usage_error`` reads a
-    403's, and an HTTPError body can be read once). Never raises."""
+    403's, and an HTTPError body can be read once)."""
     headers = headers or {}
     tag = hashlib.sha256(access_token.encode()).hexdigest()[:12]
     argv0 = os.path.basename(sys.argv[0]) if sys.argv else ""
