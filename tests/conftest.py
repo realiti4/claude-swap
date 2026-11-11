@@ -23,7 +23,7 @@ from claude_swap import macos_keychain as _macos_keychain
 from claude_swap import paths as _paths
 
 
-class RealStoreWriteBlocked(Exception):
+class RealStoreWriteBlocked(BaseException):
     """A test process tried to write the REAL account store.
 
     Raised from a process-global ``sys.addaudithook`` — installed once,
@@ -53,6 +53,12 @@ class RealStoreWriteBlocked(Exception):
     A plain ``Exception`` cannot be caught by any ``except OSError:`` in the
     stdlib or this codebase, so the refusal can no longer be absorbed by
     the very shape it is meant to guard.
+
+    Nor an ``Exception``: src has many ``except Exception``
+    containments (``check_for_update`` among them), and each absorbed the
+    refusal, which hid ``main()``'s write of ``<backup root>/cache``.
+    A ``BaseException`` passes them all, with no src change: narrowing them is
+    refused (the consume paths' ``except Exception`` is their last defence).
     """
 
 
@@ -492,6 +498,11 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(
         "claude_swap.app_bundle.APPLICATIONS_DIR",
         tmp_path_factory.mktemp("isolated_applications"),
+    )
+    # Frozen at import from the real backup root, so no $HOME redirect reaches it.
+    monkeypatch.setattr(
+        "claude_swap.update_check.CACHE_PATH",
+        tmp_path_factory.mktemp("isolated_update_check") / "update_check.json",
     )
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
