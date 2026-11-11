@@ -2616,13 +2616,14 @@ class TestTheRollbackDecidesPerKey:
         carries on so one key cannot abort the rest of the rollback. (The
         suite's own real-store guard is a `BaseException` and propagates
         through both, so it cannot stand in for this.) Measured: the failure
-        does NOT propagate. Widening this arm to `Exception` is detectable and
-        must not be done: measured, `failures` then stays 0, the staged copies
-        are discarded and this case fails on `staged.exists()`.
+        does NOT propagate. Widening the chokepoint's `except OSError` to
+        `Exception` is detectable and must not be done: the repair's own
+        sentence and the summary's accounting line then go missing, so the
+        wording asserts below fail (the first is `could not invalidate slot`).
 
         So the property to hold here is not propagation but ACCOUNTING: a
-        contained failure must keep the staged copies and say so, or a refused
-        write leaves no trace.
+        contained failure is named for what failed and carried into the
+        summary, or a refused write leaves no trace.
         """
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data_with_org)
