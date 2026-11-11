@@ -16468,6 +16468,27 @@ class TestPerAccountSwitchThreshold:
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
 
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    def test_a_spent_fleet_with_one_peer_over_its_own_line_still_names_it(
+        self, temp_home, strategy
+    ):
+        """The incident's shape: the active at the wall, #2 with room but over
+        its own 50, #3 walled. The hold names #2 and polls at the ordinary
+        cadence, not the all-exhausted sleep that never mentions it."""
+        h = self._harness(temp_home, strategy)
+        self._set(h, 2, 50.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 53, 1 * 86400),
+            "3": self._use(h, 100, 5 * 86400),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        log = [e.human() for e in h.events if not isinstance(e, PollEvent)]
+        assert any("Account-2" in line and "own threshold" in line for line in log), log
+        assert h.engine._sleep_until_ts is None
+        assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
+
     @pytest.mark.parametrize("strategy", ["dynamic", "best"])
     @pytest.mark.parametrize("escape", ["at-limit", "weekly-capped"])
     def test_an_escape_never_tries_a_peer_over_its_own_threshold(
@@ -16533,20 +16554,6 @@ class TestPerAccountSwitchThreshold:
         settings = AutoSwitchSettings(strategy=strategy, weekly_threshold=weekly)
         bars = ThresholdMap({} if own is None else {"2": own}, settings.threshold)
         assert over_own_threshold("2", {"2": value}, settings, (), bars) is over
-
-    def test_over_own_threshold_reads_the_axis_the_active_is_read_on(self):
-        """A peer over its own 80 on Fable alone is a landing in a fleet-wide
-        model blackout (the retry reads 5h/7d), and over its line otherwise."""
-        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
-        bars = ThresholdMap({"2": 80.0}, settings.threshold)
-
-        def fleet(fable):
-            return {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 5.0},
-                    "scoped": [{"name": "Fable", "pct": fable}]}
-
-        args = (settings, ("Fable",), bars)
-        assert over_own_threshold("2", {"2": fleet(85.0)}, *args) is False
-        assert over_own_threshold("2", {"2": fleet(85.0), "3": fleet(10.0)}, *args) is True
 
     def test_dynamic_two_accounts_past_their_own_line_do_not_trade_places(
         self, temp_home

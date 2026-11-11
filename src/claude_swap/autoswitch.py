@@ -298,24 +298,18 @@ def over_own_threshold(
     num: str,
     usage: Mapping[str, dict | str | None],
     settings: AutoSwitchSettings,
-    models: tuple[str, ...],
+    models: Sequence[str],
     bars: Mapping[str, float],
 ) -> bool:
     """Whether ``num`` sits at or over its OWN switch threshold, by the verdict that
     would make it leave as the active (`dynamic`: raw binding headroom against its own
-    wall, every window alike; the others: any window at its line), on the axis the
-    active is read on: the model set drops out in a fleet-wide model blackout
-    (`_model_window_binds_everywhere`), as the retry and `_dynamic_active_headroom` do.
-    The tick and the "Next best" panel drop such a peer at candidate selection, so no
-    trigger or regime lands on it. ``bars.get`` reads the overrides only: an account
-    without one, and a reading that carries no window, is never over."""
+    wall, every window alike; the others: any window at its line). The tick and the
+    "Next best" panel drop such a peer at candidate selection, so no trigger or regime
+    lands on it. ``bars.get`` reads the overrides only: an account without one, and a
+    reading that carries no window, is never over."""
     own = bars.get(num)
     if own is None:
         return False
-    if _model_window_binds_everywhere(
-        usage, models, settings.threshold, settings.weekly_threshold, bars
-    ):
-        models = ()
     value = usage.get(num)
     if settings.strategy != "dynamic":
         return bool(_over_at(value, settings, models, own))
@@ -3746,26 +3740,29 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
+
+        def _hold_over_own() -> TickOutcome:
+            """Held on purpose, not stranded: any tick can free a slot (a reset,
+            a fresh reading), so the ordinary cadence stands, not a long sleep."""
+            self._emit(NoSwitchEvent(
+                reason="over-own-threshold",
+                detail=(
+                    ", ".join(
+                        f"Account-{n} (line {pct_label(thresholds[n])}%)" for n in vetoed
+                    )
+                    + " at or over its own threshold, and no other account to land on"
+                    + (
+                        f"; Account-{current} is past its weekly cap "
+                        f"({active_capped[0]} {pct_label(active_capped[1])}%)"
+                        if active_capped else ""
+                    )
+                ),
+            ))
+            return TickOutcome.BLOCKED
+
         if not oauth_candidates and not api_key_candidates:
             if vetoed:
-                # Held on purpose, not stranded: any tick can free a slot (a reset,
-                # a fresh reading), so the ordinary cadence stands, not the long one.
-                self._emit(NoSwitchEvent(
-                    reason="over-own-threshold",
-                    detail=(
-                        "every other account is at or over its own threshold: "
-                        + ", ".join(
-                            f"Account-{n} (line {pct_label(thresholds[n])}%)"
-                            for n in vetoed
-                        )
-                        + (
-                            f"; Account-{current} is past its weekly cap "
-                            f"({active_capped[0]} {pct_label(active_capped[1])}%)"
-                            if active_capped else ""
-                        )
-                    ),
-                ))
-                return TickOutcome.BLOCKED
+                return _hold_over_own()
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -4021,6 +4018,9 @@ class AutoSwitchEngine:
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
+            if vetoed and (truly_exhausted or waiting_for_recovery):
+                # Not "all exhausted": a peer with room is only barred by its own line.
+                return _hold_over_own()
             if not truly_exhausted and not waiting_for_recovery:
                 self._emit(
                     NoSwitchEvent(

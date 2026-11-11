@@ -282,17 +282,13 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
 
     @pytest.mark.usefixtures("quick_pilot")
-    async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
+    async def test_a_candidate_over_its_own_line_on_a_model_window_is_not_listed(
         self, tmp_path, fake_engine
     ):
-        """Under dynamic the panel ranks on 5h/7d alone once no candidate is
-        open on the model axis, as the engine's retry does. Candidates 2 and 3
-        sit under the dynamic bar (97) but over their own 80 line on Fable, so
-        neither is open and the ranking drops the model: 2's real 5h (20%)
-        beats 3's (60%). Judged on the bar, both read open, the model gate
-        stays, nobody is admitted, and both fall to the waiting tail, whose
-        order here coincides with the right one: so the ranking itself is
-        asserted, empty without the per-account lines."""
+        """Candidates 2 and 3 sit under the dynamic bar (97) but over their own
+        80 line on Fable. An own line is a landing veto on the model-gated
+        reading too, a fleet-wide model blackout no exception: the panel lists
+        neither (the 5h/7d room they hold is not a landing)."""
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
             "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
@@ -324,11 +320,9 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             ordered, *_ = tui_data.rank_switch_candidates(
                 fake.accounts_snapshot(), app.screen._settings, time.time(), "1"
             )
-            assert ordered == ["2", "3"]
+            assert ordered == []
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user2@example.com") < plain.index(
-                "user3@example.com"
-            )
+            assert "no candidate qualifies" in plain and plain.count("Fable-walled") == 2, plain
 
 
 class TestAFleetOverItsLinesNeverListsAPeerOverItsOwnLineOnEitherScreen:
