@@ -32,12 +32,14 @@ from claude_swap.autoswitch import (
     PollEvent,
     QuarantineEvent,
     SwitchEvent,
+    ThresholdMap,
     TickOutcome,
     UnquarantineEvent,
     _SYSTEMIC_MESSAGES,
     _seven_day_reset_ts,
     classify_candidate_block,
     last_engine_switch,
+    over_own_threshold,
     pct_label,
     proactive_switch_bar_pct,
     record_limit_switch,
@@ -8936,25 +8938,29 @@ class TestAllAboveRoomIsDistanceToTheLimit:
         h.engine = h._make_engine()
         return h
 
-    def test_a_higher_line_does_not_make_a_fuller_account_roomier(
-        self, temp_home
+    @pytest.mark.parametrize("trigger", ["proactive", "at-limit", "failover"])
+    def test_accounts_over_their_own_lines_are_never_landed_on(
+        self, temp_home, trigger
     ):
-        """Global 90. Account 2 sits at 96% on a 95 line (line headroom 8,
-        raw room 4) and resets in ten minutes; account 3 sits at 85% on an 80
-        line (line headroom 7.5, raw room 15). Line headroom and the soonest
-        reset both take the account four points from a hard limit."""
+        """Global 90. Account 2 sits at 96% on a 95 line and account 3 at 85%
+        on an 80 line, every account over its lines. Room used to rank them
+        here (3 holds 15 points to 2's 4); an own line is now a landing veto, so
+        the move holds, whatever the trigger."""
         h = self._fleet(temp_home, {"2": 95.0, "3": 80.0})
         now = h.clock.now
-        outcome = h.tick_with_usage({
-            "1": _usage(99, _iso_at(now + 3 * 3600)),     # active, 1 pt
-            "2": _usage(96, _iso_at(now + 600)),
-            "3": _usage(85, _iso_at(now + 4.5 * 3600)),
-        })
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3, (
-            f"landed on {h.active_number()} — every account is over its own "
-            "line, and account 3 holds 15 points to account 2's 4"
-        )
+        active = {"proactive": _usage(99, _iso_at(now + 3 * 3600)),
+                  "at-limit": _usage(100), "failover": None}[trigger]
+        outcome = None
+        for _ in range(3 if trigger == "failover" else 1):  # unhealthy_ticks default is 3
+            outcome = h.tick_with_usage({
+                "1": active,
+                "2": _usage(96, _iso_at(now + 600)),
+                "3": _usage(85, _iso_at(now + 4.5 * 3600)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.BLOCKED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 1
 
     def test_a_weekly_line_does_not_make_a_weekly_window_roomier(
         self, temp_home
@@ -9011,35 +9017,6 @@ class TestAllAboveRoomIsDistanceToTheLimit:
         outcome = h.tick_with_usage({"1": _usage(97), "2": _usage(94)})
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-
-    def test_an_at_limit_escape_ranks_by_room_under_per_account_lines(
-        self, temp_home
-    ):
-        """The escape skips the landing gate, and with `best` it sorted by
-        line headroom: 96% on a 95 line (8) over 85% on an 80 line (7.5)."""
-        h = self._fleet(temp_home, {"2": 95.0, "3": 80.0})
-        outcome = h.tick_with_usage({
-            "1": _usage(100), "2": _usage(96), "3": _usage(85),
-        })
-        assert outcome is TickOutcome.SWITCHED
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "at-limit"
-        assert h.active_number() == 3
-
-    def test_a_failover_ranks_by_room_under_per_account_lines(self, temp_home):
-        """Failover cannot read the active, so the candidates' own lines
-        alone decide that nothing sits under them."""
-        h = self._fleet(temp_home, {"2": 95.0, "3": 80.0})
-        outcome = None
-        for _ in range(3):  # unhealthy_ticks default is 3
-            outcome = h.tick_with_usage({
-                "1": None, "2": _usage(96), "3": _usage(85),
-            })
-            h.clock.advance(60.0)
-        assert outcome is TickOutcome.SWITCHED
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "failover"
-        assert h.active_number() == 3
 
     def test_an_escape_reads_each_windows_own_line(self, temp_home):
         """Threshold 85, weekly line 97. Account 2's weekly window at 93% is
@@ -16441,12 +16418,13 @@ class TestPerAccountSwitchThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
-    def test_a_walled_active_still_takes_a_peer_over_its_own_threshold(
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    def test_a_walled_active_never_takes_a_peer_over_its_own_threshold(
         self, temp_home, strategy
     ):
-        """A threshold is a preference, not a veto: the last peer with room is
-        taken before the active walls, not after."""
+        """A peer's own threshold is a veto, not a preference: the active at the
+        real wall stays rather than land on a peer at or over its own line,
+        however spent the rest of the fleet is."""
         h = self._harness(temp_home, strategy)
         self._set(h, 2, 70.0)
         outcome = h.tick_with_usage({
@@ -16454,15 +16432,127 @@ class TestPerAccountSwitchThreshold:
             "2": self._use(h, 75, 5 * 86400),
             "3": self._use(h, 99, 5 * 86400),
         })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    @pytest.mark.parametrize("active", ["walled", "past-own-line", "weekly-capped"])
+    def test_every_peer_over_its_own_threshold_holds_and_says_why(
+        self, temp_home, strategy, active
+    ):
+        """Nowhere admissible to go: the active stays, below its weekly cap
+        and at it alike, the log names the vetoed peers, and the poll keeps
+        its ordinary cadence (a freed slot is seen within one interval, not
+        the 300 s no-candidates fallback)."""
+        h = self._harness(temp_home, strategy)
+        self._set(h, 2, 50.0)
+        self._set(h, 3, 50.0)
+        pct, seven = {
+            "walled": (99, 10.0), "past-own-line": (53, 10.0), "weekly-capped": (60, 95.0),
+        }[active]
+        if active == "past-own-line":
+            self._set(h, 1, 50.0)
+        if active == "weekly-capped":
+            h.switcher.set_account_weekly_cap("1", 90.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, pct, 9 * 86400, seven),
+            "2": self._use(h, 53, 1 * 86400),
+            "3": self._use(h, 60, 1 * 86400),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        (event,) = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert event.reason == "over-own-threshold"
+        assert "Account-2" in event.detail and "Account-3" in event.detail
+        assert ("weekly cap" in event.detail) == (active == "weekly-capped")
+        assert h.engine._sleep_until_ts is None
+        assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "best"])
+    @pytest.mark.parametrize("escape", ["at-limit", "weekly-capped"])
+    def test_an_escape_never_tries_a_peer_over_its_own_threshold(
+        self, temp_home, strategy, escape
+    ):
+        """The escapes skip the landing gate, so the over-own peer used to be
+        the fallback behind the healthy one: with that one refused it was
+        freshened and switched to. It is out of the pool, not ranked last."""
+        h = self._harness(temp_home, strategy)
+        self._set(h, 2, 50.0)
+        if escape == "weekly-capped":
+            h.switcher.set_account_weekly_cap("1", 90.0)
+        tried = []
+
+        def freshen(num, email):
+            tried.append(num)
+            return "transient" if num == "3" else "ok"
+
+        with patch.object(h.engine, "_freshen_target", side_effect=freshen):
+            outcome = h.tick_with_usage({
+                "1": self._use(h, 100 if escape == "at-limit" else 60, 9 * 86400,
+                               10.0 if escape == "at-limit" else 95.0),
+                "2": self._use(h, 53, 1 * 86400),
+                "3": self._use(h, 40, 5 * 86400),
+            })
+        assert tried == ["3"]
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    def test_a_peer_with_no_own_threshold_is_still_taken_at_the_real_wall(
+        self, temp_home, strategy
+    ):
+        """Control: only an account's OWN line is a veto. 2 has none and sits
+        over the global 90, so the real wall still takes it, while 3, with
+        more room, is over its own 50 and is not."""
+        h = self._harness(temp_home, strategy, threshold=90.0)
+        self._set(h, 3, 50.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 93, 5 * 86400),
+            "3": self._use(h, 60, 1 * 86400),
+        })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    @pytest.mark.parametrize(
+        "strategy, weekly, value, own, over",
+        [
+            ("dynamic", None, {"five_hour": {"pct": 53.0}}, 50.0, True),
+            ("dynamic", None, {"five_hour": {"pct": 50.0}}, 50.0, True),  # at the line
+            ("dynamic", None, {"five_hour": {"pct": 49.9}}, 50.0, False),
+            ("dynamic", None, {"five_hour": {"pct": 99.0}}, None, False),  # no own line
+            ("dynamic", 97.0, {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 60.0}}, 50.0, True),
+            ("best", 97.0, {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 60.0}}, 50.0, False),
+            ("best", 97.0, {"five_hour": {"pct": 53.0}}, 50.0, True),
+            ("best", None, {"five_hour": {"pct": 99.0}}, None, False),
+            ("dynamic", None, None, 50.0, False),  # unreadable: not measured over
+            ("best", None, "token_expired", 50.0, False),
+        ],
+    )
+    def test_over_own_threshold_predicate(self, strategy, weekly, value, own, over):
+        settings = AutoSwitchSettings(strategy=strategy, weekly_threshold=weekly)
+        bars = ThresholdMap({} if own is None else {"2": own}, settings.threshold)
+        assert over_own_threshold("2", {"2": value}, settings, (), bars) is over
+
+    def test_over_own_threshold_reads_the_axis_the_active_is_read_on(self):
+        """A peer over its own 80 on Fable alone is a landing in a fleet-wide
+        model blackout (the retry reads 5h/7d), and over its line otherwise."""
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        bars = ThresholdMap({"2": 80.0}, settings.threshold)
+
+        def fleet(fable):
+            return {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 5.0},
+                    "scoped": [{"name": "Fable", "pct": fable}]}
+
+        args = (settings, ("Fable",), bars)
+        assert over_own_threshold("2", {"2": fleet(85.0)}, *args) is False
+        assert over_own_threshold("2", {"2": fleet(85.0), "3": fleet(10.0)}, *args) is True
 
     def test_dynamic_two_accounts_past_their_own_line_do_not_trade_places(
         self, temp_home
     ):
-        """Only an active at the REAL wall lifts a peer's own line, or two
-        accounts past theirs would swap every tick (the cooldown yields to an
-        account's own wall)."""
+        """No account's own line is lifted for a peer, so two accounts past
+        theirs hold instead of swapping every tick."""
         h = self._harness(temp_home, "dynamic")
         self._set(h, 1, 80.0)
         self._set(h, 2, 80.0)
@@ -17998,7 +18088,7 @@ def test_a_weekly_cap_of_one_hundred_is_no_cap():
 
 def _dco(
     pool, *, expiring=(), plans=None, trigger="proactive", dropped=False,
-    active_headroom=2.0, raw_active_headroom=60.0, **settings,
+    raw_active_headroom=60.0, **settings,
 ):
     """`dynamic_candidate_order` on three cold peers: 2 resets within a day with 60
     points of room, 3 holds 90 and resets later, 4 resets within the day with 95.
@@ -18019,7 +18109,7 @@ def _dco(
     entries = {n: SimpleNamespace(plan=p) for n, p in (plans or {}).items()}
     return dynamic_candidate_order(
         pool, headroom, usage, entries, {}, {}, AutoSwitchSettings(strategy="dynamic", **settings),
-        now, current="1", active_headroom=active_headroom, expiring=expiring,
+        now, current="1", expiring=expiring,
         trigger=trigger, model_window_dropped=dropped, raw_active_headroom=raw_active_headroom,
     )
 

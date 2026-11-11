@@ -228,35 +228,19 @@ class TestLandingGateIsPerCandidate:
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
         assert h.active_number() == 2
 
-    def test_both_over_their_own_lines_hands_the_tick_to_the_all_above_regime(
-        self, temp_home
-    ):
-        """Rejecting *every* candidate does not produce NO_ACTION.
-
-        The landing floor is the exact complement of
-        `_every_account_above_threshold` (see the engine comment at
-        `_left_account_recovered`): if the gate rejects every measured
-        candidate while the active account is over its own line, then by
-        definition every account is at/over its line, `all_above` is True, and
-        the landing gate is bypassed by the all-above room ranking. So the
-        per-account rewrite must feed **both** sides the same map - a version
-        that made the landing gate per-account but left the all-above census on
-        the global scalar would disagree with itself here and hold.
-        """
+    def test_both_over_their_own_lines_hold_the_tick(self, temp_home):
+        """Rejecting *every* candidate is a hold, not a hand-off to the
+        all-above regime: an own line is a veto at candidate selection, so the
+        active stays on its wall until a reset frees a slot, and the log names
+        why."""
         h = _fleet(temp_home)
         h.switcher.set_account_threshold("2", 85.0)
         h.switcher.set_account_threshold("3", 85.0)
         h.engine = h._make_engine()
-        # Both candidates are over their own (lowered) lines, and so is 1.
-        thresholds = ThresholdMap({"2": 85.0, "3": 85.0}, GLOBAL)
-        assert _every_account_above_threshold(
-            ["2", "3"],
-            {n: _over(h, hr, thresholds[n]) for n, hr in {"2": 12.0, "3": 11.0}.items()},
-            _over(h, 1.0, thresholds["1"]),
-        ) is True
         outcome = h.tick_with_usage(self._usage_map())
-        assert outcome is TickOutcome.SWITCHED, _reasons(h)
-        assert h.active_number() != 1
+        assert outcome is TickOutcome.BLOCKED, _reasons(h)
+        assert _reasons(h) == ["over-own-threshold"]
+        assert h.active_number() == 1
 
     def test_the_rejected_candidate_is_not_merely_deprioritized(self, temp_home):
         """A rejected landing spot must be *excluded*, not sorted last.

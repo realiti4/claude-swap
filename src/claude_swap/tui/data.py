@@ -36,6 +36,7 @@ from claude_swap.autoswitch import (
     _seven_day_reset_ts,
     dynamic_candidate_order,
     dynamic_expiring_walk,
+    over_own_threshold,
     rank_candidates_pass,
     rank_priority_candidates,
 )
@@ -284,8 +285,9 @@ def rank_switch_candidates(
         policy = policies.get(num)
         return weekly_capped(policy.weekly_cap if policy else None, usage.get(num))
 
-    # Capped peers drop before the split by kind, as `_tick_inner` does.
-    candidates = [
+    # Capped peers drop before the split by kind, as `_tick_inner` does, and so do
+    # those at or over their own threshold (`over_own_threshold`, the engine's veto).
+    eligible = [
         acc
         for acc in snap.accounts
         if acc.number != active_number
@@ -293,6 +295,12 @@ def rank_switch_candidates(
         and not acc.disabled
         and _capped(acc.number) is None
     ]
+    vetoed = {
+        acc.number
+        for acc in eligible
+        if over_own_threshold(acc.number, usage, settings, models, bars)
+    }
+    candidates = [acc for acc in eligible if acc.number not in vetoed]
     oauth_candidates = [acc.number for acc in candidates if acc.kind != "api_key"]
     api_key_candidates = (
         [acc.number for acc in candidates if acc.kind == "api_key"]
@@ -353,9 +361,6 @@ def rank_switch_candidates(
         ordered, rank_axis = dynamic_candidate_order(
             oauth_candidates, headroom, usage, entries, bars, last, settings, now,
             current=active_number,
-            # The active reads as the engine passes it: widened on the model axis,
-            # its own unmodeled headroom on the retry.
-            active_headroom=active_headroom if axis else headroom.get(active_number),
             expiring=expiring,
             trigger=trigger, model_window_dropped=dropped, reasons=reasons,
             raw_active_headroom=model_headroom.get(active_number), models=models,
@@ -451,6 +456,7 @@ def rank_switch_candidates(
         and trigger not in (*CONSUME_FIRST_STRATEGIES, "priority")
     ):
         ordered, rank_axis = api_key_candidates, None
+    reasons.update(dict.fromkeys(vetoed, "at or over its own threshold"))
     return ordered, rank_axis, trigger, unmodeled
 
 

@@ -294,6 +294,35 @@ def _wall_headroom(own_bar: float | None, default: float = SPENT_HEADROOM_PCT) -
     return default if own_bar is None else 100.0 - own_bar
 
 
+def over_own_threshold(
+    num: str,
+    usage: Mapping[str, dict | str | None],
+    settings: AutoSwitchSettings,
+    models: tuple[str, ...],
+    bars: Mapping[str, float],
+) -> bool:
+    """Whether ``num`` sits at or over its OWN switch threshold, by the verdict that
+    would make it leave as the active (`dynamic`: raw binding headroom against its own
+    wall, every window alike; the others: any window at its line), on the axis the
+    active is read on: the model set drops out in a fleet-wide model blackout
+    (`_model_window_binds_everywhere`), as the retry and `_dynamic_active_headroom` do.
+    The tick and the "Next best" panel drop such a peer at candidate selection, so no
+    trigger or regime lands on it. ``bars.get`` reads the overrides only: an account
+    without one, and a reading that carries no window, is never over."""
+    own = bars.get(num)
+    if own is None:
+        return False
+    if _model_window_binds_everywhere(
+        usage, models, settings.threshold, settings.weekly_threshold, bars
+    ):
+        models = ()
+    value = usage.get(num)
+    if settings.strategy != "dynamic":
+        return bool(_over_at(value, settings, models, own))
+    h = oauth.account_headroom(value if isinstance(value, dict) else None, models)
+    return h is not None and h <= _wall_headroom(own)
+
+
 def _departure_wall(
     current: str | None, expiring: Sequence[str], bars: Mapping[str, float]
 ) -> float:
@@ -966,7 +995,6 @@ def dynamic_candidate_order(
     now: float,
     *,
     current: str | None,
-    active_headroom: float | None,
     expiring: list[str],
     trigger: str = "proactive",
     model_window_dropped: bool = False,
@@ -977,11 +1005,11 @@ def dynamic_candidate_order(
     """The order `dynamic` takes its candidates in, and what it sorted on: the "Next
     best" panel builds it here from the same pieces the tick's two arms rank by.
 
-    `proactive`: warm before cold, each tier by `_perish_then_room_key`; an active at
-    the real wall lifts the peers' own lines when none is left, and the cold tier
-    puts the candidates that clear their plan-scaled landing cost first (not on the
-    unmodeled retry, ``model_window_dropped``, whose floor the tick applies itself). The
-    primary (``expiring``) goes in front when the pass admitted it.
+    `proactive`: warm before cold, each tier by `_perish_then_room_key`; no state lifts
+    a peer's own line (the pool holds none at or over it, `over_own_threshold`), and the
+    cold tier puts the candidates that clear their plan-scaled landing cost first (not on
+    the unmodeled retry, ``model_window_dropped``, whose floor the tick applies itself).
+    The primary (``expiring``) goes in front when the pass admitted it.
 
     `dynamic-healthy`: an active whose own model-gated reading (``raw_active_headroom``)
     is at its wall leaves by `_escape_order` over `_walled_escape_candidates`, the
@@ -998,15 +1026,6 @@ def dynamic_candidate_order(
     warm, cold = _rank_dynamic_candidates(
         pool, headroom, usage, now, last_active_at, ttl, reasons, entries, bars
     )
-    if proactive and not warm and not cold and _about_to_wall(active_headroom):
-        # Only an active at the REAL wall lifts the peers' own lines (see `_bars`
-        # in the tick): one merely past its own line stays, or two such accounts
-        # would trade places every tick.
-        if reasons is not None:
-            reasons.clear()
-        warm, cold = _rank_dynamic_candidates(
-            pool, headroom, usage, now, last_active_at, ttl, reasons, entries
-        )
     axis = f"warm, then {_ROOM_AXIS}"
     if proactive:
         if cold and not model_window_dropped:
@@ -2968,12 +2987,13 @@ class AutoSwitchEngine:
         # `_cooldown_yields_to_the_wall` holds per account. `_bars` is that
         # same map, read with `.get(num, bar)`: it holds the overrides only, so
         # an account without one falls to the strategy's bar (97 under
-        # `dynamic`), where `thresholds[num]` would give the global. A
-        # preference, not a veto: an active at the real wall, or a fleet
-        # entirely past its lines (`_every_account_above_threshold`), still
-        # takes a peer past its own line rather than ride to the limit and pin
-        # the sessions. Unset reads exactly as before. Poll cadence follows
-        # the fleet's lowest line (`_refresh_poll_policy_inputs`).
+        # `dynamic`), where `thresholds[num]` would give the global. A VETO on
+        # the landing side, not a preference: a peer at or over its own line
+        # is dropped at candidate selection (`over_own_threshold`), so no
+        # trigger, escape or regime lands on it, and a spent fleet leaves the
+        # active where it is until a reset frees a slot. An account without an
+        # override reads exactly as before. Poll cadence follows the fleet's
+        # lowest line (`_refresh_poll_policy_inputs`).
         self._bars = thresholds
         self._active_wall = _wall_headroom(self._bars.get(current))
         entries, usage, headroom = self._collect_scheduled_usage(
@@ -2998,13 +3018,20 @@ class AutoSwitchEngine:
                 policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
             )
 
+        def _over_own(num: str) -> bool:
+            """A veto like `_capped`: a peer at or over its OWN threshold is
+            never entered, by any trigger or regime."""
+            return over_own_threshold(num, usage, settings, self._models, self._bars)
+
         # -- candidate selection ------------------------------------------
         switchable = self.switcher.switchable_account_numbers()
-        candidates = [
+        eligible = [
             num
             for num in switchable
             if num != current and num not in quarantined and _capped(num) is None
         ]
+        vetoed = [num for num in eligible if _over_own(num)]
+        candidates = [num for num in eligible if num not in vetoed]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
@@ -3316,7 +3343,7 @@ class AutoSwitchEngine:
             def rank(pool):
                 return dynamic_candidate_order(
                     pool, hroom, usage, entries, self._bars, last_active_at,
-                    settings, at_now, current=current, active_headroom=active_h,
+                    settings, at_now, current=current,
                     expiring=expiring, model_window_dropped=dropped,
                 )[0]
 
@@ -3720,6 +3747,25 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
+            if vetoed:
+                # Held on purpose, not stranded: any tick can free a slot (a reset,
+                # a fresh reading), so the ordinary cadence stands, not the long one.
+                self._emit(NoSwitchEvent(
+                    reason="over-own-threshold",
+                    detail=(
+                        "every other account is at or over its own threshold: "
+                        + ", ".join(
+                            f"Account-{n} (line {pct_label(thresholds[n])}%)"
+                            for n in vetoed
+                        )
+                        + (
+                            f"; Account-{current} is past its weekly cap "
+                            f"({active_capped[0]} {pct_label(active_capped[1])}%)"
+                            if active_capped else ""
+                        )
+                    ),
+                ))
+                return TickOutcome.BLOCKED
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -3870,7 +3916,9 @@ class AutoSwitchEngine:
             )
             decided_now = self.clock()
             # The fresh rows may have carried a candidate past its cap.
-            oauth_candidates = [n for n in oauth_candidates if _capped(n) is None]
+            oauth_candidates = [
+                n for n in oauth_candidates if _capped(n) is None and not _over_own(n)
+            ]
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,

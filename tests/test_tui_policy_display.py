@@ -331,11 +331,11 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             )
 
 
-class TestAFleetOverItsLinesListsTheAdmittedPeerFirstOnBothScreens:
+class TestAFleetOverItsLinesNeverListsAPeerOverItsOwnLineOnEitherScreen:
     """Every account is over its line: "3" over its own 60% five-hour line, "2"
-    over the weekly 97, the active over 90. The engine ranks by room and admits
-    only "3" (10 points against 2's 2); both screens list it first and the
-    refused "2" after it."""
+    over the weekly 97, the active over 90. The own line is a landing veto, so
+    "3" is never ranked, however spent the rest is, and both screens agree on
+    the order of the others."""
 
     @staticmethod
     def _entry(five_hour, five_hour_resets, seven_day, seven_day_resets):
@@ -348,7 +348,7 @@ class TestAFleetOverItsLinesListsTheAdmittedPeerFirstOnBothScreens:
             age_s=0.0,
         )
 
-    def test_both_screens_list_the_admitted_peer_before_the_refused_one(self):
+    def test_both_screens_drop_the_peer_over_its_own_line(self):
         snap = AccountsSnapshot(
             accounts=[
                 make_account(1, active=True, entry=self._entry(95.0, 600, 20.0, 86400)),
@@ -364,6 +364,7 @@ class TestAFleetOverItsLinesListsTheAdmittedPeerFirstOnBothScreens:
         settings = AutoSwitchSettings(
             strategy="best", threshold=90.0, weekly_threshold=97.0
         )
+        ordered, *_ = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
+        assert "3" not in ordered
         order = tui_data.ordered_accounts(snap, settings, time.time())
-        assert order == ["1", "3", "2"]
         assert order[1:] == _autoview_order(snap, "1", settings)

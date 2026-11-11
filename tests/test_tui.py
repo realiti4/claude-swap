@@ -2188,10 +2188,10 @@ class TestRankSwitchOwnBars:
         assert trigger == "proactive", trigger
         assert ordered == ["3"], ordered
 
-    def test_dynamic_active_at_the_real_wall_lifts_the_peers_own_bars(self):
-        """Every peer past its own line, but the active at the REAL wall
-        (headroom 2 <= 3): the engine re-ranks without the bars rather than
-        ride to the limit (`_dynamic_rank`), and so does the panel."""
+    def test_dynamic_active_at_the_real_wall_never_lists_a_peer_past_its_own_bar(self):
+        """Every peer past its own line and the active at the REAL wall
+        (headroom 2 <= 3): the engine holds (an own line is a veto), so the
+        panel lists nobody."""
         settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
         _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
             settings,
@@ -2201,7 +2201,28 @@ class TestRankSwitchOwnBars:
             make_account(2, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)),
         )
         assert trigger == "proactive", trigger
-        assert ordered == ["2"], ordered
+        assert ordered == [], ordered
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "best"])
+    def test_an_escape_never_lists_a_peer_past_its_own_bar(self, strategy):
+        """At its limit the active takes any room, but the peer past its own
+        line (#2, 53% on a 50 line) is out of the pool, not ranked behind #3."""
+        settings = AutoSwitchSettings(strategy=strategy, threshold=90.0)
+        reasons: dict = {}
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(100.0, 10.0)),
+                make_account(2, entry=make_entry(53.0, 10.0), policy=AccountPolicy(threshold=50.0)),
+                make_account(3, entry=make_entry(40.0, 10.0)),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        ordered, _axis, trigger, _unmodeled = tui_data.rank_switch_candidates(
+            snap, settings, time.time(), "1", None, reasons
+        )
+        assert (trigger, ordered) == ("at-limit", ["3"])
+        assert reasons["2"] == "at or over its own threshold"
 
 
 class TestPanelOrderIsTheEnginesOrder:
