@@ -1310,22 +1310,80 @@ class TestSetupTokenHeaderProbe:
         assert [(w["name"], w["pct"]) for w in usage["scoped"]] == [("Fable", 97.0)]
         assert usage["scoped"][0]["resets_at"]
 
-    def test_exhausted_fable_reads_100_without_rejecting_the_account(self):
+    def _fable_refused(self, values: dict):
+        return self._probe_429({
+            **values, "anthropic-ratelimit-unified-status": "rejected",
+        })
+
+    def test_refused_fable_reads_at_its_limit_whatever_its_pct(self):
+        """A rejected Fable probe at 97% is Fable unavailable until the
+        refusal ends; 5h/7d stay the main probe's and the account is not
+        rejected."""
         values = {
             **self._FABLE_HEADERS,
-            "anthropic-ratelimit-unified-status": "rejected",
             "anthropic-ratelimit-unified-7d_oi-status": "rejected",
-            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
             "Retry-After": "600",
         }
         fake, _ = self._route_by_model({
             oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
-            "claude-fable-5-1": self._probe_429(values),
+            "claude-fable-5-1": self._fable_refused(values),
+        })
+        before = datetime.now(timezone.utc).timestamp()
+        usage = self._fetch(fake).usage
+        assert usage["five_hour"]["pct"] == 34.0
+        assert usage["seven_day"]["pct"] == 60.0
+        assert "rejected" not in usage
+        [fable] = usage["scoped"]
+        assert (fable["name"], fable["pct"]) == ("Fable", 100.0)
+        until = datetime.fromisoformat(fable["resets_at"]).timestamp()
+        assert before + 600 <= until <= before + 660
+        assert oauth.account_headroom(usage) == 40.0
+        assert oauth.account_headroom(usage, ["Fable"]) == 0.0
+
+    def test_refused_fable_without_a_utilization_still_shows_its_row(self):
+        """No utilization header: the row stays, at 100%, resetting at the
+        bucket's own reset when there is no Retry-After."""
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._fable_refused({
+                "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
+                "anthropic-ratelimit-unified-reset": "1790766000",
+            }),
+        })
+        [fable] = self._fetch(fake).usage["scoped"]
+        assert fable["pct"] == 100.0
+        assert datetime.fromisoformat(fable["resets_at"]).timestamp() == 1791154800
+
+    def test_bare_429_on_the_fable_probe_adds_no_row(self):
+        """No rejected status proves nothing about Fable, even with a
+        utilization header: the main reading stands alone."""
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._probe_429(
+                {**self._FABLE_HEADERS, "Retry-After": "30"}
+            ),
+        })
+        outcome = self._fetch(fake)
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert "scoped" not in outcome.usage
+
+    def test_no_fable_probe_after_a_refused_main_probe(self):
+        values = {
+            **_UNIFIED_HEADERS,
+            "anthropic-ratelimit-unified-status": "rejected",
+            "Retry-After": "600",
+        }
+        fake, calls = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._probe_429(values),
+            "claude-fable-5-1": self._ok(self._FABLE_HEADERS),
         })
         usage = self._fetch(fake).usage
-        assert usage["scoped"][0]["pct"] == 100.0
-        assert "rejected" not in usage
-        assert oauth.account_headroom(usage) == 40.0
+        assert usage["rejected"]["retry_after_s"] == 600.0
+        assert "scoped" not in usage
+        assert [json.loads(c.data)["model"] for c in calls] == [
+            oauth.USAGE_PROBE_MODEL
+        ]
 
     @pytest.mark.parametrize("failure", [
         pytest.param(

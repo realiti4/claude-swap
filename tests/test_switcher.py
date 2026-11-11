@@ -1243,13 +1243,6 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
 
 
-def _is_scoped_probe(req) -> bool:
-    """A per-model probe riding along with the main header probe."""
-    if req.full_url != oauth.USAGE_PROBE_URL or not req.data:
-        return False
-    return json.loads(req.data)["model"] in oauth.USAGE_PROBE_SCOPED_MODELS
-
-
 class TestSetupTokenHeaderProbeWiring:
     """``usage.headerProbe`` reaches every fetch, and a probed setup-token
     account is paced by the store like any other fetch."""
@@ -1299,8 +1292,7 @@ class TestSetupTokenHeaderProbeWiring:
         urls: list[str] = []
 
         def fake_urlopen(req, timeout=None):
-            if not _is_scoped_probe(req):  # pacing counts the main probe
-                urls.append(req.full_url)
+            urls.append(req.full_url)
             if req.full_url == oauth.USAGE_PROBE_URL:
                 return probe
             raise endpoint
@@ -1311,7 +1303,10 @@ class TestSetupTokenHeaderProbeWiring:
             second = switcher._collect_usage_entries([self._info()])["3"]
 
         # The usage endpoint is never asked: it cannot read a setup-token.
-        assert urls == [oauth.USAGE_PROBE_URL]
+        # One pass = the main probe plus one per scoped model (Fable).
+        assert urls == [oauth.USAGE_PROBE_URL] * (
+            1 + len(oauth.USAGE_PROBE_SCOPED_MODELS)
+        )
         assert first.last_error is None
         assert first.last_good["five_hour"]["pct"] == 25.0
         assert first.last_good["seven_day"]["pct"] == 50.0
@@ -1329,8 +1324,7 @@ class TestSetupTokenHeaderProbeWiring:
         urls: list[str] = []
 
         def fake_urlopen(req, timeout=None):
-            if not _is_scoped_probe(req):  # pacing counts the main probe
-                urls.append(req.full_url)
+            urls.append(req.full_url)
             if isinstance(probe_result, Exception):
                 raise probe_result
             return probe_result
