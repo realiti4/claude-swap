@@ -518,6 +518,7 @@ def request_usage_data(access_token: str) -> dict:
             _log_usage_request(access_token, outcome, resp_headers, err)
         except Exception:  # a log line must never replace the result or the HTTPError
             pass
+        err = resp_headers = None  # err's traceback holds this frame: break the cycle
 
 
 def _log_safe(value, cap: int = 64, free_text: bool = False) -> str:
@@ -533,7 +534,7 @@ def _log_usage_request(
 ) -> None:
     """One INFO line per usage request, success or not, so a block can be
     traced to the token and process that spent the budget. The token appears
-    only as the 12-hex tag cswap-pin logs for its bearer; no email, so the line
+    only as a 12-hex sha256 prefix of the access token; no email, so the line
     is paste-safe. A 429 adds its Retry-After and the cause its body states
     (the one status whose body is read here: ``_classify_usage_error`` reads a
     403's, and an HTTPError body can be read once)."""

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
 import os
 import ssl
 import urllib.error
+import weakref
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -1006,12 +1008,16 @@ class TestUsageRequestLog:
                 raised = e
         return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO], raised
 
-    def test_success_logs_one_line(self, caplog):
-        resp = MagicMock(status=200, headers={"request-id": "req_ok"})
-        resp.read.return_value = b"{}"
+    @staticmethod
+    def _ok(headers=None):
+        resp = MagicMock(status=200, headers=headers or {})
+        resp.read.return_value = b'{"ok": 1}'
         resp.__enter__.return_value = resp
         resp.__exit__.return_value = False
-        (line,), raised = self._request(caplog, return_value=resp)
+        return resp
+
+    def test_success_logs_one_line(self, caplog):
+        (line,), raised = self._request(caplog, return_value=self._ok({"request-id": "req_ok"}))
         assert raised is None
         for part in ("http-200", self.TAG, f"pid {os.getpid()}", "request-id req_ok"):
             assert part in line
@@ -1034,13 +1040,32 @@ class TestUsageRequestLog:
         assert all(p in line for p in present)
         assert not any(a in line for a in absent)
 
-    def test_a_failing_log_line_changes_nothing(self):
-        err = self.HTTP(401)
+    @pytest.mark.parametrize("urlopen", [{"side_effect": HTTP(401)}, {"return_value": _ok()}])
+    def test_a_failing_log_line_changes_nothing(self, urlopen):
         with patch.object(oauth._logger, "info", side_effect=RuntimeError("boom")), \
-                patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
-                pytest.raises(urllib.error.HTTPError) as raised:
-            oauth.request_usage_data(self.TOKEN)
-        assert raised.value is err
+                patch("claude_swap.oauth.urllib.request.urlopen", **urlopen):
+            if "side_effect" in urlopen:
+                with pytest.raises(urllib.error.HTTPError) as raised:
+                    oauth.request_usage_data(self.TOKEN)
+                assert raised.value is urlopen["side_effect"]
+            else:
+                assert oauth.request_usage_data(self.TOKEN) == {"ok": 1}
+
+    def test_the_error_is_freed_when_the_caller_handler_ends(self):
+        """No frame cycle keeps the exception and its unread response alive."""
+        def boom(*args, **kwargs):
+            raise self.HTTP(500)
+
+        gc.disable()
+        try:
+            with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=boom):
+                try:
+                    oauth.request_usage_data(self.TOKEN)
+                except urllib.error.HTTPError as e:
+                    ref = weakref.ref(e)
+            assert ref() is None
+        finally:
+            gc.enable()
 
     @pytest.mark.parametrize("code, headers, body, error, retry_after", [
         (429, {"Retry-After": "3600"}, RATE, "http-429", 3600.0),
