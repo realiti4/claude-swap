@@ -136,7 +136,10 @@ def _engine_order(
     alone, as `_rank_candidates` does. The note is the panel's words for why
     nobody is previewed, empty when somebody is. `probe_cooldown` is the
     engine's own record of it. State a snapshot lacks (cooldown, the no-return
-    bar, quarantine, the failover count) is not modeled."""
+    bar, quarantine, the failover count) is not modeled, and neither is a
+    probe source's freshness or hold: no store entries are passed, because the
+    tick refetches a stale row before it decides, and a held one is never
+    fetched."""
     models = parse_model_names(settings.model)
     usage = {acc.number: acc.usage.decision_value(models) for acc in snap.accounts}
     headroom = _headroom_by_account(usage, models)
@@ -195,9 +198,7 @@ def _engine_order(
             oauth_candidates=oauth_peers,
             no_return=None, usage=usage, headroom=h, current=active_number,
             active_headroom=h.get(active_number), settings=settings, now=now,
-            probe_cooldown=probe_cooldown,
-            entries={a.number: a.usage for a in snap.accounts},
-            thresholds=bars,
+            probe_cooldown=probe_cooldown, thresholds=bars,
         )
 
     ordered, any_known, active_reset_ts, waiting, _ = rank(models)

@@ -709,8 +709,8 @@ def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
     altogether (``_row_eligible``), so admitting one here would spend the
     tick's one probe slot on a candidate that cannot resolve its reset while
     the hold lasts. ``entries=None`` (a caller with no store-entry data, e.g.
-    a direct unit-test call predating probing) skips the gate rather than
-    refusing every candidate; the panel passes its snapshot's entries.
+    a direct unit-test call predating probing, or a display) skips the gate
+    rather than refusing every candidate.
     """
     if entries is None:
         return True
@@ -763,8 +763,8 @@ def select_probe_target(
     freshness gates, to decide the switch; the "Next best" panel reaches it
     only through that pass (``tui.autoview._engine_order``). Called on the
     panel's full candidate list instead, it named a probe the pass had barred
-    (no landing room, a stale reading), or sorted an unknown reset last while
-    the engine ranks it first.
+    for lack of landing room, or sorted an unknown reset last while the
+    engine ranks it first.
 
     ``active_usage`` (the ACTIVE account's own decision value, not a
     precomputed timestamp) so the caller can pass what it already has on hand

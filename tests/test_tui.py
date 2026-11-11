@@ -4026,28 +4026,6 @@ class TestNextBestFollowsTheTick:
         assert str(h.active_number()) == "3", "the tick probed, or took no pick"
         assert _next_best_order(snap, "1", h.settings)[0] == "3"
 
-    def test_an_unknown_reset_peer_read_too_long_ago_is_not_named_the_probe(
-        self, temp_home
-    ):
-        """A probe learns a reset through a live fetch, so its stored reading
-        must be fresh (`_probe_source_fresh`): account 2's is 240 s old, inside
-        the 300 s a decision trusts and outside the 180 s a probe source may be.
-        The tick takes 3, and the panel does not name 2."""
-        from claude_swap.autoswitch import TickOutcome
-        from tests.test_autoswitch import _entry_for
-
-        fleet = {"1": _window(40, 100), "2": _window7(10, 0), "3": _window(10, 50)}
-        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "consume-first"}, fleet)
-        old = UsageEntry(last_good=fleet["2"], fetched_at=time.time() - 240.0, age_s=240.0)
-        snap = dataclasses.replace(snap, accounts=tuple(
-            dataclasses.replace(acc, usage=old) if acc.number == "2" else acc
-            for acc in snap.accounts
-        ))
-        entries = {n: _entry_for(w, h.clock.now) for n, w in fleet.items()} | {"2": old}
-        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
-        assert str(h.active_number()) == "3", "the tick probed, or took no pick"
-        assert _next_best_order(snap, "1", h.settings)[0] == "3"
-
 
 @pytest.mark.asyncio
 class TestNeedsLoginIsReported:
