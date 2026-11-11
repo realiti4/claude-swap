@@ -19060,6 +19060,29 @@ class TestBestSelectionNeverEntersAnOwnThresholdPeer:
             "1", usage=usage, current_at_limit=at_limit
         ) == expected
 
+    def test_a_peer_over_its_own_line_on_the_configured_model_window_is_vetoed(
+        self, temp_home
+    ):
+        # The pin's seam passes no models: the veto reads `autoswitch.model`,
+        # as the engine does.
+        from claude_swap.settings import set_setting
+
+        helper = TestCurrentAtLimitOverridesTheFrozenPct()
+        s = helper._setup(temp_home)
+        for num in (1, 2, 3):
+            helper._seed(s, num, f"{num}@example.com")
+        set_setting(s.backup_dir, "autoswitch.model", "Fable")
+        s.set_account_threshold("3", 50)
+        usage = {
+            "1": helper._usage(95.0),
+            "2": helper._usage(100.0),
+            "3": {**helper._usage(10.0), "scoped": [{"name": "Fable", "pct": 60.0}]},
+        }
+
+        assert s._select_best_switchable(
+            "1", usage=usage, current_at_limit=True
+        ) == (None, "exhausted")
+
 
 class TestSwitchOffAtLimitAccount:
     """The seam the pin proxy calls when it sees a 429 on `/v1/messages`."""

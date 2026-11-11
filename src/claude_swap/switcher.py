@@ -6854,7 +6854,8 @@ class ClaudeAccountSwitcher:
             )
         ]
         # Nor is a peer at or over its OWN threshold (the engine's veto), by the
-        # engine's settings; an account without one reads as before.
+        # engine's settings and model set (the pin's seam passes none); an
+        # account without one reads as before.
         from claude_swap.autoswitch import over_own_threshold
 
         settings = load_settings(self.backup_dir)
@@ -6864,7 +6865,9 @@ class ClaudeAccountSwitcher:
         }
         others = [
             n for n in uncapped
-            if not over_own_threshold(n, usage, settings, models, own)
+            if not over_own_threshold(
+                n, usage, settings, models or parse_model_names(settings.model), own
+            )
         ]
         if not others:
             return None, "capped"
