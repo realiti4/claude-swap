@@ -12642,9 +12642,10 @@ class TestGateUltraReviewFixes:
 
         `tests/conftest.py`'s `RealStoreWriteBlocked` is deliberately NOT an
         `OSError` subclass (its own docstring) precisely so that no
-        `except OSError` in this codebase can hide a real-store refusal. An
-        `except Exception` on the credential-persist path catches it and
-        disarms the guard for every write that routes through here.
+        `except OSError` in this codebase can hide a real-store refusal. It is
+        a `BaseException` now, so only an `except BaseException` on the
+        credential-persist path would disarm the guard for every write that
+        routes through here.
 
         The wrapper's whole documented fault list is EACCES on the session dir
         and a read-only mount — both `OSError`. Nothing else belongs in it.
