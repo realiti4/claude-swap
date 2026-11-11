@@ -178,6 +178,41 @@ HORIZON_HEADROOM_RATIO = 2.0
 # this much.
 SPENT_HEADROOM_PCT = 3.0
 
+
+def _binding_at(
+    value: dict | str | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    line: float,
+) -> BindingWindow | None:
+    """The window binding one account under ``settings``' lines on the window
+    set ``models`` (see ``lines.binding_window``), or None when it reports no
+    window. ``line`` is the account's effective threshold. A module function,
+    so the static ranking pass (and the "Next best" panel through it) needs no
+    engine instance."""
+    return binding_window(
+        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
+        line,
+        settings.weekly_threshold,
+        scale=settings.threshold,
+    )
+
+
+def _room_at(
+    value: dict | str | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    line: float,
+) -> float | None:
+    """Points left before one account's nearest line (see ``lines.line_room``),
+    or None when it reports no window. Same inputs as ``_binding_at``."""
+    return line_room(
+        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
+        line,
+        settings.weekly_threshold,
+    )
+
+
 MESSAGE_ERROR_SAMPLE = 5
 MESSAGE_ERROR_SHARE = 0.5
 # Per-tick cap on how many trace bytes `_message_error_burst` reads -- named
@@ -293,6 +328,50 @@ def _message_error_burst(
             # first release whose response line carries method and path.
             server_errors += 1
     return (server_errors, calls, since + len(chunk))
+
+
+def no_peer_refusal(
+    *,
+    trigger: str,
+    active_headroom: float | None,
+    oauth_candidates: Sequence[str],
+    api_key_candidates: Sequence[str],
+) -> str | None:
+    """The refusal before any pass runs, when no OAuth peer exists: a healthy
+    below-line hold for the consume-first family (API-key candidates do not
+    change it, they have no weekly window to consume), else the lack of any
+    candidate. None when a pass has someone to rank. The tick and the "Next
+    best" panel share this one reading."""
+    if (
+        trigger in ("consume-first", "priority")
+        and not oauth_candidates
+        and active_headroom is not None
+    ):
+        return "below-threshold"
+    if not oauth_candidates and not api_key_candidates:
+        return "no-candidates"
+    return None
+
+
+def empty_pass_refusal(
+    *,
+    trigger: str,
+    any_known: bool,
+    active_reset_ts: float | None,
+    waiting_for_recovery: bool,
+    candidate_headrooms: Sequence[float | None],
+) -> str:
+    """Why a pass that admitted nobody holds, from what the pass returned (see
+    ``_rank_candidates_pass``) and the model-gated headroom of the OAuth
+    candidates. Not the priority strategy's, which has its own pass. The tick
+    and the "Next best" panel share this one reading."""
+    if not any_known:
+        return "no-comparison"
+    if trigger == "consume-first":
+        return "reset-unknown" if active_reset_ts is None else "already-consuming-soonest"
+    if all(h is not None and h <= 0 for h in candidate_headrooms):
+        return "all-exhausted"
+    return "deliberate-wait" if waiting_for_recovery else "no-qualifying-candidate"
 
 
 def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
@@ -1164,6 +1243,11 @@ class AutoSwitchEngine:
         # not persisted -- like `_message_trace_offset` above, which the
         # trigger already depends on for the same scope.
         self._overload_backoff: dict[str, float] = {}
+        # The account the last tick found overloaded, else None: a 5xx burst is
+        # read off the pin's trace, which no snapshot carries, so the "Next
+        # best" panel asks the engine. The number, not a flag: after a switch
+        # the new active is not the overloaded one.
+        self.overloaded_account: str | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1951,6 +2035,7 @@ class AutoSwitchEngine:
                 window_calls >= MESSAGE_ERROR_SAMPLE
                 and window_errors >= window_calls * MESSAGE_ERROR_SHARE
             )
+        self.overloaded_account = current if is_overloaded else None
 
         # A tick with no managed active account keeps the current context;
         # a different account reseeds from the state file so its counts are
@@ -2227,11 +2312,13 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
-        if (
-            trigger in ("consume-first", "priority")
-            and not oauth_candidates
-            and active_headroom is not None
-        ):
+        no_peer = no_peer_refusal(
+            trigger=trigger,
+            active_headroom=active_headroom,
+            oauth_candidates=oauth_candidates,
+            api_key_candidates=api_key_candidates,
+        )
+        if no_peer == "below-threshold":
             # Healthy below-threshold account with no OAuth peer to compare
             # against — the same state `best` reports as below-threshold
             # NO_ACTION before ever reaching candidate selection. API-key
@@ -2249,7 +2336,7 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        if not oauth_candidates and not api_key_candidates:
+        if no_peer == "no-candidates":
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -2501,7 +2588,14 @@ class AutoSwitchEngine:
                     detail="no candidate is below every switch line with readable usage; waiting for recovery",
                 ))
                 return TickOutcome.BLOCKED
-            if not any_known:
+            refusal = empty_pass_refusal(
+                trigger=trigger,
+                any_known=any_known,
+                active_reset_ts=active_reset_ts,
+                waiting_for_recovery=waiting_for_recovery,
+                candidate_headrooms=[headroom.get(n) for n in oauth_candidates],
+            )
+            if refusal == "no-comparison":
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -2515,7 +2609,7 @@ class AutoSwitchEngine:
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
                 # so an opted-in user can see the strategy working (or inert).
-                if active_reset_ts is None:
+                if refusal == "reset-unknown":
                     # The strictly-sooner filter skips every candidate when the
                     # active account's weekly reset is unknown — without this
                     # reason the strategy would look enabled while doing
@@ -2547,11 +2641,8 @@ class AutoSwitchEngine:
             # gate, or one whose usage is unreadable this tick, can become
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
-                h is not None and h <= 0 for h in candidate_headrooms
-            )
-            if not truly_exhausted and not waiting_for_recovery:
+            truly_exhausted = refusal == "all-exhausted"
+            if refusal == "no-qualifying-candidate":
                 self._emit(
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
@@ -3271,9 +3362,16 @@ class AutoSwitchEngine:
             False,
         )
 
-    def _rank_candidates(
-        self,
+    def _rank_candidates(self, **kw) -> tuple[list[str], bool, float | None, bool]:
+        """``_rank_candidates_pass`` on the engine's own window set (see it for
+        the arguments and the four-tuple). The entry point every tick caller
+        uses."""
+        return self._rank_candidates_pass(models=self._models, **kw)
+
+    @staticmethod
+    def _rank_candidates_pass(
         *,
+        models: Sequence[str],
         trigger: str,
         consume_first: bool,
         oauth_candidates: list[str],
@@ -3296,7 +3394,10 @@ class AutoSwitchEngine:
         Pure — no emits, no state writes — so the consume-first two-phase
         commit can run it twice per tick: on the stored snapshot to decide
         provisionally, then on the escalated refetch to re-verify before
-        switching.
+        switching. ``_rank_candidates`` (above) is the entry point every tick
+        caller uses. A static method, so the "Next best" panel reaches it
+        through the module-level ``rank_candidates_pass`` with no engine
+        instance.
 
         ``waiting_for_recovery`` is the one thing the caller cannot re-derive
         without restating four conditions this method already evaluated: an
@@ -3323,7 +3424,7 @@ class AutoSwitchEngine:
         # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
         # trigger computed is reused here.
         bindings = {
-            num: self._binding(usage.get(num), settings, thresholds[num])
+            num: _binding_at(usage.get(num), settings, models, thresholds[num])
             for num in (*oauth_candidates, current)
         }
         active_binding = bindings[current]
@@ -3411,7 +3512,7 @@ class AutoSwitchEngine:
         active_recovery_ts = (
             _binding_recovery_ts(
                 usage.get(current),
-                self._models,
+                models,
                 now,
                 threshold=thresholds[current],
                 weekly_threshold=settings.weekly_threshold,
@@ -3442,7 +3543,7 @@ class AutoSwitchEngine:
             # room bar. Clamped at zero: `pct` is copied through unclamped, so
             # a spent candidate at 100.5 would lose to one at 100.0 on half a
             # point this module calls noise.
-            return (-max(h, 0.0), _binding_recovery_ts(usage.get(num), self._models, now))
+            return (-max(h, 0.0), _binding_recovery_ts(usage.get(num), models, now))
 
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
@@ -3454,7 +3555,7 @@ class AutoSwitchEngine:
             recovery_ts = (
                 _binding_recovery_ts(
                     usage.get(num),
-                    self._models,
+                    models,
                     now,
                     threshold=thresholds[num],
                     weekly_threshold=settings.weekly_threshold,
@@ -3512,7 +3613,7 @@ class AutoSwitchEngine:
             # Points left before the candidate reaches the nearest of its own
             # lines, each window in its own points (`lines.line_room`); the
             # single line against raw `h` when it reports no window.
-            room = self._room(usage.get(num), settings, thresholds[num])
+            room = _room_at(usage.get(num), settings, models, thresholds[num])
             if room is None:
                 room = thresholds[num] - (100.0 - h)
             over = (
@@ -3634,12 +3735,12 @@ class AutoSwitchEngine:
                 # servable-but-unhealthy requires a threshold under 97 and
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
-                # `tight` leads the shared key, so the Next best panel's order is this one.
+                # `tight` leads the key. The Next best panel reads this pass's order (`tui.autoview._engine_order`).
                 key = consume_first_rank_key(
                     usage.get(num),
                     thresholds[num],
                     now,
-                    self._models,
+                    models,
                     weekly_threshold=settings.weekly_threshold,
                     scale=settings.threshold,
                     tight=tight,
@@ -4103,28 +4204,7 @@ class AutoSwitchEngine:
         only ``self._models`` and the ``settings`` it is handed, never
         ``self.settings``: a tick snapshots its settings once, and the ranking
         helpers are exercised directly on bare engines."""
-        return binding_window(
-            oauth.relevant_windows(
-                value if isinstance(value, dict) else None, self._models
-            ),
-            line,
-            settings.weekly_threshold,
-            scale=settings.threshold,
-        )
-
-    def _room(
-        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
-    ) -> float | None:
-        """Points left before this account's nearest line under the tick's
-        lines (see ``lines.line_room``), or None when it reports no window.
-        Same inputs as ``_binding``."""
-        return line_room(
-            oauth.relevant_windows(
-                value if isinstance(value, dict) else None, self._models
-            ),
-            line,
-            settings.weekly_threshold,
-        )
+        return _binding_at(value, settings, self._models, line)
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
@@ -4655,3 +4735,9 @@ class AutoSwitchEngine:
             # and the next job on that thread read "waiting: write
             # suppressed" for an engine that had already stopped.
             self.switcher._suppress_login_restore_write = False
+
+
+# A direct module-level name, not `AutoSwitchEngine._rank_candidates_pass`: a
+# caller that only wants the (pure, static) ranking -- the "Next best" panel --
+# needs no engine instance to reach it.
+rank_candidates_pass = AutoSwitchEngine._rank_candidates_pass

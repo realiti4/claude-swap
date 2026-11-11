@@ -29,11 +29,17 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    ThresholdMap,
+    _binding_at,
+    _headroom_by_account,
     consume_first_rank_key,
+    empty_pass_refusal,
+    no_peer_refusal,
     pct_label,
+    rank_candidates_pass,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
-from claude_swap.lines import binding_window, line_room
+from claude_swap.lines import binding_window
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -80,6 +86,125 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     text.append(f"{data.clock_stamp()}  ", style=palette.muted)
     text.append(event.human(), style=style)
     return text
+
+
+# Triggers whose pass the panel never runs, each with WHY: a state the tick
+# acts on out of sight of a snapshot (an unreadable active counts ticks toward
+# failover) or ranks through a pass of its own. Never "no candidate qualifies",
+# the claim only a real, empty pass earns.
+_UNMODELED_TEXT = {
+    "below-threshold": "not previewed (active below threshold)",
+    "unreadable-active": "not previewed (active status unknown)",
+    "priority": "not previewed (priority strategy)",
+}
+
+
+# The panel's words for each refusal the tick reaches around its pass, one
+# key per literal `no_peer_refusal` and `empty_pass_refusal` return (the
+# engine's own reading of the state, shared with the tick). A hold the engine
+# calls healthy (NO_ACTION) is worded as a hold, never as a block. The
+# "below-threshold" here is the consume-first hold with no OAuth peer, not
+# `best` below its line (`_UNMODELED_TEXT`).
+_REFUSAL_TEXT = {
+    "below-threshold": "holding (below its line, no other OAuth account to compare)",
+    "no-candidates": "no account to switch to",
+    "no-comparison": "no candidate has readable usage",
+    "reset-unknown": "holding (the active account's weekly reset is unknown)",
+    "already-consuming-soonest":
+        "holding (no sooner-resetting account with room to spare)",
+    "no-qualifying-candidate": "no candidate qualifies",
+    "deliberate-wait": "holding for a nearer reset than any peer offers",
+    "all-exhausted": "all accounts exhausted",
+}
+
+
+def _engine_order(
+    snap: AccountsSnapshot,
+    settings,
+    active_number: str | None,
+    now: float,
+    *,
+    overloaded: bool,
+) -> tuple[list[str], str, set[str]]:
+    """(ordered, note, short): the order the engine's own pass
+    (`rank_candidates_pass`) gives this snapshot, never a key of the panel's
+    own. The trigger comes from the active's reading as `_tick_inner`
+    classifies it (`overloaded` is the engine's own verdict, a trace the
+    snapshot lacks), and a trigger in `_UNMODELED_TEXT` runs no pass. The
+    note is the panel's words for why nobody is previewed, empty when somebody
+    is. `short` is the peers the landing-room bar alone refuses: admitted by
+    the same pass with the margin at 0, the setting that removes the bar, and
+    not at the configured one. State a snapshot lacks (cooldown, the no-return
+    and refusal bars, quarantine, the failover count) is not modeled."""
+    models = parse_model_names(settings.model)
+    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+    bars = ThresholdMap(
+        {a.number: a.policy.threshold for a in snap.accounts if a.policy.threshold is not None},
+        settings.threshold,
+    )
+    headroom = _headroom_by_account(usage, models)
+    active_h = headroom.get(active_number)
+    if settings.strategy == "priority-consume-first":
+        trigger = "priority"
+    elif any(a.number == active_number and a.disabled for a in snap.accounts):
+        trigger = "disabled-active"
+    elif overloaded:
+        trigger = "overloaded"
+    elif active_h is None:
+        trigger = "unreadable-active"
+    else:
+        # Each window against its own line, as the tick reads it.
+        binding = _binding_at(usage.get(active_number), settings, models, bars[active_number])
+        below = (
+            not binding.over
+            if binding is not None
+            else (100.0 - active_h) < bars[active_number]
+        )
+        if below:
+            trigger = "consume-first" if settings.strategy == "consume-first" else "below-threshold"
+        else:
+            trigger = "at-limit" if active_h <= 0 else "proactive"
+    if trigger in _UNMODELED_TEXT:
+        return [], _UNMODELED_TEXT[trigger], set()
+
+    peers = [
+        a for a in snap.accounts
+        if a.number != active_number and a.switchable and not a.disabled
+    ]
+    oauth_peers = [a.number for a in peers if a.kind != "api_key"]
+    key_peers = [
+        a.number for a in peers
+        if a.kind == "api_key" and settings.include_api_key_accounts
+    ]
+    if refusal := no_peer_refusal(
+        trigger=trigger, active_headroom=active_h,
+        oauth_candidates=oauth_peers, api_key_candidates=key_peers,
+    ):
+        return [], _REFUSAL_TEXT[refusal], set()
+
+    def rank(cfg):
+        return rank_candidates_pass(
+            models=models, trigger=trigger, consume_first=cfg.strategy == "consume-first",
+            oauth_candidates=oauth_peers, no_return=None, usage=usage, headroom=headroom,
+            current=active_number, active_headroom=active_h, settings=cfg, now=now,
+            thresholds=bars,
+        )
+
+    ordered, any_known, active_reset_ts, waiting = rank(settings)
+    short = (
+        set(rank(replace(settings, hysteresis_pct=0.0))[0]) - set(ordered)
+        if trigger == "consume-first" else set()
+    )
+    if not ordered and key_peers and trigger != "consume-first":
+        # The tick's last resort when it must move: a metered API-key slot.
+        return key_peers, "", short
+    if ordered:
+        return ordered, "", short
+    return [], _REFUSAL_TEXT[empty_pass_refusal(
+        trigger=trigger, any_known=any_known, active_reset_ts=active_reset_ts,
+        waiting_for_recovery=waiting,
+        candidate_headrooms=[headroom.get(n) for n in oauth_peers],
+    )], short
 
 
 class AutoScreen(Screen):
@@ -393,33 +518,23 @@ class AutoScreen(Screen):
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
-        # Same strategy the engine ticks on, so the panel's order can never
-        # disagree with the account a tick would actually switch to.
+        # The strategy's bare key, for the rows the engine's pass refuses.
         consume_first = bool(
             self._settings
             and self._settings.strategy in ("consume-first", "weekly-first")
         )
-        # The landing-room bar REFUSES a peer (rather than ranking it last)
-        # only on consume-first's own trigger: that strategy, an enabled active
-        # under its line on the reading the engine decides on (`decision_value`:
-        # a sentinel, stale or walled row takes the failover path instead).
-        landing_bar = False
-        active = next((a for a in snap.accounts if a.number == active_number), None)
-        if (
-            consume_first
-            and settings.strategy == "consume-first"
-            and active is not None
-            and not active.disabled
-        ):
-            active_binding = binding_window(
-                oauth.relevant_windows(active.usage.decision_value(), models),
-                active.policy.threshold
-                if active.policy.threshold is not None
-                else threshold,
-                weekly,
-                scale=threshold,
+        now = time.time()
+        # THE ENGINE'S OWN ADMISSION AND ORDER decide the rows it admits; a
+        # refused row keeps the strategy's bare key below, behind every
+        # admitted one.
+        ordered, note, short = (
+            _engine_order(
+                snap, settings, active_number, now,
+                overloaded=active_number is not None
+                and getattr(self._engine, "overloaded_account", None) == active_number,
             )
-            landing_bar = active_binding is not None and not active_binding.over
+            if settings else ([], "", set())
+        )
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         # (acc while the row can carry a re-login note, name, the rest)
         lines: dict[str, tuple[AccountSnapshot | None, Text, Text]] = {}
@@ -444,11 +559,11 @@ class AutoScreen(Screen):
                 # `cswap add` overwrites a working stored grant. `kind` still
                 # wins for api_key — the sentinel diverges from it behind a
                 # locked keychain.
-                note = data.sentinel_label(
+                why = data.sentinel_label(
                     USAGE_API_KEY if acc.kind == "api_key"
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
-                entry.append(f"  {note}", style=palette.sev_warn)
+                entry.append(f"  {why}", style=palette.sev_warn)
                 lines[acc.number] = (None, head, entry)  # no stored login, no re-login note
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
@@ -494,7 +609,6 @@ class AutoScreen(Screen):
             else:
                 # Per-window chips, from the same helper the dashboard uses
                 # (data.window_chip_label) so one account cannot read two ways.
-                now = time.time()
                 chips = [
                     (key, label, data.window_pct(acc.usage.last_good, key))
                     for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
@@ -520,11 +634,6 @@ class AutoScreen(Screen):
                             style=palette.muted,
                         )
                 if consume_first:
-                    # The engine's forced-move room tier; a binding window means windows exist.
-                    room = line_room(
-                        oauth.relevant_windows(acc.usage.last_good, models), line, weekly
-                    )
-                    tight = room < settings.hysteresis_pct
                     key = consume_first_rank_key(
                         acc.usage.last_good,
                         line,
@@ -532,14 +641,13 @@ class AutoScreen(Screen):
                         models,
                         weekly_threshold=weekly,
                         scale=threshold,
-                        tight=tight,
                     )
-                    if landing_bar and tight:
-                        entry.append(
-                            "  too little room under its line", style=palette.sev_warn
-                        )
                 else:
                     key = (-binding.line_headroom,)
+                if acc.number in short:
+                    entry.append(
+                        "  too little room under its line", style=palette.sev_warn
+                    )
                 ranked.append((key, acc.number))
             lines[acc.number] = (acc, head, entry)
 
@@ -551,7 +659,14 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
-        order = [lines[number] for _key, number in sorted(ranked)]
+        if note:
+            # Rows are still listed, but none is something a tick would switch to.
+            text.append(f"\n  {note}", style=palette.muted)
+        place = {number: i for i, number in enumerate(ordered)}
+        order = [lines[number] for _key, number in sorted(
+            ranked,
+            key=lambda kn: ((0, place[kn[1]]) if kn[1] in place else (1, *kn[0]), kn[1]),
+        )]
         # The box has no width before its first layout; its CSS padding is 2 a side.
         budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
         # Only the rows that can carry a re-login note are fitted: an
