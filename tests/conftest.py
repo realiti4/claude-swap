@@ -44,21 +44,20 @@ class RealStoreWriteBlocked(BaseException):
     ``a@example.com``/``b@example.com`` pair ``EngineHarness.seed`` (this
     repo, ``tests/test_autoswitch.py``) writes.
 
-    I-3 (round 9): deliberately NOT a ``PermissionError``/``OSError``
-    subclass. ``pathlib.Path.mkdir(parents=True, exist_ok=True)`` catches
-    ``OSError`` internally and swallows it when the target already exists —
-    so an ``OSError``-based refusal into an EXISTING protected directory
-    (``cache.write_cache``, ``_atomic_b64_write``, ``_update_global_config``
-    all call ``mkdir(exist_ok=True)``) fired but never reached the caller.
-    A plain ``Exception`` cannot be caught by any ``except OSError:`` in the
-    stdlib or this codebase, so the refusal can no longer be absorbed by
-    the very shape it is meant to guard.
+    Deliberately neither an ``OSError`` nor an ``Exception``: a
+    ``BaseException`` subclass, so that no handler can absorb the refusal.
 
-    Nor an ``Exception``: src has many ``except Exception``
-    containments (``check_for_update`` among them), and each absorbed the
-    refusal, which hid ``main()``'s write of ``<backup root>/cache``.
-    A ``BaseException`` passes them all, with no src change: narrowing them is
-    refused (the consume paths' ``except Exception`` is their last defence).
+    * Not an ``OSError``: ``pathlib.Path.mkdir(parents=True, exist_ok=True)``
+      catches ``OSError`` internally and swallows it when the target already
+      exists, so an ``OSError`` refusal into an EXISTING protected directory
+      (``cache.write_cache``, ``_atomic_b64_write``, ``_update_global_config``
+      all call ``mkdir(exist_ok=True)``) never reached the caller. No
+      ``except OSError`` in the stdlib or this codebase catches it.
+    * Not an ``Exception``: src has many ``except Exception`` containments
+      (``check_for_update`` among them), each of which would hide a refusal
+      such as ``main()``'s write of ``<backup root>/cache``. A
+      ``BaseException`` passes them all with no src change; narrowing them is
+      refused (the consume paths' ``except Exception`` is their last defence).
     """
 
 
