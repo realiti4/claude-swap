@@ -24,6 +24,7 @@ from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEven
 from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
     USAGE_TOKEN_EXPIRED,
 )
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
@@ -2826,6 +2827,7 @@ class TestUnswitchableRowsAreListed:
         a.policy = AccountPolicy()
         # Likewise a real stamp: the login column formats it as a number or None.
         a.login_expires_at = None
+        a.disabled = False  # the pass keeps only enabled peers; a MagicMock is truthy
         if usage is not None:
             a.usage = usage
         else:
@@ -3371,6 +3373,7 @@ class TestUnswitchableRowsAreListed:
         h = EngineHarness(
             temp_home, model="Fable", threshold=90.0, strategy="consume-first",
         )
+        h.clock.now = time.time()  # the panel reads the wall clock; a 1970 reset is rolled
         for num, email in (
             (1, "a@x.invalid"), (2, "b@x.invalid"),
             (3, "c@x.invalid"), (4, "d@x.invalid"),
@@ -3537,9 +3540,10 @@ class TestUnswitchableRowsAreListed:
     ):
         """The engine's probe pick ranks the unknown-reset pool by line
         headroom (A: 5h 50 / 7d 88 is 22.9 under W97, B: 5h 84 / 7d 10 is
-        16), so the panel's own `select_probe_target` call must be handed the
-        same lines or it tops "Next best" with B, one point from its 5h line.
-        No weekly line: raw headroom (A 12, B 16) is the line headroom."""
+        16), so the pass the panel runs must be handed the same lines or it
+        tops "Next best" with B, one point from its 5h line. No weekly line:
+        raw headroom (A 12, B 16) is the line headroom, and A, over its 7d
+        line, is barred."""
         from tests.test_autoswitch import _iso_at
         from claude_swap.settings import AutoSwitchSettings
 
@@ -3550,7 +3554,8 @@ class TestUnswitchableRowsAreListed:
         a = {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 88.0}}
         b = {"five_hour": {"pct": 84.0}, "seven_day": {"pct": 10.0}}
         settings = AutoSwitchSettings(
-            strategy="consume-first", threshold=85.0, weekly_threshold=weekly
+            strategy="consume-first", threshold=85.0, weekly_threshold=weekly,
+            hysteresis_pct=0.0,  # the room bar would bar both: this pins the probe pick itself
         )
         rendered = self._render(self._snap(
             self._acct("1", "a@x.invalid", switchable=True,
@@ -3711,6 +3716,337 @@ class TestUnswitchableRowsAreListed:
             f"while the active account's own reset is stale and unknown to "
             f"the engine -- panel out:\n{rendered}"
         )
+
+
+def _next_best_text(snap, active, settings):
+    """The "Next best" panel's rendered text, with no app and no pilot."""
+    from unittest.mock import MagicMock, patch
+    from claude_swap.tui.autoview import AutoScreen
+    from claude_swap.tui.theme import CSWAP_DARK
+
+    v = AutoScreen.__new__(AutoScreen)
+    v._settings = settings
+    v._engine = None
+    app = MagicMock(current_theme=CSWAP_DARK)
+    box = MagicMock()
+    box.size.width = 200  # no layout on a `__new__` screen: a box wide enough for the login
+    with patch.object(AutoScreen, "app", property(lambda s: app)), patch.object(
+        AutoScreen, "query_one", lambda s, *a: box
+    ):
+        return str(v._candidates_text(snap, active_number=active))
+
+
+def _next_best_order(snap, active, settings):
+    """The account numbers "Next best" renders, in its own displayed order."""
+    rendered = _next_best_text(snap, active, settings)
+    others = [acc.number for acc in snap.accounts if acc.number != active]
+    return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
+
+
+def _window(five_h, reset_h):
+    """A usage payload: 5h at `five_h`, the 7d window empty and resetting in `reset_h`."""
+    return {
+        "five_hour": {"pct": five_h},
+        "seven_day": {"pct": 0.0, "resets_at": _iso_in(reset_h * 3600)},
+    }
+
+
+def _window7(five_h, seven_d, seven_reset_h=None, five_reset_h=None):
+    """A usage payload with both windows set; a reset is optional."""
+    five = {"pct": five_h}
+    seven = {"pct": seven_d}
+    if five_reset_h is not None:
+        five["resets_at"] = _iso_in(five_reset_h * 3600)
+    if seven_reset_h is not None:
+        seven["resets_at"] = _iso_in(seven_reset_h * 3600)
+    return {"five_hour": five, "seven_day": seven}
+
+
+def _harness_and_panel_snapshot(temp_home, settings, fleet, disabled=()):
+    """The engine harness and the panel's snapshot of ONE fleet (`{number: usage
+    payload or sentinel, `USAGE_NO_CREDENTIALS` a slot with no stored login on
+    both sides), account 1 the active one, `disabled` the numbers held out of
+    rotation on both sides). The harness clock is the wall clock: the panel
+    reads `time.time()`, and a reset in the harness's 1970 is already past."""
+    from tests.test_autoswitch import EngineHarness
+
+    h = EngineHarness(temp_home, **settings)
+    h.clock.now = time.time()
+    for number, usage in fleet.items():
+        h.seed(int(number), f"u{number}@x.invalid")
+        if usage == USAGE_NO_CREDENTIALS:
+            h.switcher._delete_account_credentials(number, f"u{number}@x.invalid")
+        if usage == USAGE_API_KEY:
+            data = h.switcher._get_sequence_data()
+            data["accounts"][number]["kind"] = "api_key"
+            h.switcher._write_json(h.switcher.sequence_file, data)
+        if number in disabled:
+            data = h.switcher._get_sequence_data()
+            data["accounts"][number]["disabled"] = True
+            h.switcher._write_json(h.switcher.sequence_file, data)
+    h.make_live("u1@x.invalid", 1)
+    snap = AccountsSnapshot(
+        active_number="1",
+        accounts=tuple(
+            make_account(
+                n, active=n == "1",
+                kind="api_key" if usage == USAGE_API_KEY else "oauth",
+                disabled=n in disabled,
+                switchable=usage != USAGE_NO_CREDENTIALS,
+                entry=(
+                    make_entry(sentinel=usage) if isinstance(usage, str) else UsageEntry(
+                        last_good=usage, fetched_at=time.time() - 5.0, age_s=5.0,
+                    )
+                ),
+            )
+            for n, usage in fleet.items()
+        ),
+        taken_at=0.0,
+    )
+    return h, snap
+
+
+class TestNextBestFollowsTheTick:
+    """The first Next best row is the account the engine's own tick switches to,
+    each case built so that the strategy's bare reset or headroom key names
+    another one: the panel ranks through the engine's pass, never a key of its
+    own."""
+
+    @pytest.mark.parametrize(
+        "strategy, fleet, designed",
+        [
+            # Proactive: 2 resets soonest but sits 5 points under its line, short
+            # of the hysteresis room (`tight`), so 3 leads.
+            ("consume-first", {"1": (95, 100), "2": (85, 10), "3": (10, 50)}, "3"),
+            # Weekly-first: soonest reset among the roomy ones, not the most
+            # headroom; the tight 4 resets sooner still and goes last.
+            ("weekly-first",
+             {"1": (95, 100), "2": (75, 10), "3": (5, 50), "4": (84, 5)}, "2"),
+            # CONTROL: best's key is the bare headroom on both sides.
+            ("best", {"1": (95, 100), "2": (70, 10), "3": (20, 50)}, "3"),
+            # At-limit: #305's escape tier puts the roomy 3 before 2, which has
+            # a sooner reset and 5 points of room.
+            ("consume-first", {"1": (100, 100), "2": (85, 10), "3": (10, 50)}, "3"),
+            # Below the line: consume-first's room bar bars 2 outright.
+            ("consume-first", {"1": (40, 100), "2": (85, 10), "3": (10, 50)}, "3"),
+            # No OAuth peer can serve (3 is spent): the metered key is the last resort.
+            ("best", {"1": (95, 100), "2": USAGE_API_KEY, "3": (100, 50)}, "2"),
+        ],
+        ids=[
+            "consume-first-proactive", "weekly-first-proactive", "best-proactive",
+            "consume-first-at-limit", "consume-first-below-the-line",
+            "api-key-last-resort",
+        ],
+    )
+    def test_the_first_row_is_the_account_the_tick_switches_to(
+        self, temp_home, strategy, fleet, designed
+    ):
+        from claude_swap.autoswitch import TickOutcome
+
+        fleet = {n: w if isinstance(w, str) else _window(*w) for n, w in fleet.items()}
+        h, snap = _harness_and_panel_snapshot(
+            temp_home, {"strategy": strategy, "include_api_key_accounts": True}, fleet
+        )
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        picked = str(h.active_number())
+        assert picked == designed, "the case no longer builds the pick it is named for"
+        assert _next_best_order(snap, "1", h.settings)[0] == picked
+
+    @pytest.mark.parametrize(
+        "strategy, active, claim",
+        [
+            ("consume-first", USAGE_TOKEN_EXPIRED, "not previewed (active status unknown)"),
+            ("best", _window(40, 100), "not previewed (active below threshold)"),
+        ],
+        ids=["unreadable-active", "best-below-the-line"],
+    )
+    def test_a_state_the_panel_cannot_model_claims_no_order(
+        self, temp_home, strategy, active, claim
+    ):
+        fleet = {"1": active, "2": _window(85, 10), "3": _window(10, 50)}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
+        assert claim in _next_best_text(snap, "1", h.settings)
+
+    @pytest.mark.parametrize(
+        "strategy, fleet, extra, disabled, designed",
+        [
+            # Healthy holds: the engine reports NO_ACTION, never a block.
+            ("consume-first", {"1": (40, 10), "2": (10, 50), "3": (10, 60)},
+             {}, (), "already-consuming-soonest"),
+            ("dynamic", {"1": (40, 10), "2": (10, 50), "3": (10, 60)},
+             {}, (), "already-consuming-soonest"),
+            ("consume-first",
+             {"1": _window7(40, 0), "2": (85, 10), "3": (10, 50)},
+             {}, (), "reset-unknown"),
+            ("consume-first", {"1": (40, 100), "2": USAGE_API_KEY},
+             {"include_api_key_accounts": True}, (), "below-threshold"),
+            # Blocks and waits.
+            ("best", {"1": (95, 100), "2": (88, 10), "3": (87, 50)},
+             {}, (), "no-qualifying-candidate"),
+            ("best", {"1": (95, 100), "2": USAGE_TOKEN_EXPIRED, "3": USAGE_TOKEN_EXPIRED},
+             {}, (), "no-comparison"),
+            ("best", {"1": (95, 100), "2": (10, 50)}, {}, ("2",), "no-candidates"),
+            ("best", {"1": (100, 100), "2": (100, 50), "3": (100, 60)},
+             {}, (), "all-exhausted"),
+            ("best",
+             {"1": _window7(100, 40, five_reset_h=2 / 3),
+              "2": _window7(1, 98, 96), "3": _window7(100, 100, 96)},
+             {}, (), "deliberate-wait"),
+        ],
+        ids=[
+            "consume-first-already-soonest", "dynamic-already-soonest",
+            "consume-first-reset-unknown", "consume-first-no-oauth-peer",
+            "best-no-qualifying-candidate", "best-no-comparison",
+            "best-no-candidates", "best-all-exhausted", "best-deliberate-wait",
+        ],
+    )
+    def test_an_empty_pass_says_what_the_tick_refused_with(
+        self, temp_home, strategy, fleet, extra, disabled, designed
+    ):
+        """The note is the one worded for the reason the tick emitted on the
+        same fleet, and a hold the engine calls healthy never reads as a block."""
+        from claude_swap.autoswitch import AllExhaustedEvent, TickOutcome
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        fleet = {n: w if isinstance(w, (str, dict)) else _window(*w) for n, w in fleet.items()}
+        h, snap = _harness_and_panel_snapshot(
+            temp_home, {"strategy": strategy, **extra}, fleet, disabled
+        )
+        outcome = h.tick_with_usage(fleet)
+        event = [e for e in h.events if isinstance(e, (NoSwitchEvent, AllExhaustedEvent))][-1]
+        reason = (
+            event.reason if isinstance(event, NoSwitchEvent)
+            else "deliberate-wait" if event.deliberate_wait else "all-exhausted"
+        )
+        assert reason == designed, "the case no longer builds the refusal it is named for"
+        text = _next_best_text(snap, "1", h.settings)
+        assert [t for t in _REFUSAL_TEXT.values() if t in text] == [_REFUSAL_TEXT[reason]]
+        if outcome is TickOutcome.NO_ACTION:
+            assert _REFUSAL_TEXT["no-qualifying-candidate"] not in text
+
+    def test_every_refusal_the_tick_can_emit_has_its_words_or_a_reason_not(self):
+        """A reason the tick gains cannot fall through: it is worded in the
+        panel, or listed here with why the panel does not model it."""
+        import ast
+        import inspect
+        import itertools
+        import textwrap
+
+        from claude_swap.autoswitch import (
+            AutoSwitchEngine, empty_pass_refusal, no_peer_refusal,
+        )
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        # Before the pass or beyond the snapshot (cooldown, the failover
+        # count), the priority strategy's own pass, or after a pass that admitted.
+        not_modelled = {
+            "unmanaged-active-account", "no-active-account", "active-api-key",
+            "active-idle", "active-usage-unknown", "cooldown",
+            "already-consuming-priority", "stale-usage", "no-viable-target",
+        }
+        tree = ast.parse(textwrap.dedent(inspect.getsource(AutoSwitchEngine._tick_inner)))
+        emitted = {
+            kw.value.value
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call) and getattr(call.func, "id", "") == "NoSwitchEvent"
+            for kw in call.keywords
+            if kw.arg == "reason" and isinstance(kw.value, ast.Constant)
+        }
+        assert emitted <= set(_REFUSAL_TEXT) | not_modelled, "an unclassified tick reason"
+        triggers = ("at-limit", "proactive", "consume-first", "dynamic", "disabled-active")
+        returned = {
+            no_peer_refusal(
+                trigger=t, active_headroom=h, oauth_candidates=o, api_key_candidates=a
+            )
+            for t, h, o, a in itertools.product(triggers, (None, 5.0), ([], ["2"]), ([], ["3"]))
+        } | {
+            empty_pass_refusal(
+                trigger=t, any_known=k, active_reset_ts=r, waiting_for_recovery=w,
+                candidate_headrooms=hs,
+            )
+            for t, k, r, w, hs in itertools.product(
+                triggers, (True, False), (None, 1.0), (True, False),
+                ([None], [0.0], [50.0]),
+            )
+        }
+        assert returned - {None} == set(_REFUSAL_TEXT), "a refusal without words, or words for none"
+
+    def test_a_pass_that_admits_nobody_says_so(self, temp_home):
+        """Best needs a hysteresis margin over the active's headroom, and neither
+        peer has it: the engine holds, so no row may read as its next pick."""
+        from claude_swap.autoswitch import TickOutcome
+
+        fleet = {"1": _window(95, 100), "2": _window(88, 10), "3": _window(87, 50)}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "best"}, fleet)
+        assert h.tick_with_usage(fleet) is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert "no candidate qualifies" in _next_best_text(snap, "1", h.settings)
+
+    def test_an_unswitchable_peer_leaves_the_refusal_as_the_tick_worded_it(self, temp_home):
+        """Slot 3 has no login, so its row reads its sentinel. That text is the
+        row's own: the line under "Next best" is still the tick's refusal."""
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        fleet = {"1": _window(95, 100), "2": _window(88, 10), "3": USAGE_NO_CREDENTIALS}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "best"}, fleet)
+        assert h.tick_with_usage(fleet) is not TickOutcome.SWITCHED
+        event = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+        assert event.reason == "no-qualifying-candidate"
+        text = _next_best_text(snap, "1", h.settings)
+        assert text.splitlines()[1].strip() == _REFUSAL_TEXT[event.reason]
+        assert text.count(tui_data.sentinel_label(USAGE_NO_CREDENTIALS)) == 1
+
+    @pytest.mark.parametrize("with_settings", [True, False], ids=["tick-picks", "no-settings"])
+    def test_an_unswitchable_peer_adds_no_line_under_the_header(self, temp_home, with_settings):
+        """Nothing is refused (the tick has a pick, or the panel has no
+        settings to run the engine on), so row 1 follows the header directly."""
+        from claude_swap.autoswitch import TickOutcome
+
+        fleet = {"1": _window(95, 100), "2": _window(10, 50), "3": USAGE_NO_CREDENTIALS}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "best"}, fleet)
+        if with_settings:
+            assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+            assert str(h.active_number()) == "2"
+        text = _next_best_text(snap, "1", h.settings if with_settings else None)
+        assert "user2@example.com" in text.splitlines()[1]
+
+    def test_an_unknown_reset_peer_without_landing_room_is_not_named_the_probe(
+        self, temp_home
+    ):
+        """Account 2's weekly reset was never reported and it holds 5 points
+        under its line, short of the hysteresis room: the tick bars it before
+        it can be admitted as a probe and switches to 3, which resets sooner
+        than the active. The panel names 3 first, not the probe it never takes."""
+        from claude_swap.autoswitch import TickOutcome
+
+        fleet = {"1": _window(40, 100), "2": _window7(85, 0), "3": _window(10, 50)}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "consume-first"}, fleet)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        assert str(h.active_number()) == "3", "the tick probed, or took no pick"
+        assert _next_best_order(snap, "1", h.settings)[0] == "3"
+
+    def test_an_unknown_reset_peer_read_too_long_ago_is_not_named_the_probe(
+        self, temp_home
+    ):
+        """A probe learns a reset through a live fetch, so its stored reading
+        must be fresh (`_probe_source_fresh`): account 2's is 240 s old, inside
+        the 300 s a decision trusts and outside the 180 s a probe source may be.
+        The tick takes 3, and the panel does not name 2."""
+        from claude_swap.autoswitch import TickOutcome
+        from tests.test_autoswitch import _entry_for
+
+        fleet = {"1": _window(40, 100), "2": _window7(10, 0), "3": _window(10, 50)}
+        h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": "consume-first"}, fleet)
+        old = UsageEntry(last_good=fleet["2"], fetched_at=time.time() - 240.0, age_s=240.0)
+        snap = dataclasses.replace(snap, accounts=tuple(
+            dataclasses.replace(acc, usage=old) if acc.number == "2" else acc
+            for acc in snap.accounts
+        ))
+        entries = {n: _entry_for(w, h.clock.now) for n, w in fleet.items()} | {"2": old}
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+        assert str(h.active_number()) == "3", "the tick probed, or took no pick"
+        assert _next_best_order(snap, "1", h.settings)[0] == "3"
 
 
 @pytest.mark.asyncio

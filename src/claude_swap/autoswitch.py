@@ -148,6 +148,41 @@ HORIZON_HEADROOM_RATIO = 2.0
 # this much.
 SPENT_HEADROOM_PCT = 3.0
 
+
+def _binding_at(
+    value: dict | str | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    line: float,
+) -> BindingWindow | None:
+    """The window binding one account under ``settings``' lines on the window
+    set ``models`` (see ``lines.binding_window``), or None when it reports no
+    window. ``line`` is the account's effective threshold. A module function,
+    so the static ranking pass (and the "Next best" panel through it) needs no
+    engine instance."""
+    return binding_window(
+        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
+        line,
+        settings.weekly_threshold,
+        scale=settings.threshold,
+    )
+
+
+def _room_at(
+    value: dict | str | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    line: float,
+) -> float | None:
+    """Points left before one account's nearest line (see ``lines.line_room``),
+    or None when it reports no window. Same inputs as ``_binding_at``."""
+    return line_room(
+        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
+        line,
+        settings.weekly_threshold,
+    )
+
+
 # Strategies that rank by soonest weekly reset rather than most headroom.
 # `dynamic` shares consume-first's ranking key (and every gate keyed on the
 # below-threshold "consume-first" trigger, which this literal also drives —
@@ -165,6 +200,50 @@ CONSUME_FIRST_STRATEGIES = ("consume-first", "dynamic")
 # see `_perform` — the moment the account is switched to again for any
 # reason, since that is itself a fresh chance to learn its reset.
 PROBE_COOLDOWN_S = 3600.0
+
+
+def no_peer_refusal(
+    *,
+    trigger: str,
+    active_headroom: float | None,
+    oauth_candidates: Sequence[str],
+    api_key_candidates: Sequence[str],
+) -> str | None:
+    """The refusal before any pass runs, when no OAuth peer exists: a healthy
+    below-line hold for the consume-first family (API-key candidates do not
+    change it, they have no weekly window to consume), else the lack of any
+    candidate. None when a pass has someone to rank. The tick and the "Next
+    best" panel share this one reading."""
+    if (
+        trigger in (*CONSUME_FIRST_STRATEGIES, "priority")
+        and not oauth_candidates
+        and active_headroom is not None
+    ):
+        return "below-threshold"
+    if not oauth_candidates and not api_key_candidates:
+        return "no-candidates"
+    return None
+
+
+def empty_pass_refusal(
+    *,
+    trigger: str,
+    any_known: bool,
+    active_reset_ts: float | None,
+    waiting_for_recovery: bool,
+    candidate_headrooms: Sequence[float | None],
+) -> str:
+    """Why a pass that admitted nobody holds, from what the pass returned (see
+    ``_rank_candidates_pass``) and the model-gated headroom of the OAuth
+    candidates. Not the priority strategy's, which has its own pass. The tick
+    and the "Next best" panel share this one reading."""
+    if not any_known:
+        return "no-comparison"
+    if trigger in CONSUME_FIRST_STRATEGIES:
+        return "reset-unknown" if active_reset_ts is None else "already-consuming-soonest"
+    if all(h is not None and h <= 0 for h in candidate_headrooms):
+        return "all-exhausted"
+    return "deliberate-wait" if waiting_for_recovery else "no-qualifying-candidate"
 
 
 def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
@@ -630,8 +709,8 @@ def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
     altogether (``_row_eligible``), so admitting one here would spend the
     tick's one probe slot on a candidate that cannot resolve its reset while
     the hold lasts. ``entries=None`` (a caller with no store-entry data, e.g.
-    a direct unit-test call predating probing, or a display) skips the gate
-    rather than refusing every candidate.
+    a direct unit-test call predating probing) skips the gate rather than
+    refusing every candidate; the panel passes its snapshot's entries.
     """
     if entries is None:
         return True
@@ -679,23 +758,19 @@ def select_probe_target(
     against each window's own line); with one line that is the most raw
     headroom.
 
-    ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
-    narrowed to candidates that cleared its own servability/no-return/
-    landing-health gates) to decide the switch; the "Next best" panel calls
-    it on the full candidate list to decide what to DISPLAY. Before this
-    function existed the panel had no notion of probing at all and ranked
-    every candidate with ``probe=False``, so an unknown-reset account read
-    its own absent reset as ``+inf`` (last) there while the engine ranks
-    the same candidate ``-inf`` (first) — the two could name different
-    accounts for the identical fleet. A single shared answer is the fix,
-    not a second, hand-matched copy of the predicate.
+    ONE CALLER: ``_rank_candidates_pass`` calls it, already narrowed to
+    candidates that cleared its own servability/no-return/landing-health/
+    freshness gates, to decide the switch; the "Next best" panel reaches it
+    only through that pass (``tui.autoview._engine_order``). Called on the
+    panel's full candidate list instead, it named a probe the pass had barred
+    (no landing room, a stale reading), or sorted an unknown reset last while
+    the engine ranks it first.
 
     ``active_usage`` (the ACTIVE account's own decision value, not a
-    precomputed timestamp) so both callers can pass what they already have
-    on hand rather than importing this module's private reset-parsing
-    helper. Its weekly reset must be known — an account cannot be ranked on
-    a reset the strategy has refused to ever measure, on either side of the
-    comparison.
+    precomputed timestamp) so the caller can pass what it already has on hand
+    rather than importing this module's private reset-parsing helper. Its
+    weekly reset must be known: an account cannot be ranked on a reset the
+    strategy has refused to ever measure, on either side of the comparison.
 
     ``thresholds`` maps each account to its own line (``threshold`` is the
     global one, the ruler); ``None`` reads the global line for every account.
@@ -2058,11 +2133,13 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
-        if (
-            trigger in (*CONSUME_FIRST_STRATEGIES, "priority")
-            and not oauth_candidates
-            and active_headroom is not None
-        ):
+        no_peer = no_peer_refusal(
+            trigger=trigger,
+            active_headroom=active_headroom,
+            oauth_candidates=oauth_candidates,
+            api_key_candidates=api_key_candidates,
+        )
+        if no_peer == "below-threshold":
             # Healthy below-threshold account with no OAuth peer to compare
             # against — the same state `best` reports as below-threshold
             # NO_ACTION before ever reaching candidate selection. API-key
@@ -2080,7 +2157,7 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        if not oauth_candidates and not api_key_candidates:
+        if no_peer == "no-candidates":
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -2277,7 +2354,14 @@ class AutoSwitchEngine:
                     detail="no candidate is below every switch line with readable usage; waiting for recovery",
                 ))
                 return TickOutcome.BLOCKED
-            if not any_known:
+            refusal = empty_pass_refusal(
+                trigger=trigger,
+                any_known=any_known,
+                active_reset_ts=active_reset_ts,
+                waiting_for_recovery=waiting_for_recovery,
+                candidate_headrooms=[headroom.get(n) for n in oauth_candidates],
+            )
+            if refusal == "no-comparison":
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -2291,7 +2375,7 @@ class AutoSwitchEngine:
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
                 # so an opted-in user can see the strategy working (or inert).
-                if active_reset_ts is None:
+                if refusal == "reset-unknown":
                     # The strictly-sooner filter skips every candidate when the
                     # active account's weekly reset is unknown — without this
                     # reason the strategy would look enabled while doing
@@ -2323,11 +2407,8 @@ class AutoSwitchEngine:
             # gate, or one whose usage is unreadable this tick, can become
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
-                h is not None and h <= 0 for h in candidate_headrooms
-            )
-            if not truly_exhausted and not waiting_for_recovery:
+            truly_exhausted = refusal == "all-exhausted"
+            if refusal == "no-qualifying-candidate":
                 self._emit(
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
@@ -3083,8 +3164,8 @@ class AutoSwitchEngine:
         self._last_probe_num = probe_num
         return ordered, any_known, active_reset_ts, waiting
 
+    @staticmethod
     def _rank_candidates_pass(
-        self,
         *,
         models: Sequence[str],
         trigger: str,
@@ -3115,7 +3196,9 @@ class AutoSwitchEngine:
         commit can run it twice per tick: on the stored snapshot to decide
         provisionally, then on the escalated refetch to re-verify before
         switching. ``_rank_candidates`` (above) is the entry point every
-        caller uses; it calls this twice at most (see its docstring).
+        tick caller uses; it calls this twice at most (see its docstring). A
+        static method, so the "Next best" panel reaches it through the
+        module-level ``rank_candidates_pass`` with no engine instance.
 
         ``waiting_for_recovery`` is the one thing the caller cannot re-derive
         without restating four conditions this method already evaluated: an
@@ -3152,7 +3235,7 @@ class AutoSwitchEngine:
         # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
         # trigger computed is reused here.
         bindings = {
-            num: self._binding(usage.get(num), settings, thresholds[num], models)
+            num: _binding_at(usage.get(num), settings, models, thresholds[num])
             for num in (*oauth_candidates, current)
         }
         active_binding = bindings[current]
@@ -3377,9 +3460,7 @@ class AutoSwitchEngine:
             # Points left before the candidate reaches the nearest of its own
             # lines, each window in its own points (`lines.line_room`); the
             # single line against raw `h` when it reports no window.
-            room = self._room(
-                usage.get(num), settings, thresholds[num], models=models
-            )
+            room = _room_at(usage.get(num), settings, models, thresholds[num])
             if room is None:
                 room = thresholds[num] - (100.0 - h)
             over = (
@@ -3513,10 +3594,9 @@ class AutoSwitchEngine:
                             #
                             # `select_probe_target` re-applies
                             # `_seven_day_reset_unmeasured` and the cooldown
-                            # (the shared function both this pass and the
-                            # panel call) -- membership here only needs to be
-                            # fresh enough to admit without risking the
-                            # stale-usage abort below.
+                            # -- membership here only needs to be fresh enough
+                            # to admit without risking the stale-usage abort
+                            # below.
                             if _probe_source_fresh(entries, num, now):
                                 probe_candidates.append(num)
                             continue
@@ -3658,9 +3738,8 @@ class AutoSwitchEngine:
             qualifying.append((key, num))
         # AT MOST ONE PROBE PER DECISION. `select_probe_target` picks the
         # most LINE headroom among `probe_candidates` (the key's `-lh`, so the
-        # probe is the account the key would order first) -- the shared
-        # function this pass and the "Next best" panel both call, so neither
-        # re-derives the predicate.
+        # probe is the account the key would order first). The panel reads
+        # this pick off the pass, so it never re-derives the predicate.
         probe_num = select_probe_target(
             usage,
             probe_candidates,
@@ -4099,14 +4178,8 @@ class AutoSwitchEngine:
         and the ranking helpers are exercised directly on bare engines. A
         caller ranking on another window set (dynamic's 5h/7d retry) passes
         it, so the binding and the headroom beside it read ONE set."""
-        return binding_window(
-            oauth.relevant_windows(
-                value if isinstance(value, dict) else None,
-                self._models if models is None else models,
-            ),
-            line,
-            settings.weekly_threshold,
-            scale=settings.threshold,
+        return _binding_at(
+            value, settings, self._models if models is None else models, line
         )
 
     def _room(
@@ -4120,13 +4193,8 @@ class AutoSwitchEngine:
         """Points left before this account's nearest line under the tick's
         lines (see ``lines.line_room``), or None when it reports no window.
         Same inputs as ``_binding``."""
-        return line_room(
-            oauth.relevant_windows(
-                value if isinstance(value, dict) else None,
-                self._models if models is None else models,
-            ),
-            line,
-            settings.weekly_threshold,
+        return _room_at(
+            value, settings, self._models if models is None else models, line
         )
 
     def _in_cooldown(self, state: dict) -> bool:
@@ -4488,3 +4556,9 @@ class AutoSwitchEngine:
                     )
                 )
             self._wake.wait(delay)
+
+
+# A direct module-level name, not `AutoSwitchEngine._rank_candidates_pass`: a
+# caller that only wants the (pure, static) ranking -- the "Next best" panel --
+# needs no engine instance to reach it.
+rank_candidates_pass = AutoSwitchEngine._rank_candidates_pass

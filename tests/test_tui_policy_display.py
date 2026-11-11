@@ -245,10 +245,14 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
         # global line, 9 points). Judged on the global line instead, both read
         # model-blocked, the panel drops Fable and orders on 5h (account 3's
         # 95 points beat account 2's 53), and account 2 is labelled Fable-only.
+        # The hysteresis is 2: at the default 10 account 2's 3 points under its
+        # line do not beat the active's by the margin, the engine's model-gated
+        # pass admits nobody and its 5h/7d retry ranks account 3 first.
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
             "autoswitch": {
                 "threshold": 90, "model": "Fable", "strategy": "dynamic",
+                "hysteresisPct": 2,
             },
         }))
         fake = FakeSwitcher(
