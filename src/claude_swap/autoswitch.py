@@ -301,12 +301,13 @@ def over_own_threshold(
     models: Sequence[str],
     bars: Mapping[str, float],
 ) -> bool:
-    """Whether ``num`` sits at or over its OWN switch threshold, by the verdict that
-    would make it leave as the active (`dynamic`: raw binding headroom against its own
-    wall, every window alike; the others: any window at its line). The tick and the
-    "Next best" panel drop such a peer at candidate selection, so no trigger or regime
-    lands on it. ``bars.get`` reads the overrides only: an account without one, and a
-    reading that carries no window, is never over."""
+    """Whether ``num`` sits at or over its OWN switch threshold (`dynamic`: raw binding
+    headroom against its own wall, every window alike; the others: any window at its
+    line), the line the trigger classifies an active account by. A fleet-wide model
+    blackout widens only the ACTIVE's verdict (`_dynamic_active_headroom`), never a
+    peer's. The tick and the "Next best" panel drop such a peer at candidate selection,
+    so no trigger or regime lands on it. ``bars.get`` reads the overrides only: an
+    account without one, and a reading that carries no window, is never over."""
     own = bars.get(num)
     if own is None:
         return False
@@ -3741,16 +3742,25 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        def _vetoed_clause() -> str:
+            """Names each peer the own-line veto dropped, with its line."""
+            return (
+                ", ".join(
+                    f"Account-{n} (line {pct_label(thresholds[n])}%)" for n in vetoed
+                )
+                + " at or over its own threshold"
+            )
+
         def _hold_over_own() -> TickOutcome:
             """Held on purpose, not stranded: any tick can free a slot (a reset,
-            a fresh reading), so the ordinary cadence stands, not a long sleep."""
+            a fresh reading), so the ordinary cadence stands, not a long sleep.
+            The reason stays `no-qualifying-candidate`, the one the watchers read
+            as the designed hold."""
             self._emit(NoSwitchEvent(
-                reason="over-own-threshold",
+                reason="no-qualifying-candidate",
                 detail=(
-                    ", ".join(
-                        f"Account-{n} (line {pct_label(thresholds[n])}%)" for n in vetoed
-                    )
-                    + " at or over its own threshold, and no other account to land on"
+                    _vetoed_clause()
+                    + ", and no other account to land on"
                     + (
                         f"; Account-{current} is past its weekly cap "
                         f"({active_capped[0]} {pct_label(active_capped[1])}%)"
@@ -3913,9 +3923,9 @@ class AutoSwitchEngine:
             )
             decided_now = self.clock()
             # The fresh rows may have carried a candidate past its cap.
-            oauth_candidates = [
-                n for n in oauth_candidates if _capped(n) is None and not _over_own(n)
-            ]
+            fresh = [n for n in oauth_candidates if _capped(n) is None]
+            vetoed += [n for n in fresh if _over_own(n)]
+            oauth_candidates = [n for n in fresh if not _over_own(n)]
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -4029,6 +4039,7 @@ class AutoSwitchEngine:
                             "no candidate is below its switch lines and better "
                             "than the active account by the hysteresis "
                             "margin, or usage is unreadable this tick"
+                            + (f"; {_vetoed_clause()}" if vetoed else "")
                         ),
                     )
                 )

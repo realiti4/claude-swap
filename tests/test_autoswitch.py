@@ -16462,8 +16462,9 @@ class TestPerAccountSwitchThreshold:
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
         (event,) = [e for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert event.reason == "over-own-threshold"
-        assert "Account-2" in event.detail and "Account-3" in event.detail
+        assert event.reason == "no-qualifying-candidate"
+        assert "Account-2 (line 50%)" in event.detail
+        assert "Account-3 (line 50%)" in event.detail
         assert ("weekly cap" in event.detail) == (active == "weekly-capped")
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
@@ -16472,20 +16473,22 @@ class TestPerAccountSwitchThreshold:
     def test_a_spent_fleet_with_one_peer_over_its_own_line_still_names_it(
         self, temp_home, strategy
     ):
-        """The incident's shape: the active at the wall, #2 with room but over
-        its own 50, #3 walled. The hold names #2 and polls at the ordinary
-        cadence, not the all-exhausted sleep that never mentions it."""
+        """The incident's shape: the active and #3 at 99 (1 point of room, so
+        not "all exhausted"), #2 with room but over its own 50. The tick is the
+        designed `no-qualifying-candidate` hold, which names #2 and its line,
+        at the ordinary cadence."""
         h = self._harness(temp_home, strategy)
         self._set(h, 2, 50.0)
         outcome = h.tick_with_usage({
             "1": self._use(h, 99, 9 * 86400),
             "2": self._use(h, 53, 1 * 86400),
-            "3": self._use(h, 100, 5 * 86400),
+            "3": self._use(h, 99, 5 * 86400),
         })
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
-        log = [e.human() for e in h.events if not isinstance(e, PollEvent)]
-        assert any("Account-2" in line and "own threshold" in line for line in log), log
+        (event,) = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert event.reason == "no-qualifying-candidate"
+        assert "Account-2 (line 50%)" in event.detail
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
 

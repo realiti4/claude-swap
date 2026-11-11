@@ -239,7 +239,7 @@ class TestLandingGateIsPerCandidate:
         h.engine = h._make_engine()
         outcome = h.tick_with_usage(self._usage_map())
         assert outcome is TickOutcome.BLOCKED, _reasons(h)
-        assert _reasons(h) == ["over-own-threshold"]
+        assert _reasons(h) == ["no-qualifying-candidate"]
         assert h.active_number() == 1
 
     def test_the_rejected_candidate_is_not_merely_deprioritized(self, temp_home):

@@ -19060,18 +19060,21 @@ class TestBestSelectionNeverEntersAnOwnThresholdPeer:
             "1", usage=usage, current_at_limit=at_limit
         ) == expected
 
-    def test_a_peer_over_its_own_line_on_the_configured_model_window_is_vetoed(
-        self, temp_home
+    @pytest.mark.parametrize("models", [(), ("all",)])
+    def test_a_peer_over_its_own_line_on_a_model_window_is_vetoed(
+        self, temp_home, models
     ):
-        # The pin's seam passes no models: the veto reads `autoswitch.model`,
-        # as the engine does.
+        # No models named: the veto reads `autoswitch.model`, as the engine does.
+        # The pin's seam passes `models=("all",)`: every per-model window, whatever
+        # the setting (here none).
         from claude_swap.settings import set_setting
 
         helper = TestCurrentAtLimitOverridesTheFrozenPct()
         s = helper._setup(temp_home)
         for num in (1, 2, 3):
             helper._seed(s, num, f"{num}@example.com")
-        set_setting(s.backup_dir, "autoswitch.model", "Fable")
+        if not models:
+            set_setting(s.backup_dir, "autoswitch.model", "Fable")
         s.set_account_threshold("3", 50)
         usage = {
             "1": helper._usage(95.0),
@@ -19080,7 +19083,7 @@ class TestBestSelectionNeverEntersAnOwnThresholdPeer:
         }
 
         assert s._select_best_switchable(
-            "1", usage=usage, current_at_limit=True
+            "1", models, usage=usage, current_at_limit=True
         ) == (None, "exhausted")
 
 

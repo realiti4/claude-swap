@@ -6854,7 +6854,8 @@ class ClaudeAccountSwitcher:
             )
         ]
         # Nor is a peer at or over its OWN threshold (the engine's veto), by the
-        # engine's settings and model set (the pin's seam passes none); an
+        # engine's settings and the caller's model set (the pin's seam passes
+        # `models=("all",)`, every per-model window; else `autoswitch.model`); an
         # account without one reads as before.
         from claude_swap.autoswitch import over_own_threshold
 
