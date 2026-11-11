@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
 import ssl
 import urllib.error
 from datetime import datetime, timezone
@@ -978,6 +981,71 @@ class TestClassifyUsageError:
 
     def test_fallback_type_name(self):
         assert oauth._classify_usage_error(ValueError("x"))[0] == "ValueError"
+
+
+class TestUsageRequestLog:
+    """``request_usage_data`` logs one INFO line per request (outcome, token
+    tag, process, request id, a 429's stated cause) and changes nothing it
+    returns or raises."""
+
+    TOKEN = "sk-ant-oat01-secret"
+    TAG = hashlib.sha256(TOKEN.encode()).hexdigest()[:12]
+    RATE = json.dumps({"type": "error", "error": {
+        "type": "rate_limit_error", "message": "Slow down\r\nINFO forged " + "x" * 400,
+    }}).encode()
+    HTTP = staticmethod(TestClassifyUsageError._http_error)
+
+    def _request(self, caplog, **urlopen):
+        """Run one request: its INFO lines and what it raised."""
+        raised = None
+        with patch("claude_swap.oauth.urllib.request.urlopen", **urlopen), \
+                caplog.at_level(logging.INFO, logger="claude-swap"):
+            try:
+                oauth.request_usage_data(self.TOKEN)
+            except Exception as e:
+                raised = e
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO], raised
+
+    def test_success_logs_one_line(self, caplog):
+        resp = MagicMock(status=200, headers={"request-id": "req_ok"})
+        resp.read.return_value = b"{}"
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        (line,), raised = self._request(caplog, return_value=resp)
+        assert raised is None
+        for part in ("http-200", self.TAG, f"pid {os.getpid()}", "request-id req_ok"):
+            assert part in line
+        assert self.TOKEN not in line
+
+    @pytest.mark.parametrize("err, present, absent", [
+        (HTTP(429, {"request-id": "req_abc\nforged", "X-Request-Id": "xr_1", "Retry-After": "3600"}, RATE),
+         ["http-429", "request-id req_abc", "x-request-id xr_1", "retry-after 3600",
+          "rate_limit_error: Slow down", "x" * 100], ["x" * 161]),
+        (HTTP(500, {"request-id": "req_5"}, RATE), ["http-500", "request-id req_5"],
+         ["rate_limit_error", "retry-after"]),
+        (TimeoutError(), ["TimeoutError"], []),
+        (urllib.error.URLError(TimeoutError()), ["URLError"], []),
+    ])
+    def test_failure_logs_one_line_and_reraises(self, caplog, err, present, absent):
+        """Only a 429 has its body read, and a log line never carries a newline."""
+        (line,), raised = self._request(caplog, side_effect=err)
+        assert raised is err
+        assert self.TAG in line and self.TOKEN not in line and "\n" not in line
+        assert all(p in line for p in present)
+        assert not any(a in line for a in absent)
+
+    @pytest.mark.parametrize("code, headers, body, error, retry_after", [
+        (429, {"Retry-After": "3600"}, RATE, "http-429", 3600.0),
+        (403, {}, TestClassifyUsageError.ORG_BODY, TestClassifyUsageError.ORG, None),
+    ])
+    def test_outcome_is_unchanged(self, code, headers, body, error, retry_after):
+        """The log line leaves the 403 body for ``_classify_usage_error``."""
+        with patch("claude_swap.oauth.urllib.request.urlopen",
+                   side_effect=self.HTTP(code, headers, body)):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", TestTryFetchUsageOutcome._make_credentials(), is_active=False,
+            )
+        assert (outcome.error, outcome.retry_after_s) == (error, retry_after)
 
 
 class TestTryFetchUsageOutcome:
