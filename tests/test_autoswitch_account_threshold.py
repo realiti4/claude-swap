@@ -504,26 +504,18 @@ class TestReturnToAVoluntarilyLeftAccount:
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert h.active_number() == 2
 
-    @pytest.mark.parametrize("used,released", [(49.0, False), (50.0, True)])
-    def test_the_release_opens_exactly_at_the_actives_own_line(
-        self, temp_home, used, released
+    @pytest.mark.parametrize(
+        "active,peer,released", [(49.0, 1.0, False), (50.0, 1.0, True), (50.0, 85.0, False)]
+    )
+    def test_the_release_needs_the_active_at_its_line_and_the_peer_with_room(
+        self, temp_home, active, peer, released
     ):
         h = self._fleet(temp_home)
-        usage = self._reading(h, used, 1.0)
         assert h.engine._left_account_recovered(
-            h.engine._read_state(), usage, {"1": 100.0 - used, "2": 99.0},
-            100.0 - used, h.settings, h.clock.now, "1",
-            thresholds=h.engine._resolve_thresholds(),
-        ) is released
-
-    def test_a_peer_over_its_own_line_stays_barred(self, temp_home):
-        h = self._fleet(temp_home)
-        h.switcher.set_account_threshold("2", 50.0)
-        usage = self._reading(h, 50.0, 55.0)
-        assert h.engine._left_account_recovered(
-            h.engine._read_state(), usage, {"1": 50.0, "2": 45.0}, 50.0,
+            h.engine._read_state(), self._reading(h, active, peer),
+            {"1": 100.0 - active, "2": 100.0 - peer}, 100.0 - active,
             h.settings, h.clock.now, "1", thresholds=h.engine._resolve_thresholds(),
-        ) is False
+        ) is released
 
 
 class TestPollPolicyMinimumThreshold:
