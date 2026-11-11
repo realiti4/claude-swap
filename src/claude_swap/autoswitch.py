@@ -1274,6 +1274,14 @@ def pct_label(value: float) -> str:
     return f"{value:.10g}"
 
 
+def _vetoed_clause(vetoed: list[str], thresholds: Mapping[str, float]) -> str:
+    """Names each peer the own-line veto dropped, with its line ("" if none)."""
+    if not vetoed:
+        return ""
+    names = ", ".join(f"Account-{n} (line {pct_label(thresholds[n])}%)" for n in vetoed)
+    return f"{names} at or over its own threshold"
+
+
 def _below_line_detail(
     binding: BindingWindow | None, active_headroom: float, threshold: float
 ) -> str:
@@ -2244,6 +2252,9 @@ class AutoSwitchEngine:
         # walled at (its own, or SPENT_HEADROOM_PCT).
         self._bars: dict[str, float] = {}
         self._active_wall = SPENT_HEADROOM_PCT
+        # Per tick: the vetoed-peer clause `_emit` appends to every NoSwitchEvent,
+        # cleared when the tick ends so it never reaches an event outside it.
+        self._veto_note = ""
         # The percent step's tracker: this process's last, kept for a dry run
         # (which writes no state).
         self._stay: dict | None = None
@@ -2744,6 +2755,7 @@ class AutoSwitchEngine:
             # "flag set, id stale" rather than "flag clear, id gone".
             self._tick_in_flight.set()
             self._tick_thread_id = None
+            self._veto_note = ""
 
     def _resolve_thresholds(
         self, settings: AutoSwitchSettings | None = None,
@@ -3026,6 +3038,7 @@ class AutoSwitchEngine:
             if num != current and num not in quarantined and _capped(num) is None
         ]
         vetoed = [num for num in eligible if _over_own(num)]
+        self._veto_note = _vetoed_clause(vetoed, thresholds)
         candidates = [num for num in eligible if num not in vetoed]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
@@ -3343,7 +3356,8 @@ class AutoSwitchEngine:
                 )[0]
 
             ordered = rank([n for n in cands if n != no_return])
-            bar_active = no_return is not None
+            # A bar on an account that is no candidate this tick bars nothing.
+            bar_active = no_return in cands
             if no_return is not None and not ordered and recovered:
                 ordered = rank(cands)
                 bar_active = False
@@ -3742,15 +3756,6 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
-        def _vetoed_clause() -> str:
-            """Names each peer the own-line veto dropped, with its line."""
-            return (
-                ", ".join(
-                    f"Account-{n} (line {pct_label(thresholds[n])}%)" for n in vetoed
-                )
-                + " at or over its own threshold"
-            )
-
         def _hold_over_own() -> TickOutcome:
             """Held on purpose, not stranded: any tick can free a slot (a reset,
             a fresh reading), so the ordinary cadence stands, not a long sleep.
@@ -3759,8 +3764,7 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(
                 reason="no-qualifying-candidate",
                 detail=(
-                    _vetoed_clause()
-                    + ", and no other account to land on"
+                    "no other account to land on"
                     + (
                         f"; Account-{current} is past its weekly cap "
                         f"({active_capped[0]} {pct_label(active_capped[1])}%)"
@@ -3925,6 +3929,7 @@ class AutoSwitchEngine:
             # The fresh rows may have carried a candidate past its cap.
             fresh = [n for n in oauth_candidates if _capped(n) is None]
             vetoed += [n for n in fresh if _over_own(n)]
+            self._veto_note = _vetoed_clause(vetoed, thresholds)
             oauth_candidates = [n for n in fresh if not _over_own(n)]
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
@@ -3978,7 +3983,6 @@ class AutoSwitchEngine:
                     detail=(
                         "no candidate is below every switch line with readable "
                         "usage; waiting for recovery"
-                        + (f"; {_vetoed_clause()}" if vetoed else "")
                     ),
                 ))
                 return TickOutcome.BLOCKED
@@ -4043,7 +4047,6 @@ class AutoSwitchEngine:
                             "no candidate is below its switch lines and better "
                             "than the active account by the hysteresis "
                             "margin, or usage is unreadable this tick"
-                            + (f"; {_vetoed_clause()}" if vetoed else "")
                         ),
                     )
                 )
@@ -6169,6 +6172,10 @@ class AutoSwitchEngine:
         )
 
     def _emit(self, event: AutoSwitchEvent) -> None:
+        if self._veto_note and isinstance(event, NoSwitchEvent):
+            event = replace(
+                event, detail="; ".join(filter(None, (event.detail, self._veto_note)))
+            )
         # `human()` is what the TUI panel renders, so log and screen cannot
         # drift. Gated live, not on a snapshot: `stop()` sets `dry_run`, and an
         # engine demoted at start-up can take the lock on any later tick. One

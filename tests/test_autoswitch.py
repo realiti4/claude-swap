@@ -16494,6 +16494,85 @@ class TestPerAccountSwitchThreshold:
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
 
+    def test_a_peer_left_at_its_own_line_is_named_not_called_the_only_candidate(
+        self, temp_home
+    ):
+        """The incident with the engine's last move being OFF the vetoed peer
+        (`lastSwitchFrom`=2, left at 50 headroom, now 47 and not recovered, and
+        too close to the active to dominate it): the no-return bar names a peer
+        that is no longer a candidate, so it bars nothing and the tick reaches
+        the shared hold, which names #2 and its line, never "the only
+        candidate"."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 1, 70.0)
+        self._set(h, 2, 50.0)
+        h.engine._mutate_state(
+            lambda st: st.update(
+                lastSwitchFrom="2", lastSwitchTo="1", leftHeadroom=50.0,
+                leftRecoveryAt=None, leftTrigger="proactive",
+            )
+        )
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 75, 9 * 86400),
+            "2": self._use(h, 53),
+            "3": self._use(h, 10, 5 * 86400, 99.0),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        (event,) = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert event.reason == "no-qualifying-candidate"
+        assert event.detail.count("Account-2 (line 50%)") == 1
+        assert "barred" not in event.detail
+
+    @pytest.mark.parametrize(
+        "reason, outcome, usage",
+        [
+            ("no-comparison", TickOutcome.BLOCKED, {"1": (10, 9, 99.0), "2": (53, 1, 10.0), "3": None}),
+            ("below-threshold", TickOutcome.NO_ACTION, {"1": (78, None, 56.0), "2": (53, 1, 10.0), "3": (96, 5, 10.0)}),
+            ("below-floor", TickOutcome.NO_ACTION, {"1": (30, 9, 10.0), "2": (53, 1, 10.0), "3": (96, 5, 10.0)}),
+        ],
+    )
+    def test_every_hold_names_a_vetoed_peer_once(
+        self, temp_home, reason, outcome, usage
+    ):
+        """Fail closed: the clause rides every NoSwitchEvent of a tick that
+        vetoed a peer, whichever emitter speaks, and never twice."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 2, 50.0)
+        got = h.tick_with_usage({
+            n: None if v is None
+            else self._use(h, v[0], None if v[1] is None else v[1] * 86400, v[2])
+            for n, v in usage.items()
+        })
+        assert got is outcome
+        (event,) = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert event.reason == reason
+        assert event.detail.count("Account-2 (line 50%)") == 1
+        assert event.human().count("Account-2") == 1
+
+    def test_a_tick_with_no_vetoed_peer_carries_no_clause_and_none_leaks(
+        self, temp_home
+    ):
+        """Control: the clause is per tick. A veto on one tick leaves nothing on
+        the next tick's events, nor on an event emitted between ticks."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 2, 50.0)
+        h.tick_with_usage({
+            "1": self._use(h, 10, 9 * 86400, 99.0),
+            "2": self._use(h, 53, 1 * 86400),
+            "3": None,
+        })
+        assert "Account-2 (line 50%)" in h.events[-1].detail
+        h.events.clear()
+        h.engine._emit(NoSwitchEvent(reason="already-active", detail="manual: hand"))
+        h.tick_with_usage({
+            "1": self._use(h, 10, 9 * 86400, 99.0),
+            "2": self._use(h, 10, 1 * 86400),
+            "3": None,
+        })
+        details = [e.detail for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert details and not any("own threshold" in d for d in details)
+        assert details[0] == "manual: hand"
+
     @pytest.mark.parametrize("strategy", ["dynamic", "best"])
     @pytest.mark.parametrize("escape", ["at-limit", "weekly-capped"])
     def test_an_escape_never_tries_a_peer_over_its_own_threshold(
