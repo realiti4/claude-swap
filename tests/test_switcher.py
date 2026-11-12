@@ -8495,6 +8495,182 @@ class TestProvenanceGuard:
         assert switcher.list_unclaimed_credentials() == {}
         assert op["warnings"] == []
 
+    _LAPSE_1 = 1_900_000_000_000
+    _LAPSE_2 = 1_900_500_000_000
+
+    def _lineage_creds(self, access, refresh, lapse):
+        oauth_blob = {"accessToken": access, "refreshToken": refresh}
+        if lapse is not None:
+            oauth_blob["refreshTokenExpiresAt"] = lapse
+        return json.dumps({"claudeAiOauth": oauth_blob})
+
+    def _lineage_setup(self, temp_home, sample_sequence_data):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        a1 = self._lineage_creds("at-1", "rt-1", self._LAPSE_1)
+        a2 = self._lineage_creds("at-2", "rt-2", self._LAPSE_2)
+        creds_store[("1", "test@example.com")] = a1
+        creds_store[("2", "account2@example.com")] = a2
+        return switcher, creds_store, configs_store, a1, a2
+
+    def test_desktop_relabel_live_is_other_slots_exact_bytes_offline(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The label says slot 1 but the live credential is slot 2's, byte for
+        byte, and the profile call is down: the fail-open backup used to write
+        slot 2's login into slot 1. Lineage evidence names slot 2 instead."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": a2}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == a1
+        assert creds_store[("2", "account2@example.com")] == a2
+        assert switcher.list_unclaimed_credentials() == {}  # slot 2 has it
+        assert any("Account-2" in w for w in op["warnings"])
+
+    def test_desktop_relabel_live_is_rotated_copy_of_other_slot_offline(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A rotated copy of slot 2's login (new refresh token, same lapse
+        date) under slot 1's label is preserved, never written into slot 1."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        rotated = self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2)
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == a1
+        stash = switcher.list_unclaimed_credentials()
+        assert len(stash) == 1
+        entry_id, meta = next(iter(stash.items()))
+        assert meta["reason"] == "foreign"
+        assert _read_safety_copy(switcher, entry_id) == rotated
+        # No identity was resolved, so none is claimed, and slot 2's own
+        # backup is left as it was.
+        assert meta["resolvedIdentity"] is None
+        assert creds_store[("2", "account2@example.com")] == a2
+        assert any("Account-2" in w for w in op["warnings"])
+
+    def test_unresolved_live_sharing_outgoing_lapse_backs_up_as_own_rotation(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Full refresh-token rotation of the outgoing account, oracle down:
+        the lapse date matches the outgoing slot's, so it is its own
+        rotation, backed up quietly."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        rotated = self._lineage_creds("at-1b", "rt-1b", self._LAPSE_1)
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == rotated
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
+    def test_no_lapse_data_anywhere_still_fails_open(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Without lapse dates or a fingerprint match there is no offline
+        evidence: the exact pre-fix backup, as before."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._lineage_creds(
+            "at-1", "rt-1", None)
+        creds_store[("2", "account2@example.com")] = self._lineage_creds(
+            "at-2", "rt-2", None)
+        mystery = self._lineage_creds("at-x", "rt-x", None)
+        live_state = {"creds": mystery}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == mystery
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
+    def test_slots_already_sharing_a_lapse_keep_fail_open(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Outgoing and another slot already hold the same login: lineage
+        cannot tell them apart, so the old behaviour stands."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._lineage_creds(
+            "at-1", "rt-1", self._LAPSE_2)
+        rotated = self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2)
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == rotated
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
+    def test_slot_for_login_lineage_ambiguous_or_unreadable_is_none(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Two other slots share the live lapse → ambiguous → None; a read
+        error is no match, never an exception."""
+        switcher, creds_store, configs_store, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        data = {"accounts": {
+            "1": {"email": "test@example.com"},
+            "2": {"email": "account2@example.com"},
+            "3": {"email": "account3@example.com"},
+        }}
+        stored = {
+            "1": a1,
+            "2": a2,
+            "3": self._lineage_creds("at-3", "rt-3", self._LAPSE_2),
+        }
+        live = self._lineage_creds("at-z", "rt-z", self._LAPSE_2)
+        with patch.object(
+            switcher, "_read_account_credentials",
+            side_effect=lambda num, email, **kw: stored[num],
+        ):
+            assert switcher._slot_for_login_lineage(live, "1", data) is None
+            del data["accounts"]["3"]
+            assert switcher._slot_for_login_lineage(live, "1", data) == "2"
+        with patch.object(
+            switcher, "_read_account_credentials", side_effect=OSError("x"),
+        ):
+            assert switcher._slot_for_login_lineage(live, "1", data) is None
+
 
 class TestSelfSwitchProvenance:
     """The already-active short-circuits must not hide a diverged live login."""
@@ -8596,6 +8772,284 @@ class TestSelfSwitchProvenance:
         # The rotation was captured into the slot's backup.
         assert creds_store[("1", "test@example.com")] == rotated
         assert result["switched"] is False or result["to"]["number"] == 1
+
+
+class TestSelfSwitchLoginLineageRealign:
+    """Desktop relabels ``~/.claude.json`` onto slot 1 while Claude Code's live
+    credential is still slot 2's. ``cswap switch 1`` is then a self-switch whose
+    live credential diverges from slot 1's backup, and an expired access token
+    makes the ownership oracle 401. Offline login-lineage evidence that the
+    live login is ANOTHER slot's must realign Claude Code to slot 1 instead of
+    printing "Already on" and leaving it on the wrong account."""
+
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+    _LAPSE_1 = TestProvenanceGuard._LAPSE_1
+    _LAPSE_2 = TestProvenanceGuard._LAPSE_2
+    _lineage_creds = TestProvenanceGuard._lineage_creds
+    _lineage_setup = TestProvenanceGuard._lineage_setup
+
+    S1 = ("1", "test@example.com")
+    S2 = ("2", "account2@example.com")
+
+    def _switch(self, switcher, creds_store, configs_store, live_state,
+                json_output=False):
+        # A real slot always has its config backup; activation needs it.
+        configs_store.setdefault(self.S1, json.dumps({
+            "oauthAccount": {
+                "emailAddress": "test@example.com", "accountUuid": "uuid-1",
+            },
+        }))
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch(
+                "claude_swap.oauth.fetch_oauth_profile", return_value=None
+            ), patch.object(switcher, "list_accounts"):
+                return switcher.switch_to("1", json_output=json_output)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_exact_bytes_of_other_slot_realigns(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live = {"creds": a2}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a1
+        assert creds[self.S1] == a1
+        assert creds[self.S2] == a2
+        captured = capsys.readouterr()
+        text = captured.out + captured.err
+        assert "Account-2" in text
+        assert "Already on" not in text
+
+    def test_rotated_copy_realigns_and_newer_generation_advances_owner(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds, configs, a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        older = json.loads(self._lineage_creds("at-2", "rt-2", self._LAPSE_2))
+        older["claudeAiOauth"]["expiresAt"] = 1_000
+        creds[self.S2] = json.dumps(older)
+        newer = json.loads(self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2))
+        newer["claudeAiOauth"]["expiresAt"] = 2_000
+        rotated = json.dumps(newer)
+        live = {"creds": rotated}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a1
+        assert creds[self.S1] == a1
+        assert creds[self.S2] == rotated  # rescue rule: strictly newer
+
+    def test_rotated_copy_not_newer_leaves_owner_unchanged(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds, configs, a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        current = json.loads(self._lineage_creds("at-2", "rt-2", self._LAPSE_2))
+        current["claudeAiOauth"]["expiresAt"] = 3_000
+        stored2 = json.dumps(current)
+        creds[self.S2] = stored2
+        stale = json.loads(self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2))
+        stale["claudeAiOauth"]["expiresAt"] = 2_000
+        live = {"creds": json.dumps(stale)}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a1
+        assert creds[self.S1] == a1
+        assert creds[self.S2] == stored2
+
+    def test_live_sharing_own_lapse_stays_noop(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        own_rotation = self._lineage_creds("at-1b", "rt-1b", self._LAPSE_1)
+        live = {"creds": own_rotation}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == own_rotation
+        assert creds[self.S1] == a1
+        assert "Already on" in capsys.readouterr().out
+
+    def test_no_lineage_evidence_stays_noop(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, _a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        s1 = self._lineage_creds("at-1", "rt-1", None)
+        creds[self.S1] = s1
+        creds[self.S2] = self._lineage_creds("at-2", "rt-2", None)
+        mystery = self._lineage_creds("at-x", "rt-x", None)
+        live = {"creds": mystery}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == mystery
+        assert creds[self.S1] == s1
+        assert "Already on" in capsys.readouterr().out
+
+    def test_lineage_lookup_error_keeps_noop(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live = {"creds": a2}
+        with patch.object(
+            switcher, "_slot_for_login_lineage", side_effect=RuntimeError("x")
+        ):
+            self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a2
+        assert "Already on" in capsys.readouterr().out
+
+    def test_json_mode_reports_a_realign(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live = {"creds": a2}
+        result = self._switch(switcher, creds, configs, live, json_output=True)
+        assert live["creds"] == a1
+        assert result["switched"] is False
+        assert result["reason"] == "realigned"
+        assert result["from"]["number"] == 1 and result["to"]["number"] == 1
+        assert result["message"].startswith(
+            "Realigned Claude Code's login to Account-1 (test@example.com)"
+        )
+        assert any("Account-2" in w for w in result["warnings"])
+
+
+
+
+class TestListDriftWarnings:
+    """``cswap list`` says when the CLI login disagrees with the active slot
+    (the label Claude Desktop's Code tab also writes)."""
+
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+    _LAPSE_1 = TestProvenanceGuard._LAPSE_1
+    _LAPSE_2 = TestProvenanceGuard._LAPSE_2
+    _lineage_creds = TestProvenanceGuard._lineage_creds
+    _lineage_setup = TestProvenanceGuard._lineage_setup
+
+    _LOGIN_LINE = "Claude Code is logged in as Account-2 (account2@example.com)"
+
+    def _list(self, switcher, creds, configs, live):
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            with patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(None),
+            ), patch.object(
+                switcher, "_read_active_credentials",
+                side_effect=lambda: ActiveCredentials(
+                    live["creds"], False, False
+                ),
+            ):
+                return switcher.list_accounts()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_login_drift_is_flagged(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert (
+            f"{self._LOGIN_LINE}, but Account-1 (test@example.com) is shown "
+            "as active. To put Claude Code on Account-1, run: cswap switch 1"
+        ) in out
+
+    def test_login_drift_is_not_reported_as_an_overwrite(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        """The active row carries the LIVE credential, so with Account-2's
+        login live under Account-1's label it collides with Account-2's
+        backup. Account-1's own backup is intact: that is drift, not an
+        overwrite, and telling the user to re-add would send them through
+        needless logins."""
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert "hold the same credential" not in out
+        assert self._LOGIN_LINE in out
+
+    def test_real_overwrite_still_warns(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        """Account-1's own backup holds Account-2's login: a genuine
+        overwrite, so the warning stays and no drift is claimed."""
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        creds[("1", "test@example.com")] = a2
+        self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert "hold the same credential" in out
+        assert "Claude Code is logged in as" not in out
+
+    def test_no_drift_prints_neither_line(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        self._list(switcher, creds, configs, {"creds": a1})
+        out = capsys.readouterr().out
+        assert "Claude Code is logged in as" not in out
+
+    def test_json_output_has_no_drift_lines(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        payload = self._list_json(switcher, creds, configs, {"creds": a2})
+        assert payload is not None
+        assert "logged in as" not in json.dumps(payload)
+        assert "logged in as" not in capsys.readouterr().out
+
+    def _list_json(self, switcher, creds, configs, live):
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            with patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(None),
+            ):
+                return switcher.list_accounts(json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_exception_in_login_check_still_lists(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        with patch.object(
+            switcher, "_slot_for_login_lineage", side_effect=RuntimeError("x")
+        ):
+            self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert "Accounts:" in out and "account2@example.com" in out
+        assert "Claude Code is logged in as" not in out
 
 
 class TestDuplicateAccountDetection:
@@ -13892,3 +14346,144 @@ class TestSalvageCopyMode:
         assert salvage.read_bytes() == config_path.read_bytes()
         assert salvage.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob("*.tmp"))
+
+
+def _lineage_creds(token: str, expires_in_s: float = 7200, lapse_ms: int | None = None,
+                   refresh: str | None = None) -> str:
+    """Credential JSON with an optional ``refreshTokenExpiresAt`` and an
+    explicit refresh token (so a test can share, or not share, a fingerprint)."""
+    data = {
+        "accessToken": token,
+        "refreshToken": refresh if refresh is not None else f"rt-{token}",
+        "expiresAt": int((time.time() + expires_in_s) * 1000),
+    }
+    if lapse_ms is not None:
+        data["refreshTokenExpiresAt"] = lapse_ms
+    return json.dumps({"claudeAiOauth": data})
+
+
+def _lineage_row(num: int, creds: str, active: bool = False) -> tuple:
+    return (num, f"a{num}@example.com", "Org", "org-uuid", active, creds, "")
+
+
+class TestSharedLineageSlots:
+    """A slot whose login another row holds must never be refreshed."""
+
+    def test_fingerprint_collision_is_shared(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        a = _lineage_creds("sk-a1", refresh="rt-same")
+        b = _lineage_creds("sk-a2", refresh="rt-same")
+        rows = [_lineage_row(1, a, True), _lineage_row(2, b)]
+        assert switcher._shared_lineage_slots(rows) == frozenset({"1", "2"})
+
+    def test_lapse_collision_is_shared(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-a", lapse_ms=1_900_000_000_000), True),
+            _lineage_row(2, _lineage_creds("sk-b", lapse_ms=1_900_000_000_000)),
+        ]
+        assert switcher._shared_lineage_slots(rows) == frozenset({"1", "2"})
+
+    def test_no_collision_is_empty(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-a", lapse_ms=1_900_000_000_000)),
+            _lineage_row(2, _lineage_creds("sk-b", lapse_ms=1_900_000_000_001)),
+        ]
+        assert switcher._shared_lineage_slots(rows) == frozenset()
+
+    def test_missing_keys_never_match(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.oauth.credential_fingerprint", return_value=None):
+            rows = [
+                _lineage_row(1, _lineage_creds("sk-a")),
+                _lineage_row(2, _lineage_creds("sk-b")),
+            ]
+            assert switcher._shared_lineage_slots(rows) == frozenset()
+
+    def test_empty_creds_are_skipped(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [_lineage_row(1, ""), _lineage_row(2, "")]
+        assert switcher._shared_lineage_slots(rows) == frozenset()
+
+    def test_only_the_sharing_pair_is_returned(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-a", lapse_ms=1_900_000_000_000)),
+            _lineage_row(2, _lineage_creds("sk-b", lapse_ms=1_900_000_000_000)),
+            _lineage_row(3, _lineage_creds("sk-c", lapse_ms=1_800_000_000_000)),
+        ]
+        assert switcher._shared_lineage_slots(rows) == frozenset({"1", "2"})
+
+    def test_never_raises(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.oauth.credential_fingerprint", side_effect=RuntimeError):
+            rows = [_lineage_row(1, _lineage_creds("sk-a"))]
+            assert switcher._shared_lineage_slots(rows) == frozenset()
+
+
+class TestFetchAccountUsageSharedLineage:
+    def _idle(self, creds: str) -> tuple:
+        return _lineage_row(2, creds)
+
+    def _run(self, switcher, creds, shared, outcome=None):
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials", return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=outcome or oauth.UsageOutcome({"five_hour": {"pct": 5}})
+                   ) as mock_fetch:
+            record = switcher._fetch_account_usage(
+                self._idle(creds), shared_lineage=shared
+            )
+        return record, mock_fetch
+
+    def test_shared_idle_slot_is_fetched_read_only(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        creds = _lineage_creds("sk-b", 7200)
+        record, mock_fetch = self._run(switcher, creds, True)
+        assert record.usage == {"five_hour": {"pct": 5}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == creds
+        assert kwargs.get("is_active") is True
+        assert "refresh_via" not in kwargs
+
+    def test_shared_idle_slot_with_expired_token_is_sentinel(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        record, mock_fetch = self._run(switcher, _lineage_creds("sk-b", -60), True)
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_unshared_idle_slot_still_refreshes(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        _, mock_fetch = self._run(switcher, _lineage_creds("sk-b", 7200), False)
+        _, kwargs = mock_fetch.call_args
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("refresh_via") == switcher.consume_backup_grant
+
+
+class TestCollectorServesSharedLineageReadOnly:
+    def test_idle_row_sharing_the_live_login_is_read_only(self, temp_home: Path):
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        lapse = 1_900_000_000_000
+        rows = [
+            _lineage_row(1, _lineage_creds("sk-live", lapse_ms=lapse), True),
+            _lineage_row(2, _lineage_creds("sk-stored", lapse_ms=lapse)),
+            _lineage_row(3, _lineage_creds("sk-other", lapse_ms=lapse + 1)),
+        ]
+        # Only the idle rows are fetched in this pass: the active row is
+        # not claimed, yet still has to count toward the shared lineage.
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials", return_value=None), \
+             patch.object(switcher, "_fetch_active_usage",
+                          return_value=FetchRecord(usage={"five_hour": {"pct": 1}})), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            switcher._collect_usage_entries(rows, fetch={"2", "3"})
+
+        by_email = {c.args[1]: c.kwargs for c in mock_fetch.call_args_list}
+        assert "refresh_via" not in by_email["a2@example.com"]
+        assert by_email["a2@example.com"]["is_active"] is True
+        assert by_email["a3@example.com"]["refresh_via"] == switcher.consume_backup_grant

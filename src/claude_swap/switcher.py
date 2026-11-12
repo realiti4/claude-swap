@@ -5435,9 +5435,12 @@ class ClaudeAccountSwitcher:
         self,
         account_info: tuple[int, str, str, str, bool, str, str],
         rejected_fp: str | None = None,
+        shared_lineage: bool = False,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises. ``rejected_fp``
-        is the row's refused-credential stamp, if any."""
+        is the row's refused-credential stamp, if any. ``shared_lineage``
+        marks a row whose login another row also holds (see
+        ``_shared_lineage_slots``)."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
         # The active/default account owns the live credential — route it
@@ -5540,6 +5543,19 @@ class ClaudeAccountSwitcher:
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
             return self._read_only_fetch(str(num), email, creds, rejected_fp)
 
+        if shared_lineage:
+            # Another row holds this same login (same fingerprint, or the
+            # same refreshTokenExpiresAt, which is fixed per /login and kept
+            # across rotations). Refreshing here would rotate the family and
+            # consume the refresh token that holder still uses -- the live
+            # credential's, in the field case where a switch had written one
+            # account's login into another's slot. Serve it read-only, as a
+            # live session's backup is: a stale copy is expired, not struck.
+            backup_oauth = oauth.extract_oauth_data(creds) or {}
+            if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            return self._read_only_fetch(str(num), email, creds, rejected_fp)
+
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=False,
@@ -5578,10 +5594,41 @@ class ClaudeAccountSwitcher:
             retry_after_s=outcome.retry_after_s,
         )
 
+    def _shared_lineage_slots(self, infos) -> frozenset[str]:
+        """Slot numbers whose stored login another row also holds.
+
+        Two rows share a login when they have the same credential
+        fingerprint, or the same ``refreshTokenExpiresAt`` (fixed per
+        ``/login`` and kept across rotations, so it still matches after one
+        copy has rotated past the other's refresh token). Refreshing either
+        copy consumes the token the other still uses, so the collector serves
+        these read-only. A row with no key is never shared, and two missing
+        keys never match. Never raises: on any failure no slot is marked, which
+        is the pre-existing behavior."""
+        try:
+            holders: dict[tuple[str, object], set[str]] = {}
+            for info in infos:
+                num, creds = str(info[0]), info[5]
+                if not creds:
+                    continue
+                fp = oauth.credential_fingerprint(creds)
+                lapse = oauth._refresh_token_expires_at_ms(creds)
+                if fp is not None:
+                    holders.setdefault(("fp", fp), set()).add(num)
+                if lapse is not None:
+                    holders.setdefault(("lapse", lapse), set()).add(num)
+            return frozenset(
+                num for nums in holders.values() if len(nums) > 1 for num in nums
+            )
+        except Exception as e:
+            self._logger.debug(f"Shared-lineage scan failed: {e}")
+            return frozenset()
+
     def _run_usage_fetches(
         self,
         infos: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry] | None = None,
+        shared_lineage: frozenset[str] = frozenset(),
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant. ``entries``
@@ -5595,7 +5642,9 @@ class ClaudeAccountSwitcher:
             num = str(info[0])
             entry = entries.get(num) if entries else None
             return num, self._fetch_account_usage(
-                info, entry.rejected_fingerprint if entry else None
+                info,
+                entry.rejected_fingerprint if entry else None,
+                shared_lineage=num in shared_lineage,
             )
 
         with ThreadPoolExecutor() as executor:
@@ -5713,8 +5762,11 @@ class ClaudeAccountSwitcher:
 
         if claims:
             pre = entries
+            # Over EVERY row, not just the claimed ones: the active row that
+            # holds the shared login may not be claimed in this pass.
+            shared = self._shared_lineage_slots(info_by_num.values())
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims], pre
+                [info_by_num[num] for num in claims], pre, shared_lineage=shared
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
@@ -6049,9 +6101,28 @@ class ClaudeAccountSwitcher:
         by_fp: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
         out: list[str] = []
+        # The active row carries the LIVE credential, not its slot's backup.
+        # When that live login is provably another slot's while the active
+        # slot's own backup is a different login (_slot_for_login_lineage
+        # names it only then), the collision is drift -- Claude Desktop
+        # rewrote the label -- not an overwrite: telling the user to re-add
+        # would send them through needless logins. _drift_warnings reports it.
+        drifted: str | None = None
+        try:
+            active = next((row for row in accounts_info if row[4]), None)
+            if active is not None and active[5] and self._slot_for_login_lineage(
+                active[5], str(active[0]), data
+            ) is not None:
+                drifted = str(active[0])
+        except Exception:
+            self._logger.debug("Duplicate check's drift test failed", exc_info=True)
         for num, email, _org_name, org_uuid, _is_active, creds, _alias in accounts_info:
             snum = str(num)
-            fp = oauth.credential_fingerprint(creds) if creds else None
+            fp = (
+                oauth.credential_fingerprint(creds)
+                if creds and snum != drifted
+                else None
+            )
             if fp:
                 other = by_fp.get(fp)
                 if other:
@@ -6261,12 +6332,15 @@ class ClaudeAccountSwitcher:
         # in the JSON payload and logs for diagnostics.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
-        if dup_warnings or lockstep_warnings:
+        drift_warnings = self._drift_warnings(accounts_info, seq_data)
+        if dup_warnings or lockstep_warnings or drift_warnings:
             print()
             for msg in dup_warnings:
                 warning(msg)
             for msg in lockstep_warnings:
                 warning(msg)
+            for msg in drift_warnings:
+                print(yellowed(msg))
 
         # Running instances
         try:
@@ -6300,6 +6374,40 @@ class ClaudeAccountSwitcher:
                     print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
+
+    def _drift_warnings(self, accounts_info: list, seq_data: dict) -> list[str]:
+        """Lines saying the CLI login disagrees with the active slot.
+        Advisory and offline-cheap; never raises.
+
+        The active slot comes from the ``~/.claude.json`` label, which Claude
+        Desktop's Code tab also writes, so the label can name an account while
+        Claude Code's live credential is another account's. ``cswap list`` is
+        where a user looks first, so it says so and names the fix. A failure is
+        swallowed: it must not break the listing.
+        """
+        lines: list[str] = []
+        accounts = seq_data.get("accounts", {})
+
+        def label(num: str) -> str:
+            return f"Account-{num} ({accounts.get(num, {}).get('email', '')})"
+
+        try:
+            active = next((row for row in accounts_info if row[4]), None)
+            if active is not None and active[5]:
+                active_num = str(active[0])
+                other = self._slot_for_login_lineage(
+                    active[5], active_num, seq_data
+                )
+                if other is not None:
+                    lines.append(
+                        f"Claude Code is logged in as {label(other)}, but "
+                        f"{label(active_num)} is shown as active. To put "
+                        f"Claude Code on Account-{active_num}, run: "
+                        f"cswap switch {active_num}"
+                    )
+        except Exception:
+            self._logger.debug("Login drift check failed", exc_info=True)
+        return lines
 
     def _active_account_usage(
         self, account_num: str, current_email: str, org_uuid: str
@@ -6455,6 +6563,15 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
+            if op.get("realigned"):
+                # A self-switch that really rewrote the live login (the
+                # label named this slot but the live credential was another
+                # account's): "already-active" would misdescribe it.
+                reason = "realigned"
+                message = (
+                    f"Realigned Claude Code's login to Account-"
+                    f"{to_ref['number']} ({to_ref['email']})"
+                )
         return {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
@@ -7056,6 +7173,37 @@ class ClaudeAccountSwitcher:
             return "noop", None
         provenance = self._prefetch_live_identity()
         if provenance.get("resolved") is None:
+            # The noop below exists so we never replace THIS slot's own
+            # freshly rotated token with its consumed ancestor. Offline
+            # login-lineage evidence that the live login is ANOTHER slot's
+            # (same fingerprint, or the same /login lapse date) rules that
+            # out: the live bytes are not this slot's to lose. The full
+            # switch is then safe, because _perform_switch classifies them
+            # foreign / foreign-synced, writes nothing into this slot, and
+            # activates this slot's stored credential. An error here keeps
+            # the noop: no evidence, no mutation.
+            try:
+                live = provenance.get("live")
+                if live is None:
+                    live = self._read_credentials()
+                other = (
+                    self._slot_for_login_lineage(
+                        live, slot, self._get_sequence_data() or {}
+                    )
+                    if live
+                    else None
+                )
+            except Exception as e:
+                self._logger.debug(f"Self-switch lineage check raised: {e!r}")
+                other = None
+            if other is not None:
+                self._logger.info(
+                    "Live credential diverges from Account-%s's stored backup "
+                    "and carries Account-%s's login lineage; realigning "
+                    "Claude Code to Account-%s.",
+                    slot, other, slot,
+                )
+                return "reconcile", provenance
             self._logger.info(
                 "Live credential diverges from Account-%s's stored backup "
                 "and ownership could not be verified; self-switch left "
@@ -7137,7 +7285,10 @@ class ClaudeAccountSwitcher:
           slot (``foreign_slot``) holding a different lineage; backing it up
           here would destroy this slot's only refresh token (issue #117's
           poisoning). Preserved in a safety copy, never written into any
-          slot: identity proves ownership, not generation freshness.
+          slot: identity proves ownership, not generation freshness. Also
+          reached offline, without any resolved identity, when the live
+          credential shares *login lineage* (see ``_slot_for_login_lineage``)
+          with exactly one other slot and not with this one.
         - ``"foreign-synced"`` — resolved to another managed slot whose
           stored backup already holds this exact lineage; nothing needs
           preserving, nothing may be written.
@@ -7188,7 +7339,14 @@ class ClaudeAccountSwitcher:
           fail-closed behavior this design forbids. The caller falls back to
           the exact pre-fix backup: the identity oracle is advisory, and
           endpoint state must never change switch behavior beyond skipping
-          the extra safety.
+          the extra safety. The one exception is offline lineage evidence:
+          a refresh-token lapse date (``refreshTokenExpiresAt``) is fixed per
+          ``/login`` and survives every rotation, so a live credential
+          sharing it with another slot is that account's login, and one
+          sharing it with this slot is this account's own rotation — both
+          decided without the oracle (an expired access token makes the
+          profile call 401 after any idle night, so the oracle is silent
+          exactly when Desktop's relabel needs it).
         """
         kind, foreign_slot = self._attribute_live_credential(
             current_account, current_email, original_creds, provenance, data,
@@ -7240,7 +7398,9 @@ class ClaudeAccountSwitcher:
                 )
             ) is False:
                 return ("known-foreign", None)
-            return ("unresolved", None)
+            return self._classify_by_login_lineage(
+                current_account, original_creds, data
+            )
         r_email = resolved.get("email") or ""
         r_org = resolved.get("organizationUuid") or ""
         r_uuid = (resolved.get("uuid") or "").strip()
@@ -7286,7 +7446,9 @@ class ClaudeAccountSwitcher:
             # any other oracle degradation, not preserve-and-skip.
             if r_email and resolved.get("organizationUuid") is not None:
                 return ("alien", None)
-            return ("unresolved", None)
+            return self._classify_by_login_lineage(
+                current_account, original_creds, data
+            )
         # A cross-slot attribution must be uuid-positive: an email+org match
         # against a slot with no recorded uuid (add-token placeholder) is not
         # evidence enough to name that slot in user output — treat as alien.
@@ -7304,6 +7466,100 @@ class ClaudeAccountSwitcher:
         ):
             return ("foreign-synced", slot)
         return ("foreign", slot)
+
+    def _slot_for_login_lineage(
+        self, creds: str, current_account: str, data: dict
+    ) -> str | None:
+        """The one *other* managed slot whose stored credential shares the
+        live credential's login lineage, or ``None``.
+
+        Lineage is the same refresh-token fingerprint, or both
+        ``refreshTokenExpiresAt`` values present and equal. That lapse date is
+        fixed per ``/login``: refreshes never move it and rotated copies keep
+        it, so it identifies a login with no network (a rotated copy of a
+        slot's credential has a new fingerprint but the same lapse date).
+
+        ``None`` when nothing matches, when several other slots match, or when
+        the outgoing slot's own stored credential shares the lineage too —
+        the lineage is then duplicated and cannot say whose it is, so the
+        caller keeps its old behaviour. Skips slots with no stored credential.
+        Never raises: a read error is no match.
+        """
+        try:
+            live_fp = oauth.credential_fingerprint(creds)
+            live_lapse = oauth._refresh_token_expires_at_ms(creds)
+
+            def shares(stored: str | None) -> bool:
+                if not stored:
+                    return False
+                if live_fp and oauth.credential_fingerprint(stored) == live_fp:
+                    return True
+                return (
+                    live_lapse is not None
+                    and oauth._refresh_token_expires_at_ms(stored) == live_lapse
+                )
+
+            accounts = data.get("accounts", {})
+            own_email = accounts.get(current_account, {}).get("email", "")
+            if shares(self._read_account_credentials(current_account, own_email)):
+                return None
+            matches = [
+                num
+                for num, acct in accounts.items()
+                if num != current_account
+                and shares(
+                    self._read_account_credentials(num, acct.get("email", ""))
+                )
+            ]
+            return matches[0] if len(matches) == 1 else None
+        except Exception as e:
+            self._logger.debug(f"Login-lineage lookup raised: {e!r}")
+            return None
+
+    def _classify_by_login_lineage(
+        self, current_account: str, original_creds: str, data: dict
+    ) -> tuple[str, str | None]:
+        """Offline fallback for ``_classify_outgoing_credential``'s would-be
+        ``"unresolved"`` verdicts: decide from login lineage alone.
+
+        Another slot's login → ``"foreign-synced"`` when that slot's backup
+        already holds this fingerprint, else ``"foreign"``. The outgoing
+        slot's own lapse date → ``"own-rotated"`` (same write the fail-open
+        makes, now correctly named). Anything else stays ``"unresolved"``.
+        Never raises.
+        """
+        try:
+            slot = self._slot_for_login_lineage(
+                original_creds, current_account, data
+            )
+            if slot is not None:
+                email = data.get("accounts", {}).get(slot, {}).get("email", "")
+                stored = self._read_account_credentials(slot, email)
+                if stored and (
+                    stored == original_creds
+                    or oauth.credential_fingerprint(stored)
+                    == oauth.credential_fingerprint(original_creds)
+                ):
+                    return ("foreign-synced", slot)
+                return ("foreign", slot)
+            live_lapse = oauth._refresh_token_expires_at_ms(original_creds)
+            if live_lapse is not None:
+                own_email = (
+                    data.get("accounts", {}).get(current_account, {})
+                    .get("email", "")
+                )
+                own_stored = self._read_account_credentials(
+                    current_account, own_email
+                )
+                if (
+                    own_stored
+                    and oauth._refresh_token_expires_at_ms(own_stored)
+                    == live_lapse
+                ):
+                    return ("own-rotated", None)
+        except Exception as e:
+            self._logger.debug(f"Login-lineage classification raised: {e!r}")
+        return ("unresolved", None)
 
     def _stash_live_credential(
         self,
@@ -8125,8 +8381,23 @@ class ClaudeAccountSwitcher:
         # re-acquire the lock from inside list_accounts(). All of this is display
         # only — suppressed in JSON mode (the nested list_accounts() would
         # otherwise leak human output onto the JSON stdout).
+        # Label and target agree but the live login was another account's:
+        # the switch really moved Claude Code, so say "Realigned", not
+        # "Switched to" the account the label already named.
+        realigned = current_account == target_account and kind in (
+            "foreign", "foreign-synced", "alien", "known-foreign",
+        )
         if emit_output:
-            print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+            if realigned:
+                print(
+                    f"{accent('Realigned')} Claude Code's login to "
+                    f"Account-{target_account} ({target_email})"
+                )
+            else:
+                print(
+                    f"{accent('Switched to')} Account-{target_account} "
+                    f"({target_email})"
+                )
             try:
                 self.list_accounts()
             except Exception as e:
@@ -8140,7 +8411,12 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": from_ref,
+            "to": to_ref,
+            "warnings": warnings_out,
+            "realigned": realigned,
+        }
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
