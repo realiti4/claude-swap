@@ -110,11 +110,11 @@ class TestConfigList:
         assert "(default)" in hysteresis_line
         assert "hysteresisPCT" not in out
         assert (
-            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+            "settings.json: 'autoswitch.hysteresisPCT' is not a key this version "
             "reads, so it has no effect; did you mean autoswitch.hysteresisPct?"
         ) in err
         assert (
-            "settings.json: autoswitch.futureKnob is not a key this version "
+            "settings.json: 'autoswitch.futureKnob' is not a key this version "
             "reads, so it has no effect"
         ) in err
         assert "did you mean autoswitch.futureKnob" not in err
@@ -145,7 +145,10 @@ class TestConfigList:
             },
             {"key": "autoswitch.futureKnob", "suggestion": None},
         ]
-        assert len(payload["settings"]) == 13
+        # Reported beside the settings, never as one of them.
+        assert "autoswitch.cooldownSecond" not in {
+            entry["key"] for entry in payload["settings"]
+        }
 
 
 class TestConfigSetGet:

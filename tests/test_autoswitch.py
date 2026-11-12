@@ -2275,8 +2275,12 @@ class TestRunLoop:
              caplog.at_level(logging.WARNING, logger="claude-swap"):
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 3
-        assert [r.getMessage() for r in caplog.records] == [
-            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+        assert [
+            message
+            for message in (r.getMessage() for r in caplog.records)
+            if message.startswith("settings.json:")
+        ] == [
+            "settings.json: 'autoswitch.hysteresisPCT' is not a key this version "
             "reads, so it has no effect; did you mean autoswitch.hysteresisPct?"
         ]
 

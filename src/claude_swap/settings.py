@@ -235,10 +235,16 @@ _SECTION_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 # How alike two names must be (difflib ratio, compared without case) before
-# one is offered as the spelling the other meant. 0.75 covers a wrong case, a
-# dropped or doubled letter and a missing suffix ("hysteresis"), and stays
-# clear of unrelated keys that merely share a word ("graceSeconds").
-_TYPO_CUTOFF = 0.75
+# one is offered as the spelling the other meant. 0.9 admits one wrong,
+# missing or extra character in all but the shortest names, and another word
+# separator ("weekly_threshold"). A name that only shares a word with a real
+# key ("maxThreshold", "holdSeconds") scores below it.
+_TYPO_CUTOFF = 0.9
+
+# A shortened name scores too low for that and is matched as a prefix:
+# "interval" and "cooldown", which are `cswap auto` flag names, for
+# intervalSeconds and cooldownSeconds. Shorter than this is not a name.
+_PREFIX_MIN_LENGTH = 3
 
 
 @dataclass(frozen=True)
@@ -248,15 +254,25 @@ class UnrecognizedKey:
     ``dotted`` is ``section.key`` for a key inside a known section and the
     bare name for a top-level key that is not a section. ``suggestion`` is
     the valid name it most resembles, when one is close enough to be a typo.
+    The two are equal for a setting written flat at the top level
+    (``"autoswitch.threshold": 80``): the right name in the wrong place.
     """
 
     dotted: str
     suggestion: str | None = None
 
     def describe(self) -> str:
-        hint = f"; did you mean {self.suggestion}?" if self.suggestion else ""
+        # The key is the file's own text, so it is quoted: a stray space or a
+        # newline in it stays visible and on one line.
+        if self.suggestion is None:
+            hint = ""
+        elif self.suggestion == self.dotted:
+            section, _, key = self.dotted.partition(".")
+            hint = f"; it belongs inside {section!r} as {key!r}"
+        else:
+            hint = f"; did you mean {self.suggestion}?"
         return (
-            f"{self.dotted} is not a key this version reads, "
+            f"{self.dotted!r} is not a key this version reads, "
             f"so it has no effect{hint}"
         )
 
@@ -351,11 +367,15 @@ def _read_raw(path: Path) -> dict:
 
 
 def _nearest(name: str, valid: tuple[str, ...]) -> str | None:
-    """The valid name ``name`` most resembles, or None when none is close."""
+    """The valid name ``name`` most resembles, or None when none is close:
+    the only one it is a prefix of, else the nearest spelling."""
     by_lower = {v.lower(): v for v in valid}
-    close = difflib.get_close_matches(
-        name.lower(), by_lower, n=1, cutoff=_TYPO_CUTOFF
-    )
+    lowered = name.lower()
+    if len(lowered) >= _PREFIX_MIN_LENGTH:
+        longer = [v for low, v in by_lower.items() if low.startswith(lowered)]
+        if len(longer) == 1:
+            return longer[0]
+    close = difflib.get_close_matches(lowered, by_lower, n=1, cutoff=_TYPO_CUTOFF)
     return by_lower[close[0]] if close else None
 
 
@@ -367,7 +387,12 @@ def _unrecognized(raw: dict) -> list[UnrecognizedKey]:
             continue
         known = _SECTION_KEYS.get(name)
         if known is None:
-            found.append(UnrecognizedKey(name, _nearest(name, tuple(_SECTION_KEYS))))
+            # A dotted setting name here is the spelling `cswap config`
+            # prints, written as one flat key.
+            flat = name if name in SETTING_SPECS else None
+            found.append(
+                UnrecognizedKey(name, flat or _nearest(name, tuple(_SECTION_KEYS)))
+            )
         elif isinstance(value, dict):
             for key in value:
                 if key not in known:
