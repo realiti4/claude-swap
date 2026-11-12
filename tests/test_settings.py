@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import stat
 import os
 import sys
@@ -18,6 +19,7 @@ from claude_swap.settings import (
     AutoSwitchSettings,
     RunSettings,
     UiSettings,
+    UnrecognizedKey,
     UpdateSettings,
     UsageSettings,
     effective_settings,
@@ -27,10 +29,12 @@ from claude_swap.settings import (
     load_ui_settings,
     load_update_settings,
     load_usage_settings,
+    log_unrecognized_keys,
     merged_with_cli,
     save_settings,
     set_setting,
     settings_path,
+    unrecognized_keys,
     unset_setting,
 )
 
@@ -378,6 +382,127 @@ class TestEffectiveSettings:
         by_key = {spec.dotted: is_set for spec, _, is_set in effective_settings(tmp_path)}
         assert by_key["autoswitch.threshold"] is True
         assert by_key["autoswitch.intervalSeconds"] is False
+
+
+class TestUnrecognizedKeys:
+    """A key nothing reads stays in the file and changes nothing;
+    `unrecognized_keys` is what names it."""
+
+    def test_typoed_keys_are_named_with_the_key_they_resemble(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 98.0, "hysteresisPCT": 5, "cooldownSecond": 600,
+            },
+        }))
+        assert unrecognized_keys(tmp_path) == [
+            UnrecognizedKey("autoswitch.hysteresisPCT", "autoswitch.hysteresisPct"),
+            UnrecognizedKey("autoswitch.cooldownSecond", "autoswitch.cooldownSeconds"),
+        ]
+        # The file is still read as before: the correct key applies and the
+        # mistyped ones leave their settings at the default.
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold == 98.0
+        assert loaded.hysteresis_pct == AutoSwitchSettings().hysteresis_pct
+        assert loaded.cooldown_seconds == AutoSwitchSettings().cooldown_seconds
+
+    def test_mistyped_section_is_named(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoSwitch": {"threshold": 70}})
+        )
+        assert unrecognized_keys(tmp_path) == [
+            UnrecognizedKey("autoSwitch", "autoswitch")
+        ]
+        assert load_settings(tmp_path) == AutoSwitchSettings()
+
+    def test_unrelated_key_gets_no_suggestion(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "futureSection": {"x": 1},
+            "autoswitch": {"graceSeconds": 30},
+            "ui": {"font": "mono"},
+        }))
+        assert unrecognized_keys(tmp_path) == [
+            UnrecognizedKey("futureSection"),
+            UnrecognizedKey("autoswitch.graceSeconds"),
+            UnrecognizedKey("ui.font"),
+        ]
+
+    @pytest.mark.parametrize(
+        "written, meant",
+        [
+            ("Strategy", "strategy"),
+            ("treshold", "threshold"),
+            ("hysteresis", "hysteresisPct"),
+            ("models", "model"),
+            # Shares a word with a real key, or is merely short: not a typo.
+            ("graceSeconds", None),
+            ("order", None),
+        ],
+    )
+    def test_suggestion_only_for_a_near_miss(self, tmp_path: Path, written, meant):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {written: 1}})
+        )
+        (item,) = unrecognized_keys(tmp_path)
+        assert item.dotted == f"autoswitch.{written}"
+        assert item.suggestion == (f"autoswitch.{meant}" if meant else None)
+
+    def test_every_registered_key_is_recognized(self, tmp_path: Path):
+        raw: dict = {"schemaVersion": 1}
+        for spec in SETTING_SPECS.values():
+            raw.setdefault(spec.section, {})[spec.json_key] = spec.default
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert unrecognized_keys(tmp_path) == []
+
+    @pytest.mark.parametrize("content", [None, "{not json", "[1, 2]", "{}"])
+    def test_missing_corrupt_or_empty_file_reports_nothing(
+        self, tmp_path: Path, content
+    ):
+        if content is not None:
+            settings_path(tmp_path).write_text(content)
+        assert unrecognized_keys(tmp_path) == []
+
+    def test_section_that_is_not_an_object_is_not_searched(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": "best"}))
+        assert unrecognized_keys(tmp_path) == []
+
+    def test_log_names_each_ignored_key(self, tmp_path: Path, caplog):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {"hysteresisPCT": 5, "futureKnob": True},
+        }))
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            log_unrecognized_keys(tmp_path)
+        assert [r.getMessage() for r in caplog.records] == [
+            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+            "reads, so it has no effect; did you mean autoswitch.hysteresisPct?",
+            "settings.json: autoswitch.futureKnob is not a key this version "
+            "reads, so it has no effect",
+        ]
+
+    def test_loading_does_not_log_ignored_keys(self, tmp_path: Path, caplog):
+        """The loaders run on every command; only a starting loop logs."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"hysteresisPCT": 5}, "ui": {"them": "dark"}})
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_settings(tmp_path)
+            load_ui_settings(tmp_path)
+            load_run_settings(tmp_path)
+            load_update_settings(tmp_path)
+            load_usage_settings(tmp_path)
+            effective_settings(tmp_path)
+        assert caplog.records == []
+
+    def test_unrecognized_keys_survive_a_write(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "futureSection": {"x": 1},
+            "autoswitch": {"hysteresisPCT": 5},
+        }))
+        set_setting(tmp_path, "autoswitch.threshold", "80")
+        assert [item.dotted for item in unrecognized_keys(tmp_path)] == [
+            "futureSection",
+            "autoswitch.hysteresisPCT",
+        ]
 
 
 class TestMergedWithCli:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -34,6 +35,14 @@ USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+# The unified headers carry a per-model weekly bucket only on responses to
+# that model's own requests: a Haiku probe never sees Fable's ``7d_oi``. So a
+# second, best-effort 1-token probe per scoped model reads just that bucket.
+# Model id -> the unified header prefix of the bucket its responses carry.
+# Sonnet and Opus probes carry no per-model bucket (checked 2026-11), so they
+# are not probed; a new bucket needs its model and prefix here and its display
+# name in ``_UNIFIED_SCOPED_WINDOWS``.
+USAGE_PROBE_SCOPED_MODELS = {"claude-fable-5-1": "7d_oi"}
 
 _logger = logging.getLogger("claude-swap")
 
@@ -618,8 +627,13 @@ def request_usage_via_probe(access_token: str) -> dict:
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
     utilization, and inference is the one thing a setup-token may do. The
-    request asks for a single Haiku output token. Returns the raw usage API
-    shape (possibly empty) from :func:`parse_unified_ratelimit_headers`.
+    request asks for a single Haiku output token. Per-model weekly buckets
+    (Fable's) are only reported on that model's own responses, so each of
+    :data:`USAGE_PROBE_SCOPED_MODELS` gets a 1-token probe too (see
+    :func:`_scoped_probe_limits`) — unless the main probe was refused: the
+    account is then at its limit and a second request only adds load.
+    Returns the raw usage API shape (possibly empty) from
+    :func:`parse_unified_ratelimit_headers`.
 
     A 429 carrying ``anthropic-ratelimit-unified-status: rejected`` is the
     account confirming its quota refuses inference, whatever the utilization
@@ -631,25 +645,11 @@ def request_usage_via_probe(access_token: str) -> dict:
     re-raises like any other error, so it stays an ``http-429`` failure
     with its Retry-After.
     """
-    body = json.dumps({
-        "model": USAGE_PROBE_MODEL,
-        "max_tokens": 1,
-        "system": USAGE_PROBE_SYSTEM,
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "anthropic-beta": OAUTH_BETA_HEADER,
-        "anthropic-version": USAGE_PROBE_API_VERSION,
-        "Content-Type": "application/json",
-        "User-Agent": "claude-swap/1.0",
-    }
-    req = urllib.request.Request(
-        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return parse_unified_ratelimit_headers(resp.headers)
+        with urllib.request.urlopen(
+            _probe_request(access_token, USAGE_PROBE_MODEL), timeout=10
+        ) as resp:
+            data = parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
         data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}
         if e.code != 429 or "rejected" not in data:
@@ -663,6 +663,99 @@ def request_usage_via_probe(access_token: str) -> dict:
         rejected["retry_after_s"] = retry_after
         data["rejected"] = rejected
         return data
+    scoped = _scoped_probe_limits(access_token, data.get("limits") or [])
+    if scoped:
+        data["limits"] = (data.get("limits") or []) + scoped
+    return data
+
+
+def _probe_request(access_token: str, model: str) -> urllib.request.Request:
+    """A 1-output-token ``/v1/messages`` request to ``model``."""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "system": USAGE_PROBE_SYSTEM,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "anthropic-version": USAGE_PROBE_API_VERSION,
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    return urllib.request.Request(
+        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
+    )
+
+
+def _scoped_probe_limits(access_token: str, have: list) -> list:
+    """Per-model weekly limits read by probing each scoped model.
+
+    Only the per-model ``limits`` are kept: the 5h/7d windows and any
+    account-level rejection come from the main probe, since one model's
+    limit refusing says nothing about the others.
+
+    - A served probe reports the bucket from its headers.
+    - A 429 with ``anthropic-ratelimit-unified-status: rejected`` reads as
+      that bucket at 100% whatever its utilization header says (or without
+      one), until the refusal ends: now + Retry-After, else the bucket's
+      reset header, else the unified reset header.
+    - Anything else (a bare 429, no access to the model, a network error)
+      says nothing about the bucket and adds no limit.
+
+    A bucket ``have`` already carries is not added twice.
+    """
+    names = dict(_UNIFIED_SCOPED_WINDOWS)
+    seen = {
+        ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        for lim in have if isinstance(lim, dict)
+    }
+    limits: list = []
+    for model, prefix in USAGE_PROBE_SCOPED_MODELS.items():
+        name = names[prefix]
+        if name in seen:
+            continue
+        try:
+            with urllib.request.urlopen(
+                _probe_request(access_token, model), timeout=10
+            ) as resp:
+                found = parse_unified_ratelimit_headers(resp.headers).get("limits")
+        except urllib.error.HTTPError as e:
+            refused = (
+                e.code == 429 and e.headers
+                and e.headers.get("anthropic-ratelimit-unified-status") == "rejected"
+            )
+            if not refused:
+                _logger.debug("Scoped usage probe (%s) failed: HTTP %s", model, e.code)
+                continue
+            _kind, retry_after = _classify_usage_error(e)
+            if retry_after is not None:
+                resets_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+                ).isoformat()
+            else:
+                resets_at = _epoch_header_iso(
+                    e.headers.get(f"anthropic-ratelimit-unified-{prefix}-reset")
+                ) or _epoch_header_iso(
+                    e.headers.get("anthropic-ratelimit-unified-reset")
+                )
+            limit: dict = {
+                "kind": "weekly_scoped",
+                "scope": {"model": {"display_name": name}},
+                "percent": 100.0,
+            }
+            if resets_at:
+                limit["resets_at"] = resets_at
+            found = [limit]
+        except Exception as e:
+            _logger.debug("Scoped usage probe (%s) failed: %r", model, e)
+            continue
+        for lim in found or []:
+            if lim["scope"]["model"]["display_name"] == name:
+                seen.add(name)
+                limits.append(lim)
+    return limits
 
 
 def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
@@ -771,10 +864,11 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
-    exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
-    HTTP-date form is rare enough to ignore).
+    (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
+    ``"bad-response"``, ``"oauth_not_allowed_for_organization"`` (a 403 whose
+    body says so), or the exception type name as a fallback).
+    ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
+    one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
@@ -784,12 +878,31 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
                 retry_after = max(0.0, float(raw.strip()))
             except ValueError:
                 pass
+        if e.code == 403:
+            # The org-policy 403 (a lapsed plan) names its cause only in the
+            # body, so it is the one status whose body is read. This runs
+            # inside `except` handlers: it must never raise.
+            try:
+                code = json.loads(e.read(4096))["error"]["details"]["error_code"]
+            except Exception:
+                code = None
+            if code == "oauth_not_allowed_for_organization":
+                return code, retry_after
         return f"http-{e.code}", retry_after
     if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
         return "timeout", None
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
+        # A certificate the client refused (an untrusted chain, a name that
+        # does not match, an expired one) is not an unreachable host: the
+        # repair is trust or the clock, so it gets its own kind. Measured on
+        # macOS against a local server, with truststore 0.10.4 and with stdlib
+        # ssl: all three raise this class, SSL_CERT_FILE adds a CA on both
+        # paths, and NODE_EXTRA_CA_CERTS, which Claude Code 2.1.322 honours,
+        # does not. Other TLS failures (a plaintext port) stay "network".
+        if isinstance(e.reason, ssl.SSLCertVerificationError):
+            return "tls-cert", None
         return "network", None
     if isinstance(e, (json.JSONDecodeError, _InvalidUsageResponse)):
         return "bad-response", None

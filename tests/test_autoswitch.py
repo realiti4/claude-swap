@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from dataclasses import replace
@@ -31,7 +32,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, settings_path
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -2256,6 +2257,28 @@ class TestRunLoop:
              patch.object(harness.engine._wake, "wait", return_value=None):
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 2
+
+    def test_loop_logs_settings_keys_nothing_reads_once(self, harness, caplog):
+        settings_path(harness.switcher.backup_dir).write_text(
+            json.dumps({"autoswitch": {"threshold": 98.0, "hysteresisPCT": 5}})
+        )
+        ticks = []
+
+        def fake_tick():
+            ticks.append(1)
+            if len(ticks) >= 3:
+                harness.engine.stop()
+            return TickOutcome.NO_ACTION
+
+        with patch.object(harness.engine, "tick", side_effect=fake_tick), \
+             patch.object(harness.engine._wake, "wait", return_value=None), \
+             caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert harness.engine.run_loop() == 0
+        assert len(ticks) == 3
+        assert [r.getMessage() for r in caplog.records] == [
+            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+            "reads, so it has no effect; did you mean autoswitch.hysteresisPct?"
+        ]
 
     def test_loop_survives_raising_tick(self, harness):
         calls = []
@@ -7159,9 +7182,11 @@ class TestWeeklyThreshold:
         # full refetch: a candidate that crossed its weekly line since the
         # snapshot must not be landed on.
         h = self._harness(temp_home, accounts=(1, 2, 3), strategy="consume-first")
+        # 7d 80% stored: room enough under the 97 line for consume-first to
+        # pick it on the snapshot, so the refetch is what must reject it.
         stored = {
             "1": _usage7(5, 50, _R_LATER),
-            "2": _usage7(5, 90, _R_SOON),
+            "2": _usage7(5, 80, _R_SOON),
             "3": _usage7(5, 50, _R_LATEST),
         }
         fresh = {**stored, "2": _usage7(5, 97, _R_SOON)}
