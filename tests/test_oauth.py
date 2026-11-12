@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -878,8 +879,9 @@ class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 
     @staticmethod
-    def _http_error(code: int, headers: dict | None = None):
+    def _http_error(code: int, headers: dict | None = None, body: bytes | None = None):
         import email.message
+        import io
         hdrs = None
         if headers is not None:
             hdrs = email.message.Message()
@@ -887,13 +889,31 @@ class TestClassifyUsageError:
                 hdrs[k] = v
         return urllib.error.HTTPError(
             url="https://api.anthropic.com/api/oauth/usage",
-            code=code, msg="err", hdrs=hdrs, fp=None,
+            code=code, msg="err", hdrs=hdrs,
+            fp=None if body is None else io.BytesIO(body),
         )
 
     def test_http_codes(self):
         assert oauth._classify_usage_error(self._http_error(429))[0] == "http-429"
         assert oauth._classify_usage_error(self._http_error(500))[0] == "http-500"
         assert oauth._classify_usage_error(self._http_error(401))[0] == "http-401"
+
+    ORG = "oauth_not_allowed_for_organization"
+    ORG_BODY = json.dumps({"error": {"details": {"error_code": ORG}}}).encode()
+
+    @pytest.mark.parametrize("code, body, kind", [
+        (403, ORG_BODY, ORG),
+        (401, ORG_BODY, "http-401"),
+        (403, None, "http-403"),
+        (403, b"<html>forbidden</html>", "http-403"),
+        (403, b'{"error": "x"}', "http-403"),
+    ])
+    def test_403_org_oauth_policy_names_itself(self, code, body, kind):
+        """A 403 whose body carries the server's org-policy code is told apart
+        from every other 403; an unreadable or differently shaped body, and any
+        other status, keep ``http-<code>``. Retry-After rides along either way."""
+        err = self._http_error(code, {"Retry-After": "7"}, body)
+        assert oauth._classify_usage_error(err) == (kind, 7.0)
 
     def test_retry_after_seconds(self):
         kind, retry = oauth._classify_usage_error(
@@ -930,6 +950,25 @@ class TestClassifyUsageError:
         assert oauth._classify_usage_error(
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
+
+    @pytest.mark.parametrize("reason, kind", [
+        (ssl.SSLCertVerificationError(1, "certificate verify failed"), "tls-cert"),
+        (ssl.SSLEOFError("EOF occurred in violation of protocol"), "network"),
+        (ssl.SSLError("wrong version number"), "network"),
+    ])
+    def test_refused_certificate_is_told_apart(self, reason, kind):
+        """Only a certificate the client refused is ``tls-cert``; a TLS failure
+        of any other class stays ``network``, since no CA repairs it."""
+        err = urllib.error.URLError(reason)
+        assert oauth._classify_usage_error(err) == (kind, None)
+
+    def test_refused_certificate_shows_its_remedy(self):
+        """The unavailable line names the fix, not the bare kind."""
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.usage_store import UsageEntry
+
+        (line,) = _usage_entry_lines(UsageEntry(last_error="tls-cert"))
+        assert "SSL_CERT_FILE" in line and "tls-cert" not in line
 
     def test_bad_response(self):
         try:
@@ -1218,7 +1257,13 @@ class TestSetupTokenHeaderProbe:
         assert outcome.usage["source"] == oauth.USAGE_SOURCE_HEADERS
         assert "rejected" not in outcome.usage
         # Never the usage endpoint: its inference-only scope cannot read it.
-        assert [c.full_url for c in calls] == [oauth.USAGE_PROBE_URL]
+        # The main probe, then one per scoped model (Fable's weekly bucket).
+        assert [c.full_url for c in calls] == [oauth.USAGE_PROBE_URL] * (
+            1 + len(oauth.USAGE_PROBE_SCOPED_MODELS)
+        )
+        assert [json.loads(c.data)["model"] for c in calls[1:]] == list(
+            oauth.USAGE_PROBE_SCOPED_MODELS
+        )
         probe = calls[0]
         assert probe.get_method() == "POST"
         assert probe.get_header("Authorization") == f"Bearer {self.TOKEN}"
@@ -1232,6 +1277,130 @@ class TestSetupTokenHeaderProbe:
             r.levelno >= logging.WARNING for r in caplog.records
         )
         assert not any(self.TOKEN in m for m in messages)
+
+    def _route_by_model(self, by_model: dict):
+        """urlopen fake answering each probe by its request's model."""
+        calls: list = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            assert req.full_url == oauth.USAGE_PROBE_URL
+            result = by_model[json.loads(req.data)["model"]]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return fake_urlopen, calls
+
+    _FABLE_HEADERS = {
+        **_UNIFIED_HEADERS,
+        "anthropic-ratelimit-unified-7d_oi-status": "allowed_warning",
+        "anthropic-ratelimit-unified-7d_oi-utilization": "0.97",
+        "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
+    }
+
+    def test_fable_bucket_is_read_from_a_fable_probe(self):
+        """The Haiku probe never carries ``7d_oi``; the Fable probe does."""
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._ok(self._FABLE_HEADERS),
+        })
+        usage = self._fetch(fake).usage
+        assert usage["seven_day"]["pct"] == 60.0
+        assert [(w["name"], w["pct"]) for w in usage["scoped"]] == [("Fable", 97.0)]
+        assert usage["scoped"][0]["resets_at"]
+
+    def _fable_refused(self, values: dict):
+        return self._probe_429({
+            **values, "anthropic-ratelimit-unified-status": "rejected",
+        })
+
+    def test_refused_fable_reads_at_its_limit_whatever_its_pct(self):
+        """A rejected Fable probe at 97% is Fable unavailable until the
+        refusal ends; 5h/7d stay the main probe's and the account is not
+        rejected."""
+        values = {
+            **self._FABLE_HEADERS,
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+            "Retry-After": "600",
+        }
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._fable_refused(values),
+        })
+        before = datetime.now(timezone.utc).timestamp()
+        usage = self._fetch(fake).usage
+        assert usage["five_hour"]["pct"] == 34.0
+        assert usage["seven_day"]["pct"] == 60.0
+        assert "rejected" not in usage
+        [fable] = usage["scoped"]
+        assert (fable["name"], fable["pct"]) == ("Fable", 100.0)
+        until = datetime.fromisoformat(fable["resets_at"]).timestamp()
+        assert before + 600 <= until <= before + 660
+        assert oauth.account_headroom(usage) == 40.0
+        assert oauth.account_headroom(usage, ["Fable"]) == 0.0
+
+    def test_refused_fable_without_a_utilization_still_shows_its_row(self):
+        """No utilization header: the row stays, at 100%, resetting at the
+        bucket's own reset when there is no Retry-After."""
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._fable_refused({
+                "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
+                "anthropic-ratelimit-unified-reset": "1790766000",
+            }),
+        })
+        [fable] = self._fetch(fake).usage["scoped"]
+        assert fable["pct"] == 100.0
+        assert datetime.fromisoformat(fable["resets_at"]).timestamp() == 1791154800
+
+    def test_bare_429_on_the_fable_probe_adds_no_row(self):
+        """No rejected status proves nothing about Fable, even with a
+        utilization header: the main reading stands alone."""
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": self._probe_429(
+                {**self._FABLE_HEADERS, "Retry-After": "30"}
+            ),
+        })
+        outcome = self._fetch(fake)
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert "scoped" not in outcome.usage
+
+    def test_no_fable_probe_after_a_refused_main_probe(self):
+        values = {
+            **_UNIFIED_HEADERS,
+            "anthropic-ratelimit-unified-status": "rejected",
+            "Retry-After": "600",
+        }
+        fake, calls = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._probe_429(values),
+            "claude-fable-5-1": self._ok(self._FABLE_HEADERS),
+        })
+        usage = self._fetch(fake).usage
+        assert usage["rejected"]["retry_after_s"] == 600.0
+        assert "scoped" not in usage
+        assert [json.loads(c.data)["model"] for c in calls] == [
+            oauth.USAGE_PROBE_MODEL
+        ]
+
+    @pytest.mark.parametrize("failure", [
+        pytest.param(
+            urllib.error.HTTPError(oauth.USAGE_PROBE_URL, 404, "nf", hdrs=None, fp=None),
+            id="no-access-to-model",
+        ),
+        pytest.param(urllib.error.URLError("down"), id="network"),
+    ])
+    def test_a_failed_fable_probe_keeps_the_main_reading(self, failure):
+        fake, _ = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+            "claude-fable-5-1": failure,
+        })
+        outcome = self._fetch(fake)
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert "scoped" not in outcome.usage
 
     def test_active_account_probes_too(self):
         fake, _ = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
