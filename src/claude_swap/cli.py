@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
+from claude_swap.models import (
+    ACCOUNT_PRIORITY_MAX,
+    ACCOUNT_THRESHOLD_MAX,
+    ACCOUNT_THRESHOLD_MIN,
+)
 from claude_swap.printer import (
     accent,
     bolded,
@@ -19,7 +25,11 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings
+from claude_swap.settings import (
+    AUTOSWITCH_STRATEGIES,
+    load_ui_settings,
+    load_update_settings,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -60,6 +70,7 @@ _SUBCOMMAND_FLAGS = {
     "enable": "--enable-account",
     "export": "--export",
     "import": "--import",
+    "import-usage": "--import-usage",
     "purge": "--purge",
     "upgrade": "--upgrade",
     "update": "--upgrade",
@@ -130,7 +141,7 @@ Examples:
   cswap run 2
   cswap run user@example.com
   cswap run 2 --no-share
-  cswap run 2 --share-history
+  cswap run 2 --no-share-history
   cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
@@ -146,21 +157,26 @@ Examples:
         "--no-share",
         action="store_true",
         help=(
-            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents "
+            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
             "from ~/.claude into the session profile (and remove previously "
-            "shared items)"
+            "shared items). Chat history is not affected: see "
+            "--no-share-history"
         ),
     )
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
-            "unified history. History the profile already accumulated is "
-            "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "unified history. This is the default; history the profile "
+            "already accumulated is merged into ~/.claude first. "
+            "--no-share-history keeps this account's history separate for "
+            "this launch, `cswap config set run.shareHistory false` for "
+            "every launch. On Windows, projects/ is shared either way and "
+            "history.jsonl only when symlinks are allowed (Developer Mode, "
+            "or an elevated terminal)."
         ),
     )
     parser.add_argument(
@@ -187,6 +203,8 @@ Examples:
 
         manager = SessionManager(switcher)
 
+        # share_history goes through as given: None (neither flag) leaves it
+        # to run.shareHistory, which SessionManager.run resolves.
         if args.account is not None:
             manager.run(
                 args.account,
@@ -573,6 +591,156 @@ Examples:
         sys.exit(130)
 
 
+def _threshold_command(argv: list[str]) -> None:
+    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+
+    With no arguments, prints the global `autoswitch.threshold` and every
+    per-account override. Otherwise sets (or, with --unset, removes) one
+    account's own switch-away threshold. Pre-dispatched before the main parser
+    for the same reason as `alias`: the main parser's required
+    mutually-exclusive group cannot hold a positional subcommand.
+
+    The value is validated inside `set_account_threshold`, before any file is
+    touched, so a rejected value leaves `sequence.json` byte-identical.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap threshold",
+        description=(
+            "Set, remove, or list a per-account switch-away threshold. The "
+            "per-account value replaces autoswitch.threshold for that account "
+            "only, so one shared account can reserve headroom without capping "
+            "the whole fleet."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  cswap threshold 2 85
+  cswap threshold user@example.com 99.9
+  cswap threshold 2 --unset           # back to the global default
+  cswap threshold                     # list the global default and overrides
+
+Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to set (number, email, or alias). Omit to list.",
+    )
+    parser.add_argument(
+        "threshold",
+        nargs="?",
+        metavar="PCT",
+        help=(
+            f"Percent used at which to switch away "
+            f"({ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g})."
+        ),
+    )
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's override"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.threshold:
+        parser.error("--unset does not take a PCT argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and args.threshold is None:
+        parser.error("PCT is required (or pass --unset to remove the override)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            _print_threshold_table(switcher)
+            return
+
+        switcher.set_account_threshold(
+            args.account, None if args.unset else args.threshold
+        )
+    except ValueError as e:
+        # normalize_account_threshold's message; it always names the range.
+        error(f"Error: {e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
+    """Print the global switch-away threshold and every per-account override.
+
+    The global line is printed unconditionally: an operator reading a list of
+    overrides needs to know what the accounts *without* one are using.
+    """
+    from claude_swap.settings import load_settings
+
+    default = load_settings(switcher.backup_dir).threshold
+    print(bolded("Switch-away thresholds:"))
+    print(f"  {dimmed('global default')}  {default:g}%")
+
+    rows = sorted(
+        (
+            (num, policy.threshold)
+            for num, policy in switcher.account_policies().items()
+            if policy.threshold is not None
+        ),
+        key=lambda row: (not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0),
+    )
+    if not rows:
+        print(dimmed("  No per-account overrides set"))
+        return
+    for num, value in rows:
+        print(f"  Account-{num}  {value:g}%")
+
+
+def _priority_command(argv: list[str]) -> None:
+    """Set, clear, or inspect tiers without enabling the strategy implicitly."""
+    parser = argparse.ArgumentParser(
+        prog="cswap priority",
+        description=(
+            "Set or list account priority tiers for the optional "
+            "priority-consume-first strategy. Higher numbers are used first; "
+            "accounts in the same tier are ordered by soonest weekly reset."
+        ),
+    )
+    parser.add_argument("account", nargs="?", metavar="NUM|EMAIL|ALIAS")
+    parser.add_argument(
+        "priority", nargs="?", metavar="TIER",
+        help=f"Integer from 0 to {ACCOUNT_PRIORITY_MAX} (default 0)",
+    )
+    parser.add_argument("--unset", action="store_true", help="Return to priority 0")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+    if args.unset and args.priority is not None:
+        parser.error("--unset does not take a TIER argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL|ALIAS is required with --unset")
+    if args.account is not None and args.priority is None and not args.unset:
+        parser.error("TIER is required (or pass --unset)")
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if args.account is None:
+            print(bolded("Account priorities (higher first; default 0):"))
+            for num, policy in switcher.account_policies().items():
+                print(f"  Account-{num}  {switcher.account_email(num)}  {policy.priority}")
+            print(dimmed("Used only by: cswap auto --strategy priority-consume-first"))
+            return
+        switcher.set_account_priority(args.account, None if args.unset else args.priority)
+    except (ValueError, ClaudeSwitchError) as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -602,8 +770,9 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  cswap auto                       # foreground loop, switch at 90%% used
+  cswap auto                       # foreground loop, switch at 90% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -633,8 +802,19 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Switch when the active account's 5h window (or any window, "
+            "without a weekly line) reaches this utilization (50-99.9; "
+            "default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Separate switch line for the 7-day and per-model weekly windows "
+            "(50-99.9; default: the threshold). A flag cannot unset a "
+            "configured value; use 'cswap config unset'"
         ),
     )
     parser.add_argument(
@@ -664,12 +844,15 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=AUTOSWITCH_STRATEGIES,
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
+            "'weekly-first' (switch at the threshold like best, onto the "
+            "account whose weekly window resets soonest), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'priority-consume-first' (highest account "
+            "priority, then soonest weekly reset; only targets below all switch lines)"
         ),
     )
     parser.add_argument(
@@ -684,7 +867,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -723,10 +906,15 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            weekly = (
+                f", weekly {pct_label(settings.weekly_threshold)}%"
+                if settings.weekly_threshold is not None
+                else ""
+            )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
+                    f"{weekly}, every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -783,6 +971,7 @@ Examples:
   cswap config                              # list effective settings
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
+  cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,
@@ -915,6 +1104,164 @@ def _use_native_tls() -> None:
         pass
 
 
+def _menubar_settings_path():
+    from claude_swap.paths import get_backup_root
+
+    return get_backup_root() / "menubar_settings.json"
+
+
+def _set_menubar_auto_switch(enabled: bool) -> bool:
+    """Set the menu bar's auto-switch toggle and return its previous value."""
+    from claude_swap.menubar import MenuBarSettings
+
+    path = _menubar_settings_path()
+    settings = MenuBarSettings.load(path)
+    previous = settings.auto_switch_enabled
+    settings.auto_switch_enabled = enabled
+    settings.save(path)
+    return previous
+
+
+def _print_menubar_auto_switch(*, suggest_flag: bool) -> None:
+    """Say whether the menu bar will switch accounts or only show usage.
+
+    The toggle defaults to off and lives only in the menu, so a service
+    installed from a terminal can run for weeks as a display while its owner
+    believes it is switching (it only shows when an account hits its limit).
+    """
+    from claude_swap.menubar import MenuBarSettings
+
+    if MenuBarSettings.load(_menubar_settings_path()).auto_switch_enabled:
+        print("  auto-switch: on")
+        return
+    hint = (
+        "turn it on from the menu, or re-run with --auto-switch"
+        if suggest_flag
+        else "turn it on from the menu, or run `cswap menubar --auto-switch`"
+    )
+    warning(
+        f"  auto-switch: off -- the menu bar shows usage but will not switch "
+        f"accounts; {hint}",
+        file=sys.stderr,
+    )
+
+
+def _menubar_extra_missing() -> str | None:
+    """Why the menu bar cannot run here: the optional extra is not installed.
+
+    Checked before anything touches launchd. A worker that exits on ``import
+    rumps`` would give launchd a service that crash-loops at every login, which
+    is strictly worse than the import error a foreground run shows.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("rumps") is not None:
+        return None
+    from claude_swap.update_check import _detect_install_method
+
+    method = _detect_install_method()
+    if method == "uv":
+        remedy = "uv tool install --force 'claude-swap[menubar]'"
+    elif method == "pipx":
+        remedy = "pipx install --force 'claude-swap[menubar]'"
+    else:
+        remedy = "pip install 'claude-swap[menubar]'"
+    return f"The menu bar needs the 'menubar' extra. Install it with: {remedy}"
+
+
+def _menubar_foreground(switcher, service_pid: int | None, *, worker: bool) -> int:
+    """Run the menu bar in this process: launchd's job, or ``--foreground`` from a shell.
+
+    A second instance beside the service would draw a second icon over the same
+    accounts, so a shell run refuses while the service has a pid. launchd's own
+    job is that pid, which is what ``worker`` says.
+    """
+    if not worker and service_pid is not None:
+        error(
+            f"The menu bar is already running as a service (pid {service_pid}). "
+            "Quit it from the menu, or run 'cswap menubar --uninstall-service', "
+            "before running it in the foreground."
+        )
+        return 1
+    # menubar is import-safe without the extra; a missing rumps surfaces from
+    # run() as a ClaudeSwitchError with the install hint.
+    from claude_swap.menubar import run as menubar_run
+
+    return menubar_run(switcher)
+
+
+def _menubar_start(args) -> int:
+    """Handle plain ``cswap menubar``: make the service run, say what happened, return.
+
+    First setup registers the menu bar at login and says so, since a command
+    that quietly arranged to run at every login would be a surprise. Later runs
+    only make sure the service is up: a quit job is kickstarted, a plist pinning
+    an old program is repaired, a running one is left alone and reported.
+    """
+    from claude_swap import launch_agent
+    from claude_swap.menubar import framework_build_warning
+
+    missing = _menubar_extra_missing()
+    if missing:
+        error(missing)
+        return 1
+    unsupported = framework_build_warning()
+    # Before ensure(): the menu bar reads its toggle once at launch, so a
+    # changed value needs the write first and a running service restarted.
+    previous = None
+    if args.auto_switch is not None:
+        previous = _set_menubar_auto_switch(args.auto_switch)
+    toggled = previous is not None and previous != args.auto_switch
+    try:
+        result = launch_agent.ensure(restart=toggled)
+    except BaseException:
+        # Don't leave the toggle changed with no service behind it.
+        if toggled:
+            _set_menubar_auto_switch(previous)
+        raise
+
+    pid = f" (pid {result['pid']})" if result["pid"] else ""
+    action = result["action"]
+    if action == "already-running":
+        print(f"Menu bar is already running{pid}.")
+    elif action == "first-setup":
+        print(f"Menu bar started{pid}.")
+        print(
+            dimmed(
+                "  It keeps running after you close this terminal and starts at "
+                "login. Settings → Start at login in the menu turns that off; "
+                "cswap menubar --uninstall-service removes it."
+            )
+        )
+        print(f"  plist: {result['plist']}")
+        print(f"  logs:  {result['stderr_log']}")
+    elif action == "restarted":
+        why = (
+            "to apply the auto-switch setting"
+            if toggled
+            else "so the service runs the current build"
+        )
+        print(f"Menu bar restarted{pid} {why}.")
+    else:
+        print(f"Menu bar started{pid}.")
+        if not result["start_at_login"]:
+            print(dimmed("  Start at login is off, so this lasts until you log out."))
+    if result["switched_off"]:
+        # macOS allowed this start; the switch only governs the start at login.
+        warning(
+            f"  Switched off under {launch_agent.SYSTEM_SETTINGS_HINT}: it runs "
+            "now because you asked, but macOS will not start it at login until "
+            "you turn that back on.",
+            file=sys.stderr,
+        )
+    _print_menubar_auto_switch(suggest_flag=True)
+    if unsupported:
+        # Said here too, not only at launch: the service survives reboots and
+        # shows nothing, which is the worst version of the bug.
+        warning(unsupported, file=sys.stderr)
+    return 0
+
+
 def _menubar_service(args) -> int:
     """Handle ``menubar --install-service|--uninstall-service|--service-status``.
 
@@ -931,15 +1278,38 @@ def _menubar_service(args) -> int:
         # nothing. Say so here too, not only when the menu bar is launched.
         from claude_swap.menubar import framework_build_warning
 
+        missing = _menubar_extra_missing()
+        if missing:
+            error(missing)
+            return 1
         unsupported = framework_build_warning()
-        result = launch_agent.install()
+        # Before install(): it restarts a running service, and the menu bar
+        # reads its toggle once at launch.
+        previous = None
+        if args.auto_switch is not None:
+            previous = _set_menubar_auto_switch(args.auto_switch)
+        try:
+            result = launch_agent.install()
+        except BaseException:
+            # Don't leave the toggle changed with no service behind it.
+            if previous is not None and previous != args.auto_switch:
+                _set_menubar_auto_switch(previous)
+            raise
         print(f"Menu bar service installed ({result['label']}).")
         print(f"  plist: {result['plist']}")
         print(f"  logs:  {result['stderr_log']}")
+        _print_menubar_auto_switch(suggest_flag=True)
+        for key, old, new in result["profile_changes"]:
+            warning(
+                f"  now follows {key}={new or '(unset)'} (was {old or '(unset)'}); "
+                "the service manages that profile from now on",
+                file=sys.stderr,
+            )
         print(
             dimmed(
-                "It starts at login from now on. Re-run this after a cswap "
-                "upgrade to point launchd at the new build."
+                "It starts at login from now on; plain `cswap menubar` is enough "
+                "to start it again. Re-run this after a cswap upgrade to point "
+                "launchd at the new build."
             )
         )
         if unsupported:
@@ -953,22 +1323,48 @@ def _menubar_service(args) -> int:
 
     if args.uninstall_service:
         result = launch_agent.uninstall()
-        if result["was_loaded"] or result["removed_plist"]:
+        if result["was_loaded"] or result["removed"]:
             print("Menu bar service removed.")
+            for path in result["removed"]:
+                print(dimmed(f"  removed {path}"))
+            if result["cleared_override"]:
+                print(dimmed("  cleared its switch under Login Items & Extensions"))
         else:
             print("Menu bar service was not installed.")
+        if result["bundle_error"]:
+            warning(
+                f"  the wrapper app could not be removed: {result['bundle_error']}",
+                file=sys.stderr,
+            )
         return 0
 
     result = launch_agent.status()
-    if not result["installed"] and not result["loaded"]:
+    if not result["configured"] and not result["loaded"]:
         print("Menu bar service is not installed.")
-        print(dimmed("Install it with: cswap menubar --install-service"))
+        print(dimmed("Start it with: cswap menubar"))
         return 0
     state = result["state"] or ("loaded" if result["loaded"] else "stopped")
     pid = f" (pid {result['pid']})" if result["pid"] else ""
     print(f"Menu bar service: {state}{pid}")
-    print(f"  plist: {result['plist']}")
-    if not result["installed"]:
+    print(f"  starts at login: {'yes' if result['start_at_login'] else 'no'}")
+    plist = result["plist"] if result["start_at_login"] else result["session_plist"]
+    print(f"  plist: {plist or result['plist']}")
+    if result["running_build"]:
+        print(f"  build: {result['running_build']}")
+    if result["stale_build"]:
+        warning(
+            f"  installed build is {result['installed_build']}; plain "
+            "`cswap menubar` restarts it onto that",
+            file=sys.stderr,
+        )
+    _print_menubar_auto_switch(suggest_flag=False)
+    if result["switched_off"]:
+        warning(
+            f"  switched off under {launch_agent.SYSTEM_SETTINGS_HINT}; "
+            "macOS will not start it at login until you turn that back on",
+            file=sys.stderr,
+        )
+    if not result["configured"]:
         print(dimmed("launchd still has it loaded, but the plist is gone."))
     return 0
 
@@ -1011,6 +1407,12 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "threshold":
+        _threshold_command(argv[1:])
+        return
+    if argv and argv[0] == "priority":
+        _priority_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1045,6 +1447,11 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
+  %(prog)s threshold <num|email> <pct>  set one account's switch-away point
+  %(prog)s threshold <num|email> --unset  clear it (use the global default)
+  %(prog)s threshold                  list the global default and overrides
+  %(prog)s priority <num|email> <tier>  set priority (higher first; default 0)
+  %(prog)s priority                   list account priorities
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account
@@ -1060,10 +1467,11 @@ Commands:
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
+  %(prog)s import-usage <path>        adopt usage another machine read (list --json)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
-  %(prog)s menubar                    macOS menu bar app
-  %(prog)s menubar --install-service  keep the menu bar running via launchd
+  %(prog)s menubar                    macOS menu bar app, kept running by launchd
+  %(prog)s menubar --service-status   is it running? does it start at login?
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1075,6 +1483,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch user@example.com
   %(prog)s list --token-status
   %(prog)s list --json
+  %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
@@ -1169,24 +1578,65 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
     )
     parser.add_argument(
+        "--hold",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "With 'import-usage': keep this machine from fetching the "
+            "imported accounts for this many seconds (0 lifts an earlier hold)"
+        ),
+    )
+    # `cswap menubar` runs the menu bar as a launchd service (launch_agent.py);
+    # these pick another operation on that service, so at most one applies.
+    service = parser.add_mutually_exclusive_group()
+    service.add_argument(
         "--install-service",
         action="store_true",
         help=(
-            "With 'menubar': install a launchd LaunchAgent so the menu bar "
-            "starts at login and restarts on crash (macOS)"
+            "With 'menubar': register the menu bar to start at login and "
+            "(re)start it now; plain 'cswap menubar' does this on first use (macOS)"
         ),
     )
-    parser.add_argument(
+    service.add_argument(
         "--uninstall-service",
         action="store_true",
-        help="With 'menubar': stop the LaunchAgent and remove its plist (macOS)",
+        help="With 'menubar': stop the menu bar and remove its LaunchAgent (macOS)",
     )
-    parser.add_argument(
+    service.add_argument(
         "--service-status",
         action="store_true",
         help=(
-            "With 'menubar': report whether the LaunchAgent is installed "
-            "and running"
+            "With 'menubar': report whether the menu bar service is installed, "
+            "running and set to start at login"
+        ),
+    )
+    service.add_argument(
+        "--foreground",
+        action="store_true",
+        help=(
+            "With 'menubar': run the menu bar attached to this terminal instead "
+            "of as the background service"
+        ),
+    )
+    parser.add_argument(
+        "--auto-switch",
+        dest="auto_switch",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "With 'menubar' or 'menubar --install-service': turn the menu bar's "
+            "auto-switch on (it defaults to off)"
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-switch",
+        dest="auto_switch",
+        action="store_const",
+        const=False,
+        help=(
+            "With 'menubar' or 'menubar --install-service': turn the menu bar's "
+            "auto-switch off"
         ),
     )
 
@@ -1254,6 +1704,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--import-usage",
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--tui",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1303,9 +1758,29 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
+        or args.import_usage is not None
         or args.add_token is not None
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
+
+    # An empty value satisfies the guard above (the option *is* set) but matches
+    # no truthiness-tested branch of the dispatch chain below, so cswap would
+    # fall out of it and exit 0 having done nothing: `cswap export "$DEST"` with
+    # an unset DEST must not look like a completed backup. Rejected here, ahead
+    # of the modifier guards, so the error names the empty value instead of
+    # blaming an --account/--force/--full that was used correctly. --add-token is
+    # exempt: its const="" means "prompt me for the token".
+    for subcommand, metavar, value in (
+        ("remove", "NUM|EMAIL", args.remove_account),
+        ("disable", "NUM|EMAIL", args.disable_account),
+        ("enable", "NUM|EMAIL", args.enable_account),
+        ("switch", "NUM|EMAIL", args.switch_to),
+        ("export", "PATH", args.export),
+        ("import", "PATH", args.import_),
+        ("import-usage", "PATH", args.import_usage),
+    ):
+        if value is not None and not value:
+            parser.error(f"'{subcommand}' requires a non-empty {metavar}")
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
@@ -1347,12 +1822,32 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
+    if args.hold is not None and args.import_usage is None:
+        parser.error("--hold can only be used with 'import-usage'")
+
+    if args.hold is not None and not (math.isfinite(args.hold) and args.hold >= 0):
+        parser.error("--hold must be a non-negative number of seconds")
+
     if (
-        args.install_service or args.uninstall_service or args.service_status
+        args.install_service
+        or args.uninstall_service
+        or args.service_status
+        or args.foreground
     ) and not args.menubar:
         parser.error(
-            "--install-service, --uninstall-service and --service-status "
-            "can only be used with 'menubar'"
+            "--install-service, --uninstall-service, --service-status and "
+            "--foreground can only be used with 'menubar'"
+        )
+
+    if args.auto_switch is not None and (
+        not args.menubar
+        or args.uninstall_service
+        or args.service_status
+        or args.foreground
+    ):
+        parser.error(
+            "--auto-switch/--no-auto-switch can only be used with "
+            "'menubar' or 'menubar --install-service'"
         )
 
     # Self-upgrade runs before switcher init so we don't touch config/keychain
@@ -1431,6 +1926,19 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.status(json_output=args.json)
         elif args.purge:
             switcher.purge()
+            if sys.platform == "darwin":
+                # The menu bar's LaunchAgent, wrapper app and logs live outside
+                # the directory purge just removed; "all traces" means them too.
+                # After purge() so a refused purge leaves the menu bar alone.
+                from claude_swap import launch_agent
+
+                try:
+                    gone = launch_agent.uninstall(backup_dir=switcher.backup_dir)
+                except ClaudeSwitchError as e:
+                    warning(f"Menu bar service not removed: {e}", file=sys.stderr)
+                else:
+                    if gone["was_loaded"] or gone["removed"]:
+                        print("Removed the menu bar service, its app bundle and logs.")
         elif args.export:
             from claude_swap.transfer import export_accounts
 
@@ -1439,6 +1947,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.transfer import import_accounts
 
             import_accounts(switcher, args.import_, force=args.force)
+        elif args.import_usage:
+            from claude_swap.transfer import import_usage
+
+            import_usage(switcher, args.import_usage, hold_s=args.hold)
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
@@ -1453,11 +1965,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
             if args.install_service or args.uninstall_service or args.service_status:
                 sys.exit(_menubar_service(args))
-            # menubar is import-safe without the extra; a missing rumps
-            # surfaces from run() as a ClaudeSwitchError with the install hint.
-            from claude_swap.menubar import run as menubar_run
+            from claude_swap import launch_agent
 
-            sys.exit(menubar_run(switcher))
+            # launchd's own job runs the menu bar here (recognised by pid, so a
+            # plist from before the --foreground flag still works); everything
+            # else asks launchd to run it and returns.
+            service_pid = launch_agent.service_pid()
+            worker = service_pid is not None and service_pid == os.getpid()
+            if args.foreground or worker:
+                sys.exit(_menubar_foreground(switcher, service_pid, worker=worker))
+            sys.exit(_menubar_start(args))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
@@ -1481,8 +1998,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
-    # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    # in case the dispatch is later refactored to fall through. Skipped when
+    # `updates.check` is false, so no request goes to PyPI at all.
+    if (
+        not args.purge
+        and not args.upgrade
+        and not args.json
+        and load_update_settings(paths.get_backup_root()).check
+    ):
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)

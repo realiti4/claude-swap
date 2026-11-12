@@ -9,14 +9,17 @@ auto-switch trigger line), and stale-measurement dimming.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap import oauth, pace, subscription
+from claude_swap.json_output import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
 from claude_swap.models import AccountSnapshot
+from claude_swap.oauth import FIVE_HOUR_LABEL
+from claude_swap.printer import format_age
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -110,9 +113,10 @@ def _pace_suffix(window: dict, fetched_at: float | None) -> str:
 
 def usage_rows(
     last_good: dict | None, now: float, fetched_at: float | None = None
-) -> list[tuple[str, float, str, str]]:
+) -> list[tuple[str, float | None, str, str]]:
     """(label, pct, suffix, suffix_full) rows mirroring the CLI's
-    ``_format_usage_lines``.
+    ``_format_usage_lines``. ``pct`` is None for a 5h/7d window reported
+    without a figure; ``usage_bar`` draws that row as ``usage unknown``.
 
     ``suffix_full`` extends the reset countdown with the absolute clock time
     (``resets 2h 13m · 20:39``) for rows that have room; otherwise it equals
@@ -125,7 +129,7 @@ def usage_rows(
     """
     if not isinstance(last_good, dict):
         return []
-    rows: list[tuple[str, float, str, str]] = []
+    rows: list[tuple[str, float | None, str, str]] = []
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
@@ -133,7 +137,7 @@ def usage_rows(
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
             reset, reset_full = _reset_parts(window, now)
@@ -143,7 +147,13 @@ def usage_rows(
                 if marker:
                     suffix = f"{suffix}  {marker}" if suffix else marker
                     suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
-            rows.append((label, float(window["pct"]), suffix, suffix_full))
+            pct = window.get("pct")
+            rows.append((
+                label,
+                float(pct) if isinstance(pct, (int, float)) else None,
+                suffix,
+                suffix_full,
+            ))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
         suffix, suffix_full = _reset_parts(window, now)
@@ -157,7 +167,83 @@ def usage_rows(
                 suffix = f"{suffix}  {marker}" if suffix else marker
                 suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
         rows.append((window["name"], pct, suffix, suffix_full))
+    rejected = last_good.get("rejected")
+    if isinstance(rejected, dict):
+        # A refused setup-token probe: at its limit until the refusal ends,
+        # whatever the windows above say (auto-switching excludes it).
+        reset, reset_full = _reset_parts(rejected, now)
+        suffix = f"rejected (!)  {reset}" if reset else "rejected (!)"
+        suffix_full = f"rejected (!)  {reset_full}" if reset_full else "rejected (!)"
+        rows.append(("probe", 100.0, suffix, suffix_full))
     return rows
+
+
+# Login-note forms, fullest first: "re-login in 5d 12h", "re-login in 5d",
+# nothing. A row carries one only while its login is due
+# (``oauth.login_time_left``), so most rows read as if there were no note.
+LOGIN_FORMS = ("full", "short", None)
+
+
+def login_segment(
+    acc: AccountSnapshot, form: str | None, now: float | None = None, gap: str = "  "
+) -> str:
+    """The row's ``re-login in …`` note led by ``gap``, or ``""`` when
+    ``form`` is None or the slot's login is not due."""
+    if form is None:
+        return ""
+    quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+    note = oauth.format_login_expiry(
+        acc.login_expires_at, quarantined, now, short=form == "short"
+    )
+    return f"{gap}{note}" if note else ""
+
+
+def fit_login(build: Callable[[str | None], list[Text]], budget: int) -> list[Text]:
+    """``build(form)`` for the fullest login form in which every row's first
+    line fits ``budget`` columns; usage figures are never cut, so with no
+    fitting form the login goes."""
+    for form in LOGIN_FORMS:
+        rows = build(form)
+        if all(cell_len(row.plain.strip("\n").partition("\n")[0]) <= budget for row in rows):
+            break
+    return rows
+
+
+def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
+    """``· Ultra`` after the header — the same marker ``cswap list`` prints:
+    a lapsed subscription is a highlighted ``Free`` rather than an appended
+    "expired", and the age follows once the plan has gone two TTLs without
+    refreshing."""
+    record = acc.subscription_plan
+    if not record:
+        return
+    plan = record["plan"]
+    text.append(f"{gap}· ", style=palette.muted)
+    text.append(
+        subscription.plan_label(plan),
+        style=palette.sev_warn if subscription.is_expired(plan) else palette.muted,
+    )
+    if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
+        age = format_age(int(record["fetchedAt"] * 1000))
+        text.append(f" ({age})", style=palette.muted)
+
+
+def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
+    """Badge strings for the account's per-account policy, in display order.
+
+    Returns an empty list for an account carrying no policy, which is every
+    account in a store that has never used the feature — that is what keeps
+    those rows byte-identical to their pre-policy render.
+
+    ``gap`` is the leading separator each render path already uses for its own
+    badges (three spaces on the card, two on the minimized row).
+    """
+    badges: list[str] = []
+    if acc.policy.threshold is not None:
+        # ``:g`` so 75.0 reads as "75%" and 82.5 keeps its fraction — the store
+        # accepts one decimal place and the row shows back exactly what was set.
+        badges.append(f"{gap}th {acc.policy.threshold:g}%")
+    return badges
 
 
 def account_card_text(
@@ -165,10 +251,16 @@ def account_card_text(
     width: int,
     *,
     threshold: float | None = None,
+    weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    login: str | None = "full",
 ) -> Text:
-    """The full account card: header line + per-window bar rows."""
+    """The full account card: header line + per-window bar rows. Each row's
+    tick is the switch line that row is judged against: ``threshold`` on the
+    5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
+    per-model rows, which reset weekly. ``login`` is the form of the re-login
+    note that ends the header while the login is due (see ``LOGIN_FORMS``)."""
     now = now if now is not None else time.time()
 
     text = Text()
@@ -183,9 +275,13 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    for badge in _policy_badges(acc, "   "):
+        text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "   ", palette)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
+    text.append(login_segment(acc, login, now, "   "), style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
@@ -218,13 +314,19 @@ def account_card_text(
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     label_width = max(len(label) for label, _pct, _suffix, _full in rows)
     bar_width = max(12, min(30, width - 42 - label_width))
-    # everything on a row except the suffix: indent, label, bar, " NNN%", gap
-    row_overhead = 4 + label_width + 1 + bar_width + 5 + 2
     for label, pct, suffix, suffix_full in rows:
+        # everything on a row except the suffix: indent, label, bar, " NNN%"
+        # (or "  usage unknown" on a row without a figure), gap
+        row_overhead = 4 + label_width + 1 + bar_width + (15 if pct is None else 5) + 2
         # per-row: show the absolute clock only where it fits, so a long
         # spend row degrading doesn't cost the 5h/7d rows their clocks
         if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
             suffix = suffix_full
+        row_line = (
+            weekly_threshold
+            if weekly_threshold is not None and label not in ("$$", FIVE_HOUR_LABEL)
+            else threshold
+        )
         text.append("\n    ")
         text.append(
             usage_bar(
@@ -233,22 +335,44 @@ def account_card_text(
                 suffix or None,
                 bar_width,
                 stale=stale,
-                threshold=threshold,
+                threshold=row_line,
                 palette=palette,
             )
         )
     return text
 
 
+def fitted_card_text(acc: AccountSnapshot, width: int, budget: int, **kwargs) -> Text:
+    """``account_card_text`` with the login-note form its header has room for in ``budget`` columns."""
+    (card,) = fit_login(
+        lambda login: [account_card_text(acc, width, login=login, **kwargs)], budget
+    )
+    return card
+
+
+def _end_mini(text: Text, acc: AccountSnapshot, form: str | None, now: float, palette: Palette) -> Text:
+    """Close a mini row with its ``re-login in …`` note, while the login is due."""
+    note = login_segment(acc, form, now, gap="")
+    if note:
+        text.append(" · ", style=palette.track)
+        text.append(note, style=palette.muted)
+    return text
+
+
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
+    login: str | None = "full",
 ) -> Text:
     """One minimized line for an inactive account.
 
     ``2  work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
     colored; a window at/over 100% brings its reset countdown along, and a
     maxed per-model window shows as ``Fable (!)``. Sentinel states show
-    their label instead.
+    their label instead. ``login`` is the form of the ``· re-login in …``
+    note that ends the row while the login is due (see ``LOGIN_FORMS``).
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
@@ -260,13 +384,16 @@ def mini_account_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
+    for badge in _policy_badges(acc, "  "):
+        text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "  ", palette)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)
-        return text
+        return _end_mini(text, acc, login, now, palette)
 
     last_good = acc.usage.last_good
     fetched_at = acc.usage.fetched_at
@@ -276,9 +403,15 @@ def mini_account_text(
         window = last_good.get(key) if isinstance(last_good, dict) else None
         if not window:
             continue
-        pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
+        if not isinstance(window.get("pct"), (int, float)):
+            # No figure: unknown, not 0%.
+            text.append(f"{label} ", style=palette.muted)
+            text.append("?", style=palette.muted)
+            parts += 1
+            continue
+        pct = float(window["pct"])
         color = palette.severity(pct)
         text.append(f"{label} ", style=palette.muted)
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
@@ -296,6 +429,8 @@ def mini_account_text(
         for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
         if float(w["pct"]) >= 100
     ]
+    if isinstance(last_good, dict) and isinstance(last_good.get("rejected"), dict):
+        maxed.append("rejected")  # a refused setup-token probe
     for name in maxed:
         if parts:
             text.append(" · ", style=palette.track)
@@ -303,7 +438,7 @@ def mini_account_text(
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)
-    return text
+    return _end_mini(text, acc, login, now, palette)
 
 
 class AccountsPanel(Static):
@@ -333,18 +468,33 @@ class AccountsPanel(Static):
                 style=palette.muted,
             )
         now = time.time()
-        width = (self.size.width or 80) - 2
+        panel_width = self.size.width or 80
+        width = panel_width - 2
+        # One login-note form for all the minis, so the rows that carry one
+        # read alike; the card's header also carries the plan and age, so it
+        # fits its own.
+        inactive = [acc for acc in snap.accounts if not acc.is_active and self._show_minis]
+        minis = iter(
+            fit_login(
+                lambda login: [
+                    mini_account_text(acc, now, palette=palette, login=login)
+                    for acc in inactive
+                ],
+                panel_width,
+            )
+        )
         blocks: list[Text] = []
         for acc in snap.accounts:
             if acc.is_active:
                 blocks.append(
-                    account_card_text(
-                        acc, width, threshold=app.threshold_pct, now=now,
+                    fitted_card_text(
+                        acc, width, panel_width, threshold=app.threshold_pct,
+                        weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette,
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(next(minis))
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
@@ -372,8 +522,9 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        return account_card_text(
-            self._acc, self.size.width or 80, threshold=self._threshold,
+        width = self.size.width or 80
+        return fitted_card_text(
+            self._acc, width, width, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
         )
 
