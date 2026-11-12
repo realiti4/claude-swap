@@ -36,8 +36,9 @@ USAGE_PROBE_API_VERSION = "2023-06-01"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 # The unified headers carry a per-model weekly bucket only on responses to
-# that model's own requests: a Haiku probe never sees Fable's ``7d_oi``. So a
-# second, best-effort 1-token probe per scoped model reads just that bucket.
+# that model's own requests: a Haiku probe never sees Fable's ``7d_oi``. So,
+# with ``usage.fableProbe`` on, a second, best-effort 1-token probe per scoped
+# model reads just that bucket (see ``_add_scoped_limits``).
 # Model id -> the unified header prefix of the bucket its responses carry.
 # Sonnet and Opus probes carry no per-model bucket (checked 2026-11), so they
 # are not probed; a new bucket needs its model and prefix here and its display
@@ -597,20 +598,11 @@ def parse_unified_ratelimit_headers(headers) -> dict:
         data[key] = {"utilization": pct}
         if resets_at:
             data[key]["resets_at"] = resets_at
-    limits = []
-    for prefix, name in _UNIFIED_SCOPED_WINDOWS:
-        window = _unified_window(headers, prefix)
-        if window is None:
-            continue
-        pct, resets_at = window
-        limit: dict = {
-            "kind": "weekly_scoped",
-            "scope": {"model": {"display_name": name}},
-            "percent": pct,
-        }
-        if resets_at:
-            limit["resets_at"] = resets_at
-        limits.append(limit)
+    limits = [
+        _scoped_limit(name, *window)
+        for prefix, name in _UNIFIED_SCOPED_WINDOWS
+        if (window := _unified_window(headers, prefix)) is not None
+    ]
     if limits:
         data["limits"] = limits
     if headers.get("anthropic-ratelimit-unified-status") == "rejected":
@@ -622,18 +614,38 @@ def parse_unified_ratelimit_headers(headers) -> dict:
     return data
 
 
+def _scoped_limit(
+    name: str,
+    pct: float,
+    resets_at: str | None = None,
+    probe_after: str | None = None,
+) -> dict:
+    """One per-model weekly limit in the usage API's ``limits`` shape.
+
+    ``probe_after`` is the header probe's own addition, for a bucket it read
+    as spent (see :func:`_scoped_limit_from_headers`).
+    """
+    limit: dict = {
+        "kind": "weekly_scoped",
+        "scope": {"model": {"display_name": name}},
+        "percent": pct,
+    }
+    if resets_at:
+        limit["resets_at"] = resets_at
+    if probe_after:
+        limit["probe_after"] = probe_after
+    return limit
+
+
 def request_usage_via_probe(access_token: str) -> dict:
     """Read utilization from the rate-limit headers of a minimal model request.
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
     utilization, and inference is the one thing a setup-token may do. The
-    request asks for a single Haiku output token. Per-model weekly buckets
-    (Fable's) are only reported on that model's own responses, so each of
-    :data:`USAGE_PROBE_SCOPED_MODELS` gets a 1-token probe too (see
-    :func:`_scoped_probe_limits`) — unless the main probe was refused: the
-    account is then at its limit and a second request only adds load.
-    Returns the raw usage API shape (possibly empty) from
-    :func:`parse_unified_ratelimit_headers`.
+    request asks for a single Haiku output token. Returns the raw usage API
+    shape (possibly empty) from :func:`parse_unified_ratelimit_headers`.
+    Per-model weekly buckets (Fable's) are not in it: they are only reported
+    on that model's own responses, see :func:`_add_scoped_limits`.
 
     A 429 carrying ``anthropic-ratelimit-unified-status: rejected`` is the
     account confirming its quota refuses inference, whatever the utilization
@@ -649,7 +661,7 @@ def request_usage_via_probe(access_token: str) -> dict:
         with urllib.request.urlopen(
             _probe_request(access_token, USAGE_PROBE_MODEL), timeout=10
         ) as resp:
-            data = parse_unified_ratelimit_headers(resp.headers)
+            return parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
         data = parse_unified_ratelimit_headers(e.headers) if e.headers else {}
         if e.code != 429 or "rejected" not in data:
@@ -663,10 +675,6 @@ def request_usage_via_probe(access_token: str) -> dict:
         rejected["retry_after_s"] = retry_after
         data["rejected"] = rejected
         return data
-    scoped = _scoped_probe_limits(access_token, data.get("limits") or [])
-    if scoped:
-        data["limits"] = (data.get("limits") or []) + scoped
-    return data
 
 
 def _probe_request(access_token: str, model: str) -> urllib.request.Request:
@@ -689,77 +697,185 @@ def _probe_request(access_token: str, model: str) -> urllib.request.Request:
     )
 
 
-def _scoped_probe_limits(access_token: str, have: list) -> list:
-    """Per-model weekly limits read by probing each scoped model.
+def _add_scoped_limits(
+    data: dict, access_token: str, last_usage: dict | None
+) -> None:
+    """Add to ``data`` each per-model weekly bucket the main probe lacks.
 
-    Only the per-model ``limits`` are kept: the 5h/7d windows and any
-    account-level rejection come from the main probe, since one model's
-    limit refusing says nothing about the others.
+    The unified headers report such a bucket (Fable's) only on that model's
+    own responses, so each of :data:`USAGE_PROBE_SCOPED_MODELS` costs one
+    more 1-token request per poll (:func:`_probe_scoped_limit`). Only the
+    per-model ``limits`` are taken from it: the 5h/7d windows and any
+    account-level rejection stay the main probe's, since one model's limit
+    refusing says nothing about the others.
 
-    - A served probe reports the bucket from its headers.
-    - A 429 with ``anthropic-ratelimit-unified-status: rejected`` reads as
-      that bucket at 100% whatever its utilization header says (or without
-      one), until the refusal ends: now + Retry-After, else the bucket's
-      reset header, else the unified reset header.
-    - Anything else (a bare 429, no access to the model, a network error)
-      says nothing about the bucket and adds no limit.
+    No request is sent for a bucket:
 
-    A bucket ``have`` already carries is not added twice.
+    - the main response already carries;
+    - whose row in ``last_usage`` (the stored reading) is still paused
+      (``poll_policy.scoped_probe_paused``): it was read as spent, and that
+      row is carried into this reading as it is;
+    - when the main probe says ``rejected``, refused or served: the account
+      is past a limit of its own, and a second request only adds load or
+      spends usage credits.
     """
-    names = dict(_UNIFIED_SCOPED_WINDOWS)
-    seen = {
+    limits = list(data.get("limits") or [])
+    have = {
         ((lim.get("scope") or {}).get("model") or {}).get("display_name")
-        for lim in have if isinstance(lim, dict)
+        for lim in limits if isinstance(lim, dict)
     }
-    limits: list = []
+    names = dict(_UNIFIED_SCOPED_WINDOWS)
+    now = datetime.now(timezone.utc)
     for model, prefix in USAGE_PROBE_SCOPED_MODELS.items():
         name = names[prefix]
-        if name in seen:
+        if name in have:
             continue
-        try:
-            with urllib.request.urlopen(
-                _probe_request(access_token, model), timeout=10
-            ) as resp:
-                found = parse_unified_ratelimit_headers(resp.headers).get("limits")
-        except urllib.error.HTTPError as e:
-            refused = (
-                e.code == 429 and e.headers
-                and e.headers.get("anthropic-ratelimit-unified-status") == "rejected"
+        limit = _paused_scoped_limit(last_usage, name, now)
+        if limit is not None:
+            _logger.debug(
+                "Scoped usage probe (%s) paused until %s: keeping the stored row",
+                model, limit["probe_after"],
             )
-            if not refused:
-                _logger.debug("Scoped usage probe (%s) failed: HTTP %s", model, e.code)
-                continue
-            _kind, retry_after = _classify_usage_error(e)
-            if retry_after is not None:
-                resets_at = (
-                    datetime.now(timezone.utc) + timedelta(seconds=retry_after)
-                ).isoformat()
-            else:
-                resets_at = _epoch_header_iso(
-                    e.headers.get(f"anthropic-ratelimit-unified-{prefix}-reset")
-                ) or _epoch_header_iso(
-                    e.headers.get("anthropic-ratelimit-unified-reset")
-                )
-            limit: dict = {
-                "kind": "weekly_scoped",
-                "scope": {"model": {"display_name": name}},
-                "percent": 100.0,
-            }
-            if resets_at:
-                limit["resets_at"] = resets_at
-            found = [limit]
-        except Exception as e:
-            _logger.debug("Scoped usage probe (%s) failed: %r", model, e)
+        elif "rejected" not in data:
+            limit = _probe_scoped_limit(access_token, model, prefix, name, now)
+        if limit is not None:
+            have.add(name)
+            limits.append(limit)
+    if limits:
+        data["limits"] = limits
+
+
+def _paused_scoped_limit(
+    last_usage: dict | None, name: str, now: datetime
+) -> dict | None:
+    """The stored row for bucket ``name`` as a raw limit while its probe is
+    paused, else None. A row whose reset cannot be read is not kept."""
+    from claude_swap import poll_policy  # it imports this module
+
+    rows = last_usage.get("scoped") if isinstance(last_usage, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        if not (
+            isinstance(row, dict)
+            and row.get("name") == name
+            and isinstance(row.get("pct"), (int, float))
+            and poll_policy.scoped_probe_paused(row, now.timestamp())
+        ):
             continue
-        for lim in found or []:
-            if lim["scope"]["model"]["display_name"] == name:
-                seen.add(name)
-                limits.append(lim)
-    return limits
+        resets_at = row.get("resets_at")
+        try:
+            if resets_at:
+                format_reset(resets_at)
+        except (ValueError, TypeError):
+            return None
+        return _scoped_limit(name, float(row["pct"]), resets_at, row["probe_after"])
+    return None
 
 
-def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
+def _probe_scoped_limit(
+    access_token: str, model: str, prefix: str, name: str, now: datetime
+) -> dict | None:
+    """One 1-token request to ``model``, read as its weekly bucket.
+
+    A served response, and a 429 with ``anthropic-ratelimit-unified-status:
+    rejected``, both describe the bucket
+    (:func:`_scoped_limit_from_headers`). Anything else (a bare 429, no
+    access to the model, a network error) says nothing about it: None.
+    """
+    try:
+        with urllib.request.urlopen(
+            _probe_request(access_token, model), timeout=10
+        ) as resp:
+            return _scoped_limit_from_headers(resp.headers, prefix, name, None, now)
+    except urllib.error.HTTPError as e:
+        refused = (
+            e.code == 429 and e.headers
+            and e.headers.get("anthropic-ratelimit-unified-status") == "rejected"
+        )
+        if not refused:
+            _logger.debug("Scoped usage probe (%s) failed: HTTP %s", model, e.code)
+            return None
+        _kind, retry_after = _classify_usage_error(e)
+        return _scoped_limit_from_headers(e.headers, prefix, name, retry_after, now)
+    except Exception as e:
+        _logger.debug("Scoped usage probe (%s) failed: %r", model, e)
+        return None
+
+
+def _scoped_limit_from_headers(
+    headers, prefix: str, name: str, retry_after_s: float | None, now: datetime
+) -> dict | None:
+    """The per-model bucket a scoped probe's response reports, or None when
+    it reports none.
+
+    The bucket is spent when the response's unified status is ``rejected``,
+    when the bucket's own ``-status`` is, or when its utilization is at
+    100%. As Claude Code 2.1.322 reads these headers: a served response
+    whose unified status is ``rejected`` (with an overage status of
+    ``allowed`` or ``allowed_warning``) ran on usage credits, and a bucket
+    status of ``rejected`` means "at or past its limit", which alone does
+    not say requests are refused. So whichever way the next request would
+    go, refused or billed to credits, a spent bucket:
+
+    - reads as at least 100%, whatever its utilization header says (a
+      refusal can bind below it, or arrive without one);
+    - resets at the bucket's own reset, else at the unified reset when the
+      unified status is what marked it;
+    - carries ``probe_after``, before which no request is sent for it again
+      (``poll_policy.scoped_probe_after``). A refusal's Retry-After moves
+      only that deadline: as the row's reset it would end before the bucket
+      does, and a display that rolls a passed weekly reset forward would
+      then show a spent bucket as empty.
+
+    A ``rejected`` unified status whose representative claim names the 5h
+    or 7d window is the account's own limit, reached since the main probe
+    was served. It marks nothing here (the next main probe reports it), so
+    the bucket is read from its own headers alone.
+    """
+    from claude_swap import poll_policy  # it imports this module
+
+    base = f"anthropic-ratelimit-unified-{prefix}"
+    window = _unified_window(headers, prefix)
+    pct = window[0] if window else None
+    resets_at = _epoch_header_iso(headers.get(f"{base}-reset"))
+    past_limit = (
+        headers.get("anthropic-ratelimit-unified-status") == "rejected"
+        and headers.get("anthropic-ratelimit-unified-representative-claim")
+        not in {key for _prefix, key in _UNIFIED_WINDOWS}
+    )
+    spent = (
+        past_limit
+        or headers.get(f"{base}-status") == "rejected"
+        or (pct is not None and pct >= 100.0)
+    )
+    if not spent:
+        return None if pct is None else _scoped_limit(name, pct, resets_at)
+    if not past_limit:
+        retry_after_s = None  # the Retry-After of another limit's refusal
+    elif not resets_at:
+        resets_at = _epoch_header_iso(
+            headers.get("anthropic-ratelimit-unified-reset")
+        )
+    until = poll_policy.scoped_probe_after(now.timestamp(), resets_at, retry_after_s)
+    return _scoped_limit(
+        name,
+        max(pct or 0.0, 100.0),
+        resets_at,
+        datetime.fromtimestamp(until, tz=timezone.utc).isoformat(),
+    )
+
+
+def _usage_from_probe(
+    access_token: str,
+    context: str,
+    scoped_probe: bool = False,
+    last_usage: dict | None = None,
+) -> "UsageOutcome":
     """Usage from the header probe, classified like an endpoint fetch.
+
+    ``scoped_probe`` (``usage.fableProbe``) adds the per-model weekly
+    buckets, each from a request of its own unless ``last_usage``, the
+    account's stored reading, shows that bucket as spent (see
+    :func:`_add_scoped_limits`).
 
     The result is marked ``source: headers`` and keeps the probe's
     ``rejected`` entry, so a refused probe is stored (and decided on) as an
@@ -770,6 +886,8 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
     """
     try:
         data = request_usage_via_probe(access_token)
+        if scoped_probe:
+            _add_scoped_limits(data, access_token, last_usage)
     except Exception as e:
         kind, retry_after = _classify_usage_error(e)
         cause = kind if retry_after is None else f"{kind}, retry-after {retry_after:.0f}s"
@@ -997,6 +1115,9 @@ def build_usage_result(data: dict) -> dict | None:
             if lim.get("resets_at"):
                 scoped_entry["resets_at"] = lim["resets_at"]
                 scoped_entry["countdown"], scoped_entry["clock"] = format_reset(lim["resets_at"])
+            if isinstance(lim.get("probe_after"), str):
+                # Only the header probe sets it (see _scoped_limit_from_headers).
+                scoped_entry["probe_after"] = lim["probe_after"]
             scoped.append(scoped_entry)
         if scoped:
             result["scoped"] = scoped
@@ -1019,10 +1140,11 @@ def _header_reading_complete(usage: dict, models: Sequence[str]) -> bool:
     """Whether a header-probe reading carries every window a decision needs.
 
     The 7d window always, plus each configured per-model window; the headers
-    only carry Fable's, so ``all`` (every per-model window the account has)
-    can never be shown complete. A missing 5h window is not a gap: an Ultra
-    account has none (a 5h header without a usable utilization fails the
-    reading instead, see :func:`parse_unified_ratelimit_headers`).
+    only carry Fable's, and only with ``usage.fableProbe`` on, so ``all``
+    (every per-model window the account has) can never be shown complete.
+    A missing 5h window is not a gap: an Ultra account has none (a 5h header
+    without a usable utilization fails the reading instead, see
+    :func:`parse_unified_ratelimit_headers`).
     """
     if not isinstance(usage.get("seven_day"), dict):
         return False
@@ -1165,6 +1287,8 @@ def try_fetch_usage_for_account(
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
     header_probe: bool = False,
+    scoped_probe: bool = False,
+    last_usage: dict | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -1180,7 +1304,9 @@ def try_fetch_usage_for_account(
     ``header_probe`` its usage comes from :func:`request_usage_via_probe`
     instead, in place of the endpoint request, so the caller's poll plan and
     backoff pace it exactly like an endpoint fetch; without it the outcome is
-    the ``"setup-token"`` error and no request is sent.
+    the ``"setup-token"`` error and no request is sent. ``scoped_probe`` and
+    ``last_usage`` (the account's stored reading) only shape that probe, see
+    :func:`_usage_from_probe`.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -1190,7 +1316,9 @@ def try_fetch_usage_for_account(
 
     if is_setup_token(oauth):
         if header_probe:
-            return _usage_from_probe(access_token, context)
+            return _usage_from_probe(
+                access_token, context, scoped_probe, last_usage
+            )
         return UsageOutcome(None, error="setup-token")
 
     working_credentials = credentials

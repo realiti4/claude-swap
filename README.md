@@ -312,6 +312,7 @@ cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fa
 cswap config set run.shareHistory false   # each account keeps its own chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
+cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -404,8 +405,8 @@ cswap add-token --email user@example.com     # optional label override
 <details>
 <summary>Limits — setup-token usage & API-key accounts</summary>
 
-- **Setup-tokens show `usage unavailable` by default**, because the usage endpoint does not answer them (their scope is inference-only). With `cswap config set usage.headerProbe true`, cswap reads their 5h/7d utilization from the rate-limit headers of a 1-output-token Haiku request instead, sent at the normal poll cadence, plus Fable's weekly window from a second 1-output-token Fable request (the headers report a model's own weekly limit only on that model's responses; an account without Fable access just shows no Fable row). Each probe is a real (tiny) request on that account's subscription, which is why it is off by default.
-- **What the probe can't do.** Other per-model windows and extra-usage spend are not in those headers. A reading missing the 5h or 7d window (or a window `autoswitch.model` names) is shown but not used for auto-switching. An account the server rejects for quota is marked as at its limit, with no further probe, until the refusal's `Retry-After` passes.
+- **Setup-tokens show `usage unavailable` by default**, because the usage endpoint does not answer them (their scope is inference-only). With `cswap config set usage.headerProbe true`, cswap reads their 5h/7d utilization from the rate-limit headers of a 1-output-token Haiku request instead, sent at the normal poll cadence. `cswap config set usage.fableProbe true` adds Fable's weekly window from a second 1-output-token Fable request per poll (the headers report a model's own weekly limit only on that model's responses; an account without Fable access just shows no Fable row). Once that window is used up, cswap keeps the row and sends no Fable request until it resets, so it does not keep asking a model that would refuse or bill usage credits. Each probe is a real (tiny) request on that account's subscription, which is why both are off by default.
+- **What the probe can't do.** Other per-model windows and extra-usage spend are not in those headers. A reading missing the 5h or 7d window (or a window `autoswitch.model` names; Fable's needs `usage.fableProbe`) is shown but not used for auto-switching. An account the server rejects for quota is marked as at its limit, with no further probe, until the refusal's `Retry-After` passes.
 - **API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token (`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses after `/login` with a key). It switches like any other account, but API keys have no subscription quota, so they show no usage and the usage-aware `switch` strategies never skip them as rate-limited. Use keys scoped to a single workspace: a multi-workspace key needs an `anthropic-workspace-id` header on every request, which Claude Code does not add for a stored key.
 
 </details>
