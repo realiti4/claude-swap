@@ -719,14 +719,16 @@ class TestSecureStorageOverride:
 
 
 class TestTheClearReachesEveryStoreTheReadDoes:
-    """The read walks `_active_oauth_keychain_services()`; the delete named
-    one service.
+    """The read walks `_active_oauth_keychain_services()`; the delete clears
+    the first name, the item claude reads for this environment.
 
     Under a custom profile the read resolves a SUFFIXED item while the delete
-    removed the unsuffixed one, returned True (a clean rc-44 is a success),
-    and the landing then believed the live store was empty. The two must
-    resolve the same set or the delete's verdict is about a different item
-    than the read's.
+    once removed the unsuffixed one, returned True (a clean rc-44 is a
+    success), and the landing then believed the live store was empty. The
+    delete's verdict has to be about the read's first item. Any later name is
+    a read-only fallback that belongs to another login and is never deleted;
+    the landing refuses up front while one holds a login
+    (`TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores`).
     """
 
     def test_the_delete_covers_the_same_services_the_read_walks(
@@ -751,10 +753,9 @@ class TestTheClearReachesEveryStoreTheReadDoes:
             lambda service, account: deleted.append(service))
 
         assert store._delete_active_keychain_entry() is True
-        assert deleted == wanted, (
-            f"the read walks {wanted} and the delete touched {deleted} — a "
-            "survivor in a store the read would have found keeps "
-            "authenticating under the new slot's name"
+        assert deleted == wanted[:1], (
+            f"the delete touched {deleted}, not just the item claude reads "
+            f"({wanted[0]}): a later name is another login's, with no copy"
         )
 
 
