@@ -124,6 +124,23 @@ class TestGetCredentialsPath:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
         assert get_credentials_path() == custom / ".credentials.json"
 
+    def test_follows_a_defined_secure_storage_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Claude Code 2.1.322 reads the file from the secure-storage directory,
+        which the override names ahead of ``CLAUDE_CONFIG_DIR``."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "ccd"))
+        secure = tmp_path / "secure"
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+        assert get_credentials_path() == secure / ".credentials.json"
+
+    def test_an_empty_secure_storage_override_selects_the_default_home(
+        self, isolated_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "ccd"))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+        assert get_credentials_path() == isolated_home / ".claude" / ".credentials.json"
+
 
 class TestGetBackupRoot:
     """Linux/WSL: XDG-aware path. Other platforms: legacy ~/.claude-swap-backup."""

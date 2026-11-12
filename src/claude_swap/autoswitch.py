@@ -68,7 +68,11 @@ from claude_swap.poll_policy import (
     binding_pct,
 )
 from claude_swap.settings import (
-    AutoSwitchSettings, atomic_write_json, load_settings, parse_model_names,
+    AutoSwitchSettings,
+    atomic_write_json,
+    load_settings,
+    log_unrecognized_keys,
+    parse_model_names,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry, due_candidate, plan_oversleeps_interval
@@ -6417,6 +6421,9 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        # Once per loop, not per tick: a settings key nothing reads would
+        # otherwise leave the loop running on a default with no trace of why.
+        log_unrecognized_keys(self.switcher.backup_dir)
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear

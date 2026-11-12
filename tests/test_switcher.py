@@ -643,6 +643,43 @@ class TestStatus:
 
         switcher.status()
 
+    @pytest.mark.parametrize(
+        "mode, other_email, tagged",
+        [
+            ("auto", "other@example.com", False),
+            ("auto", "test@example.com", True),
+            ("on", "other@example.com", True),
+            ("off", "test@example.com", False),
+        ],
+    )
+    def test_status_org_tag_follows_ui_org_tag(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys, mode, other_email, tagged,
+    ):
+        accounts = sample_sequence_data["accounts"]
+        accounts["1"].update(
+            email="test@example.com", organizationUuid="", organizationName="orgA"
+        )
+        accounts["2"].update(
+            email=other_email, organizationUuid="org-2", organizationName="orgB"
+        )
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)):
+            switcher.status()
+
+        output = capsys.readouterr().out
+        assert ("[orgA]" in output) is tagged
+        assert ("(test@example.com)" in output) is not tagged
+
 
 class TestStatusCache:
     """status() shares the usage.json cache with list_accounts."""
@@ -1271,12 +1308,22 @@ class TestSetupTokenHeaderProbeWiring:
             switcher._fetch_account_usage(self._info())
             # Opt-in: each probe is a real request on the subscription.
             assert mock_fetch.call_args.kwargs["header_probe"] is False
+            assert mock_fetch.call_args.kwargs["scoped_probe"] is False
             set_setting(switcher.backup_dir, "usage.headerProbe", "true")
             # A same-second rewrite can keep the mtime; force a visible change.
             path = settings_path(switcher.backup_dir)
             os.utime(path, (time.time() + 5, time.time() + 5))
             switcher._fetch_account_usage(self._info())
             assert mock_fetch.call_args.kwargs["header_probe"] is True
+            # The Fable probe is a second opt-in.
+            assert mock_fetch.call_args.kwargs["scoped_probe"] is False
+            set_setting(switcher.backup_dir, "usage.fableProbe", "true")
+            os.utime(path, (time.time() + 10, time.time() + 10))
+            stored = {"seven_day": {"pct": 1.0}}
+            switcher._fetch_account_usage(self._info(), None, stored)
+            assert mock_fetch.call_args.kwargs["scoped_probe"] is True
+            # The stored reading rides along: it can pause the Fable probe.
+            assert mock_fetch.call_args.kwargs["last_usage"] is stored
 
     def test_probe_is_paced_by_the_store(self, temp_home: Path):
         """One collect pass sends one probe; a second pass inside the serve
@@ -1311,15 +1358,73 @@ class TestSetupTokenHeaderProbeWiring:
             second = switcher._collect_usage_entries([self._info()])["3"]
 
         # The usage endpoint is never asked: it cannot read a setup-token.
-        # One pass = the main probe plus one per scoped model (Fable).
-        assert urls == [oauth.USAGE_PROBE_URL] * (
-            1 + len(oauth.USAGE_PROBE_SCOPED_MODELS)
-        )
+        # One pass = one probe; Fable's is off unless usage.fableProbe is set.
+        assert urls == [oauth.USAGE_PROBE_URL]
         assert first.last_error is None
         assert first.last_good["five_hour"]["pct"] == 25.0
         assert first.last_good["seven_day"]["pct"] == 50.0
         assert first.next_poll_at is not None
         assert oauth.account_headroom(second.decision_value()) == 50.0
+
+    @pytest.mark.parametrize("active", [False, True])
+    def test_a_spent_fable_bucket_is_not_asked_about_again(
+        self, temp_home: Path, active
+    ):
+        """With ``usage.fableProbe`` on, the pass that finds Fable refused
+        stores the row; later passes send the main probe only and keep that
+        row, for an idle account and for the active one."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerProbe", "true")
+        set_setting(switcher.backup_dir, "usage.fableProbe", "true")
+        clock = {"now": time.time()}
+        switcher._usage_store.clock = lambda: clock["now"]
+        now = int(time.time())
+        main = {
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-5h-utilization": "0.25",
+            "anthropic-ratelimit-unified-5h-reset": str(now + 3 * 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.5",
+            "anthropic-ratelimit-unified-7d-reset": str(now + 4 * 86400),
+        }
+        ok = MagicMock()
+        ok.headers = main
+        ok.__enter__ = lambda s: s
+        ok.__exit__ = MagicMock(return_value=False)
+        refused = self._probe_429({
+            **main,
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d_oi-reset": str(now + 2 * 86400),
+        })
+        asked: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            model = json.loads(req.data)["model"]
+            asked.append(model)
+            if model == oauth.USAGE_PROBE_MODEL:
+                return ok
+            raise refused
+
+        info = (3, "setup-token-3@token.local", "", "", active, self.CREDS, "")
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            first = switcher._collect_usage_entries([info])["3"]
+            assert asked == [oauth.USAGE_PROBE_MODEL, "claude-fable-5-1"]
+            [row] = first.last_good["scoped"]
+            assert (row["name"], row["pct"]) == ("Fable", 100.0)
+            for elapsed in (900, 1800, 2700):
+                clock["now"] += 900
+                entry = switcher._collect_usage_entries([info], {"3"})["3"]
+        assert asked == [oauth.USAGE_PROBE_MODEL, "claude-fable-5-1"] + [
+            oauth.USAGE_PROBE_MODEL
+        ] * 3
+        assert entry.last_error is None
+        assert entry.last_good["five_hour"]["pct"] == 25.0
+        [kept] = entry.last_good["scoped"]
+        for key in ("name", "pct", "resets_at", "probe_after"):
+            assert kept[key] == row[key]
+        assert oauth.account_headroom(entry.last_good, ["Fable"]) == 0.0
 
     def _probe_switcher(self, probe_result):
         """A switcher with the probe on, its store on a fake clock, and a
@@ -1416,6 +1521,56 @@ class TestSetupTokenHeaderProbeWiring:
             "source": oauth.USAGE_SOURCE_HEADERS,
         }
         assert _format_usage_lines(rejected)[-1] == "probe: rejected"
+
+
+class TestFetchAccountUsageFromAnotherProfile:
+    """From a session shell the active slot is resolved through
+    ``CLAUDE_CONFIG_DIR``, so the default login's slot is polled as an idle
+    one. Its token family still belongs to the default profile's claude."""
+
+    def _switcher_in_session_shell(self, monkeypatch) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        profile = switcher.backup_dir / "sessions" / "2-account2_example.com"
+        profile.mkdir(parents=True)
+        (profile / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "account2@example.com"}}
+        ))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        return switcher
+
+    def test_default_login_is_not_refreshed(
+        self, temp_home: Path, mock_claude_config: Path, monkeypatch
+    ):
+        """Consuming the backup's grant would leave the default store on the
+        consumed generation and log the default profile's claude out."""
+        switcher = self._switcher_in_session_shell(monkeypatch)
+        expired = _oauth_creds("sk-default", -3600)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(
+                (1, "test@example.com", "", "", False, expired, "")
+            )
+
+        refresh.assert_not_called()
+        mock_fetch.assert_not_called()
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+
+    def test_a_slot_nobody_is_logged_into_still_refreshes(
+        self, temp_home: Path, mock_claude_config: Path, monkeypatch
+    ):
+        switcher = self._switcher_in_session_shell(monkeypatch)
+        expired = _oauth_creds("sk-idle", -3600)
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(
+                (3, "idle@example.com", "", "", False, expired, "")
+            )
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        assert mock_fetch.call_args.kwargs["refresh_via"] == switcher.consume_backup_grant
 
 
 class TestAdoptSessionCredential:
@@ -1595,6 +1750,23 @@ class TestLiveSessionGuardOnAnUnreadableRecord:
         switcher._ensure_no_live_session("2", "test@example.com", "the operation")
 
 
+class TestOrgTagShown:
+    @pytest.mark.parametrize(
+        "mode, email, shown",
+        [
+            ("on", "solo@x.com", True),
+            ("off", "dup@x.com", False),
+            ("auto", "dup@x.com", True),
+            ("auto", "solo@x.com", False),
+        ],
+    )
+    def test_modes(self, mode, email, shown):
+        from claude_swap.models import org_tag_shown
+
+        emails = ["dup@x.com", "dup@x.com", "solo@x.com"]
+        assert org_tag_shown(mode, email, emails) is shown
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -1624,12 +1796,52 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "test@example.com [personal] (active)" in output
+        assert "test@example.com (active)" in output
         assert "account2@example.com" in output
         assert "├ 5h:" in output
         assert "└ 7d:" in output
         assert "10%" in output
         assert "50%" in output
+
+    @pytest.mark.parametrize(
+        "mode, tagged",
+        [
+            ("auto", {"orgA", "orgB"}),
+            ("on", {"orgA", "orgB", "solo"}),
+            ("off", set()),
+        ],
+    )
+    def test_list_org_tag_follows_ui_org_tag(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys, mode, tagged,
+    ):
+        """Two accounts share an email and one does not: ``auto`` tags the pair only."""
+        for num, email, org in (
+            ("1", "dup@example.com", "orgA"),
+            ("2", "dup@example.com", "orgB"),
+            ("3", "solo@example.com", "solo"),
+        ):
+            sample_sequence_data["accounts"][num] = {
+                "email": email, "uuid": f"uuid-{num}", "added": "2024-01-01T00:00:00Z",
+                "organizationUuid": f"org-{num}", "organizationName": org,
+            }
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert {o for o in ("orgA", "orgB", "solo") if f"[{o}]" in output} == tagged
+        # A hidden tag leaves no stray space behind.
+        assert ("  3: solo@example.com\n" in output) is (mode != "on")
 
     def test_list_shows_alias_before_email(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
@@ -1652,7 +1864,7 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "  1: dev (test@example.com) [personal] (active)" in output
+        assert "  1: dev (test@example.com) (active)" in output
         # unaliased account keeps rendering plain email, no spurious parens
         assert "  2: account2@example.com" in output
         assert "(account2@example.com)" not in output
@@ -5337,6 +5549,7 @@ class TestBackwardCompatibility:
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        settings_path(backup_dir).write_text(json.dumps({"ui": {"orgTag": "on"}}))
 
         config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
@@ -5362,6 +5575,7 @@ class TestBackwardCompatibility:
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        settings_path(backup_dir).write_text(json.dumps({"ui": {"orgTag": "on"}}))
 
         config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
