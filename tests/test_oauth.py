@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -878,8 +879,9 @@ class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 
     @staticmethod
-    def _http_error(code: int, headers: dict | None = None):
+    def _http_error(code: int, headers: dict | None = None, body: bytes | None = None):
         import email.message
+        import io
         hdrs = None
         if headers is not None:
             hdrs = email.message.Message()
@@ -887,13 +889,31 @@ class TestClassifyUsageError:
                 hdrs[k] = v
         return urllib.error.HTTPError(
             url="https://api.anthropic.com/api/oauth/usage",
-            code=code, msg="err", hdrs=hdrs, fp=None,
+            code=code, msg="err", hdrs=hdrs,
+            fp=None if body is None else io.BytesIO(body),
         )
 
     def test_http_codes(self):
         assert oauth._classify_usage_error(self._http_error(429))[0] == "http-429"
         assert oauth._classify_usage_error(self._http_error(500))[0] == "http-500"
         assert oauth._classify_usage_error(self._http_error(401))[0] == "http-401"
+
+    ORG = "oauth_not_allowed_for_organization"
+    ORG_BODY = json.dumps({"error": {"details": {"error_code": ORG}}}).encode()
+
+    @pytest.mark.parametrize("code, body, kind", [
+        (403, ORG_BODY, ORG),
+        (401, ORG_BODY, "http-401"),
+        (403, None, "http-403"),
+        (403, b"<html>forbidden</html>", "http-403"),
+        (403, b'{"error": "x"}', "http-403"),
+    ])
+    def test_403_org_oauth_policy_names_itself(self, code, body, kind):
+        """A 403 whose body carries the server's org-policy code is told apart
+        from every other 403; an unreadable or differently shaped body, and any
+        other status, keep ``http-<code>``. Retry-After rides along either way."""
+        err = self._http_error(code, {"Retry-After": "7"}, body)
+        assert oauth._classify_usage_error(err) == (kind, 7.0)
 
     def test_retry_after_seconds(self):
         kind, retry = oauth._classify_usage_error(
@@ -930,6 +950,25 @@ class TestClassifyUsageError:
         assert oauth._classify_usage_error(
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
+
+    @pytest.mark.parametrize("reason, kind", [
+        (ssl.SSLCertVerificationError(1, "certificate verify failed"), "tls-cert"),
+        (ssl.SSLEOFError("EOF occurred in violation of protocol"), "network"),
+        (ssl.SSLError("wrong version number"), "network"),
+    ])
+    def test_refused_certificate_is_told_apart(self, reason, kind):
+        """Only a certificate the client refused is ``tls-cert``; a TLS failure
+        of any other class stays ``network``, since no CA repairs it."""
+        err = urllib.error.URLError(reason)
+        assert oauth._classify_usage_error(err) == (kind, None)
+
+    def test_refused_certificate_shows_its_remedy(self):
+        """The unavailable line names the fix, not the bare kind."""
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.usage_store import UsageEntry
+
+        (line,) = _usage_entry_lines(UsageEntry(last_error="tls-cert"))
+        assert "SSL_CERT_FILE" in line and "tls-cert" not in line
 
     def test_bad_response(self):
         try:
@@ -1218,7 +1257,9 @@ class TestSetupTokenHeaderProbe:
         assert outcome.usage["source"] == oauth.USAGE_SOURCE_HEADERS
         assert "rejected" not in outcome.usage
         # Never the usage endpoint: its inference-only scope cannot read it.
+        # One request: the Fable probe is an opt-in of its own.
         assert [c.full_url for c in calls] == [oauth.USAGE_PROBE_URL]
+        assert "scoped" not in outcome.usage
         probe = calls[0]
         assert probe.get_method() == "POST"
         assert probe.get_header("Authorization") == f"Bearer {self.TOKEN}"
@@ -1232,6 +1273,364 @@ class TestSetupTokenHeaderProbe:
             r.levelno >= logging.WARNING for r in caplog.records
         )
         assert not any(self.TOKEN in m for m in messages)
+
+    def _route_by_model(self, by_model: dict):
+        """urlopen fake answering each probe by its request's model."""
+        calls: list = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            assert req.full_url == oauth.USAGE_PROBE_URL
+            result = by_model[json.loads(req.data)["model"]]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return fake_urlopen, calls
+
+    FABLE = "claude-fable-5-1"
+
+    @staticmethod
+    def _now() -> float:
+        return datetime.now(timezone.utc).timestamp()
+
+    def _fable_headers(self, reset_in_s: int = 3 * 86400, **overrides) -> dict:
+        """A Fable response's unified headers: the main ones plus its
+        ``7d_oi`` bucket, resetting ``reset_in_s`` from now. ``overrides``
+        are header-name suffixes; None removes one."""
+        values = {
+            **_UNIFIED_HEADERS,
+            "anthropic-ratelimit-unified-7d_oi-status": "allowed_warning",
+            "anthropic-ratelimit-unified-7d_oi-utilization": "0.97",
+            "anthropic-ratelimit-unified-7d_oi-reset": str(
+                int(self._now()) + reset_in_s
+            ),
+        }
+        for suffix, value in overrides.items():
+            key = f"anthropic-ratelimit-unified-{suffix.replace('__', '-')}"
+            if value is None:
+                values.pop(key, None)
+            else:
+                values[key] = value
+        return values
+
+    FABLE_CLAIM = "seven_day_overage_included"  # Claude Code's "Fable limit"
+
+    def _fable_refused(self, values: dict, claim: str | None = FABLE_CLAIM):
+        """A 429 whose unified status is ``rejected``, naming ``claim`` as
+        the limit that refused (None: no claim header)."""
+        values = {**values, "anthropic-ratelimit-unified-status": "rejected"}
+        key = "anthropic-ratelimit-unified-representative-claim"
+        if claim is None:
+            values.pop(key, None)
+        else:
+            values[key] = claim
+        return self._probe_429(values)
+
+    def _fable_fetch(self, fable, main=None, **kw):
+        """A fetch with ``usage.fableProbe`` on. Returns ``(outcome, models
+        asked)``; ``fable``/``main`` are a response or an exception."""
+        fake, calls = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: main or self._ok(_UNIFIED_HEADERS),
+            self.FABLE: fable,
+        })
+        outcome = self._fetch(fake, scoped_probe=True, **kw)
+        return outcome, [json.loads(c.data)["model"] for c in calls]
+
+    @staticmethod
+    def _ts(iso: str) -> float:
+        return datetime.fromisoformat(iso).timestamp()
+
+    def test_fable_bucket_is_read_from_a_fable_probe(self):
+        """The Haiku probe never carries ``7d_oi``; the Fable probe does."""
+        outcome, asked = self._fable_fetch(self._ok(self._fable_headers()))
+        usage = outcome.usage
+        assert asked == [oauth.USAGE_PROBE_MODEL, self.FABLE]
+        assert usage["seven_day"]["pct"] == 60.0
+        [fable] = usage["scoped"]
+        assert (fable["name"], fable["pct"]) == ("Fable", 97.0)
+        assert fable["resets_at"]
+        # A bucket with room is asked about again on the next poll.
+        assert "probe_after" not in fable
+
+    def test_refused_fable_reads_at_its_limit_whatever_its_pct(self):
+        """A rejected Fable probe at 97% is Fable unavailable until its
+        bucket resets; 5h/7d stay the main probe's and the account is not
+        rejected. Retry-After sets when to ask again, not the row's reset."""
+        values = self._fable_headers(**{"7d_oi__status": "rejected"})
+        values["Retry-After"] = "600"
+        before = self._now()
+        outcome, _ = self._fable_fetch(self._fable_refused(values))
+        usage = outcome.usage
+        assert usage["five_hour"]["pct"] == 34.0
+        assert usage["seven_day"]["pct"] == 60.0
+        assert "rejected" not in usage
+        [fable] = usage["scoped"]
+        assert (fable["name"], fable["pct"]) == ("Fable", 100.0)
+        assert self._ts(fable["resets_at"]) == int(
+            values["anthropic-ratelimit-unified-7d_oi-reset"]
+        )
+        assert before + 600 <= self._ts(fable["probe_after"]) <= before + 660
+        assert oauth.account_headroom(usage) == 40.0
+        assert oauth.account_headroom(usage, ["Fable"]) == 0.0
+
+    def test_refused_fable_without_a_utilization_still_shows_its_row(self):
+        """No utilization header: the row stays, at 100%, resetting at the
+        bucket's own reset, which is also when it is asked about again."""
+        reset = int(self._now()) + 2 * 86400
+        outcome, _ = self._fable_fetch(self._fable_refused({
+            "anthropic-ratelimit-unified-7d_oi-reset": str(reset),
+            "anthropic-ratelimit-unified-reset": str(reset - 3600),
+        }))
+        [fable] = outcome.usage["scoped"]
+        assert fable["pct"] == 100.0
+        assert self._ts(fable["resets_at"]) == reset
+        assert self._ts(fable["probe_after"]) == reset
+
+    @pytest.mark.parametrize("claim", [FABLE_CLAIM, None])
+    def test_refused_fable_falls_back_to_the_unified_reset(self, claim):
+        reset = int(self._now()) + 86400
+        outcome, _ = self._fable_fetch(self._fable_refused({
+            "anthropic-ratelimit-unified-reset": str(reset),
+        }, claim))
+        [fable] = outcome.usage["scoped"]
+        assert fable["pct"] == 100.0
+        assert self._ts(fable["resets_at"]) == reset
+        assert self._ts(fable["probe_after"]) == reset
+
+    def test_refused_fable_naming_no_deadline_is_asked_again_later(self):
+        """Neither a reset nor a Retry-After: the row has no reset to show,
+        and the next request waits the fallback interval."""
+        from claude_swap.poll_policy import SCOPED_PROBE_RETRY_S
+
+        before = self._now()
+        outcome, _ = self._fable_fetch(self._fable_refused({}))
+        [fable] = outcome.usage["scoped"]
+        assert fable["pct"] == 100.0
+        assert "resets_at" not in fable
+        after = self._ts(fable["probe_after"])
+        assert before + SCOPED_PROBE_RETRY_S <= after <= before + SCOPED_PROBE_RETRY_S + 60
+
+    @pytest.mark.parametrize("overrides, pct", [
+        # Served past the limit: Claude Code 2.1.322 reads this pair as the
+        # request running on usage credits.
+        pytest.param(
+            {"status": "rejected", "overage__status": "allowed",
+             "representative__claim": FABLE_CLAIM}, 100.0,
+            id="served-on-credits",
+        ),
+        pytest.param({"7d_oi__status": "rejected"}, 100.0, id="bucket-status"),
+        pytest.param({"7d_oi__utilization": "1.0"}, 100.0, id="at-100"),
+        pytest.param({"7d_oi__utilization": "1.2"}, 120.0, id="past-100"),
+    ])
+    def test_a_served_fable_response_can_say_the_bucket_is_spent(
+        self, overrides, pct
+    ):
+        headers = self._fable_headers(**overrides)
+        outcome, _ = self._fable_fetch(self._ok(headers))
+        usage = outcome.usage
+        [fable] = usage["scoped"]
+        assert fable["pct"] == pct
+        reset = int(headers["anthropic-ratelimit-unified-7d_oi-reset"])
+        assert self._ts(fable["resets_at"]) == reset
+        assert self._ts(fable["probe_after"]) == reset
+        # One model's bucket says nothing about the account's own windows.
+        assert "rejected" not in usage
+        assert oauth.account_headroom(usage) == 40.0
+
+    @pytest.mark.parametrize("claim", [
+        # The account's own window filled between the two probes.
+        "five_hour", "seven_day",
+        # The usage credits ran out, as Claude Code 2.1.322 names that limit.
+        "overage",
+        "seven_day_opus", "a_limit_added_later",
+    ])
+    @pytest.mark.parametrize("served", [False, True])
+    def test_a_rejection_naming_another_limit_is_not_fables(self, claim, served):
+        """Only Fable's own claim, or none, makes the unified status speak
+        for Fable's bucket. Under any other the row keeps its own figure
+        and is asked about again: a bucket wrongly paused stays wrong for
+        days, one wrongly asked about is corrected by the next poll."""
+        headers = self._fable_headers(
+            status="rejected", representative__claim=claim,
+            **{"7d_oi__utilization": "0.4", "7d_oi__status": "allowed"},
+        )
+        headers["Retry-After"] = "600"
+        fable = self._ok(headers) if served else self._probe_429(headers)
+        outcome, _ = self._fable_fetch(fable)
+        [row] = outcome.usage["scoped"]
+        assert row["pct"] == 40.0
+        assert "probe_after" not in row
+        assert "rejected" not in outcome.usage
+
+    def test_another_limits_retry_after_is_not_fables_deadline(self):
+        """Spent by its own status, under a refusal the 5h window caused."""
+        headers = self._fable_headers(
+            status="rejected", **{"7d_oi__status": "rejected"},
+        )
+        headers["Retry-After"] = "600"
+        outcome, _ = self._fable_fetch(self._probe_429(headers))
+        [row] = outcome.usage["scoped"]
+        assert row["pct"] == 100.0
+        assert self._ts(row["probe_after"]) == self._ts(row["resets_at"])
+
+    def _spent_reading(self, **refusal) -> dict:
+        """The stored reading after a refused Fable probe."""
+        values = self._fable_headers(**{"7d_oi__status": "rejected"})
+        values.update(refusal)
+        outcome, _ = self._fable_fetch(self._fable_refused(values))
+        return outcome.usage
+
+    def test_no_fable_request_while_the_stored_row_is_spent(self):
+        """The spent row is carried into the next reading as it is, and
+        only the main probe is sent."""
+        stored = self._spent_reading()
+        outcome, asked = self._fable_fetch(
+            self._ok(self._fable_headers()), last_usage=stored
+        )
+        assert asked == [oauth.USAGE_PROBE_MODEL]
+        [kept], [fable] = stored["scoped"], outcome.usage["scoped"]
+        for key in ("name", "pct", "resets_at", "probe_after"):
+            assert fable[key] == kept[key]
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert oauth.account_headroom(outcome.usage, ["Fable"]) == 0.0
+
+    def _stored_row(self, **changes) -> dict:
+        row = dict(self._spent_reading()["scoped"][0])
+        row.update(changes)
+        return {"scoped": [row], "source": oauth.USAGE_SOURCE_HEADERS}
+
+    @staticmethod
+    def _iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    def test_fable_is_asked_again_once_the_pause_ends(self):
+        stored = self._stored_row(probe_after=self._iso(self._now() - 1))
+        outcome, asked = self._fable_fetch(
+            self._ok(self._fable_headers(**{"7d_oi__utilization": "0.02"})),
+            last_usage=stored,
+        )
+        assert asked == [oauth.USAGE_PROBE_MODEL, self.FABLE]
+        [fable] = outcome.usage["scoped"]
+        assert fable["pct"] == 2.0
+        assert "probe_after" not in fable
+
+    @pytest.mark.parametrize("changes", [
+        pytest.param(
+            lambda now, iso: {"resets_at": iso(now - 1)}, id="its-reset-passed",
+        ),
+        pytest.param(
+            lambda now, iso: {"probe_after": iso(now + 30 * 86400)},
+            id="deadline-past-a-week",
+        ),
+        pytest.param(lambda now, iso: {"probe_after": "soon"}, id="unreadable-deadline"),
+        pytest.param(lambda now, iso: {"resets_at": "2026-13-45"}, id="unreadable-reset"),
+        pytest.param(lambda now, iso: {"pct": None}, id="no-figure"),
+    ])
+    def test_a_stored_row_that_cannot_be_trusted_is_not_kept(self, changes):
+        """Such a row pauses nothing: Fable is asked and the answer replaces
+        it (a reading imported from another machine can carry anything)."""
+        stored = self._stored_row(**changes(self._now(), self._iso))
+        outcome, asked = self._fable_fetch(
+            self._ok(self._fable_headers()), last_usage=stored
+        )
+        assert asked == [oauth.USAGE_PROBE_MODEL, self.FABLE]
+        assert [w["pct"] for w in outcome.usage["scoped"]] == [97.0]
+
+    def test_turning_the_fable_probe_off_drops_a_kept_row(self):
+        fake, calls = self._route_by_model({
+            oauth.USAGE_PROBE_MODEL: self._ok(_UNIFIED_HEADERS),
+        })
+        outcome = self._fetch(fake, last_usage=self._spent_reading())
+        assert len(calls) == 1
+        assert "scoped" not in outcome.usage
+
+    def test_bare_429_on_the_fable_probe_adds_no_row(self):
+        """No rejected status proves nothing about Fable, even with a
+        utilization header: the main reading stands alone."""
+        outcome, _ = self._fable_fetch(
+            self._probe_429({**self._fable_headers(), "Retry-After": "30"})
+        )
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert "scoped" not in outcome.usage
+
+    def _refused_main(self):
+        return self._probe_429({
+            **_UNIFIED_HEADERS,
+            "anthropic-ratelimit-unified-status": "rejected",
+            "Retry-After": "600",
+        })
+
+    def test_no_fable_probe_after_a_refused_main_probe(self):
+        outcome, asked = self._fable_fetch(
+            self._ok(self._fable_headers()), main=self._refused_main()
+        )
+        assert outcome.usage["rejected"]["retry_after_s"] == 600.0
+        assert "scoped" not in outcome.usage
+        assert asked == [oauth.USAGE_PROBE_MODEL]
+
+    def test_no_fable_probe_after_a_main_probe_served_past_its_limit(self):
+        """A served response can say ``rejected`` too (the account is on
+        usage credits): a Fable request would be the same."""
+        served = self._ok({
+            **_UNIFIED_HEADERS,
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-overage-status": "allowed",
+        })
+        outcome, asked = self._fable_fetch(
+            self._ok(self._fable_headers()), main=served
+        )
+        assert asked == [oauth.USAGE_PROBE_MODEL]
+        assert "rejected" in outcome.usage
+        assert "scoped" not in outcome.usage
+
+    @pytest.mark.parametrize("main", [
+        pytest.param(
+            {**_UNIFIED_HEADERS, "Retry-After": "600"}, id="readable-windows",
+        ),
+        # The reading then drops the account's windows and keeps the refusal.
+        pytest.param(
+            {"anthropic-ratelimit-unified-5h-status": "rejected",
+             "anthropic-ratelimit-unified-7d-utilization": "0.6"},
+            id="a-window-without-a-figure",
+        ),
+    ])
+    def test_a_spent_fable_row_survives_a_refused_main_probe(self, main):
+        """Otherwise the first reading after the refusal ends would ask
+        Fable again, inside its pause."""
+        stored = self._spent_reading()
+        refused = self._probe_429({
+            **main, "anthropic-ratelimit-unified-status": "rejected",
+        })
+        outcome, asked = self._fable_fetch(
+            self._ok(self._fable_headers()), main=refused, last_usage=stored,
+        )
+        usage = outcome.usage
+        assert asked == [oauth.USAGE_PROBE_MODEL]
+        [fable] = usage["scoped"]
+        assert fable["probe_after"] == stored["scoped"][0]["probe_after"]
+        # The kept row does not make a refused account look usable.
+        assert "rejected" in usage
+        assert oauth.account_headroom(usage) == 0.0
+        # The refusal has ended: Fable is still not asked.
+        _, asked = self._fable_fetch(
+            self._ok(self._fable_headers()), last_usage=usage
+        )
+        assert asked == [oauth.USAGE_PROBE_MODEL]
+
+    @pytest.mark.parametrize("failure", [
+        pytest.param(
+            urllib.error.HTTPError(oauth.USAGE_PROBE_URL, 404, "nf", hdrs=None, fp=None),
+            id="no-access-to-model",
+        ),
+        pytest.param(urllib.error.URLError("down"), id="network"),
+    ])
+    def test_a_failed_fable_probe_keeps_the_main_reading(self, failure):
+        outcome, _ = self._fable_fetch(failure)
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert "scoped" not in outcome.usage
 
     def test_active_account_probes_too(self):
         fake, _ = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))

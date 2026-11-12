@@ -940,15 +940,18 @@ def _config_command(argv: list[str]) -> None:
     (same limitation: `config` must be the first argument). Edits
     settings.json in the backup root with strict validation — unlike loading,
     which forgivingly clamps — so a typo'd key or out-of-range value errors
-    loudly here instead of silently degrading at `cswap auto` time.
+    loudly here instead of silently degrading at `cswap auto` time. `list`
+    also names the keys a hand edit left in the file that nothing reads.
     """
     from claude_swap.settings import (
         SETTING_SPECS,
         effective_settings,
         format_setting_value,
+        load_usage_settings,
         set_setting,
         setting_spec,
         settings_path,
+        unrecognized_keys,
         unset_setting,
     )
 
@@ -1025,6 +1028,7 @@ Examples:
             print(settings_path(root))
         elif action == "list":
             rows = effective_settings(root)
+            ignored = unrecognized_keys(root)
             if json_mode:
                 payload = {
                     "schemaVersion": 1,
@@ -1032,6 +1036,10 @@ Examples:
                     "settings": [
                         {"key": spec.dotted, "value": value, "isSet": is_set}
                         for spec, value, is_set in rows
+                    ],
+                    "unrecognized": [
+                        {"key": item.dotted, "suggestion": item.suggestion}
+                        for item in ignored
                     ],
                 }
                 print(json.dumps(payload, indent=2))
@@ -1041,6 +1049,11 @@ Examples:
                 for spec, value, is_set in rows:
                     line = f"{spec.dotted:<{key_w}}  {format_setting_value(value):<{val_w}}"
                     print(line if is_set else f"{line}  {dimmed('(default)')}")
+                for item in ignored:
+                    warning(
+                        f"Warning: settings.json: {item.describe()}",
+                        file=sys.stderr,
+                    )
         elif action == "get":
             spec = setting_spec(args.key)
             value, is_set = next(
@@ -1059,6 +1072,20 @@ Examples:
         elif action == "set":
             value = set_setting(root, args.key, args.value)
             print(f"{args.key} = {format_setting_value(value)}")
+            usage = load_usage_settings(root)
+            if (
+                args.key.startswith("usage.")
+                and usage.fable_probe
+                and not usage.header_probe
+            ):
+                # The Fable probe rides on the header probe's request cycle.
+                print(
+                    muted(
+                        "usage.fableProbe does nothing until "
+                        "usage.headerProbe is true"
+                    ),
+                    file=sys.stderr,
+                )
         elif action == "unset":
             if unset_setting(root, args.key):
                 default = setting_spec(args.key).default

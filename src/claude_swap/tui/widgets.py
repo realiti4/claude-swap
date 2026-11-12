@@ -255,6 +255,7 @@ def account_card_text(
     weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    show_tag: bool = True,
     login: str | None = "full",
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
@@ -271,7 +272,8 @@ def account_card_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -460,14 +462,21 @@ def _mini_body(
     return cells, None if cells else Text("usage unknown", style=palette.muted), ahead
 
 
-def mini_widths(accs: Iterable[AccountSnapshot], now: float) -> MiniWidths:
-    """Column widths that fit every one of ``accs``, the compact rows shown."""
+def mini_widths(
+    accs: Iterable[AccountSnapshot],
+    now: float,
+    show_tag: Callable[[AccountSnapshot], bool] = lambda _acc: True,
+) -> MiniWidths:
+    """Column widths that fit every one of ``accs``, the compact rows shown.
+    The tag column fits the tags ``show_tag`` keeps, and is absent (0) when
+    none is."""
     palette = Palette.DARK  # widths do not depend on style
     name = tag = note = marker = 0
     cells = {"5h": 0, "7d": 0}  # fixed order; scoped windows follow as seen
     for acc in accs:
         name = max(name, _mini_name(acc, palette).cell_len)
-        tag = max(tag, _mini_tag(acc, palette).cell_len)
+        if show_tag(acc):
+            tag = max(tag, _mini_tag(acc, palette).cell_len)
         row_cells, row_note, ahead = _mini_body(acc, now, palette)
         for label, cell in row_cells.items():
             cells[label] = max(cells.get(label, 0), cell.cell_len)
@@ -485,6 +494,7 @@ def mini_account_text(
     widths: MiniWidths | None = None,
     width: int | None = None,
     login: str | None = "full",
+    show_tag: bool = True,
 ) -> Text:
     """One minimized line for an inactive account, in fixed columns.
 
@@ -502,7 +512,9 @@ def mini_account_text(
     row's body is as wide as the wider of the cells and the longest such
     note, so the marker field keeps one column.
     ``widths`` (from :func:`mini_widths` over the rows shown) lines the
-    columns up across rows; alone, a row fits itself. A row wider than
+    columns up across rows; alone, a row fits itself. ``show_tag=False``
+    blanks the tag cell (``ui.orgTag``), and the column itself goes when
+    ``widths`` has none. A row wider than
     ``width`` is ellipsized before the marker field, which stays whole and
     starts where the widest field shown would, so the markers still share
     one column. ``login`` is the form of the ``· re-login in …`` note that
@@ -510,17 +522,16 @@ def mini_account_text(
     the marker field, padded so the notes share one column, and is cut with
     it, never before it.
     """
-    widths = widths or mini_widths([acc], now)
+    widths = widths or mini_widths([acc], now, lambda _acc: show_tag)
     cells, note, ahead = _mini_body(acc, now, palette)
     marks = _mini_marks(acc, ahead, palette)
     grid = Text(_MINI_GAP).join(
         _fit(cells.get(label) or Text(), width) for label, width in widths.cells.items()
     )
-    fields = [
-        _fit(_mini_name(acc, palette), widths.name),
-        _fit(_mini_tag(acc, palette), widths.tag),
-        _fit(note or grid, max(grid.cell_len, widths.note)),
-    ]
+    fields = [_fit(_mini_name(acc, palette), widths.name)]
+    if widths.tag:  # a hidden tag is a blank cell, unless no row shows one
+        fields.append(_fit(_mini_tag(acc, palette) if show_tag else Text(), widths.tag))
+    fields.append(_fit(note or grid, max(grid.cell_len, widths.note)))
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
     text.append(Text(_MINI_GAP).join(fields))
@@ -574,7 +585,7 @@ class AccountsPanel(Static):
         panel_width = self.size.width or 80
         width = panel_width - 2
         inactive = [a for a in snap.accounts if not a.is_active and self._show_minis]
-        widths = mini_widths(inactive, now)
+        widths = mini_widths(inactive, now, app.tag_shown)
         # One login-note form for all the minis, so the rows that carry one
         # read alike; only the row without a note is cut to the width, any
         # other form fits whole or steps down, so usage is never cut for it.
@@ -583,7 +594,7 @@ class AccountsPanel(Static):
                 lambda login: [
                     mini_account_text(
                         acc, now, palette=palette, widths=widths, login=login,
-                        width=None if login else width,
+                        width=None if login else width, show_tag=app.tag_shown(acc),
                     )
                     for acc in inactive
                 ],
@@ -597,7 +608,7 @@ class AccountsPanel(Static):
                     fitted_card_text(
                         acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
-                        palette=palette,
+                        palette=palette, show_tag=app.tag_shown(acc),
                     )
                 )
             elif self._show_minis:
@@ -633,6 +644,7 @@ class AccountCard(Static):
         return fitted_card_text(
             self._acc, width, width, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
+            show_tag=self.app.tag_shown(self._acc),
         )
 
 

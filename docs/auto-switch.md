@@ -15,6 +15,8 @@ Set with `--strategy`, or `cswap config set autoswitch.strategy`.
 
 A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is already over its switch lines, it moves to the one with the most quota left before a limit (the lowest usage on its fullest window, whatever line that window carries) under `best`, `weekly-first` and `consume-first` alike, once that account has twice the current one's remaining quota or 3 points more than it, whichever is less. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset. `priority-consume-first` does neither: it holds rather than land on an account over its lines (see [Account priority tiers](#account-priority-tiers)).
 
+Under `consume-first` the margin (10 points by default, `autoswitch.hysteresisPct`) is instead the room a landing needs. A move made below the threshold only lands on an account with at least that many points left under every one of its lines, each window against its own line: the cooldown that move starts would otherwise hold it on an account that crosses its line minutes later. Setting the margin to 0 removes that bar. A move forced by the active account's line prefers targets with that room, under `weekly-first` too, and still takes the soonest reset when none has it. An at-limit or failover escape lands on an account below its lines before one over them under every strategy; under `consume-first` it keeps the soonest-reset order only among accounts with that room, and otherwise takes the one with the most quota left.
+
 ## A separate line for the weekly windows
 
 Set with `--weekly-threshold 97`, or `cswap config set autoswitch.weeklyThreshold 97`.
@@ -38,6 +40,8 @@ To hold an account out of rotation yourself — a work account you don't want to
 By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
 
 **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
+
+A setup-token account (`cswap add-token`) has a Fable row only with `usage.fableProbe` on, next to `usage.headerProbe`. Without it, `--model Fable` leaves that account's reading shown but not used for switching.
 
 ## Accounts with no 5-hour window
 

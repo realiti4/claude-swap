@@ -88,13 +88,13 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
 
 ```bash
-cswap auto                     # foreground loop, polls every 60s
-cswap auto --threshold 80      # switch earlier
-cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
-cswap auto --model Fable       # also switch when the Fable weekly limit is hit
-cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first (more strategies below)
-cswap auto --once              # single check-and-switch, for cron/scripts
-cswap auto --dry-run           # log what it would do, never switch
+cswap auto                           # foreground loop, polls every 60s
+cswap auto --threshold 80            # switch earlier
+cswap auto --weekly-threshold 97     # let the weekly window run higher before switching
+cswap auto --model Fable             # also switch when the Fable weekly limit is hit
+cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first
+cswap auto --once                    # single check-and-switch, for cron/scripts
+cswap auto --dry-run                 # log what it would do, never switch
 ```
 
 <details>
@@ -160,7 +160,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 - **On Windows**, conversations are shared through a directory junction, which needs no special rights; the prompt-history file (`history.jsonl`) is shared only when Windows lets cswap create a symlink (Developer Mode, or an elevated terminal) and otherwise stays per-account.
 - **MCP servers.** User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` stops sharing your `~/.claude` setup (settings, skills, etc.) and removes the mirrored MCP config (profiles that never mirrored are left alone). Chat history is separate: it stays shared unless you also pass `--no-share-history`.
-- **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead.
+- **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead. When that login holds no usable token any more (missing, or emptied by Claude Code after a failed refresh), the account launches in its session profile from its stored login instead, since plain `claude` would only stop at "Not logged in".
 - **Tokens.** A session refreshes its own copy of the account's token; once it exits, the credential it rotated is captured back into the account's stored backup before a switch, swap, move, or usage check uses it. While the session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail) — exit the session first, or pick another account.
 - **Usage.** While a session runs, its account's usage is read with the session's own credential, which cswap never refreshes. A read the server refuses shows as token expired, and isn't retried, until the session renews the credential on its next call.
 
@@ -312,11 +312,12 @@ cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fa
 cswap config set run.shareHistory false   # each account keeps its own chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
+cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
 
-`cswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `cswap config` is just a safer front door. `list` and `get` take `--json` for scripting.
+`cswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `cswap config` is just a safer front door, and it points out any key in the file that nothing reads (a typo, say). `list` and `get` take `--json` for scripting.
 
 </details>
 
@@ -404,8 +405,8 @@ cswap add-token --email user@example.com     # optional label override
 <details>
 <summary>Limits — setup-token usage & API-key accounts</summary>
 
-- **Setup-tokens show `usage unavailable` by default**, because the usage endpoint does not answer them (their scope is inference-only). With `cswap config set usage.headerProbe true`, cswap reads their 5h/7d utilization (and Fable's weekly window) from the rate-limit headers of a 1-output-token Haiku request instead, sent at the normal poll cadence. Each probe is a real (tiny) request on that account's subscription, which is why it is off by default.
-- **What the probe can't do.** Other per-model windows and extra-usage spend are not in those headers. A reading missing the 5h or 7d window (or a window `autoswitch.model` names) is shown but not used for auto-switching. An account the server rejects for quota is marked as at its limit, with no further probe, until the refusal's `Retry-After` passes.
+- **Setup-tokens show `usage unavailable` by default**, because the usage endpoint does not answer them (their scope is inference-only). With `cswap config set usage.headerProbe true`, cswap reads their 5h/7d utilization from the rate-limit headers of a 1-output-token Haiku request instead, sent at the normal poll cadence. `cswap config set usage.fableProbe true` adds Fable's weekly window from a second 1-output-token Fable request per poll (the headers report a model's own weekly limit only on that model's responses; an account without Fable access just shows no Fable row). Once that window is used up, cswap keeps the row and sends no Fable request until it resets, so it does not keep asking a model that would refuse or bill usage credits. Each probe is a real (tiny) request on that account's subscription, which is why both are off by default.
+- **What the probe can't do.** Other per-model windows and extra-usage spend are not in those headers. A reading missing the 5h or 7d window (or a window `autoswitch.model` names; Fable's needs `usage.fableProbe`) is shown but not used for auto-switching. An account the server rejects for quota is marked as at its limit, with no further probe, until the refusal's `Retry-After` passes.
 - **API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token (`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses after `/login` with a key). It switches like any other account, but API keys have no subscription quota, so they show no usage and the usage-aware `switch` strategies never skip them as rate-limited. Use keys scoped to a single workspace: a multi-workspace key needs an `anthropic-workspace-id` header on every request, which Claude Code does not add for a stored key.
 
 </details>

@@ -61,6 +61,15 @@ def _subprocess_env(**extra: str) -> dict[str, str]:
     for var in ("CLAUDE_CONFIG_DIR", "XDG_DATA_HOME"):
         if var not in extra:
             env.pop(var, None)
+    # A child is outside conftest.py's in-process socket guard, and `cli.main`
+    # reaches `check_for_update` -> `urlopen(PYPI_URL)` on most invocations.
+    # Route it through a dead loopback proxy that no_proxy can't bypass.
+    for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        if var not in extra:
+            env[var] = "http://127.0.0.1:1"
+    for var in ("no_proxy", "NO_PROXY"):
+        if var not in extra:
+            env[var] = ""
     return env
 
 
@@ -1196,7 +1205,9 @@ class TestCLICommands:
             sys, "argv", ["claude-swap", "--add-token", "sk-ant-oat01-abc"],
         ), patch.object(
             ClaudeAccountSwitcher, "add_account_from_token"
-        ) as mock_add:
+        ) as mock_add, patch(
+            "claude_swap.update_check.check_for_update", return_value=None
+        ):
             cli.main()
 
         mock_add.assert_called_once_with(
@@ -1220,7 +1231,9 @@ class TestCLICommands:
             ["claude-swap", "--add-token", "mytoken", "--email", "u@example.com"],
         ), patch.object(
             ClaudeAccountSwitcher, "add_account_from_token"
-        ) as mock_add:
+        ) as mock_add, patch(
+            "claude_swap.update_check.check_for_update", return_value=None
+        ):
             cli.main()
 
         mock_add.assert_called_once_with(
@@ -1236,7 +1249,9 @@ class TestCLICommands:
             ["claude-swap", "--add-token", "tok", "--email", "u@example.com", "--slot", "3"],
         ), patch.object(
             ClaudeAccountSwitcher, "add_account_from_token"
-        ) as mock_add:
+        ) as mock_add, patch(
+            "claude_swap.update_check.check_for_update", return_value=None
+        ):
             cli.main()
 
         mock_add.assert_called_once_with(
@@ -1917,6 +1932,28 @@ class TestMapCommand:
         assert "Directory mappings" in out
         assert "work@co.com" in out
         assert "2:" in out  # slot number resolved
+        assert "[personal]" not in out  # sole holder of its email: ``auto`` hides the tag
+
+    @pytest.mark.parametrize("mode, tagged", [("auto", True), ("off", False)])
+    def test_map_list_org_tag_follows_ui_org_tag(self, temp_home, capsys, mode, tagged):
+        from claude_swap.mappings import MappingStore
+        from claude_swap.settings import settings_path
+        switcher = self._seeded_switcher_env(temp_home)
+        data = switcher._get_sequence_data()
+        data["accounts"]["3"] = {
+            **data["accounts"]["2"], "organizationUuid": "org-3", "organizationName": "orgB",
+        }
+        data["sequence"] = [2, 3]
+        switcher._write_json(switcher.sequence_file, data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+        target = temp_home / "proj"
+        target.mkdir()
+        MappingStore(switcher.backup_dir).set(target, "work@co.com", "")
+
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._map_command([])
+
+        assert ("[personal]" in capsys.readouterr().out) is tagged
 
     def test_map_list_flags_removed_account(self, temp_home, capsys):
         from claude_swap.mappings import MappingStore
