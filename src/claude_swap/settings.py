@@ -416,7 +416,8 @@ def _unrecognized(raw: dict) -> list[UnrecognizedKey]:
     """Keys in a parsed settings file that no loader reads, in file order."""
     found = []
     for name, value in raw.items():
-        if name == "schemaVersion":
+        # remoteControl is the pin's record (pin.py); no loader here reads it.
+        if name in ("schemaVersion", "remoteControl"):
             continue
         known = _SECTION_KEYS.get(name)
         if known is None:

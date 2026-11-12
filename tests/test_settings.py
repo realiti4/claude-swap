@@ -573,6 +573,14 @@ class TestUnrecognizedKeys:
         settings_path(tmp_path).write_text(json.dumps({"autoswitch": "best"}))
         assert unrecognized_keys(tmp_path) == []
 
+    def test_pin_record_section_is_not_reported(self, tmp_path: Path):
+        """pin.py reads and writes `remoteControl`; it is read, just not here."""
+        settings_path(tmp_path).write_text(json.dumps({
+            "schemaVersion": 1,
+            "remoteControl": {"pinnedEmail": "a@b.c", "pinnedOrganizationUuid": "u"},
+        }))
+        assert unrecognized_keys(tmp_path) == []
+
     def test_log_names_each_ignored_key(self, tmp_path: Path, caplog):
         settings_path(tmp_path).write_text(json.dumps({
             "autoswitch": {"hysteresisPCT": 5, "futureKnob": True},
