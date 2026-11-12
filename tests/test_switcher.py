@@ -19444,22 +19444,32 @@ class TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores:
         return s
 
     @pytest.mark.parametrize(
-        "variable, hashed, unsuffixed, unreadable, remedy",
+        "variable, hashed, unsuffixed, unreadable, pinned, remedy",
         [
-            pytest.param(False, None, SLOT_1, False, None, id="no-variable"),
-            pytest.param(True, SLOT_1, OTHER, False, "log-out", id="two-logins"),
-            pytest.param(True, None, SLOT_1, False, "unset", id="unsuffixed-only"),
-            pytest.param(True, SLOT_1, None, True, "log-out", id="unsuffixed-unreadable"),
+            pytest.param(False, None, SLOT_1, False, False, None, id="no-variable"),
+            pytest.param(True, SLOT_1, OTHER, False, False, "log-out", id="two-logins"),
+            pytest.param(True, None, SLOT_1, False, False, "unset", id="unsuffixed-only"),
+            pytest.param(True, SLOT_1, None, True, False, "log-out", id="unsuffixed-unreadable"),
+            # A failed Keychain write pinned this process to file mode and the
+            # delete then succeeded: the login is in the file, the hashed item
+            # is gone, and nothing in this process asks the Keychain.
+            pytest.param(True, None, None, False, True, "restart", id="pinned-unsuffixed-empty"),
+            pytest.param(True, None, OTHER, False, True, "unset", id="pinned-unsuffixed-login"),
         ],
     )
     def test_a_landing_leaves_nothing_the_read_still_finds(
         self, temp_home, monkeypatch, block_real_keychain,
-        variable, hashed, unsuffixed, unreadable, remedy,
+        variable, hashed, unsuffixed, unreadable, pinned, remedy,
     ):
         s = self._world(
             temp_home, monkeypatch, block_real_keychain,
             variable=variable, hashed=hashed, unsuffixed=unsuffixed,
         )
+        if pinned:
+            get_credentials_path().write_text(self.SLOT_1)
+            with s._store._pin_lock:
+                s._store._pin_file_mode(residual_cleared=True)
+                s._store._pinned_to_oauth_file = True
         answering = macos_keychain.get_password
         if unreadable:
             def denied(service, account):
@@ -19490,7 +19500,7 @@ class TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores:
         monkeypatch.setattr(macos_keychain, "get_password", answering)
         if remedy == "unset":
             monkeypatch.delenv("CLAUDE_CONFIG_DIR")
-        else:
+        elif remedy == "log-out":
             block_real_keychain.data.pop(
                 (CLAUDE_CODE_KEYCHAIN_SERVICE, _kc.keychain_account_name()), None
             )
