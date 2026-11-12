@@ -247,6 +247,10 @@ class AccountSnapshot:
     #: None for a slot whose plan has never been fetched. Defaulted for the
     #: same reason as ``policy``.
     subscription_plan: dict | None = None
+    # Stored refresh token's expiry (epoch seconds), or None when missing/
+    # unreadable; see oauth.login_expires_at_epoch. Feeds the "re-login in
+    # 5d 12h" note every account view shows while the login is due.
+    login_expires_at: float | None = None
 
     @property
     def display_tag(self) -> str:

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from claude_swap import oauth, pace, subscription
 from claude_swap.models import AccountPolicy
+from claude_swap.poll_policy import parse_reset_ts
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
@@ -96,9 +97,16 @@ def _weekly_window_to_json(entry: dict, fetched_at: float | None) -> dict:
 
 
 def _scoped_window_to_json(entry: dict, fetched_at: float | None) -> dict:
-    """Project a per-model scoped weekly window, carrying its model name."""
+    """Project a per-model scoped weekly window, carrying its model name.
+
+    ``probeAfter`` marks a row the header probe read as spent and keeps
+    until then instead of asking again (``oauth._add_scoped_limits``). It
+    survives export so a machine importing the reading keeps it too.
+    """
     out = _weekly_window_to_json(entry, fetched_at)
     out["name"] = entry["name"]
+    if "probe_after" in entry:
+        out["probeAfter"] = entry["probe_after"]
     return out
 
 
@@ -152,14 +160,24 @@ def _is_number(value: object) -> bool:
     )
 
 
-def _window_from_json(window: object, label: str) -> dict:
-    """One JSON window back to the internal shape, fetch-time strings rebuilt."""
+def _window_from_json(window: object, label: str, nullable: bool = False) -> dict:
+    """One JSON window back to the internal shape, fetch-time strings rebuilt.
+
+    ``nullable`` admits ``"pct": null``, which :func:`usage_to_json` emits for
+    a 5h/7d window the API reported without a utilization figure.
+    """
     if not isinstance(window, dict):
         raise ValueError(f"{label} must be an object")
     pct = window.get("pct")
-    if not _is_number(pct) or pct < 0:
-        raise ValueError(f"{label}.pct must be a non-negative number")
-    out: dict = {"pct": float(pct)}
+    if nullable and "pct" in window and pct is None:
+        pct_value = None
+    elif _is_number(pct) and pct >= 0:
+        pct_value = float(pct)
+    else:
+        raise ValueError(
+            f"{label}.pct must be a non-negative number{' or null' if nullable else ''}"
+        )
+    out: dict = {"pct": pct_value}
     resets_at = window.get("resetsAt")
     if resets_at is not None:
         if not isinstance(resets_at, str):
@@ -179,17 +197,23 @@ def usage_from_json(usage: object) -> dict:
     ``resetsAt``, the spend amounts and the scoped model names. Everything
     derived at serialization (countdown, clock, pace fields) is dropped, and
     the fetch-time strings are rebuilt from ``resets_at``, which gives the
-    shape :func:`oauth.build_usage_result` stores. Raises ``ValueError`` on
-    anything malformed, so an importer can refuse a document before writing
-    any of it.
+    shape :func:`oauth.build_usage_result` stores. A 5h/7d window's ``pct``
+    may be ``null`` (reported without a figure), except in a ``source:
+    headers`` document, which the probe never produces that way. Raises
+    ``ValueError`` on anything malformed, so an importer can refuse a
+    document before writing any of it.
     """
     if not isinstance(usage, dict):
         raise ValueError("usage must be an object")
     out: dict = {}
     if "fiveHour" in usage:
-        out["five_hour"] = _window_from_json(usage["fiveHour"], "fiveHour")
+        out["five_hour"] = _window_from_json(
+            usage["fiveHour"], "fiveHour", nullable=True
+        )
     if "sevenDay" in usage:
-        out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
+        out["seven_day"] = _window_from_json(
+            usage["sevenDay"], "sevenDay", nullable=True
+        )
     if "spend" in usage:
         spend = usage["spend"]
         out_spend = _window_from_json(spend, "spend")
@@ -211,6 +235,11 @@ def usage_from_json(usage: object) -> dict:
             name = window.get("name")
             if not isinstance(name, str) or not name:
                 raise ValueError(f"{label}.name must be a non-empty string")
+            probe_after = window.get("probeAfter")
+            if probe_after is not None:
+                if not isinstance(probe_after, str) or parse_reset_ts(probe_after) is None:
+                    raise ValueError(f"{label}.probeAfter must be an ISO-8601 time")
+                entry["probe_after"] = probe_after
             scoped.append({"name": name, **entry})
         out["scoped"] = scoped
     if "rejected" in usage:
@@ -227,6 +256,11 @@ def usage_from_json(usage: object) -> dict:
     if not out:
         raise ValueError("usage carries no windows")
     if usage.get("source") == oauth.USAGE_SOURCE_HEADERS:
+        # The header probe never reports a window without a figure, and one
+        # would pass the completeness check while contributing no window.
+        for key, label in (("five_hour", "fiveHour"), ("seven_day", "sevenDay")):
+            if key in out and out[key]["pct"] is None:
+                raise ValueError(f"{label}.pct cannot be null in a headers reading")
         out["source"] = oauth.USAGE_SOURCE_HEADERS
     return out
 
@@ -341,6 +375,9 @@ def subscription_plan_fields(record: dict) -> dict:
     for key in ("organizationType", "billingType", "subscriptionStatus"):
         if key in plan:
             fields[key] = plan[key]
+    name = plan.get("planDisplayName")
+    if isinstance(name, str) and name:
+        fields["planDisplayName"] = name
     fields["expired"] = subscription.is_expired(plan)
     fields["fetchedAt"] = _timestamp(record["fetchedAt"])
     return fields

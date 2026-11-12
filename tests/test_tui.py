@@ -555,6 +555,34 @@ class TestUsageRows:
         assert usage_rows(None, time.time()) == []
         assert usage_rows({}, time.time()) == []
 
+    def test_window_without_a_figure_is_a_row_drawn_as_unknown(self):
+        # ``utilization: null`` keeps its row with no pct; the card draws it as
+        # "usage unknown".
+        from claude_swap.tui.widgets import account_card_text, mini_account_text, usage_rows
+
+        entry = make_entry(pct5=47.0, pct7=12.0)
+        entry.last_good["five_hour"]["pct"] = None
+        now = time.time()
+        rows = usage_rows(entry.last_good, now)
+        assert [(label, pct) for label, pct, *_ in rows] == [("5h", None), ("7d", 12.0)]
+        assert rows[0][2].startswith("resets ")
+        card = account_card_text(make_account(1, entry=entry), 80, now=now).plain
+        assert "5h" in card and "usage unknown" in card and " 0%" not in card
+        mini = mini_account_text(make_account(2, entry=entry), now).plain
+        assert "5h ? · 7d 12%" in mini
+
+    @pytest.mark.parametrize("key", ["five_hour", "seven_day"])
+    @pytest.mark.parametrize("width", [60, 70, 80])
+    def test_unknown_row_stays_within_the_card_width(self, key, width):
+        # "usage unknown" is wider than " NNN%": the row must budget for it
+        # when deciding whether the clock-extended reset suffix fits.
+        from claude_swap.tui.widgets import account_card_text
+
+        entry = make_entry(pct5=47.0, pct7=12.0)
+        entry.last_good[key]["pct"] = None
+        card = account_card_text(make_account(1, entry=entry), width, now=time.time()).plain
+        assert all(len(line) <= width for line in card.splitlines()), card
+
     def test_seven_day_ahead_of_pace_marker(self):
         # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
         from claude_swap.tui.widgets import usage_rows

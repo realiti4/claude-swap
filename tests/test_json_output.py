@@ -436,7 +436,7 @@ class TestStatusJson:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_active_account_usage", return_value=entry):
+             patch.object(switcher, "_active_account_usage", return_value=(entry, None)):
             payload = switcher.status(json_output=True)
 
         active = payload["active"]
@@ -803,10 +803,67 @@ class TestUsageFromJson:
         partial = usage_from_json({"fiveHour": {"pct": 5}, "source": "headers"})
         assert oauth.account_headroom(partial) is None
 
+    def test_a_spent_fable_row_keeps_its_probe_pause(self):
+        """Without it the importing machine would ask Fable again on its
+        next poll, where the reading's own machine does not."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            "seven_day": {"pct": 40.0},
+            "scoped": [{
+                "name": "Fable", "pct": 100.0,
+                "resets_at": "2099-01-01T05:00:00+00:00",
+                "probe_after": "2099-01-01T04:00:00+00:00",
+            }],
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        exported = usage_to_json(internal)
+        assert exported["scoped"][0]["probeAfter"] == "2099-01-01T04:00:00+00:00"
+        back = usage_from_json(exported)
+        assert back["scoped"][0]["probe_after"] == "2099-01-01T04:00:00+00:00"
+        # A row with room carries no such field.
+        assert "probeAfter" not in usage_to_json(
+            {"scoped": [{"name": "Fable", "pct": 40.0}]}
+        )["scoped"][0]
+
+    @pytest.mark.parametrize("bad", [5, "soon", ""])
+    def test_an_unreadable_probe_pause_is_refused(self, bad):
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError, match="probeAfter"):
+            usage_from_json(
+                {"scoped": [{"name": "Fable", "pct": 100, "probeAfter": bad}]}
+            )
+
     def test_a_window_without_a_reset_keeps_its_pct(self):
         from claude_swap.json_output import usage_from_json
 
         assert usage_from_json({"fiveHour": {"pct": 3}}) == {"five_hour": {"pct": 3.0}}
+
+    @pytest.mark.parametrize("window, key, other", [
+        ("five_hour", "fiveHour", "seven_day"), ("seven_day", "sevenDay", "five_hour"),
+    ])
+    @pytest.mark.parametrize("resets_at", [None, "2099-01-01T05:00:00+00:00"])
+    def test_a_window_without_a_figure_round_trips(self, window, key, other, resets_at):
+        # ``list --json`` emits ``"pct": null`` for a window reported without a
+        # utilization figure; ``cswap import-usage`` must read that document back.
+        import time
+
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            window: {"pct": None},
+            other: {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
+        }
+        if resets_at:
+            internal[window]["resets_at"] = resets_at
+        exported = usage_to_json(internal, fetched_at=time.time())
+        assert exported[key]["pct"] is None
+        back = usage_from_json(exported)
+        for entry in back.values():
+            entry.pop("countdown", None)
+            entry.pop("clock", None)
+        assert back == internal
 
     @pytest.mark.parametrize("usage", [
         None,
@@ -815,6 +872,12 @@ class TestUsageFromJson:
         {"fiveHour": {"pct": -1}},
         {"fiveHour": {"pct": float("nan")}},
         {"fiveHour": {"pct": True}},
+        {"fiveHour": {}},
+        {"fiveHour": {"pct": None, "resetsAt": "next tuesday"}},
+        {"spend": {"pct": None, "used": 1, "limit": 2, "currency": "USD"}},
+        {"scoped": [{"name": "Fable", "pct": None}]},
+        # a header probe never reports a window without a figure
+        {"fiveHour": {"pct": None}, "sevenDay": {"pct": 5}, "source": "headers"},
         {"sevenDay": {"pct": 1, "resetsAt": "next tuesday"}},
         {"spend": {"pct": 1, "used": 1, "currency": "USD"}},
         {"scoped": [{"pct": 1}]},

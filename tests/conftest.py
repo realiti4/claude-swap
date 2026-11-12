@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import atexit
 import gc
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
-import types
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +23,7 @@ from claude_swap import macos_keychain as _macos_keychain
 from claude_swap import paths as _paths
 
 
-class RealStoreWriteBlocked(Exception):
+class RealStoreWriteBlocked(BaseException):
     """A test process tried to write the REAL account store.
 
     Raised from a process-global ``sys.addaudithook`` — installed once,
@@ -40,15 +44,20 @@ class RealStoreWriteBlocked(Exception):
     ``a@example.com``/``b@example.com`` pair ``EngineHarness.seed`` (this
     repo, ``tests/test_autoswitch.py``) writes.
 
-    I-3 (round 9): deliberately NOT a ``PermissionError``/``OSError``
-    subclass. ``pathlib.Path.mkdir(parents=True, exist_ok=True)`` catches
-    ``OSError`` internally and swallows it when the target already exists —
-    so an ``OSError``-based refusal into an EXISTING protected directory
-    (``cache.write_cache``, ``_atomic_b64_write``, ``_update_global_config``
-    all call ``mkdir(exist_ok=True)``) fired but never reached the caller.
-    A plain ``Exception`` cannot be caught by any ``except OSError:`` in the
-    stdlib or this codebase, so the refusal can no longer be absorbed by
-    the very shape it is meant to guard.
+    Deliberately neither an ``OSError`` nor an ``Exception``: a
+    ``BaseException`` subclass, so that no handler can absorb the refusal.
+
+    * Not an ``OSError``: ``pathlib.Path.mkdir(parents=True, exist_ok=True)``
+      catches ``OSError`` internally and swallows it when the target already
+      exists, so an ``OSError`` refusal into an EXISTING protected directory
+      (``cache.write_cache``, ``_atomic_b64_write``, ``_update_global_config``
+      all call ``mkdir(exist_ok=True)``) never reached the caller. No
+      ``except OSError`` in the stdlib or this codebase catches it.
+    * Not an ``Exception``: src has many ``except Exception`` containments
+      (``check_for_update`` among them), each of which would hide a refusal
+      such as ``main()``'s write of ``<backup root>/cache``. A
+      ``BaseException`` passes them all with no src change; narrowing them is
+      refused (the consume paths' ``except Exception`` is their last defence).
     """
 
 
@@ -436,7 +445,7 @@ sys.addaudithook(_real_store_audit_hook)
 
 class _KeychainStore:
     """In-memory ``(service, account) -> secret`` map standing in for the real
-    macOS Keychain so unit tests never shell out to ``security`` or ``keyring``."""
+    macOS Keychain so unit tests never shell out to ``security``."""
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], str] = {}
@@ -453,41 +462,6 @@ class _KeychainStore:
 
     def delete_password(self, service: str, account: str) -> None:
         self.data.pop((service, account), None)  # absent = no-op (rc 44)
-
-
-def _make_fake_keyring() -> types.ModuleType:
-    """Build an in-memory stand-in for the ``keyring`` module (which would hit the
-    real Keychain on macOS) for code paths that lazily ``import keyring``."""
-
-    class _Errors:
-        class PasswordDeleteError(Exception):
-            pass
-
-        class PasswordSetError(Exception):
-            pass
-
-        class KeyringError(Exception):
-            pass
-
-    store: dict[tuple[str, str], str] = {}
-    mod = types.ModuleType("keyring")
-    mod.errors = _Errors  # type: ignore[attr-defined]
-
-    def get_password(service: str, username: str):
-        return store.get((service, username))
-
-    def set_password(service: str, username: str, password: str) -> None:
-        store[(service, username)] = password
-
-    def delete_password(service: str, username: str) -> None:
-        if (service, username) not in store:
-            raise _Errors.PasswordDeleteError("not found")
-        del store[(service, username)]
-
-    mod.get_password = get_password  # type: ignore[attr-defined]
-    mod.set_password = set_password  # type: ignore[attr-defined]
-    mod.delete_password = delete_password  # type: ignore[attr-defined]
-    return mod
 
 
 @pytest.fixture(autouse=True)
@@ -517,6 +491,18 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    # The menu bar's wrapper .app lives in /Applications, outside $HOME, and
+    # launch_agent.uninstall() deletes it: on a developer's Mac the real one
+    # may be the very app drawing the menu bar while the suite runs.
+    monkeypatch.setattr(
+        "claude_swap.app_bundle.APPLICATIONS_DIR",
+        tmp_path_factory.mktemp("isolated_applications"),
+    )
+    # Frozen at import from the real backup root, so no $HOME redirect reaches it.
+    monkeypatch.setattr(
+        "claude_swap.update_check.CACHE_PATH",
+        tmp_path_factory.mktemp("isolated_update_check") / "update_check.json",
+    )
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
     if "tmp_keychain" in request.fixturenames:
@@ -533,8 +519,7 @@ def block_real_keychain(request, monkeypatch):
     """Safety net: no test may touch the real macOS Keychain.
 
     Replaces the ``security``-CLI wrapper (``claude_swap.macos_keychain``) with an
-    in-memory fake and injects a fake ``keyring`` module (for the lazy
-    ``import keyring`` paths in purge/migrations). Tests marked
+    in-memory fake. Tests marked
     ``@pytest.mark.no_keychain_fake`` opt out — either because they mock
     ``subprocess`` themselves (the wrapper's own unit tests) or because they run
     against a temporary keychain on GitHub Actions.
@@ -549,7 +534,6 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "item_exists", store.item_exists)
     monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
     monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
-    monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
     yield store
 
 
@@ -733,6 +717,49 @@ def _deterministic_poll_jitter(monkeypatch):
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
 
 
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _loopback_only_getaddrinfo(host, *args, **kwargs):
+    """Refuses to resolve any non-loopback host, for the whole test process:
+    ``localhost``, a loopback/unspecified IP literal, and ``None``/``""``
+    still resolve. A ``*_proxy`` naming a loopback proxy defeats this,
+    because urllib then resolves only the proxy. Spawned CLIs are outside
+    this process; they are covered by test_cli.py's ``_subprocess_env``.
+    """
+    if host in (None, "") or (isinstance(host, str) and host.lower() == "localhost"):
+        return _real_getaddrinfo(host, *args, **kwargs)
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        raise socket.gaierror(
+            socket.EAI_NONAME,
+            "blocked by tests/conftest.py network guard: %r" % (host,),
+        )
+    if addr.is_loopback or addr.is_unspecified:
+        return _real_getaddrinfo(host, *args, **kwargs)
+    raise socket.gaierror(
+        socket.EAI_NONAME, "blocked by tests/conftest.py network guard: %r" % (host,)
+    )
+
+
+socket.getaddrinfo = _loopback_only_getaddrinfo
+
+
+def _unreachable_urlopen(*args, **kwargs):
+    """No test may make a live ``urllib`` request, for the whole test process.
+
+    The getaddrinfo guard cannot see a loopback egress proxy (urllib then
+    resolves only the proxy), so a fetch still went out: ~0.8 s each on a
+    host with a proxy, the fake token on the vendor on CI. A test that needs
+    an answer patches ``urllib.request.urlopen`` itself, over this.
+    """
+    raise urllib.error.URLError("network blocked under test")
+
+
+urllib.request.urlopen = _unreachable_urlopen
+
+
 @pytest.fixture(autouse=True)
 def _no_fsync(monkeypatch):
     """Durability is not under test, and one real fsync per atomic write is
@@ -903,3 +930,72 @@ def pytest_configure():
     # unraisable-exception sweep included; the controller and -n 0 never freeze.
     if os.environ.get("PYTEST_XDIST_WORKER"):
         atexit.register(gc.freeze)
+
+
+def _advancing_clock(clock, budget):
+    """A scripted `monotonic` that MOVES ON READ.
+
+    A clock advanced only inside the fake sleep parks on one instant the moment
+    the code under test stops sleeping, so the retry loop never reaches its
+    deadline and the case HANGS instead of failing -- which is worse than the
+    bug, because a hung xdist worker holds the job with nothing to read.
+
+    A FIXED hair does not scale: at a 3s budget it needs three million
+    iterations, and the stale-takeover fires first, so the case reports the
+    wrong failure. The step itself is set below, with why.
+    """
+    # SMALL ENOUGH NOT TO PERTURB. A thousandth of the budget shifts the
+    # remainders these cases assert on; a hundred-thousandth bounds a
+    # sleepless loop at ~100k reads (a fraction of a second) and leaves
+    # every measured remainder unchanged.
+    step = budget / 100000.0
+    # NOT THREAD-SCOPED, and it cannot be: the heartbeat under test runs on
+    # its own thread and must see the clock move (scoping it fails 6 cases,
+    # because the subject IS a thread). The asymmetry with the `fake_sleep`
+    # beside it: a read from an unrelated thread advances this clock too, and
+    # the remainder assert in `test_no_retry_sleep_outlives_the_budget_it_was_
+    # given` would then accuse pristine code. This suite has no such reader.
+
+    def monotonic():
+        clock[0] += step
+        return clock[0]
+
+    return monotonic
+
+
+def _thread_scoped_sleep(module, clock, slept, budget=None, step=0.0):
+    """A recorder for ``module.time.sleep`` bound to the calling thread.
+
+    The patch is process-global, so an unscoped recorder writes every other
+    thread's sleeps into the sample and spins them through a sleep that never
+    sleeps. Records ``(remaining, seconds)`` when ``budget`` is given, else
+    ``seconds``, and advances ``clock`` by the sleep plus ``step`` -- one
+    iteration of work, so a clamped 0.0 cannot park a scripted clock on the
+    deadline.
+    """
+    mine = threading.get_ident()
+    real = module.time.sleep
+
+    def fake_sleep(seconds):
+        if threading.get_ident() != mine:
+            return real(seconds)
+        if budget is None:
+            slept.append(seconds)
+        else:
+            slept.append((round(budget - clock[0], 3), round(seconds, 3)))
+        clock[0] += seconds + step
+
+    return fake_sleep
+
+
+def _crossing_clock(reads):
+    """0.0 twice (start, deadline check), then 0.6 forever: the clamp's own
+    read lands past a 0.5 deadline. Every read is appended to ``reads``."""
+    ticks = iter([0.0, 0.0])
+
+    def clock():
+        tick = next(ticks, 0.6)
+        reads.append(tick)
+        return tick
+
+    return clock
