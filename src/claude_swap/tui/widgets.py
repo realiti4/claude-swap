@@ -284,6 +284,7 @@ def account_card_text(
     now: float | None = None,
     palette: Palette = Palette.DARK,
     cloud_pinned: bool = False,
+    show_tag: bool = True,
     login: str | None = "full",
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
@@ -306,7 +307,8 @@ def account_card_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if cloud_pinned:
@@ -415,6 +417,7 @@ def mini_account_text(
     palette: Palette = Palette.DARK,
     login: str | None = "full",
     cloud_pinned: bool = False,
+    show_tag: bool = True,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -431,7 +434,8 @@ def mini_account_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if cloud_pinned:
         # Labelled, like the full card: a bare glyph sitting between the
         # org tag and the usage figures read as decoration, not as a state.
@@ -554,7 +558,7 @@ class AccountsPanel(Static):
                 lambda login: [
                     mini_account_text(
                         acc, now, palette=palette, login=login,
-                        cloud_pinned=is_pinned(acc),
+                        cloud_pinned=is_pinned(acc), show_tag=app.tag_shown(acc),
                     )
                     for acc in inactive
                 ],
@@ -569,6 +573,7 @@ class AccountsPanel(Static):
                         acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette, cloud_pinned=is_pinned(acc),
+                        show_tag=app.tag_shown(acc),
                     )
                 )
             elif self._show_minis:
@@ -621,6 +626,7 @@ class AccountCard(Static):
             self._acc, width, width, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
             cloud_pinned=self._cloud_pinned,
+            show_tag=self.app.tag_shown(self._acc),
         )
 
 
