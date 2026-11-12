@@ -710,8 +710,17 @@ class CredentialStore:
         one: the unsuffixed item, for a user who has never logged in with the
         variable set. See :func:`_active_oauth_keychain_services`. Returns
         ``(value, failed)`` as :meth:`_read_active_oauth_keychain` does.
+
+        While the Keychain is not in use (a pinned file mode, a cooldown) the
+        item is not asked, and an unasked fallback is an unreadable Keychain,
+        not an empty slot: ``failed`` is True. Asking anyway would go through
+        :meth:`_kc_call`, which re-arms or clears the routing state the pin
+        exists to keep.
         """
-        for service in _active_oauth_keychain_services()[1:]:
+        services = _active_oauth_keychain_services()[1:]
+        if services and self._host.platform == Platform.MACOS and not self._use_keychain():
+            return None, True
+        for service in services:
             value, failed = self._read_one_oauth_keychain(service)
             if value:
                 return value, False
@@ -910,14 +919,7 @@ class CredentialStore:
             and not keychain_failed
             and len(_active_oauth_keychain_services()) > 1
         ):
-            if self._use_keychain():
-                val, keychain_failed = self._read_fallback_oauth_keychain()
-            else:
-                # The Keychain answered for this environment's own item and has
-                # stopped since: the managed-key lookup above failed. The
-                # fallback item was never asked, so finding nothing is an
-                # unreadable Keychain, not an empty slot.
-                val, keychain_failed = None, True
+            val, keychain_failed = self._read_fallback_oauth_keychain()
             self._active_read_failed = keychain_failed
             if val:
                 return ActiveCredentials(val, False)
