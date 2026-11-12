@@ -88,13 +88,13 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
 
 ```bash
-cswap auto                     # foreground loop, polls every 60s
-cswap auto --threshold 80      # switch earlier
-cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
-cswap auto --model Fable       # also switch when the Fable weekly limit is hit
-cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first (more strategies below)
-cswap auto --once              # single check-and-switch, for cron/scripts
-cswap auto --dry-run           # log what it would do, never switch
+cswap auto                           # foreground loop, polls every 60s
+cswap auto --threshold 80            # switch earlier
+cswap auto --weekly-threshold 97     # let the weekly window run higher before switching
+cswap auto --model Fable             # also switch when the Fable weekly limit is hit
+cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first
+cswap auto --once                    # single check-and-switch, for cron/scripts
+cswap auto --dry-run                 # log what it would do, never switch
 ```
 
 <details>
