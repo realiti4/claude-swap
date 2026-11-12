@@ -1090,12 +1090,22 @@ class CredentialStore:
         ``session``'s module docstring on why writing claude's hashed format is
         a hard "logged out" failure when it drifts — so the switch retires the
         stale item and seeds ``.credentials.json``, exactly as session profiles
-        are seeded, and lets claude migrate it on its first write.
+        are seeded, and lets claude migrate it on its first write. That route
+        does not pin file mode once the stale item is verifiably gone: nothing
+        failed, and claude (2.1.322) puts its first rotation back in the
+        Keychain, so the next read has to ask the Keychain first, as claude
+        does. A pin would also move this process's backup writes to ``.enc``
+        files on a Mac whose Keychain works.
 
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
-        if self._use_keychain() and _active_store_is_the_default_secure_store():
+        keychain_usable = self._use_keychain()
+        default_store = keychain_usable and _active_store_is_the_default_secure_store()
+        # The Keychain answers and the file is where this profile's write
+        # belongs: a routing choice, as opposed to a fallback after a failure.
+        deliberate_file_route = keychain_usable and not default_store
+        if default_store:
             try:
                 self._kc_call(
                     macos_keychain.set_password,
@@ -1115,16 +1125,18 @@ class CredentialStore:
                 self._last_active_credentials_backend = "keychain"
                 return
 
-        # File mode: non-macOS, macOS Keychain known unusable, or a Keychain write
-        # that just failed. Write the plaintext file and (macOS) best-effort clear
-        # any stale Keychain entry so Claude Code's keychain-first read can't shadow
-        # it (#30337).
+        # File mode: non-macOS, a custom profile on macOS, macOS Keychain known
+        # unusable, or a Keychain write that just failed. Write the plaintext file
+        # and (macOS) best-effort clear any stale Keychain entry so Claude Code's
+        # keychain-first read can't shadow it (#30337).
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
             raise CredentialWriteError(f"Failed to write credentials: {e}")
         cleared = self._delete_active_keychain_entry()
-        if self._host.platform == Platform.MACOS:
+        if self._host.platform == Platform.MACOS and not (
+            deliberate_file_route and cleared
+        ):
             # The delete above is best-effort; a stale Keychain item may remain.
             # Pin file mode so a later read-timeout cooldown can't re-probe onto
             # that residual and resurrect the wrong account (see _pin_file_mode).

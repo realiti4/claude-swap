@@ -78,6 +78,14 @@ TARGET_SLOT_CREDS = json.dumps({
     }
 })
 
+ROTATED_BY_CLAUDE_CREDS = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-rotated-by-claude",
+        "refreshToken": "rt-rotated-by-claude",
+        "expiresAt": 9999999999000,
+    }
+})
+
 
 def _keychain(mapping: dict[str, str], seen: list[str]):
     """A fake Keychain: only the listed services exist, and record every probe.
@@ -354,6 +362,80 @@ class TestActiveWriteStaysOnOneProfile:
         assert store._last_active_credentials_backend == "keychain"
         assert not (tmp_path / ".claude" / ".credentials.json").exists()
 
+    def test_the_same_store_follows_claudes_rotation_after_the_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """Claude puts its first rotation back in the profile's Keychain item,
+        so a long-running process has to read that item again after its own
+        write. The seed is left in place here: claude removes it when it
+        migrates, but the read must not depend on that."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        hashed = keychain_service_name(str(custom))
+        block_real_keychain.data[(hashed, account)] = CUSTOM_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+        assert store._read_credentials() == TARGET_SLOT_CREDS
+
+        block_real_keychain.data[(hashed, account)] = ROTATED_BY_CLAUDE_CREDS
+
+        assert store._read_credentials() == ROTATED_BY_CLAUDE_CREDS
+
+    def test_a_clean_custom_profile_write_keeps_backups_in_the_keychain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """The file route is a choice here, with the Keychain answering, so it
+        must not move this process's backup writes to ``.enc`` files."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        block_real_keychain.data[
+            (keychain_service_name(str(custom)), account)
+        ] = CUSTOM_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert store._use_keychain() is True
+        assert store._uses_file_backup_backend() is False
+        assert store._residual_verdict is None
+
+    def test_a_failed_delete_under_a_custom_profile_still_pins_file_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """An item that could not be cleared still shadows the seed for claude,
+        so the write must keep the pin and report the read as degraded."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        hashed = keychain_service_name(str(custom))
+        block_real_keychain.data[(hashed, account)] = CUSTOM_PROFILE_CREDS
+
+        def locked(service: str, account: str) -> None:
+            raise macos_keychain.KeychainError("keychain is locked")
+
+        monkeypatch.setattr("claude_swap.macos_keychain.delete_password", locked)
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert (hashed, account) in block_real_keychain.data
+        assert store._use_keychain() is False
+        assert store._residual_verdict is False
+        active = store._read_active_credentials()
+        assert active.value == TARGET_SLOT_CREDS
+        assert active.degraded is True
 
 class TestSecureStorageOverride:
     """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` takes precedence when *defined*.
