@@ -4773,7 +4773,8 @@ class TestActiveAccountRefresh:
         )
         write_live.assert_called_once_with(self._REFRESHED)
         mock_fetch.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED, is_active=True, header_probe=False
+            "1", "test@example.com", self._REFRESHED, is_active=True,
+            header_probe=False, scoped_probe=False, last_usage=None,
         )
         assert result.usage == {"five_hour": {"pct": 9}}
         assert "1" not in switcher._unpersisted
@@ -4815,7 +4816,8 @@ class TestActiveAccountRefresh:
         )
         write_live.assert_called_once_with(self._REFRESHED)
         mock_fetch.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED, is_active=True, header_probe=False
+            "1", "test@example.com", self._REFRESHED, is_active=True,
+            header_probe=False, scoped_probe=False, last_usage=None,
         )
         assert result.usage == {"five_hour": {"pct": 9}}
         assert switcher.list_unclaimed_credentials() == {}
