@@ -335,6 +335,30 @@ class TestUsageSettings:
         assert unset_setting(tmp_path, "usage.headerProbe") is True
         assert load_usage_settings(tmp_path).header_probe is False
 
+    def test_fable_probe_is_an_opt_in_of_its_own(self, tmp_path: Path):
+        # Agreeing to a Haiku token is not agreeing to spend Fable quota.
+        assert set_setting(tmp_path, "usage.headerProbe", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, fable_probe=False
+        )
+        assert set_setting(tmp_path, "usage.fableProbe", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, fable_probe=True
+        )
+        assert unset_setting(tmp_path, "usage.fableProbe") is True
+        assert load_usage_settings(tmp_path).fable_probe is False
+
+    def test_a_non_bool_key_does_not_take_the_other_one_down(
+        self, tmp_path: Path, caplog
+    ):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": True, "fableProbe": "yes"}})
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            loaded = load_usage_settings(tmp_path)
+        assert loaded == UsageSettings(header_probe=True, fable_probe=False)
+        assert "usage.fableProbe must be true or false" in caplog.text
+
 
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):

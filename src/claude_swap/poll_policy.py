@@ -152,6 +152,19 @@ ESCALATION_MARGIN_PCT = 15.0
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
 
+# The header probe's per-model request (``usage.fableProbe``) stops once that
+# model's weekly bucket is spent: usage only rises within a window, so until
+# the bucket resets another request can only be refused or billed to usage
+# credits. Unlike the account-level poll above, which keeps a slow cadence at
+# exhaustion to notice an early grant, this pause is complete, because a
+# request on credits costs money the user did not agree to spend; the price
+# is that a bucket Anthropic resets early reads as spent until its advertised
+# reset. A spent response that names neither a reset nor a Retry-After is
+# asked about again after SCOPED_PROBE_RETRY_S, and no deadline further away
+# than a weekly bucket's own period is honoured.
+SCOPED_PROBE_RETRY_S = 3600.0
+SCOPED_PROBE_MAX_PAUSE_S = 7 * 86400.0
+
 
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
     """Utilization of the binding (worst) relevant window, or None."""
@@ -196,6 +209,45 @@ def parse_reset_ts(resets_at: str | None) -> float | None:
         ).timestamp()
     except ValueError:
         return None
+
+
+def scoped_probe_after(
+    now: float, resets_at: str | None, retry_after_s: float | None
+) -> float:
+    """Epoch before which a per-model bucket just read as spent is not
+    probed again.
+
+    The server's Retry-After when the refusal carried a positive one, else
+    the bucket's reset, else ``SCOPED_PROBE_RETRY_S`` from now. Never past
+    the bucket's reset (the stored row describes nothing after it) and never
+    more than ``SCOPED_PROBE_MAX_PAUSE_S`` away.
+    """
+    reset_ts = parse_reset_ts(resets_at)
+    if retry_after_s is not None and retry_after_s > 0:
+        until = now + retry_after_s
+    elif reset_ts is not None:
+        until = reset_ts
+    else:
+        until = now + SCOPED_PROBE_RETRY_S
+    if reset_ts is not None:
+        until = min(until, reset_ts)
+    return min(until, now + SCOPED_PROBE_MAX_PAUSE_S)
+
+
+def scoped_probe_paused(row: dict, now: float) -> bool:
+    """Whether a stored per-model row is still kept in place of a new probe.
+
+    True while its ``probe_after`` (:func:`scoped_probe_after`) lies ahead
+    and its own reset has not passed. A deadline more than
+    ``SCOPED_PROBE_MAX_PAUSE_S`` away is not one this module writes (a
+    reading imported from another machine can carry anything), so it pauses
+    nothing.
+    """
+    until = parse_reset_ts(row.get("probe_after"))
+    if until is None or not now < until <= now + SCOPED_PROBE_MAX_PAUSE_S:
+        return False
+    reset_ts = parse_reset_ts(row.get("resets_at"))
+    return reset_ts is None or now < reset_ts
 
 
 def plan_after_fetch(

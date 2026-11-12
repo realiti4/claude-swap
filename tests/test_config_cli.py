@@ -55,6 +55,7 @@ class TestConfigList:
             "pin.desktopFollows",
             "pin.connectorsFollowPin",
             "usage.headerProbe",
+            "usage.fableProbe",
         ):
             assert key in out
         # From the schema, not a literal: a bare count drifts every time a
@@ -204,6 +205,17 @@ class TestConfigSetGet:
         assert f"pin.{key} = false" in out
         _, out, _ = _run(["get", f"pin.{key}"], capsys)
         assert out.strip() == "false"
+
+    def test_fable_probe_alone_says_it_needs_the_header_probe(
+        self, temp_home, capsys
+    ):
+        code, out, err = _run(["set", "usage.fableProbe", "true"], capsys)
+        assert code == 0
+        assert "usage.fableProbe = true" in out
+        assert "does nothing until usage.headerProbe is true" in err
+        code, _, err = _run(["set", "usage.headerProbe", "true"], capsys)
+        assert code == 0
+        assert err == ""
 
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)

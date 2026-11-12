@@ -1185,6 +1185,7 @@ def _config_command(argv: list[str]) -> None:
         SETTING_SPECS,
         effective_settings,
         format_setting_value,
+        load_usage_settings,
         set_setting,
         setting_spec,
         settings_path,
@@ -1309,6 +1310,20 @@ Examples:
         elif action == "set":
             value = set_setting(root, args.key, args.value)
             print(f"{args.key} = {format_setting_value(value)}")
+            usage = load_usage_settings(root)
+            if (
+                args.key.startswith("usage.")
+                and usage.fable_probe
+                and not usage.header_probe
+            ):
+                # The Fable probe rides on the header probe's request cycle.
+                print(
+                    muted(
+                        "usage.fableProbe does nothing until "
+                        "usage.headerProbe is true"
+                    ),
+                    file=sys.stderr,
+                )
         elif action == "unset":
             if unset_setting(root, args.key):
                 default = setting_spec(args.key).default
