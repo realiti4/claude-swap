@@ -8579,9 +8579,8 @@ class ClaudeAccountSwitcher:
         # claude reads for this environment and never the fallback one, which
         # belongs to a claude started without CLAUDE_CONFIG_DIR; the re-read
         # then finds it and refuses, after the live item is already gone. A
-        # process pinned to file mode never asks that item, so the re-read
-        # would report an empty slot a fresh process does not see: the helper
-        # answers "unreadable" there, and this refuses too.
+        # process pinned to file mode never asks that item and would re-read
+        # "empty"; the helper answers "unreadable" there instead.
         other, unreadable = self._store._read_fallback_oauth_keychain()
         if other or unreadable:
             raise SwitchError(
