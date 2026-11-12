@@ -1080,10 +1080,11 @@ class TestMdatLookupIsPinnedToTheServingService:
         assert store._active_oauth_keychain_mdat(kc_service) is None, (
             "the mdat lookup wandered to svc-b, which never served the value"
         )
-        # CONTROL: an unpinned (scanning) lookup DOES find svc-b's mdat --
-        # proving pinning, not an unreachable fake, is what the assertion
-        # above depends on.
-        assert store._active_oauth_keychain_mdat(None) == 1_000_000.0
+        # CONTROL: svc-b's mdat IS readable when asked for by name -- proving
+        # pinning, not an unreachable fake, is what the assertion above
+        # depends on. Unpinned, the lookup stays on the first name.
+        assert store._active_oauth_keychain_mdat("svc-b") == 1_000_000.0
+        assert store._active_oauth_keychain_mdat() is None
 
 
 class TestTheLineageJitterToleranceIsPublic:

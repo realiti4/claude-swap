@@ -23054,6 +23054,42 @@ class TestT1313LoginRestore:
         ):
             assert s._live_write_time() == 1_000_000.0, "the file is later"
 
+    @pytest.mark.parametrize(
+        "hashed_mdat, other_mdat, file_mtime, expected",
+        [
+            pytest.param(3e6, 2e6, 1e6, 3e6, id="the-hashed-item-is-the-store"),
+            pytest.param(None, 2e6, 1e6, 1e6, id="the-other-login-is-not-this-environments"),
+            pytest.param(None, 2e6, None, None, id="no-store-of-its-own"),
+        ],
+    )
+    def test_the_write_time_is_the_environments_own_item_under_the_default_profile(
+        self, temp_home, monkeypatch, block_real_keychain,
+        hashed_mdat, other_mdat, file_mtime, expected,
+    ):
+        """With CLAUDE_CONFIG_DIR naming ~/.claude, a claude started without it
+        keeps another login in the unsuffixed item. Its mdat dates a write to
+        a store this environment never reads, so it cannot stand in for the
+        live store's write time, or the settle floor waits on that login."""
+        from claude_swap.session import keychain_service_name
+
+        default = temp_home / ".claude"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(default))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        account = _kc.keychain_account_name()
+        for service, mdat in (
+            (keychain_service_name(str(default)), hashed_mdat),
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, other_mdat),
+        ):
+            if mdat is not None:
+                block_real_keychain.data[(service, account)] = "{}"
+                block_real_keychain.mtimes[(service, account)] = mdat
+        if file_mtime is not None:
+            get_credentials_path().write_text("{}")
+            os.utime(get_credentials_path(), (file_mtime, file_mtime))
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        assert s._live_write_time() == expected
+
 
 class TestLoginLineHelper:
     """`_log_detected_login`: every detected login gets exactly one INFO

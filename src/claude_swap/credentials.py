@@ -737,17 +737,14 @@ class CredentialStore:
         :meth:`_read_active_oauth_keychain` call served its value from —
         required whenever such a value is in hand, since re-scanning the
         try-order independently could stop at a different item than the one
-        that produced it. With none given, scans the try-order itself and
-        returns the first hit (there is no prior read to pin to).
+        that produced it. With none given (no prior read to pin to), the item
+        claude reads for this environment, the first name: a later one is
+        another login's, and its write time says nothing about this store.
         """
-        account = macos_keychain.keychain_account_name()
-        if service is not None:
-            return macos_keychain.item_modified_at(service, account)
-        for svc in _active_oauth_keychain_services():
-            mdat = macos_keychain.item_modified_at(svc, account)
-            if mdat is not None:
-                return mdat
-        return None
+        return macos_keychain.item_modified_at(
+            service or _active_oauth_keychain_services()[0],
+            macos_keychain.keychain_account_name(),
+        )
 
     def _read_one_oauth_keychain(self, service: str) -> tuple[str | None, bool]:
         """Read one OAuth Keychain item with a bounded retry.
