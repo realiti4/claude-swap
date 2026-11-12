@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch``, ``ui``, ``run``, ``updates`` and ``usage`` sections; other sections can
+``autoswitch``, ``ui``, ``run``, ``updates``, ``usage`` and ``notify`` sections; other sections can
 be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
@@ -118,12 +118,33 @@ class UsageSettings:
     header_probe: bool = False
 
 
+# Auto-switch event kinds ``notify.events`` selects by default: the ones a
+# person away from the terminal would act on. ``poll``, ``sleep`` and
+# ``no-switch`` fire every tick and are never sent unless named.
+NOTIFY_DEFAULT_EVENTS = "switch,account-quarantined,all-exhausted,error"
+
+
+@dataclass(frozen=True)
+class NotifySettings:
+    """Event notifications (``notify`` section); see ``notify.py``.
+
+    ``command``: a shell command run for each selected auto-switch event, with
+    the event as JSON on stdin and a ready-made title and message in the
+    environment. None (the default) sends nothing. ``events``: comma-separated
+    event kinds to send.
+    """
+
+    command: str | None = None
+    events: str = NOTIFY_DEFAULT_EVENTS
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "run": RunSettings,
     "updates": UpdateSettings,
     "usage": UsageSettings,
+    "notify": NotifySettings,
 }
 
 
@@ -211,6 +232,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "usage", "headerProbe", "header_probe", "bool",
             help="Read setup-token usage from a 1-token Haiku request's rate-limit headers (opt-in: uses quota)",
+        ),
+        SettingSpec(
+            "notify", "command", "command", "string",
+            help="Shell command run on auto-switch events (event JSON on stdin; CSWAP_TITLE/CSWAP_MESSAGE in env)",
+        ),
+        SettingSpec(
+            "notify", "events", "events", "string",
+            help="Comma-separated auto-switch event kinds that run notify.command",
         ),
     )
 }
@@ -399,6 +428,28 @@ def load_usage_settings(backup_root: Path) -> UsageSettings:
     return UsageSettings(header_probe=header_probe)
 
 
+def load_notify_settings(backup_root: Path) -> NotifySettings:
+    """Load the notify section; a missing, empty or non-string value → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("notify")
+    default = NotifySettings()
+    if not isinstance(section, dict):
+        return default
+    values = {}
+    for key, field in (("command", "command"), ("events", "events")):
+        value = section.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():
+            values[field] = value.strip()
+        else:
+            _logger.warning(
+                "settings.json: notify.%s must be a non-empty string, got %r; "
+                "using %r", key, value, getattr(default, field),
+            )
+    return NotifySettings(**values)
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
@@ -573,6 +624,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
         "usage": load_usage_settings(backup_root),
+        "notify": load_notify_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

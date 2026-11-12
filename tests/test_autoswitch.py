@@ -7433,3 +7433,22 @@ class TestHeaderProbeReadings:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+class TestNotifyHook:
+    """The engine offers its events to notify.command (see test_notify.py)."""
+
+    def test_engine_notifies_and_dry_run_does_not(self, temp_home: Path):
+        from claude_swap.settings import set_setting
+
+        h = EngineHarness(temp_home)
+        set_setting(h.switcher.backup_dir, "notify.command", "true")
+        sent: list = []
+        engine = h._make_engine()
+        assert engine._notifier is not None
+        engine._notifier._runner = lambda cmd, payload, env: sent.append(env["CSWAP_EVENT"]) or 0
+        engine._notifier._background = False
+        engine._emit(ErrorEvent(message="boom"))
+        assert sent == ["error"]
+        assert h.events[-1].kind == "error"  # the frontend still gets it
+        assert h._make_engine(dry_run=True)._notifier is None
