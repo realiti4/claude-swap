@@ -95,6 +95,7 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import (
+    UsageSettings,
     load_settings,
     load_usage_settings,
     parse_model_names,
@@ -444,8 +445,8 @@ class ClaudeAccountSwitcher:
             float | None, tuple[float, float | None, tuple[str, ...]]
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
-        # (settings mtime, usage.headerProbe) — see _header_probe_enabled.
-        self._header_probe_cache: tuple[float | None, bool] | None = None
+        # (settings mtime, the usage section) — see _usage_settings.
+        self._usage_settings_cache: tuple[float | None, UsageSettings] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -2077,20 +2078,32 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
-    def _header_probe_enabled(self) -> bool:
-        """``usage.headerProbe`` from the settings file (reloaded only when it
+    def _usage_settings(self) -> UsageSettings:
+        """The ``usage`` section of the settings file (reloaded only when it
         changes — one stat per fetch)."""
         path = settings_path(self.backup_dir)
         try:
             mtime: float | None = path.stat().st_mtime
         except OSError:
             mtime = None
-        cache = getattr(self, "_header_probe_cache", None)
+        cache = getattr(self, "_usage_settings_cache", None)
         if cache is not None and cache[0] == mtime:
             return cache[1]
-        enabled = load_usage_settings(self.backup_dir).header_probe
-        self._header_probe_cache = (mtime, enabled)
-        return enabled
+        loaded = load_usage_settings(self.backup_dir)
+        self._usage_settings_cache = (mtime, loaded)
+        return loaded
+
+    def _probe_options(self, last_usage: dict | None) -> dict:
+        """The header-probe arguments of ``oauth.try_fetch_usage_for_account``
+        for a setup-token account: ``usage.headerProbe``, ``usage.fableProbe``
+        and the account's stored reading, which tells the probe that a
+        per-model bucket is spent and not to be asked about again yet."""
+        usage = self._usage_settings()
+        return {
+            "header_probe": usage.header_probe,
+            "scoped_probe": usage.fable_probe,
+            "last_usage": last_usage,
+        }
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -4683,7 +4696,12 @@ class ClaudeAccountSwitcher:
         return accounts_info
 
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str, org_uuid: str = ""
+        self,
+        account_num: str,
+        email: str,
+        creds: str,
+        org_uuid: str = "",
+        last_usage: dict | None = None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -4751,7 +4769,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
-                header_probe=self._header_probe_enabled(),
+                **self._probe_options(last_usage),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -5243,7 +5261,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
-            header_probe=self._header_probe_enabled(),
+            **self._probe_options(last_usage),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5435,16 +5453,20 @@ class ClaudeAccountSwitcher:
         self,
         account_info: tuple[int, str, str, str, bool, str, str],
         rejected_fp: str | None = None,
+        last_usage: dict | None = None,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises. ``rejected_fp``
-        is the row's refused-credential stamp, if any."""
+        is the row's refused-credential stamp, if any, and ``last_usage`` its
+        stored reading (see ``_probe_options``)."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds, org_uuid)
+            return self._fetch_active_usage(
+                str(num), email, creds, org_uuid, last_usage
+            )
 
         from claude_swap.session import (
             read_session_credentials,
@@ -5519,7 +5541,9 @@ class ClaudeAccountSwitcher:
                 # active account in _fetch_active_usage).
                 if oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                return self._read_only_fetch(str(num), email, session_creds, rejected_fp)
+                return self._read_only_fetch(
+                    str(num), email, session_creds, rejected_fp, last_usage
+                )
 
         if has_live_session or self._is_default_login_from_another_profile(
             email, org_uuid
@@ -5538,13 +5562,15 @@ class ClaudeAccountSwitcher:
             backup_oauth = oauth.extract_oauth_data(creds) or {}
             if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-            return self._read_only_fetch(str(num), email, creds, rejected_fp)
+            return self._read_only_fetch(
+                str(num), email, creds, rejected_fp, last_usage
+            )
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=False,
             refresh_via=self.consume_backup_grant,
-            header_probe=self._header_probe_enabled(),
+            **self._probe_options(last_usage),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5554,7 +5580,12 @@ class ClaudeAccountSwitcher:
         )
 
     def _read_only_fetch(
-        self, num: str, email: str, creds: str, rejected_fp: str | None
+        self,
+        num: str,
+        email: str,
+        creds: str,
+        rejected_fp: str | None,
+        last_usage: dict | None = None,
     ) -> FetchRecord:
         """A fetch with a live session's credential, which cswap must never
         refresh. A 401 is the live claude having rotated past the copy we
@@ -5568,7 +5599,7 @@ class ClaudeAccountSwitcher:
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
         outcome = oauth.try_fetch_usage_for_account(
             num, email, creds, is_active=True,
-            header_probe=self._header_probe_enabled(),
+            **self._probe_options(last_usage),
         )
         if outcome.error == "http-401":
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
@@ -5585,7 +5616,8 @@ class ClaudeAccountSwitcher:
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant. ``entries``
-        is the pre-fetch snapshot, for each row's refused-credential stamp."""
+        is the pre-fetch snapshot, for each row's refused-credential stamp
+        and stored reading."""
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
@@ -5595,7 +5627,9 @@ class ClaudeAccountSwitcher:
             num = str(info[0])
             entry = entries.get(num) if entries else None
             return num, self._fetch_account_usage(
-                info, entry.rejected_fingerprint if entry else None
+                info,
+                entry.rejected_fingerprint if entry else None,
+                entry.last_good if entry else None,
             )
 
         with ThreadPoolExecutor() as executor:
