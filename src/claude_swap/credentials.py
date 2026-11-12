@@ -711,14 +711,16 @@ class CredentialStore:
         variable set. See :func:`_active_oauth_keychain_services`. Returns
         ``(value, failed)`` as :meth:`_read_active_oauth_keychain` does.
 
-        While the Keychain is not in use (a pinned file mode, a cooldown) the
-        item is not asked, and an unasked fallback is an unreadable Keychain,
-        not an empty slot: ``failed`` is True. Asking anyway would go through
-        :meth:`_kc_call`, which re-arms or clears the routing state the pin
-        exists to keep.
+        Off macOS there is no Keychain. On macOS while it is not in use (a
+        pinned file mode, a cooldown) the item is not asked, and an unasked
+        fallback is an unreadable Keychain, not an empty slot: ``failed`` is
+        True. Asking anyway goes through :meth:`_kc_call`, which re-arms or
+        clears the routing state the pin exists to keep.
         """
+        if self._host.platform != Platform.MACOS:
+            return None, False
         services = _active_oauth_keychain_services()[1:]
-        if services and self._host.platform == Platform.MACOS and not self._use_keychain():
+        if services and not self._use_keychain():
             return None, True
         for service in services:
             value, failed = self._read_one_oauth_keychain(service)
