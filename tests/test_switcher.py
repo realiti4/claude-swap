@@ -19444,32 +19444,35 @@ class TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores:
         return s
 
     @pytest.mark.parametrize(
-        "variable, hashed, unsuffixed, lands",
+        "variable, hashed, unsuffixed, unreadable, remedy",
         [
-            pytest.param(False, None, SLOT_1, True, id="no-variable"),
-            pytest.param(True, SLOT_1, OTHER, False, id="two-logins"),
-            pytest.param(True, None, SLOT_1, False, id="unsuffixed-only"),
+            pytest.param(False, None, SLOT_1, False, None, id="no-variable"),
+            pytest.param(True, SLOT_1, OTHER, False, "log-out", id="two-logins"),
+            pytest.param(True, None, SLOT_1, False, "unset", id="unsuffixed-only"),
+            pytest.param(True, SLOT_1, None, True, "log-out", id="unsuffixed-unreadable"),
         ],
     )
     def test_a_landing_leaves_nothing_the_read_still_finds(
         self, temp_home, monkeypatch, block_real_keychain,
-        variable, hashed, unsuffixed, lands,
+        variable, hashed, unsuffixed, unreadable, remedy,
     ):
         s = self._world(
             temp_home, monkeypatch, block_real_keychain,
             variable=variable, hashed=hashed, unsuffixed=unsuffixed,
         )
+        answering = macos_keychain.get_password
+        if unreadable:
+            def denied(service, account):
+                if service == CLAUDE_CODE_KEYCHAIN_SERVICE:
+                    raise KeychainError("denied")
+                return answering(service, account)
+
+            monkeypatch.setattr(macos_keychain, "get_password", denied)
+            monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
         before = dict(block_real_keychain.data)
 
-        if lands:
-            result = s.switch_to("2", json_output=True)
-            assert result["needsLogin"] is True
-            assert s._get_sequence_data()["activeAccountNumber"] == 2
-            fresh = ClaudeAccountSwitcher()
-            fresh.platform = Platform.MACOS
-            assert fresh._store._read_active_credentials().value == "", (
-                "the landing reported success over a store the read still finds"
-            )
+        if remedy is None:
+            self._assert_lands(s)
             return
 
         with pytest.raises(SwitchError, match="Nothing was changed"):
@@ -19479,6 +19482,28 @@ class TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores:
         )
         assert s._get_sequence_data()["activeAccountNumber"] == 1
 
+        # The remedy the message names, applied, and the retry lands.
+        monkeypatch.setattr(macos_keychain, "get_password", answering)
+        if remedy == "unset":
+            monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        else:
+            block_real_keychain.data.pop(
+                (CLAUDE_CODE_KEYCHAIN_SERVICE, _kc.keychain_account_name()), None
+            )
+        retry = ClaudeAccountSwitcher()
+        retry.platform = Platform.MACOS
+        self._assert_lands(retry)
+
+    @staticmethod
+    def _assert_lands(s):
+        result = s.switch_to("2", json_output=True)
+        assert result["needsLogin"] is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        fresh = ClaudeAccountSwitcher()
+        fresh.platform = Platform.MACOS
+        assert fresh._store._read_active_credentials().value == "", (
+            "the landing reported success over a store the read still finds"
+        )
 
 def test_keychain_blind_probes_rather_than_reading_an_unset_cache(
     temp_home: Path, monkeypatch
