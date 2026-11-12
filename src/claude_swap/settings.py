@@ -8,11 +8,15 @@ Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
+A key nothing reads (a typo, or a key from another version) is kept in the
+file but changes nothing. ``unrecognized_keys`` finds those: `cswap config`
+lists them and the auto-switch loop logs them as it starts.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import json
 import logging
 import math
@@ -221,6 +225,41 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
     if spec.section == "autoswitch"
 }
 
+# Every key the loaders read, per section. Anything else in the file is read
+# by nothing.
+_SECTION_KEYS: dict[str, tuple[str, ...]] = {
+    section: tuple(
+        spec.json_key for spec in SETTING_SPECS.values() if spec.section == section
+    )
+    for section in _SECTION_DEFAULT_SOURCES
+}
+
+# How alike two names must be (difflib ratio, compared without case) before
+# one is offered as the spelling the other meant. 0.75 covers a wrong case, a
+# dropped or doubled letter and a missing suffix ("hysteresis"), and stays
+# clear of unrelated keys that merely share a word ("graceSeconds").
+_TYPO_CUTOFF = 0.75
+
+
+@dataclass(frozen=True)
+class UnrecognizedKey:
+    """A key in settings.json that nothing reads, so it changes nothing.
+
+    ``dotted`` is ``section.key`` for a key inside a known section and the
+    bare name for a top-level key that is not a section. ``suggestion`` is
+    the valid name it most resembles, when one is close enough to be a typo.
+    """
+
+    dotted: str
+    suggestion: str | None = None
+
+    def describe(self) -> str:
+        hint = f"; did you mean {self.suggestion}?" if self.suggestion else ""
+        return (
+            f"{self.dotted} is not a key this version reads, "
+            f"so it has no effect{hint}"
+        )
+
 
 def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
@@ -309,6 +348,55 @@ def _read_raw(path: Path) -> dict:
         _logger.warning("%s is not a JSON object; using defaults", path)
         return {}
     return raw
+
+
+def _nearest(name: str, valid: tuple[str, ...]) -> str | None:
+    """The valid name ``name`` most resembles, or None when none is close."""
+    by_lower = {v.lower(): v for v in valid}
+    close = difflib.get_close_matches(
+        name.lower(), by_lower, n=1, cutoff=_TYPO_CUTOFF
+    )
+    return by_lower[close[0]] if close else None
+
+
+def _unrecognized(raw: dict) -> list[UnrecognizedKey]:
+    """Keys in a parsed settings file that no loader reads, in file order."""
+    found = []
+    for name, value in raw.items():
+        if name == "schemaVersion":
+            continue
+        known = _SECTION_KEYS.get(name)
+        if known is None:
+            found.append(UnrecognizedKey(name, _nearest(name, tuple(_SECTION_KEYS))))
+        elif isinstance(value, dict):
+            for key in value:
+                if key not in known:
+                    near = _nearest(key, known)
+                    found.append(
+                        UnrecognizedKey(
+                            f"{name}.{key}", f"{name}.{near}" if near else None
+                        )
+                    )
+    return found
+
+
+def unrecognized_keys(backup_root: Path) -> list[UnrecognizedKey]:
+    """Keys in settings.json that nothing reads: a typo'd or misplaced key,
+    or one written by another version. They survive every write; they just
+    do nothing, which the file alone does not show."""
+    return _unrecognized(_read_raw(settings_path(backup_root)))
+
+
+def log_unrecognized_keys(backup_root: Path) -> None:
+    """Log one warning per key ``unrecognized_keys`` finds.
+
+    For a process that keeps running to call once as it starts, not for the
+    loaders: they run on every command, so a key left in the file would add
+    a line to the log each time, and the first of them runs before the log
+    file is attached, where a warning lands on stderr instead.
+    """
+    for item in unrecognized_keys(backup_root):
+        _logger.warning("settings.json: %s", item.describe())
 
 
 def load_settings(backup_root: Path) -> AutoSwitchSettings:

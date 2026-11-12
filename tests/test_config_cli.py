@@ -91,6 +91,61 @@ class TestConfigList:
         assert by_key["autoswitch.weeklyThreshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
         assert by_key["updates.check"]["value"] is True
+        assert payload["unrecognized"] == []
+
+    def test_list_warns_about_keys_nothing_reads(self, temp_home, capsys):
+        path = _settings_file(capsys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 98.0, "hysteresisPCT": 5, "futureKnob": True},
+        }))
+        code, out, err = _run([], capsys)
+        assert code == 0
+        # The table is unchanged: the setting the typo was meant for still
+        # shows its default, and the warning is what explains why.
+        hysteresis_line = next(
+            ln for ln in out.splitlines() if "hysteresisPct" in ln
+        )
+        assert "(default)" in hysteresis_line
+        assert "hysteresisPCT" not in out
+        assert (
+            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+            "reads, so it has no effect; did you mean autoswitch.hysteresisPct?"
+        ) in err
+        assert (
+            "settings.json: autoswitch.futureKnob is not a key this version "
+            "reads, so it has no effect"
+        ) in err
+        assert "did you mean autoswitch.futureKnob" not in err
+
+    def test_list_is_quiet_when_every_key_is_read(self, temp_home, capsys):
+        _run(["set", "autoswitch.threshold", "80"], capsys)
+        code, _, err = _run([], capsys)
+        assert code == 0
+        assert "settings.json" not in err
+
+    def test_json_list_names_keys_nothing_reads(self, temp_home, capsys):
+        path = _settings_file(capsys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "autoSwitch": {"threshold": 70},
+            "autoswitch": {"cooldownSecond": 600, "futureKnob": True},
+        }))
+        code, out, err = _run(["--json"], capsys)
+        assert code == 0
+        # The payload carries them; a second copy on stderr would be noise.
+        assert "settings.json" not in err
+        payload = json.loads(out)
+        assert payload["unrecognized"] == [
+            {"key": "autoSwitch", "suggestion": "autoswitch"},
+            {
+                "key": "autoswitch.cooldownSecond",
+                "suggestion": "autoswitch.cooldownSeconds",
+            },
+            {"key": "autoswitch.futureKnob", "suggestion": None},
+        ]
+        assert len(payload["settings"]) == 13
 
 
 class TestConfigSetGet:
