@@ -574,6 +574,35 @@ class TestExplicitDefaultProfileKeepsTheOtherLogin:
         assert fresh._read_credentials() == TARGET_SLOT_CREDS
 
 
+    def test_a_failed_key_lookup_does_not_report_an_empty_login(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """The managed key is looked up before the unsuffixed login. When that
+        lookup fails the Keychain stops being asked, so the login behind it was
+        never looked for: that is an unreadable Keychain, and reporting an
+        empty slot would send the user to a re-login that cannot help."""
+        default, hashed, unsuffixed = self._two_logins(
+            tmp_path, monkeypatch, block_real_keychain
+        )
+        del block_real_keychain.data[hashed]
+        answering = macos_keychain.get_password
+
+        def managed_item_times_out(service: str, account: str):
+            if service == CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE:
+                raise macos_keychain.KeychainError("keychain did not answer")
+            return answering(service, account)
+
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password", managed_item_times_out
+        )
+
+        active = CredentialStore(_Host(tmp_path / "backups"))._read_active_credentials()
+
+        assert active.value == ""
+        assert active.keychain_unavailable is True
+        assert active.degraded is True
+
+
 class TestSecureStorageOverride:
     """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` takes precedence when *defined*.
 

@@ -798,8 +798,19 @@ class CredentialStore:
         # never this one, so a seed or a key that a switch just wrote for this
         # environment has to win over it. An unreadable Keychain is a property
         # of the Keychain, so a failed read is not retried under a second name.
-        if keychain_asked and not keychain_failed and self._use_keychain():
-            val, keychain_failed = self._read_fallback_oauth_keychain()
+        if (
+            keychain_asked
+            and not keychain_failed
+            and len(_active_oauth_keychain_services()) > 1
+        ):
+            if self._use_keychain():
+                val, keychain_failed = self._read_fallback_oauth_keychain()
+            else:
+                # The Keychain answered for this environment's own item and has
+                # stopped since: the managed-key lookup above failed. The
+                # fallback item was never asked, so finding nothing is an
+                # unreadable Keychain, not an empty slot.
+                val, keychain_failed = None, True
             self._active_read_failed = keychain_failed
             if val:
                 return ActiveCredentials(val, False)
