@@ -1438,12 +1438,19 @@ class TestSetupTokenHeaderProbe:
         assert "rejected" not in usage
         assert oauth.account_headroom(usage) == 40.0
 
-    @pytest.mark.parametrize("claim", ["five_hour", "seven_day"])
+    @pytest.mark.parametrize("claim", [
+        # The account's own window filled between the two probes.
+        "five_hour", "seven_day",
+        # The usage credits ran out, as Claude Code 2.1.322 names that limit.
+        "overage",
+        "seven_day_opus", "a_limit_added_later",
+    ])
     @pytest.mark.parametrize("served", [False, True])
-    def test_the_accounts_own_limit_is_not_fables(self, claim, served):
-        """The account reached its 5h or 7d limit between the two probes:
-        that refusal says nothing about Fable's bucket, so the row keeps
-        its own figure and is asked about again."""
+    def test_a_rejection_naming_another_limit_is_not_fables(self, claim, served):
+        """Only Fable's own claim, or none, makes the unified status speak
+        for Fable's bucket. Under any other the row keeps its own figure
+        and is asked about again: a bucket wrongly paused stays wrong for
+        days, one wrongly asked about is corrected by the next poll."""
         headers = self._fable_headers(
             status="rejected", representative__claim=claim,
             **{"7d_oi__utilization": "0.4", "7d_oi__status": "allowed"},
@@ -1578,17 +1585,39 @@ class TestSetupTokenHeaderProbe:
         assert "rejected" in outcome.usage
         assert "scoped" not in outcome.usage
 
-    def test_a_spent_fable_row_survives_a_refused_main_probe(self):
-        """Otherwise the reading after the refusal would ask Fable again."""
+    @pytest.mark.parametrize("main", [
+        pytest.param(
+            {**_UNIFIED_HEADERS, "Retry-After": "600"}, id="readable-windows",
+        ),
+        # The reading then drops the account's windows and keeps the refusal.
+        pytest.param(
+            {"anthropic-ratelimit-unified-5h-status": "rejected",
+             "anthropic-ratelimit-unified-7d-utilization": "0.6"},
+            id="a-window-without-a-figure",
+        ),
+    ])
+    def test_a_spent_fable_row_survives_a_refused_main_probe(self, main):
+        """Otherwise the first reading after the refusal ends would ask
+        Fable again, inside its pause."""
         stored = self._spent_reading()
+        refused = self._probe_429({
+            **main, "anthropic-ratelimit-unified-status": "rejected",
+        })
         outcome, asked = self._fable_fetch(
-            self._ok(self._fable_headers()),
-            main=self._refused_main(), last_usage=stored,
+            self._ok(self._fable_headers()), main=refused, last_usage=stored,
+        )
+        usage = outcome.usage
+        assert asked == [oauth.USAGE_PROBE_MODEL]
+        [fable] = usage["scoped"]
+        assert fable["probe_after"] == stored["scoped"][0]["probe_after"]
+        # The kept row does not make a refused account look usable.
+        assert "rejected" in usage
+        assert oauth.account_headroom(usage) == 0.0
+        # The refusal has ended: Fable is still not asked.
+        _, asked = self._fable_fetch(
+            self._ok(self._fable_headers()), last_usage=usage
         )
         assert asked == [oauth.USAGE_PROBE_MODEL]
-        assert "rejected" in outcome.usage
-        [fable] = outcome.usage["scoped"]
-        assert fable["probe_after"] == stored["scoped"][0]["probe_after"]
 
     @pytest.mark.parametrize("failure", [
         pytest.param(

@@ -42,7 +42,7 @@ USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 # Model id -> the unified header prefix of the bucket its responses carry.
 # Sonnet and Opus probes carry no per-model bucket (checked 2026-11), so they
 # are not probed; a new bucket needs its model and prefix here and its display
-# name in ``_UNIFIED_SCOPED_WINDOWS``.
+# name and claim in ``_UNIFIED_SCOPED_WINDOWS``.
 USAGE_PROBE_SCOPED_MODELS = {"claude-fable-5-1": "7d_oi"}
 
 _logger = logging.getLogger("claude-swap")
@@ -536,10 +536,13 @@ USAGE_SOURCE_HEADERS = "headers"
 
 # Unified rate-limit header prefix → usage API window key.
 _UNIFIED_WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
-# Per-model weekly buckets in the unified headers → the model display name the
-# usage API's ``weekly_scoped`` limits use, so ``autoswitch.model`` matches
-# them the same way. ``7d_oi`` is Fable's weekly window.
-_UNIFIED_SCOPED_WINDOWS = (("7d_oi", "Fable"),)
+# Per-model weekly buckets in the unified headers, by header prefix: the model
+# display name the usage API's ``weekly_scoped`` limits use, so
+# ``autoswitch.model`` matches them the same way, and the representative claim
+# the headers give when that bucket is the limit their status is about.
+# ``7d_oi`` is Fable's weekly window; Claude Code 2.1.322 labels its claim the
+# "Fable limit".
+_UNIFIED_SCOPED_WINDOWS = {"7d_oi": ("Fable", "seven_day_overage_included")}
 
 
 def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
@@ -600,7 +603,7 @@ def parse_unified_ratelimit_headers(headers) -> dict:
             data[key]["resets_at"] = resets_at
     limits = [
         _scoped_limit(name, *window)
-        for prefix, name in _UNIFIED_SCOPED_WINDOWS
+        for prefix, (name, _claim) in _UNIFIED_SCOPED_WINDOWS.items()
         if (window := _unified_window(headers, prefix)) is not None
     ]
     if limits:
@@ -724,10 +727,9 @@ def _add_scoped_limits(
         ((lim.get("scope") or {}).get("model") or {}).get("display_name")
         for lim in limits if isinstance(lim, dict)
     }
-    names = dict(_UNIFIED_SCOPED_WINDOWS)
     now = datetime.now(timezone.utc)
     for model, prefix in USAGE_PROBE_SCOPED_MODELS.items():
-        name = names[prefix]
+        name, _claim = _UNIFIED_SCOPED_WINDOWS[prefix]
         if name in have:
             continue
         limit = _paused_scoped_limit(last_usage, name, now)
@@ -737,7 +739,7 @@ def _add_scoped_limits(
                 model, limit["probe_after"],
             )
         elif "rejected" not in data:
-            limit = _probe_scoped_limit(access_token, model, prefix, name, now)
+            limit = _probe_scoped_limit(access_token, model, prefix, now)
         if limit is not None:
             have.add(name)
             limits.append(limit)
@@ -772,7 +774,7 @@ def _paused_scoped_limit(
 
 
 def _probe_scoped_limit(
-    access_token: str, model: str, prefix: str, name: str, now: datetime
+    access_token: str, model: str, prefix: str, now: datetime
 ) -> dict | None:
     """One 1-token request to ``model``, read as its weekly bucket.
 
@@ -785,7 +787,7 @@ def _probe_scoped_limit(
         with urllib.request.urlopen(
             _probe_request(access_token, model), timeout=10
         ) as resp:
-            return _scoped_limit_from_headers(resp.headers, prefix, name, None, now)
+            return _scoped_limit_from_headers(resp.headers, prefix, None, now)
     except urllib.error.HTTPError as e:
         refused = (
             e.code == 429 and e.headers
@@ -795,21 +797,21 @@ def _probe_scoped_limit(
             _logger.debug("Scoped usage probe (%s) failed: HTTP %s", model, e.code)
             return None
         _kind, retry_after = _classify_usage_error(e)
-        return _scoped_limit_from_headers(e.headers, prefix, name, retry_after, now)
+        return _scoped_limit_from_headers(e.headers, prefix, retry_after, now)
     except Exception as e:
         _logger.debug("Scoped usage probe (%s) failed: %r", model, e)
         return None
 
 
 def _scoped_limit_from_headers(
-    headers, prefix: str, name: str, retry_after_s: float | None, now: datetime
+    headers, prefix: str, retry_after_s: float | None, now: datetime
 ) -> dict | None:
     """The per-model bucket a scoped probe's response reports, or None when
     it reports none.
 
-    The bucket is spent when the response's unified status is ``rejected``,
-    when the bucket's own ``-status`` is, or when its utilization is at
-    100%. As Claude Code 2.1.322 reads these headers: a served response
+    The bucket is spent when the response's unified status is ``rejected``
+    for it, when the bucket's own ``-status`` is, or when its utilization is
+    at 100%. As Claude Code 2.1.322 reads these headers: a served response
     whose unified status is ``rejected`` (with an overage status of
     ``allowed`` or ``allowed_warning``) ran on usage credits, and a bucket
     status of ``rejected`` means "at or past its limit", which alone does
@@ -826,13 +828,17 @@ def _scoped_limit_from_headers(
       does, and a display that rolls a passed weekly reset forward would
       then show a spent bucket as empty.
 
-    A ``rejected`` unified status whose representative claim names the 5h
-    or 7d window is the account's own limit, reached since the main probe
-    was served. It marks nothing here (the next main probe reports it), so
-    the bucket is read from its own headers alone.
+    The unified status is for this bucket only when its representative
+    claim names it, or when the response carries no claim. One that names
+    another limit (the 5h window filling after the main probe was served,
+    the usage credits running out) is not this bucket's, which is then read
+    from its own headers alone. The two mistakes are not equal: a bucket
+    wrongly read as spent stays so until ``probe_after``, while one wrongly
+    read as having room costs a request that the next poll corrects.
     """
     from claude_swap import poll_policy  # it imports this module
 
+    name, claim = _UNIFIED_SCOPED_WINDOWS[prefix]
     base = f"anthropic-ratelimit-unified-{prefix}"
     window = _unified_window(headers, prefix)
     pct = window[0] if window else None
@@ -840,7 +846,7 @@ def _scoped_limit_from_headers(
     past_limit = (
         headers.get("anthropic-ratelimit-unified-status") == "rejected"
         and headers.get("anthropic-ratelimit-unified-representative-claim")
-        not in {key for _prefix, key in _UNIFIED_WINDOWS}
+        in (None, claim)
     )
     spent = (
         past_limit
@@ -880,9 +886,10 @@ def _usage_from_probe(
     The result is marked ``source: headers`` and keeps the probe's
     ``rejected`` entry, so a refused probe is stored (and decided on) as an
     account at its limit until the refusal ends, never as a healthy reading.
-    That rejection outranks a window that fails to normalise: the reading
-    then keeps only ``rejected`` (readable windows go with the unreadable
-    one) instead of failing as ``bad-response``.
+    That rejection outranks a window that fails to normalise: instead of
+    failing as ``bad-response``, the reading then keeps ``rejected`` and
+    drops the account's windows, readable ones included. Per-model rows are
+    not among those and stay.
     """
     try:
         data = request_usage_via_probe(access_token)
@@ -903,11 +910,13 @@ def _usage_from_probe(
             _logger.warning("Usage header probe failed %s: %s", context, kind)
             return UsageOutcome(None, error=kind)
         # A rejection outranks its unreadable windows: the refusal and its
-        # Retry-After are kept, so the account stays at its limit.
+        # Retry-After are kept, so the account stays at its limit. So are
+        # the per-model rows: a paused one dropped here would be asked about
+        # again as soon as the refusal ends.
         _logger.warning(
             "Usage header probe %s: %s, keeping the rejection", context, kind
         )
-        usage = {}
+        usage = build_usage_result({"limits": data.get("limits")}) or {}
     if "rejected" in data:
         usage["rejected"] = data["rejected"]
         _logger.warning(
