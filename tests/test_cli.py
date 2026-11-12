@@ -2202,6 +2202,28 @@ class TestMapCommand:
         assert "Directory mappings" in out
         assert "work@co.com" in out
         assert "2:" in out  # slot number resolved
+        assert "[personal]" not in out  # sole holder of its email: ``auto`` hides the tag
+
+    @pytest.mark.parametrize("mode, tagged", [("auto", True), ("off", False)])
+    def test_map_list_org_tag_follows_ui_org_tag(self, temp_home, capsys, mode, tagged):
+        from claude_swap.mappings import MappingStore
+        from claude_swap.settings import settings_path
+        switcher = self._seeded_switcher_env(temp_home)
+        data = switcher._get_sequence_data()
+        data["accounts"]["3"] = {
+            **data["accounts"]["2"], "organizationUuid": "org-3", "organizationName": "orgB",
+        }
+        data["sequence"] = [2, 3]
+        switcher._write_json(switcher.sequence_file, data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+        target = temp_home / "proj"
+        target.mkdir()
+        MappingStore(switcher.backup_dir).set(target, "work@co.com", "")
+
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._map_command([])
+
+        assert ("[personal]" in capsys.readouterr().out) is tagged
 
     def test_map_list_flags_removed_account(self, temp_home, capsys):
         from claude_swap.mappings import MappingStore

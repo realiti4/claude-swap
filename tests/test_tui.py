@@ -1001,6 +1001,33 @@ class TestMiniAccountText:
         )
         assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
 
+    @pytest.mark.parametrize("show", [True, False])
+    def test_org_tag_follows_show_tag(self, show):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        acc = dataclasses.replace(make_account(1, active=True), org_name="acme")
+        card = account_card_text(acc, 80, show_tag=show).plain
+        mini = mini_account_text(acc, time.time(), show_tag=show).plain
+        assert ("[acme]" in card) is show
+        assert ("[acme]" in mini) is show
+
+
+class TestOrgTagSetting:
+    @pytest.mark.parametrize(
+        "mode, shown", [("on", (True, True, True)), ("off", (False, False, False))]
+    )
+    def test_org_tag_on_and_off_ignore_email_sharing(self, tmp_path, mode, shown):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"orgTag": mode}}))
+        accounts = [
+            make_account(n, email=email)
+            for n, email in ((1, "dup@example.com"), (2, "dup@example.com"), (3, "solo@example.com"))
+        ]
+        app = make_app(FakeSwitcher(accounts, tmp_path))
+        app.snapshot = AccountsSnapshot(
+            active_number=None, accounts=tuple(accounts), taken_at=time.time()
+        )
+        assert tuple(app.tag_shown(a) for a in accounts) == shown
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
@@ -1194,6 +1221,7 @@ class TestDashboard:
         # org name of "red" makes that literally "[red]" — a valid Rich
         # color markup tag. MenuItem must render it as text, not consume it
         # as styling (which would silently drop the tag from the label).
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"orgTag": "on"}}))
         fake = FakeSwitcher(
             [dataclasses.replace(make_account(1, active=True), org_name="red")],
             tmp_path,
@@ -1211,6 +1239,45 @@ class TestDashboard:
                 item.query_one(Static).render().plain for item in menu.query(MenuItem)
             ]
             assert any("[red]" in label for label in labels)
+
+    async def test_org_tag_auto_tags_only_shared_email_on_every_view(self, tmp_path):
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import AccountCard, AccountsPanel, MenuItem
+
+        accounts = [
+            dataclasses.replace(
+                make_account(n, active=n == 1, email=email), org_name=org
+            )
+            for n, email, org in (
+                (1, "dup@example.com", "orgA"),
+                (2, "dup@example.com", "orgB"),
+                (3, "solo@example.com", "solo"),
+            )
+        ]
+        app = make_app(FakeSwitcher(accounts, tmp_path))
+
+        def tags(text: str) -> set[str]:
+            return {o for o in ("orgA", "orgB", "solo") if f"[{o}]" in text}
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            # Menus entered by action, not keys: one pause instead of five.
+            await app.workers.wait_for_complete(
+                [w for w in app.workers if w.group != "engine"]
+            )
+            assert tags(app.screen.query_one(AccountsPanel).render().plain) == {
+                "orgA", "orgB"
+            }
+            await app.screen._dispatch("remove-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            labels = " ".join(
+                item.query_one(Static).render().plain for item in menu.query(MenuItem)
+            )
+            assert tags(labels) == {"orgA", "orgB"}
+            app.screen.action_open_switch()
+            await pilot.pause()
+            cards = " ".join(c.render().plain for c in app.screen.query(AccountCard))
+            assert tags(cards) == {"orgA", "orgB"}
 
     async def test_back_menu_entry_pops_submenu(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
