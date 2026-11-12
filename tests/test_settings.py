@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import stat
-import os
 import sys
 from pathlib import Path
 
