@@ -8583,11 +8583,14 @@ class ClaudeAccountSwitcher:
             other, unreadable = self._store._read_fallback_oauth_keychain()
             if other or unreadable:
                 raise SwitchError(
-                    "CLAUDE_CONFIG_DIR names the default profile, and a login "
-                    "(or an unreadable item) sits in the unsuffixed Keychain "
-                    "item, which cswap does not remove, so this slot would not "
-                    "read as logged out. Nothing was changed. Unset "
-                    "CLAUDE_CONFIG_DIR, or log in with it set, and retry."
+                    "CLAUDE_CONFIG_DIR names the default profile, and the "
+                    "unsuffixed Keychain item (the login of a claude started "
+                    "without it) holds a login or could not be read. cswap "
+                    "does not remove that item, so this slot would not read "
+                    "as logged out. Nothing was changed. If that item is the "
+                    "login you use, unset CLAUDE_CONFIG_DIR; if it is another "
+                    "login, log it out; if it could not be read, unlock the "
+                    "Keychain. Then retry."
                 )
         if live:
             self._stash_live_credential(
