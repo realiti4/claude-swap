@@ -290,6 +290,8 @@ async def _dashboard(tmp_path, accounts, size):
 
     from claude_swap.tui.widgets import AccountsPanel, MenuItem
 
+    # The widths below are calibrated with every org tag drawn.
+    (tmp_path / "settings.json").write_text('{"ui": {"orgTag": "on"}}')
     app = make_app(FakeSwitcher(accounts, tmp_path))
     async with app.run_test(size=size) as pilot:
         await _workers_done(pilot)
@@ -403,6 +405,7 @@ async def test_switch_screen_card_header_keeps_the_note_within_the_width(tmp_pat
         make_account(1, active=True, email="dev-account-1@a.io", alias="work"), time.time() + DUE
     )
     # 76 columns: the full note overflows the header, the short one fits.
+    (tmp_path / "settings.json").write_text('{"ui": {"orgTag": "on"}}')
     for size, expect in (((100, 24), "re-login in 5d 12h"), ((76, 24), "re-login in 5d")):
         app = make_app(FakeSwitcher([acc, make_account(2)], tmp_path))
         async with app.run_test(size=size) as pilot:

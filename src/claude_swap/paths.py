@@ -9,7 +9,9 @@ claude-code does. Key rules (from claude-code source):
   rule of claude-code 2.1.299), otherwise
   ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``. Note the asymmetry:
   ``.claude.json`` sits at homedir by default, not inside ``.claude/``.
-- Credentials: ``<config_home>/.credentials.json``.
+- Credentials: ``.credentials.json`` in the secure-storage directory, which is
+  ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when that is defined (empty means
+  ``~/.claude``) and the config home otherwise.
 
 Also resolves the cswap backup root, which on Linux/WSL follows the XDG Base
 Directory Specification (``$XDG_DATA_HOME/claude-swap``) and falls back to the
@@ -93,8 +95,20 @@ def get_default_global_config_path() -> Path:
 
 
 def get_credentials_path() -> Path:
-    """Return the path to the Claude credentials file."""
-    return get_claude_config_home() / ".credentials.json"
+    """Return the path to the Claude credentials file.
+
+    Claude Code (2.1.322) keeps the file in its secure-storage directory:
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when that is defined, where an empty
+    value selects the default profile's ``~/.claude``, and the config home
+    otherwise. Its Keychain item is named from the same variable (see
+    ``credentials._active_oauth_keychain_services``), so the file and the item
+    always belong to one profile.
+    """
+    secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if secure_env is None:
+        return get_claude_config_home() / ".credentials.json"
+    secure_home = Path(secure_env) if secure_env else get_default_claude_config_home()
+    return secure_home / ".credentials.json"
 
 
 def get_legacy_backup_root() -> Path:
