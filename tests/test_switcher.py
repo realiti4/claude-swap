@@ -19508,6 +19508,27 @@ class TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores:
         retry.platform = Platform.MACOS
         self._assert_lands(retry)
 
+    def test_off_macos_the_landing_never_asks_the_keychain(
+        self, temp_home, monkeypatch, block_real_keychain
+    ):
+        """Linux with the variable naming the default profile still resolves two
+        service names; with no `security` binary an ask reads as unreadable."""
+        s = self._world(
+            temp_home, monkeypatch, block_real_keychain,
+            variable=True, hashed=None, unsuffixed=None,
+        )
+        s.platform = Platform.LINUX
+        get_credentials_path().write_text(self.SLOT_1)
+
+        def no_security(service, account):
+            raise FileNotFoundError("security")
+
+        monkeypatch.setattr(macos_keychain, "get_password", no_security)
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+        result = s.switch_to("2", json_output=True)
+        assert result["needsLogin"] is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
     @staticmethod
     def _assert_lands(s):
         result = s.switch_to("2", json_output=True)
