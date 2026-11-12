@@ -8746,20 +8746,23 @@ class ClaudeAccountSwitcher:
         # Same rule, for the read's last step. The clear below removes the item
         # claude reads for this environment and never the fallback one, which
         # belongs to a claude started without CLAUDE_CONFIG_DIR; the re-read
-        # then finds it and refuses, after the live item is already gone.
-        if self._store._use_keychain():
-            other, unreadable = self._store._read_fallback_oauth_keychain()
-            if other or unreadable:
-                raise SwitchError(
-                    "CLAUDE_CONFIG_DIR names the default profile, and the "
-                    "unsuffixed Keychain item (the login of a claude started "
-                    "without it) holds a login or could not be read. cswap "
-                    "does not remove that item, so this slot would not read "
-                    "as logged out. Nothing was changed. If that item is the "
-                    "login you use, unset CLAUDE_CONFIG_DIR; if it is another "
-                    "login, log it out; if it could not be read, unlock the "
-                    "Keychain. Then retry."
-                )
+        # then finds it and refuses, after the live item is already gone. A
+        # process pinned to file mode never asks that item, so the re-read
+        # would report an empty slot a fresh process does not see: the helper
+        # answers "unreadable" there, and this refuses too.
+        other, unreadable = self._store._read_fallback_oauth_keychain()
+        if other or unreadable:
+            raise SwitchError(
+                "CLAUDE_CONFIG_DIR names the default profile, and the "
+                "unsuffixed Keychain item (the login of a claude started "
+                "without it) holds a login or could not be checked. cswap "
+                "does not remove that item, so this slot would not read "
+                "as logged out. Nothing was changed. If that item is the "
+                "login you use, unset CLAUDE_CONFIG_DIR; if it is another "
+                "login, log it out; if it could not be checked, unlock the "
+                "Keychain, or restart cswap if a failed Keychain write pinned "
+                "it to file mode. Then retry."
+            )
         if live:
             self._stash_live_credential(
                 live,
