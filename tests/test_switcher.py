@@ -19481,6 +19481,10 @@ class TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores:
             "a refused landing deleted a Keychain item"
         )
         assert s._get_sequence_data()["activeAccountNumber"] == 1
+        # Above the stash: "Nothing was changed" holds only if no entry exists.
+        assert not list(s._store._host.credentials_dir.glob(".unclaimed-*")), (
+            "the refusal sat below the stash and left an entry behind"
+        )
 
         # The remedy the message names, applied, and the retry lands.
         monkeypatch.setattr(macos_keychain, "get_password", answering)
