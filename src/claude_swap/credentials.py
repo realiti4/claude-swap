@@ -86,6 +86,11 @@ def _active_oauth_keychain_services() -> list[str]:
     only store claude will read for this environment, so a miss means claude
     sees a logged-out profile and reaching into another store would report a
     credential claude is not using.
+
+    The first name is the item claude reads for this environment, and the only
+    one cswap deletes. A second name is a read-only fallback: claude started
+    without the variable keeps its own login there, which a switch in this
+    environment has neither backed up nor been asked to change.
     """
     # Local import: session imports from this module, so a top-level import
     # would close the cycle. _read_capture_credentials does the same.
@@ -641,22 +646,28 @@ class CredentialStore:
         return self._read_active_credentials().value
 
     def _read_active_oauth_keychain(self) -> tuple[str | None, bool]:
-        """Read the active profile's OAuth Keychain item(s).
+        """Read the OAuth Keychain item claude reads for this environment.
 
-        Reads the item(s) :func:`_active_oauth_keychain_services` resolves for
-        the current environment, in order, stopping at the first hit. Only the
-        explicit-``CLAUDE_CONFIG_DIR``-names-the-default-profile case yields
-        more than one; see that function for why.
+        That is the first name :func:`_active_oauth_keychain_services` resolves.
 
-        Returns ``(value, failed)`` exactly as before: ``value`` is the
-        credential string, or ``None`` when every item was absent (rc-44) or the
-        Keychain was unreadable. ``failed`` is True only for unreadable.
-
-        An unreadable Keychain stops the walk. It is a property of the Keychain,
-        not of the item, so a second service name cannot fare better — and
-        ``_kc_call`` has already flipped routing to file mode by then.
+        Returns ``(value, failed)``: ``value`` is the credential string, or
+        ``None`` when the item was absent (rc-44) or the Keychain was
+        unreadable. ``failed`` is True only for unreadable.
         """
-        for service in _active_oauth_keychain_services():
+        value, failed = self._read_one_oauth_keychain(
+            _active_oauth_keychain_services()[0]
+        )
+        return (value or None), failed
+
+    def _read_fallback_oauth_keychain(self) -> tuple[str | None, bool]:
+        """Read the fallback OAuth Keychain item, when this environment has one.
+
+        Only an explicit ``CLAUDE_CONFIG_DIR`` naming the default profile has
+        one: the unsuffixed item, for a user who has never logged in with the
+        variable set. See :func:`_active_oauth_keychain_services`. Returns
+        ``(value, failed)`` as :meth:`_read_active_oauth_keychain` does.
+        """
+        for service in _active_oauth_keychain_services()[1:]:
             value, failed = self._read_one_oauth_keychain(service)
             if value:
                 return value, False
@@ -707,6 +718,10 @@ class CredentialStore:
         raw ``sk-ant-…`` string — callers distinguish it via ``looks_like_api_key``.
         Non-mutating.
 
+        One environment has a last step after those: with ``CLAUDE_CONFIG_DIR``
+        naming the default profile, the unsuffixed OAuth item is read when
+        nothing else answered (see :func:`_active_oauth_keychain_services`).
+
         Reports ``keychain_unavailable`` when the OAuth Keychain read failed and
         nothing else covered it, so the display layer can say "keychain unavailable"
         rather than "no credentials" for a merely-unreadable slot — which would
@@ -735,7 +750,8 @@ class CredentialStore:
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
         self._lift_pin_if_oauth_file_gone()
-        if self._use_keychain():
+        keychain_asked = self._use_keychain()
+        if keychain_asked:
             val, keychain_failed = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
             # item cannot erase it. Sticky until this read succeeds again,
@@ -776,6 +792,17 @@ class CredentialStore:
         key = self._read_managed_key()
         if key:
             return ActiveCredentials(key, False, keychain_failed)
+
+        # 4. The fallback OAuth Keychain item, only when nothing above answered.
+        # Claude with the variable set reads its own item and then the file,
+        # never this one, so a seed or a key that a switch just wrote for this
+        # environment has to win over it. An unreadable Keychain is a property
+        # of the Keychain, so a failed read is not retried under a second name.
+        if keychain_asked and not keychain_failed and self._use_keychain():
+            val, keychain_failed = self._read_fallback_oauth_keychain()
+            self._active_read_failed = keychain_failed
+            if val:
+                return ActiveCredentials(val, False)
         # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
         # UI distinguishes it from a real empty slot.
         return ActiveCredentials("", keychain_failed, keychain_failed)
@@ -879,11 +906,13 @@ class CredentialStore:
         resurrect it (#30337). Best-effort: when the Keychain is down the delete
         can't run, which is the documented recovery residual.
 
-        Clears the item(s) :func:`_active_oauth_keychain_services` resolves, the
-        same set the read walks. The fixed name deleted the DEFAULT profile's
-        login from a custom profile while leaving in place the hashed item that
-        actually shadows the seed we just wrote — so claude kept serving the
-        outgoing account (#206). Deleting a hashed item is sanctioned where
+        Clears the first item :func:`_active_oauth_keychain_services` resolves:
+        the one claude reads for this environment, and so the only one that can
+        shadow the seed we just wrote for it (#206). A fallback name is left
+        alone. With ``CLAUDE_CONFIG_DIR`` naming the default profile it is the
+        login of a claude started without the variable, which the switch's
+        outgoing backup never read, and the active read takes the file and a
+        managed key ahead of it. Deleting a hashed item is sanctioned where
         authoring one is not: ``session.delete_macos_keychain_entry`` retires
         one before every reseed, for this same reason.
 
@@ -894,15 +923,14 @@ class CredentialStore:
         """
         if self._host.platform != Platform.MACOS:
             return True
-        cleared = True
-        for service in _active_oauth_keychain_services():
-            try:
-                macos_keychain.delete_password(
-                    service, macos_keychain.keychain_account_name()
-                )
-            except Exception:
-                cleared = False  # best-effort; a down Keychain can't be cleaned now
-        return cleared
+        try:
+            macos_keychain.delete_password(
+                _active_oauth_keychain_services()[0],
+                macos_keychain.keychain_account_name(),
+            )
+        except Exception:
+            return False  # best-effort; a down Keychain can't be cleaned now
+        return True
 
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
