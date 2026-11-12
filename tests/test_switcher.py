@@ -8774,6 +8774,284 @@ class TestSelfSwitchProvenance:
         assert result["switched"] is False or result["to"]["number"] == 1
 
 
+class TestSelfSwitchLoginLineageRealign:
+    """Desktop relabels ``~/.claude.json`` onto slot 1 while Claude Code's live
+    credential is still slot 2's. ``cswap switch 1`` is then a self-switch whose
+    live credential diverges from slot 1's backup, and an expired access token
+    makes the ownership oracle 401. Offline login-lineage evidence that the
+    live login is ANOTHER slot's must realign Claude Code to slot 1 instead of
+    printing "Already on" and leaving it on the wrong account."""
+
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+    _LAPSE_1 = TestProvenanceGuard._LAPSE_1
+    _LAPSE_2 = TestProvenanceGuard._LAPSE_2
+    _lineage_creds = TestProvenanceGuard._lineage_creds
+    _lineage_setup = TestProvenanceGuard._lineage_setup
+
+    S1 = ("1", "test@example.com")
+    S2 = ("2", "account2@example.com")
+
+    def _switch(self, switcher, creds_store, configs_store, live_state,
+                json_output=False):
+        # A real slot always has its config backup; activation needs it.
+        configs_store.setdefault(self.S1, json.dumps({
+            "oauthAccount": {
+                "emailAddress": "test@example.com", "accountUuid": "uuid-1",
+            },
+        }))
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch(
+                "claude_swap.oauth.fetch_oauth_profile", return_value=None
+            ), patch.object(switcher, "list_accounts"):
+                return switcher.switch_to("1", json_output=json_output)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_exact_bytes_of_other_slot_realigns(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live = {"creds": a2}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a1
+        assert creds[self.S1] == a1
+        assert creds[self.S2] == a2
+        captured = capsys.readouterr()
+        text = captured.out + captured.err
+        assert "Account-2" in text
+        assert "Already on" not in text
+
+    def test_rotated_copy_realigns_and_newer_generation_advances_owner(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds, configs, a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        older = json.loads(self._lineage_creds("at-2", "rt-2", self._LAPSE_2))
+        older["claudeAiOauth"]["expiresAt"] = 1_000
+        creds[self.S2] = json.dumps(older)
+        newer = json.loads(self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2))
+        newer["claudeAiOauth"]["expiresAt"] = 2_000
+        rotated = json.dumps(newer)
+        live = {"creds": rotated}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a1
+        assert creds[self.S1] == a1
+        assert creds[self.S2] == rotated  # rescue rule: strictly newer
+
+    def test_rotated_copy_not_newer_leaves_owner_unchanged(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds, configs, a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        current = json.loads(self._lineage_creds("at-2", "rt-2", self._LAPSE_2))
+        current["claudeAiOauth"]["expiresAt"] = 3_000
+        stored2 = json.dumps(current)
+        creds[self.S2] = stored2
+        stale = json.loads(self._lineage_creds("at-2b", "rt-2b", self._LAPSE_2))
+        stale["claudeAiOauth"]["expiresAt"] = 2_000
+        live = {"creds": json.dumps(stale)}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a1
+        assert creds[self.S1] == a1
+        assert creds[self.S2] == stored2
+
+    def test_live_sharing_own_lapse_stays_noop(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        own_rotation = self._lineage_creds("at-1b", "rt-1b", self._LAPSE_1)
+        live = {"creds": own_rotation}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == own_rotation
+        assert creds[self.S1] == a1
+        assert "Already on" in capsys.readouterr().out
+
+    def test_no_lineage_evidence_stays_noop(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, _a1, _a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        s1 = self._lineage_creds("at-1", "rt-1", None)
+        creds[self.S1] = s1
+        creds[self.S2] = self._lineage_creds("at-2", "rt-2", None)
+        mystery = self._lineage_creds("at-x", "rt-x", None)
+        live = {"creds": mystery}
+        self._switch(switcher, creds, configs, live)
+        assert live["creds"] == mystery
+        assert creds[self.S1] == s1
+        assert "Already on" in capsys.readouterr().out
+
+    def test_lineage_lookup_error_keeps_noop(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live = {"creds": a2}
+        with patch.object(
+            switcher, "_slot_for_login_lineage", side_effect=RuntimeError("x")
+        ):
+            self._switch(switcher, creds, configs, live)
+        assert live["creds"] == a2
+        assert "Already on" in capsys.readouterr().out
+
+    def test_json_mode_reports_a_realign(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        live = {"creds": a2}
+        result = self._switch(switcher, creds, configs, live, json_output=True)
+        assert live["creds"] == a1
+        assert result["switched"] is False
+        assert result["reason"] == "realigned"
+        assert result["from"]["number"] == 1 and result["to"]["number"] == 1
+        assert result["message"].startswith(
+            "Realigned Claude Code's login to Account-1 (test@example.com)"
+        )
+        assert any("Account-2" in w for w in result["warnings"])
+
+
+
+
+class TestListDriftWarnings:
+    """``cswap list`` says when the CLI login disagrees with the active slot
+    (the label Claude Desktop's Code tab also writes)."""
+
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+    _LAPSE_1 = TestProvenanceGuard._LAPSE_1
+    _LAPSE_2 = TestProvenanceGuard._LAPSE_2
+    _lineage_creds = TestProvenanceGuard._lineage_creds
+    _lineage_setup = TestProvenanceGuard._lineage_setup
+
+    _LOGIN_LINE = "Claude Code is logged in as Account-2 (account2@example.com)"
+
+    def _list(self, switcher, creds, configs, live):
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            with patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(None),
+            ), patch.object(
+                switcher, "_read_active_credentials",
+                side_effect=lambda: ActiveCredentials(
+                    live["creds"], False, False
+                ),
+            ):
+                return switcher.list_accounts()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_login_drift_is_flagged(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert (
+            f"{self._LOGIN_LINE}, but Account-1 (test@example.com) is shown "
+            "as active. To put Claude Code on Account-1, run: cswap switch 1"
+        ) in out
+
+    def test_login_drift_is_not_reported_as_an_overwrite(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        """The active row carries the LIVE credential, so with Account-2's
+        login live under Account-1's label it collides with Account-2's
+        backup. Account-1's own backup is intact: that is drift, not an
+        overwrite, and telling the user to re-add would send them through
+        needless logins."""
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert "hold the same credential" not in out
+        assert self._LOGIN_LINE in out
+
+    def test_real_overwrite_still_warns(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        """Account-1's own backup holds Account-2's login: a genuine
+        overwrite, so the warning stays and no drift is claimed."""
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        creds[("1", "test@example.com")] = a2
+        self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert "hold the same credential" in out
+        assert "Claude Code is logged in as" not in out
+
+    def test_no_drift_prints_neither_line(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        self._list(switcher, creds, configs, {"creds": a1})
+        out = capsys.readouterr().out
+        assert "Claude Code is logged in as" not in out
+
+    def test_json_output_has_no_drift_lines(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        payload = self._list_json(switcher, creds, configs, {"creds": a2})
+        assert payload is not None
+        assert "logged in as" not in json.dumps(payload)
+        assert "logged in as" not in capsys.readouterr().out
+
+    def _list_json(self, switcher, creds, configs, live):
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            with patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(None),
+            ):
+                return switcher.list_accounts(json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_exception_in_login_check_still_lists(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys,
+    ):
+        switcher, creds, configs, a1, a2 = self._lineage_setup(
+            temp_home, sample_sequence_data,
+        )
+        with patch.object(
+            switcher, "_slot_for_login_lineage", side_effect=RuntimeError("x")
+        ):
+            self._list(switcher, creds, configs, {"creds": a2})
+        out = capsys.readouterr().out
+        assert "Accounts:" in out and "account2@example.com" in out
+        assert "Claude Code is logged in as" not in out
+
+
 class TestDuplicateAccountDetection:
     def _switcher(self, temp_home, sample_sequence_data):
         switcher = ClaudeAccountSwitcher()

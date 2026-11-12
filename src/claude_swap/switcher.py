@@ -6101,9 +6101,28 @@ class ClaudeAccountSwitcher:
         by_fp: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
         out: list[str] = []
+        # The active row carries the LIVE credential, not its slot's backup.
+        # When that live login is provably another slot's while the active
+        # slot's own backup is a different login (_slot_for_login_lineage
+        # names it only then), the collision is drift -- Claude Desktop
+        # rewrote the label -- not an overwrite: telling the user to re-add
+        # would send them through needless logins. _drift_warnings reports it.
+        drifted: str | None = None
+        try:
+            active = next((row for row in accounts_info if row[4]), None)
+            if active is not None and active[5] and self._slot_for_login_lineage(
+                active[5], str(active[0]), data
+            ) is not None:
+                drifted = str(active[0])
+        except Exception:
+            self._logger.debug("Duplicate check's drift test failed", exc_info=True)
         for num, email, _org_name, org_uuid, _is_active, creds, _alias in accounts_info:
             snum = str(num)
-            fp = oauth.credential_fingerprint(creds) if creds else None
+            fp = (
+                oauth.credential_fingerprint(creds)
+                if creds and snum != drifted
+                else None
+            )
             if fp:
                 other = by_fp.get(fp)
                 if other:
@@ -6313,12 +6332,15 @@ class ClaudeAccountSwitcher:
         # in the JSON payload and logs for diagnostics.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
-        if dup_warnings or lockstep_warnings:
+        drift_warnings = self._drift_warnings(accounts_info, seq_data)
+        if dup_warnings or lockstep_warnings or drift_warnings:
             print()
             for msg in dup_warnings:
                 warning(msg)
             for msg in lockstep_warnings:
                 warning(msg)
+            for msg in drift_warnings:
+                print(yellowed(msg))
 
         # Running instances
         try:
@@ -6352,6 +6374,40 @@ class ClaudeAccountSwitcher:
                     print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
+
+    def _drift_warnings(self, accounts_info: list, seq_data: dict) -> list[str]:
+        """Lines saying the CLI login disagrees with the active slot.
+        Advisory and offline-cheap; never raises.
+
+        The active slot comes from the ``~/.claude.json`` label, which Claude
+        Desktop's Code tab also writes, so the label can name an account while
+        Claude Code's live credential is another account's. ``cswap list`` is
+        where a user looks first, so it says so and names the fix. A failure is
+        swallowed: it must not break the listing.
+        """
+        lines: list[str] = []
+        accounts = seq_data.get("accounts", {})
+
+        def label(num: str) -> str:
+            return f"Account-{num} ({accounts.get(num, {}).get('email', '')})"
+
+        try:
+            active = next((row for row in accounts_info if row[4]), None)
+            if active is not None and active[5]:
+                active_num = str(active[0])
+                other = self._slot_for_login_lineage(
+                    active[5], active_num, seq_data
+                )
+                if other is not None:
+                    lines.append(
+                        f"Claude Code is logged in as {label(other)}, but "
+                        f"{label(active_num)} is shown as active. To put "
+                        f"Claude Code on Account-{active_num}, run: "
+                        f"cswap switch {active_num}"
+                    )
+        except Exception:
+            self._logger.debug("Login drift check failed", exc_info=True)
+        return lines
 
     def _active_account_usage(
         self, account_num: str, current_email: str, org_uuid: str
@@ -6507,6 +6563,15 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
+            if op.get("realigned"):
+                # A self-switch that really rewrote the live login (the
+                # label named this slot but the live credential was another
+                # account's): "already-active" would misdescribe it.
+                reason = "realigned"
+                message = (
+                    f"Realigned Claude Code's login to Account-"
+                    f"{to_ref['number']} ({to_ref['email']})"
+                )
         return {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
@@ -7108,6 +7173,37 @@ class ClaudeAccountSwitcher:
             return "noop", None
         provenance = self._prefetch_live_identity()
         if provenance.get("resolved") is None:
+            # The noop below exists so we never replace THIS slot's own
+            # freshly rotated token with its consumed ancestor. Offline
+            # login-lineage evidence that the live login is ANOTHER slot's
+            # (same fingerprint, or the same /login lapse date) rules that
+            # out: the live bytes are not this slot's to lose. The full
+            # switch is then safe, because _perform_switch classifies them
+            # foreign / foreign-synced, writes nothing into this slot, and
+            # activates this slot's stored credential. An error here keeps
+            # the noop: no evidence, no mutation.
+            try:
+                live = provenance.get("live")
+                if live is None:
+                    live = self._read_credentials()
+                other = (
+                    self._slot_for_login_lineage(
+                        live, slot, self._get_sequence_data() or {}
+                    )
+                    if live
+                    else None
+                )
+            except Exception as e:
+                self._logger.debug(f"Self-switch lineage check raised: {e!r}")
+                other = None
+            if other is not None:
+                self._logger.info(
+                    "Live credential diverges from Account-%s's stored backup "
+                    "and carries Account-%s's login lineage; realigning "
+                    "Claude Code to Account-%s.",
+                    slot, other, slot,
+                )
+                return "reconcile", provenance
             self._logger.info(
                 "Live credential diverges from Account-%s's stored backup "
                 "and ownership could not be verified; self-switch left "
@@ -8285,8 +8381,23 @@ class ClaudeAccountSwitcher:
         # re-acquire the lock from inside list_accounts(). All of this is display
         # only — suppressed in JSON mode (the nested list_accounts() would
         # otherwise leak human output onto the JSON stdout).
+        # Label and target agree but the live login was another account's:
+        # the switch really moved Claude Code, so say "Realigned", not
+        # "Switched to" the account the label already named.
+        realigned = current_account == target_account and kind in (
+            "foreign", "foreign-synced", "alien", "known-foreign",
+        )
         if emit_output:
-            print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+            if realigned:
+                print(
+                    f"{accent('Realigned')} Claude Code's login to "
+                    f"Account-{target_account} ({target_email})"
+                )
+            else:
+                print(
+                    f"{accent('Switched to')} Account-{target_account} "
+                    f"({target_email})"
+                )
             try:
                 self.list_accounts()
             except Exception as e:
@@ -8300,7 +8411,12 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": from_ref,
+            "to": to_ref,
+            "warnings": warnings_out,
+            "realigned": realigned,
+        }
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
