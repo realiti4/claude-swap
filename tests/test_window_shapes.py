@@ -31,6 +31,7 @@ from claude_swap import menubar, oauth, poll_policy, subscription, usage_store
 from claude_swap.autoswitch import PollEvent, _window_pcts, consume_first_rank_key
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountSnapshot
+from claude_swap.settings import settings_path
 from claude_swap.switcher import ClaudeAccountSwitcher, _format_usage_lines
 from claude_swap.tui import data as tui_data, widgets
 from claude_swap.usage_store import WALL_FALLBACK_S, FetchRecord, UsageEntry, UsageStore
@@ -374,6 +375,8 @@ def _list_with(blob: dict, sample_sequence_data: dict) -> None:
     switcher = ClaudeAccountSwitcher()
     switcher._setup_directories()
     switcher._write_json(switcher.sequence_file, sample_sequence_data)
+    # `auto` hides the tag where emails are distinct; the test reads the tag.
+    settings_path(switcher.backup_dir).write_text('{"ui": {"orgTag": "on"}}')
     with patch.object(switcher, "_read_credentials", return_value=active), \
          patch.object(switcher, "_read_account_credentials", return_value=backup), \
          patch("claude_swap.oauth.urllib.request.urlopen", return_value=response):
