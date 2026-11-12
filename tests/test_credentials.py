@@ -437,6 +437,42 @@ class TestActiveWriteStaysOnOneProfile:
         assert active.value == TARGET_SLOT_CREDS
         assert active.degraded is True
 
+
+    def test_a_secure_storage_override_gets_the_seed_claude_reads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """With ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` naming another directory,
+        claude (2.1.322) reads both the Keychain item and the plaintext file
+        from it. Clearing that item while seeding ``CLAUDE_CONFIG_DIR`` would
+        leave the environment logged out, with the credential in a profile
+        nobody asked to change."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        secure = tmp_path / "secure-profile"
+        secure.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+
+        account = macos_keychain.keychain_account_name()
+        secure_item = (keychain_service_name(str(secure)), account)
+        custom_item = (keychain_service_name(str(custom)), account)
+        default_item = (CLAUDE_CODE_KEYCHAIN_SERVICE, account)
+        block_real_keychain.data[secure_item] = SECURE_PROFILE_CREDS
+        block_real_keychain.data[custom_item] = CUSTOM_PROFILE_CREDS
+        block_real_keychain.data[default_item] = DEFAULT_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        seed = secure / ".credentials.json"
+        assert seed.read_text(encoding="utf-8") == TARGET_SLOT_CREDS
+        assert not (custom / ".credentials.json").exists()
+        assert secure_item not in block_real_keychain.data
+        assert block_real_keychain.data[custom_item] == CUSTOM_PROFILE_CREDS
+        assert block_real_keychain.data[default_item] == DEFAULT_PROFILE_CREDS
+        assert store._read_credentials() == TARGET_SLOT_CREDS
+
+
 class TestSecureStorageOverride:
     """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` takes precedence when *defined*.
 

@@ -867,9 +867,9 @@ class CredentialStore:
 
     def _write_active_credentials_file(self, credentials: str) -> None:
         """Atomically write Claude Code's plaintext active-credentials file."""
-        cred_dir = get_claude_config_home()
-        cred_dir.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(cred_dir / ".credentials.json", credentials)
+        cred_file = get_credentials_path()
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(cred_file, credentials)
 
     def _delete_active_keychain_entry(self) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
