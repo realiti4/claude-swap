@@ -182,6 +182,21 @@ class TestUiSettings:
         with pytest.raises(ConfigError, match="dark, light"):
             set_setting(tmp_path, "ui.theme", "purple")
 
+    def test_org_tag_defaults_auto_round_trips_and_ignores_bad_values(
+        self, tmp_path: Path
+    ):
+        assert load_ui_settings(tmp_path).org_tag == "auto"
+        assert set_setting(tmp_path, "ui.orgTag", "off") == "off"
+        assert load_ui_settings(tmp_path).org_tag == "off"
+        with pytest.raises(ConfigError, match="auto, on, off"):
+            set_setting(tmp_path, "ui.orgTag", "sometimes")
+        raw = {"ui": {"orgTag": "no", "theme": "light"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(theme="light")
+        raw = {"ui": {"orgTag": "on", "theme": "purple"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(org_tag="on")
+
 
 class TestRunSettings:
     def test_missing_file_defaults_to_shared_history(self, tmp_path: Path):
