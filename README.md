@@ -93,6 +93,7 @@ cswap auto --threshold 80      # switch earlier
 cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first (more strategies below)
+cswap auto --model Fable --fallback-model Opus   # ...and fall back to Opus once every account's Fable is spent
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 ```
@@ -127,6 +128,23 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 - If a usage check fails it keeps using the last-known numbers for a limited time while it retries, and an expired token on an idle machine makes it hold rather than fail over.
 - An account whose refresh token has died is quarantined and reported until you [re-add it](#refresh-expired-tokens).
 - API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
+
+**Model fallback**
+
+With `--model Fable` alone, once *every* account's Fable window is at the threshold there is nowhere left to rotate to, although the same accounts would still run another model. `--fallback-model Opus` (or `cswap config set autoswitch.fallbackModel Opus`) keeps rotating on Opus's window plus 5h/7d instead, until any account's Fable window is back under the threshold by the hysteresis margin.
+
+- It engages only when every account in rotation has readable usage and each one's `--model` window is at or over the threshold. A full 5h/7d window never engages it, since that limit binds every model alike. The state is saved, so a restart or a cron `--once` run carries on where the last one left off.
+- cswap swaps credentials; it cannot change the model of a session that is already running. Each change is announced as a `model-change` event (`"change": "fallback"` or `"restored"`), and `--on-model-change COMMAND` (or `autoswitch.onModelChange`) runs your command with `CSWAP_MODEL_EVENT`, `CSWAP_MODEL`, `CSWAP_PRIMARY_MODEL` and `CSWAP_FALLBACK_MODEL` set. It gets 60s; a failing command is reported and never stops rotation.
+- [`examples/tmux-model-change.sh`](examples/tmux-model-change.sh) does it for sessions in **tmux**: it types `/model` into every pane running `claude`, confirms the *Switch model?* prompt, skips sessions started with `--model`, and retries panes whose prompt holds text you are typing.
+
+```bash
+cswap config set autoswitch.model Fable
+cswap config set autoswitch.fallbackModel Opus
+cswap config set autoswitch.onModelChange ~/bin/tmux-model-change.sh
+cswap auto
+```
+
+`/model` also saves the model as Claude Code's default, so sessions started during a fallback begin on the fallback model too.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
@@ -309,6 +327,7 @@ cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/per-model windows
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.fallbackModel Opus   # model to fall back to once every account's autoswitch.model is spent
 cswap config set run.shareHistory false   # each account keeps its own chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
@@ -383,7 +402,7 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 
 </details>
 
-`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `model-change`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 Every optional field (usage age, last-known usage, fetch errors, pace, login expiry, …) is listed in [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md).
 
