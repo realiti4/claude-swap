@@ -483,7 +483,7 @@ class AccountsPanel(Static):
                 lambda login: [
                     mini_account_text(
                         acc, now, palette=palette, login=login,
-                        show_tag=app.show_org_tag,
+                        show_tag=app.tag_shown(acc),
                     )
                     for acc in inactive
                 ],
@@ -497,7 +497,7 @@ class AccountsPanel(Static):
                     fitted_card_text(
                         acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
-                        palette=palette, show_tag=app.show_org_tag,
+                        palette=palette, show_tag=app.tag_shown(acc),
                     )
                 )
             elif self._show_minis:

@@ -18,7 +18,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
-from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot, org_tag_shown
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -83,9 +83,9 @@ class CswapApp(App):
             self.weekly_threshold_pct = None
         try:
             ui = load_ui_settings(switcher.backup_dir)
-            self._theme_name, self.show_org_tag = ui.theme, ui.show_org_tag
+            self._theme_name, self.org_tag = ui.theme, ui.org_tag
         except Exception:
-            self._theme_name, self.show_org_tag = "auto", True
+            self._theme_name, self.org_tag = "auto", "auto"
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -411,13 +411,9 @@ class CswapApp(App):
         self.push_screen(WatchScreen())
 
     def tag_shown(self, acc: AccountSnapshot) -> bool:
-        """Whether a list that must tell accounts apart draws ``acc``'s org tag:
-        always with ``ui.showOrgTag``, else only when another listed account
-        shares its email."""
-        if self.show_org_tag:
-            return True
+        """Whether ``ui.orgTag`` draws ``acc``'s org tag in any TUI account view."""
         accounts = self.snapshot.accounts if self.snapshot else ()
-        return sum(a.email == acc.email for a in accounts) > 1
+        return org_tag_shown(self.org_tag, acc.email, [a.email for a in accounts])
 
     # -- theme --------------------------------------------------------------
 

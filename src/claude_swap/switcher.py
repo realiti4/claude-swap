@@ -68,6 +68,7 @@ from claude_swap.models import (
     normalize_account_priority,
     normalize_account_threshold,
     normalize_alias,
+    org_tag_shown,
 )
 from claude_swap.printer import (
     abbreviate_path,
@@ -96,6 +97,7 @@ from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import (
     load_settings,
+    load_ui_settings,
     load_usage_settings,
     parse_model_names,
     settings_path,
@@ -1828,6 +1830,8 @@ class ClaudeAccountSwitcher:
             print(muted("Map one with: cswap map <NUM|EMAIL> [PATH]"))
             return
         seq = self._get_sequence_data_migrated() or {}
+        tag_mode = load_ui_settings(self.backup_dir).org_tag
+        emails = [a.get("email", "") for a in seq.get("accounts", {}).values()]
         print(bolded("Directory mappings:"))
         for path in sorted(mappings):
             entry = mappings[path]
@@ -1836,10 +1840,10 @@ class ClaudeAccountSwitcher:
             slot = self._find_account_slot(seq, email, org_uuid)
             if slot:
                 account = seq.get("accounts", {}).get(slot, {})
-                tag = self._get_display_tag(
-                    email, account.get("organizationName", ""), org_uuid
+                tag = self._tag_suffix(
+                    tag_mode, emails, email, account.get("organizationName", ""), org_uuid
                 )
-                print(f"  {path} {dimmed('→')} {slot}: {email} {muted(f'[{tag}]')}")
+                print(f"  {path} {dimmed('→')} {slot}: {email}{tag}")
             else:
                 print(f"  {path} {dimmed('→')} {email} {muted('(account removed)')}")
 
@@ -3906,6 +3910,15 @@ class ClaudeAccountSwitcher:
     def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
         """Return display tag for an account's org context."""
         return org_name if org_name else "personal"
+
+    def _tag_suffix(
+        self, mode: str, emails: list[str], email: str, org_name: str, org_uuid: str
+    ) -> str:
+        """`` [org]`` for a per-account listing row, or ``""`` when ``ui.orgTag``
+        (``mode``) hides it; ``emails`` lists every managed account's email."""
+        if not org_tag_shown(mode, email, emails):
+            return ""
+        return f" {muted(f'[{self._get_display_tag(email, org_name, org_uuid)}]')}"
 
     def _find_account_by_alias(self, alias: str) -> str | None:
         """Return the account number whose alias matches (case-insensitive), if any.
@@ -6234,9 +6247,11 @@ class ClaudeAccountSwitcher:
             return self._build_list_payload(accounts_info, entries, plans)
 
         seq_data = self._get_sequence_data() or {}
+        tag_mode = load_ui_settings(self.backup_dir).org_tag
+        emails = [info[1] for info in accounts_info]
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
-            tag = self._get_display_tag(email, org_name, org_uuid)
+            tag = self._tag_suffix(tag_mode, emails, email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
             if is_active:
@@ -6244,7 +6259,7 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            print(f"  {num}: {label}{tag}{markers}")
             login_expires_at = oauth.login_expires_at_epoch(creds)
             for line in _usage_entry_lines(entries[str(num)], login_expires_at):
                 print(f"     {line}")
@@ -6402,11 +6417,15 @@ class ClaudeAccountSwitcher:
             org_name = data["accounts"][account_num].get("organizationName", "") or ""
 
         if account_num:
-            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
+            emails = [a.get("email", "") for a in data.get("accounts", {}).values()]
+            tag = self._tag_suffix(
+                load_ui_settings(self.backup_dir).org_tag,
+                emails, current_email, org_name, current_org_uuid,
+            )
             total = len(data.get("accounts", {}))
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email} {muted(f'[{tag}]')})"
+                f"({current_email}{tag})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry, login_expires_at = self._active_account_usage(

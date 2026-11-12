@@ -635,6 +635,43 @@ class TestStatus:
 
         switcher.status()
 
+    @pytest.mark.parametrize(
+        "mode, other_email, tagged",
+        [
+            ("auto", "other@example.com", False),
+            ("auto", "test@example.com", True),
+            ("on", "other@example.com", True),
+            ("off", "test@example.com", False),
+        ],
+    )
+    def test_status_org_tag_follows_ui_org_tag(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys, mode, other_email, tagged,
+    ):
+        accounts = sample_sequence_data["accounts"]
+        accounts["1"].update(
+            email="test@example.com", organizationUuid="", organizationName="orgA"
+        )
+        accounts["2"].update(
+            email=other_email, organizationUuid="org-2", organizationName="orgB"
+        )
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)):
+            switcher.status()
+
+        output = capsys.readouterr().out
+        assert ("[orgA]" in output) is tagged
+        assert ("(test@example.com)" in output) is not tagged
+
 
 class TestStatusCache:
     """status() shares the usage.json cache with list_accounts."""
@@ -1637,6 +1674,23 @@ class TestLiveSessionGuardOnAnUnreadableRecord:
         switcher._ensure_no_live_session("2", "test@example.com", "the operation")
 
 
+class TestOrgTagShown:
+    @pytest.mark.parametrize(
+        "mode, email, shown",
+        [
+            ("on", "solo@x.com", True),
+            ("off", "dup@x.com", False),
+            ("auto", "dup@x.com", True),
+            ("auto", "solo@x.com", False),
+        ],
+    )
+    def test_modes(self, mode, email, shown):
+        from claude_swap.models import org_tag_shown
+
+        emails = ["dup@x.com", "dup@x.com", "solo@x.com"]
+        assert org_tag_shown(mode, email, emails) is shown
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -1666,12 +1720,52 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "test@example.com [personal] (active)" in output
+        assert "test@example.com (active)" in output
         assert "account2@example.com" in output
         assert "├ 5h:" in output
         assert "└ 7d:" in output
         assert "10%" in output
         assert "50%" in output
+
+    @pytest.mark.parametrize(
+        "mode, tagged",
+        [
+            ("auto", {"orgA", "orgB"}),
+            ("on", {"orgA", "orgB", "solo"}),
+            ("off", set()),
+        ],
+    )
+    def test_list_org_tag_follows_ui_org_tag(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys, mode, tagged,
+    ):
+        """Two accounts share an email and one does not: ``auto`` tags the pair only."""
+        for num, email, org in (
+            ("1", "dup@example.com", "orgA"),
+            ("2", "dup@example.com", "orgB"),
+            ("3", "solo@example.com", "solo"),
+        ):
+            sample_sequence_data["accounts"][num] = {
+                "email": email, "uuid": f"uuid-{num}", "added": "2024-01-01T00:00:00Z",
+                "organizationUuid": f"org-{num}", "organizationName": org,
+            }
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert {o for o in ("orgA", "orgB", "solo") if f"[{o}]" in output} == tagged
+        # A hidden tag leaves no stray space behind.
+        assert ("  3: solo@example.com\n" in output) is (mode != "on")
 
     def test_list_shows_alias_before_email(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
@@ -1694,7 +1788,7 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "  1: dev (test@example.com) [personal] (active)" in output
+        assert "  1: dev (test@example.com) (active)" in output
         # unaliased account keeps rendering plain email, no spurious parens
         assert "  2: account2@example.com" in output
         assert "(account2@example.com)" not in output
@@ -5118,6 +5212,7 @@ class TestBackwardCompatibility:
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        settings_path(backup_dir).write_text(json.dumps({"ui": {"orgTag": "on"}}))
 
         config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
@@ -5143,6 +5238,7 @@ class TestBackwardCompatibility:
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        settings_path(backup_dir).write_text(json.dumps({"ui": {"orgTag": "on"}}))
 
         config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({

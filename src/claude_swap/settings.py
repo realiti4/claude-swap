@@ -82,11 +82,12 @@ class AutoSwitchSettings:
 @dataclass(frozen=True)
 class UiSettings:
     """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection.
-    ``show_org_tag`` shows the ``[org]`` tag beside each account in the TUI."""
+    color theme; ``auto`` follows terminal-background detection. ``org_tag``
+    picks when listings draw the ``[org]`` tag: ``on``, ``off``, or ``auto``
+    (only on accounts sharing an email with another managed account)."""
 
     theme: str = "auto"
-    show_org_tag: bool = True
+    org_tag: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -207,9 +208,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Color theme; auto follows the terminal background",
         ),
         SettingSpec(
-            "ui", "showOrgTag", "show_org_tag", "bool",
-            help="Show the [org] tag beside accounts in the TUI "
-            "(when off, kept only to tell same-email accounts apart)",
+            "ui", "orgTag", "org_tag", "choice", choices=("auto", "on", "off"),
+            help="Show the [org] tag beside accounts; auto only where accounts share an email",
         ),
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
@@ -455,21 +455,17 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
     default = UiSettings()
     if not isinstance(section, dict):
         return default
-    theme = section.get("theme", default.theme)
-    if theme not in SETTING_SPECS["ui.theme"].choices:
-        _logger.warning(
-            "settings.json: unsupported ui.theme %r; using %r",
-            theme, default.theme,
-        )
-        theme = default.theme
-    show_org_tag = section.get("showOrgTag", default.show_org_tag)
-    if not isinstance(show_org_tag, bool):
-        _logger.warning(
-            "settings.json: ui.showOrgTag must be true or false, got %r; using %r",
-            show_org_tag, default.show_org_tag,
-        )
-        show_org_tag = default.show_org_tag
-    return UiSettings(theme=theme, show_org_tag=show_org_tag)
+    fields = {}
+    for spec in (SETTING_SPECS["ui.theme"], SETTING_SPECS["ui.orgTag"]):
+        value = section.get(spec.json_key, spec.default)
+        if value not in spec.choices:
+            _logger.warning(
+                "settings.json: unsupported %s %r; using %r",
+                spec.dotted, value, spec.default,
+            )
+            value = spec.default
+        fields[spec.field] = value
+    return UiSettings(**fields)
 
 
 def load_run_settings(backup_root: Path) -> RunSettings:
