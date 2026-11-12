@@ -66,7 +66,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    log_unrecognized_keys,
+    parse_model_names,
+)
 from claude_swap.switcher import (
     LOGIN_RESTORE_RECHECK_MARGIN_S,
     LOGIN_RESTORE_SETTLE_FLOOR_S,
@@ -4680,6 +4685,9 @@ class AutoSwitchEngine:
         that flip.
         """
         try:
+            # Once per loop, not per tick: a settings key nothing reads would
+            # otherwise leave the loop running on a default with no trace of why.
+            log_unrecognized_keys(self.switcher.backup_dir)
             while True:
                 # Clear at the top, not after the wait: a wake() racing a wait
                 # timeout is then never lost — the tick right after this

@@ -45,6 +45,8 @@ By default only the account-wide 5h/7d windows drive switching. If you work on o
 
 **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
 
+A setup-token account (`cswap add-token`) has a Fable row only with `usage.fableProbe` on, next to `usage.headerProbe`. Without it, `--model Fable` leaves that account's reading shown but not used for switching.
+
 ## Accounts with no 5-hour window
 
 When the usage API reports no `five_hour` window for an account (verified Ultra accounts have no 5-hour limit), cswap judges it on its 7-day window and any `--model` window alone and shows no 5h row. A setup-token read through the rate-limit headers (`usage.headerProbe`) is judged the same way when its response carries no 5-hour headers at all; a 5-hour header without a usable utilization fails the reading instead.
