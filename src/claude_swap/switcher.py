@@ -8743,6 +8743,20 @@ class ClaudeAccountSwitcher:
                 "cleared — and a survivor keeps authenticating under this "
                 "slot's name. Nothing was changed. Repair the file and retry."
             )
+        # Same rule, for the read's last step. The clear below removes the item
+        # claude reads for this environment and never the fallback one, which
+        # belongs to a claude started without CLAUDE_CONFIG_DIR; the re-read
+        # then finds it and refuses, after the live item is already gone.
+        if self._store._use_keychain():
+            other, unreadable = self._store._read_fallback_oauth_keychain()
+            if other or unreadable:
+                raise SwitchError(
+                    "CLAUDE_CONFIG_DIR names the default profile, and a login "
+                    "(or an unreadable item) sits in the unsuffixed Keychain "
+                    "item, which cswap does not remove, so this slot would not "
+                    "read as logged out. Nothing was changed. Unset "
+                    "CLAUDE_CONFIG_DIR, or log in with it set, and retry."
+                )
         if live:
             self._stash_live_credential(
                 live,

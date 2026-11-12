@@ -19458,6 +19458,97 @@ class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
         assert len(out.get("warnings", [])) == 1, out
 
 
+class TestAnEmptySlotLandingAgreesWithTheReadAboutItsStores:
+    """The landing may only clear stores the read will not find again.
+
+    ``CLAUDE_CONFIG_DIR`` naming ``~/.claude`` puts two Keychain items in play:
+    the clear removes the hashed one claude reads, and the read falls back to
+    the unsuffixed one, which belongs to a claude started without the variable
+    and is never removed. A landing that clears and then re-reads finds that
+    login on the "empty" slot, and refuses AFTER the live item is gone.
+    """
+
+    SLOT_1 = json.dumps({"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}})
+    OTHER = json.dumps({"claudeAiOauth": {"accessToken": "sk-x", "refreshToken": "rt-x"}})
+
+    def _world(self, temp_home, monkeypatch, keychain, *, variable, hashed, unsuffixed):
+        """Slot 1 is active and slot 2 has no login. ``hashed`` and
+        ``unsuffixed`` are what the two Keychain items hold."""
+        from claude_swap.session import keychain_service_name
+
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        default = temp_home / ".claude"
+        if variable:
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(default))
+        else:
+            monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        s._write_account_credentials("1", "a@example.com", self.SLOT_1)
+        s._write_account_config(
+            "1", "a@example.com",
+            json.dumps({"oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-1"}}),
+        )
+        data = s._get_sequence_data()
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            data["accounts"][str(num)] = {
+                "email": email, "uuid": f"uuid-{num}", "organizationUuid": "",
+                "organizationName": "", "added": "2024-01-01T00:00:00Z",
+            }
+        data["sequence"] = [1, 2]
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        get_global_config_path().write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-1"},
+        }))
+        account = _kc.keychain_account_name()
+        for service, held in (
+            (keychain_service_name(str(default)), hashed),
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, unsuffixed),
+        ):
+            if held:
+                keychain.data[(service, account)] = held
+        return s
+
+    @pytest.mark.parametrize(
+        "variable, hashed, unsuffixed, lands",
+        [
+            pytest.param(False, None, SLOT_1, True, id="no-variable"),
+            pytest.param(True, SLOT_1, OTHER, False, id="two-logins"),
+            pytest.param(True, None, SLOT_1, False, id="unsuffixed-only"),
+        ],
+    )
+    def test_a_landing_leaves_nothing_the_read_still_finds(
+        self, temp_home, monkeypatch, block_real_keychain,
+        variable, hashed, unsuffixed, lands,
+    ):
+        s = self._world(
+            temp_home, monkeypatch, block_real_keychain,
+            variable=variable, hashed=hashed, unsuffixed=unsuffixed,
+        )
+        before = dict(block_real_keychain.data)
+
+        if lands:
+            result = s.switch_to("2", json_output=True)
+            assert result["needsLogin"] is True
+            assert s._get_sequence_data()["activeAccountNumber"] == 2
+            fresh = ClaudeAccountSwitcher()
+            fresh.platform = Platform.MACOS
+            assert fresh._store._read_active_credentials().value == "", (
+                "the landing reported success over a store the read still finds"
+            )
+            return
+
+        with pytest.raises(SwitchError, match="Nothing was changed"):
+            s.switch_to("2", json_output=True)
+        assert block_real_keychain.data == before, (
+            "a refused landing deleted a Keychain item"
+        )
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+
 def test_keychain_blind_probes_rather_than_reading_an_unset_cache(
     temp_home: Path, monkeypatch
 ):
