@@ -89,6 +89,7 @@ from claude_swap.paths import (
     get_claude_config_home,
     get_credentials_path,
     get_default_claude_config_home,
+    get_default_global_config_path,
     get_global_config_path,
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
@@ -4215,6 +4216,26 @@ class ClaudeAccountSwitcher:
         identity = self._live_login_identity(ask_server=False)
         return identity is not None and identity == (email, org_uuid or "")
 
+    def _is_default_login_from_another_profile(
+        self, email: str, org_uuid: str
+    ) -> bool:
+        """Whether this slot is the default profile's login while this process
+        reads another profile (``CLAUDE_CONFIG_DIR``, a session shell).
+
+        Read from the default profile's config on purpose: the identity this
+        process resolves as current is the other profile's.
+        """
+        default_config = get_default_global_config_path()
+        if self._get_claude_config_path() == default_config:
+            return False
+        if not default_config.exists():
+            return False
+        account = (self._read_json(default_config) or {}).get("oauthAccount") or {}
+        return (
+            account.get("emailAddress", ""),
+            account.get("organizationUuid", "") or "",
+        ) == (email, org_uuid or "")
+
     def _resolved_matches_slot_identity(
         self, account_num: str, resolved: dict
     ) -> bool | None:
@@ -6553,11 +6574,20 @@ class ClaudeAccountSwitcher:
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 return self._read_only_fetch(str(num), email, session_creds, rejected_fp)
 
-        if has_live_session:
+        if has_live_session or self._is_default_login_from_another_profile(
+            email, org_uuid
+        ):
             # No profile credential to read (wiped under the session, or
             # unreadable): the backup copy serves read-only, and once the
             # live claude has rotated past it the server refuses it for
             # good. An expired copy is known refused without asking.
+            #
+            # The default login polled from another profile's shell is owned
+            # the same way. _build_accounts_info resolves the active slot
+            # through CLAUDE_CONFIG_DIR, so this slot arrives here as idle
+            # while the default profile's claude still rotates its family in
+            # the default store. Refreshing the backup would consume the
+            # generation that store holds and log that claude out.
             backup_oauth = oauth.extract_oauth_data(creds) or {}
             if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)

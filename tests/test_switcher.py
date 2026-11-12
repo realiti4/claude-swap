@@ -1412,6 +1412,56 @@ class TestSetupTokenHeaderProbeWiring:
         assert _format_usage_lines(rejected)[-1] == "probe: rejected"
 
 
+class TestFetchAccountUsageFromAnotherProfile:
+    """From a session shell the active slot is resolved through
+    ``CLAUDE_CONFIG_DIR``, so the default login's slot is polled as an idle
+    one. Its token family still belongs to the default profile's claude."""
+
+    def _switcher_in_session_shell(self, monkeypatch) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        profile = switcher.backup_dir / "sessions" / "2-account2_example.com"
+        profile.mkdir(parents=True)
+        (profile / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "account2@example.com"}}
+        ))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        return switcher
+
+    def test_default_login_is_not_refreshed(
+        self, temp_home: Path, mock_claude_config: Path, monkeypatch
+    ):
+        """Consuming the backup's grant would leave the default store on the
+        consumed generation and log the default profile's claude out."""
+        switcher = self._switcher_in_session_shell(monkeypatch)
+        expired = _oauth_creds("sk-default", -3600)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(
+                (1, "test@example.com", "", "", False, expired, "")
+            )
+
+        refresh.assert_not_called()
+        mock_fetch.assert_not_called()
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+
+    def test_a_slot_nobody_is_logged_into_still_refreshes(
+        self, temp_home: Path, mock_claude_config: Path, monkeypatch
+    ):
+        switcher = self._switcher_in_session_shell(monkeypatch)
+        expired = _oauth_creds("sk-idle", -3600)
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(
+                (3, "idle@example.com", "", "", False, expired, "")
+            )
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        assert mock_fetch.call_args.kwargs["refresh_via"] == switcher.consume_backup_grant
+
+
 class TestAdoptSessionCredential:
     """An exited session's profile holds the slot's newest generation; the
     backup only learns about it through adoption."""
