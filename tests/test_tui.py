@@ -1369,6 +1369,7 @@ class _FakeEngine:
         self.stopped = False
         self.applied_thresholds: list[float] = []
         self.applied_strategies: list[str] = []
+        self.applied_models: list[str | None] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1389,6 +1390,10 @@ class _FakeEngine:
     def apply_strategy(self, strategy: str) -> None:
         self.settings = dataclasses.replace(self.settings, strategy=strategy)
         self.applied_strategies.append(strategy)
+
+    def apply_model(self, model: str | None) -> None:
+        self.settings = dataclasses.replace(self.settings, model=model)
+        self.applied_models.append(model)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -1707,6 +1712,129 @@ class TestAutoScreen:
             assert "could not save defaults" in self._log(screen)
             assert "strategy consume-first (session)" in self._summary(screen)
             assert (tmp_path / "settings.json").read_text() == "{not json"
+
+    # -- model watch (m) ---------------------------------------------------
+
+    @staticmethod
+    def _fleet(tmp_path):
+        """#2 resets soonest but its Fable weekly limit is spent."""
+        return FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(20.0, 20.0)),
+                make_account(
+                    2,
+                    entry=make_entry(
+                        20.0, 20.0, scoped=[("Fable", 100.0), ("Opus", 5.0)],
+                        reset7_s=3600,
+                    ),
+                ),
+                make_account(3, entry=make_entry(20.0, 20.0, reset7_s=86400)),
+            ],
+            tmp_path,
+        )
+
+    async def test_model_cycle_is_session_only(self, tmp_path, fake_engine):
+        app = make_app(self._fleet(tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            engine = fake_engine.instances[0]
+            assert "models off ·" in self._summary(screen)
+            await pilot.press("m")
+            await pilot.pause()
+            assert screen._settings.model == "all"
+            assert engine.applied_models == ["all"]
+            assert engine.wakes == 1  # decide on the new windows now
+            assert "models all (session)" in self._summary(screen)
+            assert "models → all for this session" in self._log(screen)
+            assert not (tmp_path / "settings.json").exists()
+            # then each model the accounts report, then back to off, where
+            # matching the file value again drops the (session) tag
+            await pilot.press("m", "m", "m")
+            await pilot.pause()
+            assert engine.applied_models == ["all", "Fable", "Opus", None]
+            assert "models off ·" in self._summary(screen)
+            # a dry↔live restart rebuilds the engine with the session pick
+            await pilot.press("m", "l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert fake_engine.instances[1].settings.model == "all"
+
+    async def test_model_cycle_keeps_a_saved_custom_list(self, tmp_path, fake_engine):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"model": "Fable,Opus"},
+        }))
+        app = make_app(self._fleet(tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert "models Fable,Opus ·" in self._summary(screen)
+            seen = []
+            for _ in range(5):
+                await pilot.press("m")
+                await pilot.pause()
+                seen.append(screen._settings.model)
+            assert seen == [None, "all", "Fable", "Opus", "Fable,Opus"]
+
+    async def test_model_watch_drops_a_spent_account_from_the_top(
+        self, tmp_path, fake_engine
+    ):
+        from textual.widgets import Static
+
+        app = make_app(self._fleet(tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await self._cycle_to(pilot, screen, "consume-first")
+
+            def order() -> tuple[int, int]:
+                plain = screen.query_one("#candidates", Static).render().plain
+                return (
+                    plain.index("user2@example.com"),
+                    plain.index("user3@example.com"),
+                )
+
+            spent, healthy = order()
+            assert spent < healthy  # soonest reset wins while Fable is ignored
+            await pilot.press("m")
+            await pilot.pause()
+            spent, healthy = order()
+            assert healthy < spent
+
+    async def test_save_defaults_persists_and_clears_the_model(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.modals import ConfirmModal
+
+        app = make_app(self._fleet(tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("m", "d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            assert "models all" in app.screen._message
+            await pilot.press("y")
+            await pilot.pause()
+            assert load_settings(tmp_path).model == "all"
+            assert "models all ·" in self._summary(screen)
+            assert "models all" in self._log(screen)
+            # back to off and save: the key is removed, not written as ""
+            await pilot.press("m", "m", "m", "d")
+            await pilot.pause()
+            assert "models off" in app.screen._message
+            await pilot.press("y")
+            await pilot.pause()
+            assert load_settings(tmp_path).model is None
+            raw = _json.loads((tmp_path / "settings.json").read_text())
+            assert "model" not in raw["autoswitch"]
+            assert "(session)" not in self._summary(screen)
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

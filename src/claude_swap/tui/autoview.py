@@ -42,6 +42,7 @@ from claude_swap.settings import (
     load_settings,
     parse_model_names,
     set_setting,
+    unset_setting,
 )
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
@@ -77,6 +78,7 @@ class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("s", "cycle_strategy", "Strategy"),
+        Binding("m", "cycle_model", "Models"),
         Binding("t", "adjust_threshold", "Threshold"),
         Binding("d", "save_defaults", "Save defaults"),
         Binding("left", "threshold_step(-1)", "-1%"),
@@ -104,6 +106,9 @@ class AutoScreen(Screen):
         # "(session)" tags compare against them, and ``d`` (save defaults)
         # is the only thing that moves them after mount.
         self._configured_strategy: str | None = None
+        # And for the model watch (m cycles it): the per-model weekly limits
+        # that bind the switch decision, None when only 5h/7d do.
+        self._configured_model: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -126,6 +131,7 @@ class AutoScreen(Screen):
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
         self._configured_strategy = self._settings.strategy
+        self._configured_model = self._settings.model
         self.app.threshold_pct = self._settings.threshold
         # The weekly line is not session-adjustable, so this is only the same
         # sync-to-the-file correction; nothing to restore on unmount.
@@ -228,12 +234,17 @@ class AutoScreen(Screen):
             text.append(
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
+        # Always shown, "off" included: an unwatched per-model limit is why
+        # an account with (say) Fable spent can still rank first.
+        text.append(f" · models {self._settings.model or 'off'}")
+        if self._settings.model != self._configured_model:
+            text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
 
-    # -- strategy (s) and save as defaults (d) --------------------------------
+    # -- strategy (s), model watch (m) and save as defaults (d) ----------------
 
     def action_cycle_strategy(self) -> None:
         """Next strategy in AUTOSWITCH_STRATEGIES order, session-only like the
@@ -254,21 +265,62 @@ class AutoScreen(Screen):
         self._refresh_candidates()
         self._note(f"— strategy → {nxt} for this session —")
 
+    def _model_choices(self) -> list[str | None]:
+        """The m cycle: off, every per-model window, then each model the
+        accounts report by name, in the order first seen. A saved list the
+        cycle would not otherwise reach (e.g. "Fable,Opus") is kept at the
+        end, so cycling never loses the configured value."""
+        choices: list[str | None] = [None, "all"]
+        seen = {"all"}
+        snap = self.app.snapshot
+        for acc in snap.accounts if snap is not None else ():
+            for window in (acc.usage.last_good or {}).get("scoped") or []:
+                name = window.get("name") if isinstance(window, dict) else None
+                if isinstance(name, str) and name.lower() not in seen:
+                    seen.add(name.lower())
+                    choices.append(name)
+        configured = self._configured_model
+        if configured is not None and configured.lower() not in seen:
+            choices.append(configured)
+        return choices
+
+    def action_cycle_model(self) -> None:
+        """Next model watch, session-only like the strategy. The Next list
+        reads the same setting, so it re-ranks at once."""
+        choices = self._model_choices()
+        current = self._settings.model
+        nxt = (
+            choices[(choices.index(current) + 1) % len(choices)]
+            if current in choices
+            else choices[0]
+        )
+        self._settings = replace(self._settings, model=nxt)
+        if self._engine is not None:
+            self._engine.apply_model(nxt)
+            self._engine.wake()
+        self._update_summary()
+        self._refresh_candidates()
+        self._note(f"— models → {nxt or 'off'} for this session —")
+
     def action_save_defaults(self) -> None:
         if self._adjusting:
             self._end_adjust()  # save what the user is looking at, mode closed
         s = self._settings
-        if (s.strategy, s.threshold) == (
+        if (s.strategy, s.threshold, s.model) == (
             self._configured_strategy,
             self._configured_threshold,
+            self._configured_model,
         ):
-            self._note("— strategy and threshold are already the defaults —")
+            self._note(
+                "— strategy, threshold and models are already the defaults —"
+            )
             return
         self.app.push_screen(
             ConfirmModal(
                 "Save as defaults?\n\n"
                 f"  strategy {s.strategy}\n"
-                f"  threshold {pct_label(s.threshold)}%\n\n"
+                f"  threshold {pct_label(s.threshold)}%\n"
+                f"  models {s.model or 'off'}\n\n"
                 "Written to settings.json. A `cswap auto` or menu-bar engine "
                 "that is already running picks them up on its next start.",
                 title="Save defaults",
@@ -282,7 +334,7 @@ class AutoScreen(Screen):
             return
         s = self._settings
         root = self.app.switcher.backup_dir
-        # Two single-key writes through `cswap config set`'s path: validated,
+        # Single-key writes through `cswap config set`'s path: validated,
         # and every other key in the file survives. Each baseline moves only
         # once its own write landed, so after a partial failure the
         # "(session)" tags still tell the truth about what is on disk.
@@ -291,6 +343,12 @@ class AutoScreen(Screen):
             self._configured_strategy = s.strategy
             set_setting(root, "autoswitch.threshold", str(s.threshold))
             self._configured_threshold = s.threshold
+            # "off" removes the key rather than storing an empty string.
+            if s.model is None:
+                unset_setting(root, "autoswitch.model")
+            else:
+                set_setting(root, "autoswitch.model", s.model)
+            self._configured_model = s.model
         except (ConfigError, OSError) as e:
             self._update_summary()
             self._note(f"— could not save defaults: {e} —", role="sev_warn")
@@ -298,7 +356,7 @@ class AutoScreen(Screen):
         self._update_summary()
         self._note(
             f"— saved as defaults: strategy {s.strategy}, "
-            f"threshold {pct_label(s.threshold)}% —"
+            f"threshold {pct_label(s.threshold)}%, models {s.model or 'off'} —"
         )
 
     def _note(self, message: str, *, role: str = "muted") -> None:
