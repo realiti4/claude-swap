@@ -84,6 +84,7 @@ from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
+from claude_swap.process_tree import run_and_reap
 from claude_swap.settings import (
     atomic_write_json,
     explicit_share_history,
@@ -1347,11 +1348,12 @@ class SessionManager:
         # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
         try:
-            result = spawn.run(
+            # run_and_reap, not spawn.run: on Windows this short-lived
+            # claude can strand a suspended `git` it started (see
+            # process_tree), one per `cswap run`.
+            result = run_and_reap(
                 [claude_bin, "auth", "status", "--json"],
                 env=_probe_env(session_dir),
-                capture_output=True,
-                text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
