@@ -211,8 +211,11 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
         # --- write + verify before deleting the source ------------------------
         # Keychain-only helpers: this migration targets the security service, so
         # it must not be diverted to .enc files by the transparent backup methods.
+        # attributed=True: `creds` was read from this slot's own legacy entry (the
+        # exact `account-{num}-{email}` key, or `account-None-{email}` only when
+        # the email is unique, checked above): the same bytes moved between services.
         try:
-            switcher._kc_write_backup(account_num, email, creds)
+            switcher._kc_write_backup(account_num, email, creds, attributed=True)
             readback = switcher._kc_read_backup(account_num, email)
         except Exception as e:  # noqa: BLE001
             switcher._logger.warning(
