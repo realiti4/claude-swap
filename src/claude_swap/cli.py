@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -195,6 +196,26 @@ Examples:
     )
     args = parser.parse_args(head)
 
+    # The parser's --help belongs on stdout. Nothing printed after it does:
+    # see _run_launch.
+    with contextlib.redirect_stdout(sys.stderr):
+        _run_launch(args, tail)
+
+
+def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
+    """Resolve the account for `cswap run` and hand the terminal to claude.
+
+    Runs with stdout redirected to stderr. Stdout belongs to claude, and a
+    caller may be reading it as data (`cswap run 2 -- -p ... --output-format
+    stream-json`), so a notice printed there lands in that stream: ahead of
+    claude's output when stdout is unbuffered, after it on Windows, where
+    cswap stays resident and flushes its buffer at exit. On a POSIX pipe it
+    is lost instead, because the exec discards what is still buffered.
+
+    The redirect covers every print on the way to the launch, the session
+    bootstrap's included, and rebinds only Python's ``sys.stdout``: claude
+    inherits the real stream.
+    """
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
