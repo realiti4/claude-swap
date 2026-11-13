@@ -19,10 +19,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap.models import AccountPolicy
+from claude_swap.models import AccountPolicy, UsageEntry
+from claude_swap.settings import load_settings
+from claude_swap.tui.autoview import AutoScreen
+from claude_swap.tui.theme import CSWAP_DARK
 from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
@@ -34,28 +38,37 @@ from tests.test_tui import (
     settle,
 )
 
-# Goldens captured from the unmodified engine at
-# 4f6c6ac6f303bd910d51bf5bf2fb36d553f4f37f60a50e438291d4feb5cadfbe, rendered
-# through the same ``make_account`` fixture used below.  Only the header row and
-# the whole mini row are pinned as literals: the card's bar rows carry a wall
-# clock date and would rot daily.  Their invariance is asserted structurally
-# instead (see ``test_the_card_bar_rows_are_untouched``).  The re-login note
-# (tests/test_login_expiry.py) only joins a row while its login is due, so
-# these fixtures, which carry no expiry, render without it.
-GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h 25% · 7d 10%"
-GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h 25% · 7d 10%"
-
 NOW = 1000.0
 
+# Goldens first captured from the unmodified engine at
+# 4f6c6ac6f303bd910d51bf5bf2fb36d553f4f37f60a50e438291d4feb5cadfbe, through the
+# same ``make_account`` fixture used below.  Only the header row and the whole
+# mini row are pinned as literals: the card's bar rows carry a wall clock date
+# and would rot daily.  Their invariance is asserted structurally instead (see
+# ``test_the_card_bar_rows_are_untouched``).  The mini row's window chips carry
+# a reset countdown, so its goldens were re-rendered through ``NO_RESET``, an
+# entry that reports no reset (``⟳?``), and stay fixed.  The re-login note
+# (tests/test_login_expiry.py) only joins a row while its login is due, so
+# these fixtures, which carry no expiry, render without it.
+NO_RESET = UsageEntry(
+    last_good={"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}},
+    fetched_at=NOW - 5.0,
+    age_s=5.0,
+)
+GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
+GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h(⟳?):25% · 7d(⟳?):10%"
+GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
+GOLDEN_MINI_DISABLED = (
+    " 3  user3@example.com  [personal]  (disabled)   5h(⟳?):25% · 7d(⟳?):10%"
+)
 
 def with_policy(acc, **kwargs):
     """Attach an ``AccountPolicy`` to a snapshot from ``tests.test_tui``.
 
     ``make_account`` predates the policy field and takes no ``policy=``
-    argument; ``test_tui.py`` is upstream's and stays byte-unchanged, so the
-    snapshot is rebuilt here instead of the helper being widened.
+    argument; ``test_tui.py`` is upstream's and takes only the one change a
+    merge forced (the ``_acct`` fixture's real policy), so the snapshot is
+    rebuilt here instead of the helper being widened.
     """
     return dataclasses.replace(acc, policy=AccountPolicy(**kwargs))
 
@@ -123,10 +136,12 @@ class TestUnpolicedAccountsRenderExactlyAsBefore:
         )
 
     def test_the_mini_row_is_byte_identical_to_the_golden(self):
-        assert mini(make_account(2, active=True, alias="dev")) == GOLDEN_MINI
+        assert mini(
+            make_account(2, active=True, alias="dev", entry=NO_RESET)
+        ) == GOLDEN_MINI
 
     def test_a_disabled_account_is_byte_identical_to_the_golden(self):
-        acc = make_account(3, disabled=True)
+        acc = make_account(3, disabled=True, entry=NO_RESET)
         assert card(acc).splitlines()[0] == GOLDEN_CARD_HEADER_DISABLED
         assert mini(acc) == GOLDEN_MINI_DISABLED
 
@@ -198,7 +213,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
             assert "(line" not in self._row(plain, "user3@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
@@ -219,4 +234,56 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
+
+    async def test_the_model_gate_and_label_follow_each_accounts_own_line(
+        self, tmp_path
+    ):
+        # Dynamic, model Fable, global 90. Account 2 sits at Fable 92% under a
+        # 95% line of its own: open, so the engine's model-gated pass ranks on
+        # Fable and account 2 (13 points) beats account 3 (Fable 91% over the
+        # global line, 9 points). Judged on the global line instead, both read
+        # model-blocked, the panel drops Fable and orders on 5h (account 3's
+        # 95 points beat account 2's 53), and account 2 is labelled Fable-only.
+        # The hysteresis is 2: at the default 10 account 2's 3 points under its
+        # line do not beat the active's by the margin, the engine's model-gated
+        # pass admits nobody and its 5h/7d retry ranks account 3 first.
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 90, "model": "Fable", "strategy": "dynamic",
+                "hysteresisPct": 2,
+            },
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(
+                        2, entry=make_entry(50.0, 5.0, scoped=[("Fable", 92.0)])
+                    ),
+                    threshold=95.0,
+                ),
+                make_account(
+                    3, entry=make_entry(5.0, 5.0, scoped=[("Fable", 91.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        # Rendered straight off the screen: the ranking needs no engine and no
+        # pilot (the sibling tests cover the mount wiring).
+        v = AutoScreen.__new__(AutoScreen)
+        v._settings = load_settings(tmp_path)
+        v._engine = None
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK
+        box = MagicMock()
+        box.size.width = 200  # no layout on a `__new__` screen: a box wide enough for the login
+        with patch.object(AutoScreen, "app", property(lambda s: app)), patch.object(
+            AutoScreen, "query_one", lambda s, *a: box
+        ):
+            snap = fake.accounts_snapshot()
+            plain = str(v._candidates_text(snap, active_number=snap.active_number))
+        assert plain.index("user2@example.com") < plain.index("user3@example.com")
+        assert "Fable-only" not in self._row(plain, "user2@example.com")
+        assert "Fable-only" in self._row(plain, "user3@example.com")
