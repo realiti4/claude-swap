@@ -22,6 +22,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 
 - `switcher.py`: `ClaudeAccountSwitcher`. Slots, add, remove, switch, swap, move, usage collection and the token refresh gate. See the map below.
 - `autoswitch.py`: `AutoSwitchEngine`. Decides when to switch and reports through typed events; it never prints. `lines.py` holds the per-window switch lines.
+- `schedule.py`: daily one-token window activation, strict 99% failover, a sanitized display snapshot and its dedicated login agent. It reuses the switcher credential refresh and transaction paths.
 - `session.py`: `SessionManager`, behind `cswap run`. `mappings.py` maps a directory to an account.
 - `usage_store.py`: `UsageStore`, the per-account usage table. `poll_policy.py` holds every polling number. `snapshot_source.py` is the read path for dashboards.
 - `oauth.py`: the token, usage and profile endpoints, the header probe, and the formatting of reset times. `subscription.py` reads the plan label; `pace.py` computes the weekly pace marker.
