@@ -503,7 +503,7 @@ class TestRoomWithoutAWindow:
         # are: 2 has 50 points under 90, so a forced move takes it ahead of 3, which
         # resets sooner but is 5 under its line.
         h = _fleet(temp_home, 3, threshold=90.0)
-        ordered, _, _ = h.engine._rank_candidates(
+        ordered, *_ = h.engine._rank_candidates(
             trigger="proactive",
             consume_first=True,
             oauth_candidates=["2", "3"],
