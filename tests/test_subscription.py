@@ -706,6 +706,18 @@ class TestCollector:
         )
         assert calls == ["live"]
 
+    def test_read_only_list_issues_no_profile_fetch(
+        self, switcher, monkeypatch, sample_sequence_data
+    ):
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        monkeypatch.setattr(switcher, "_build_accounts_info", lambda: info)
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: pytest.fail("network")
+        )
+        switcher.list_accounts(json_output=True, read_only=True)
+        assert not (switcher.backup_dir / "cache" / subscription.PLAN_FILENAME).exists()
+
     def test_inactive_slot_rereads_a_token_the_usage_pass_refreshed(
         self, switcher, monkeypatch
     ):

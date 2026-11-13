@@ -167,7 +167,8 @@ class TestBackupReadCooldown:
         assert keychain.backup_calls(2) == 1
 
     def test_a_cooldown_is_announced_once_and_its_skips_are_silent(
-        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog
+        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog,
+        monkeypatch,
     ):
         """Skipped reads are expected, not failures: no per-lookup warning
         (31 per snapshot at 11 accounts, ~600/min on the 3 s tick), one info
@@ -193,8 +194,11 @@ class TestBackupReadCooldown:
             assert len(announced) == 1, "one announcement per cooldown"
 
             # The cooldown lapses, the re-probe fails again: a new cooldown,
-            # announced again — once.
-            s._store._keychain_disabled_until = time.monotonic() - 1
+            # announced again, once. The clock advances rather than the
+            # deadline rewinding: on a coarse tick (Windows, 15.6 ms) a rewound
+            # deadline lets both cooldowns start in one tick, equal floats.
+            real = time.monotonic
+            monkeypatch.setattr(time, "monotonic", lambda: real() + 61)
             s.accounts_snapshot(fetch=set())
             s.accounts_snapshot(fetch=set())
             announced = [
@@ -430,9 +434,9 @@ class TestStrikeBindingReadsFresh:
         calls: list = []
         real = s._usage_store.clear_dead_token
 
-        def spy(nums, identities):
+        def spy(nums, identities, **kwargs):
             calls.append(list(nums))
-            return real(nums, identities)
+            return real(nums, identities, **kwargs)
 
         monkeypatch.setattr(s._usage_store, "clear_dead_token", spy)
         return calls
@@ -492,3 +496,55 @@ class TestStrikeBindingReadsFresh:
         assert row.usage.sentinel == USAGE_RELOGIN_REQUIRED
         assert cleared == []
         assert keychain.backup_calls(2) == 0
+
+
+class TestResyncDecidesOnAFreshRead:
+    """`_resync_rotated_backup` pre-checks drift through the display cache
+    (the steady state costs no spawn), but once the cached read says drift it
+    re-reads fresh before it can write: the cache may only over-hold."""
+
+    def _arm(self, temp_home, block_real_keychain, monkeypatch):
+        s = _switcher(temp_home, block_real_keychain, 2)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda _t: {
+            "uuid": "acct-1", "email": _email(1), "organizationUuid": "org-1",
+        })
+        s._read_account_credentials("1", _email(1), cached=True)  # fills the cache
+        lines: list[str] = []
+        monkeypatch.setattr(
+            s._store, "_log_detected_login",
+            lambda _c, *, outcome, **_k: lines.append(outcome),
+        )
+        return s, lines
+
+    def test_a_fresh_read_that_matches_live_writes_nothing(
+        self, temp_home: Path, block_real_keychain, keychain: _Keychain, monkeypatch
+    ):
+        s, lines = self._arm(temp_home, block_real_keychain, monkeypatch)
+        rotated = _cred("rotated")
+        # Another process rotated the backup without touching the registry:
+        # the cache still holds generation A, the item holds the live bytes.
+        block_real_keychain.data[_backup_key(1)] = rotated
+        before = keychain.backup_calls(1)
+
+        s._resync_rotated_backup("1", _email(1), "org-1", rotated)
+
+        assert keychain.backup_calls(1) == before + 1, "one fresh read decided it"
+        assert lines == [], "the stale cached read must not reach the lock"
+
+    def test_a_drift_is_decided_on_the_fresh_backup_not_the_cached_one(
+        self, temp_home: Path, block_real_keychain, keychain: _Keychain, monkeypatch
+    ):
+        s, lines = self._arm(temp_home, block_real_keychain, monkeypatch)
+        rotated = _cred("rotated")
+        block_real_keychain.data[
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+        ] = rotated
+        # The cache holds generation A, the item moved to B (neither is live):
+        # a pre-lock read served from the cache hands the locked re-read a
+        # backup that "moved" and the write is refused.
+        block_real_keychain.data[_backup_key(1)] = _cred("B")
+
+        s._resync_rotated_backup("1", _email(1), "org-1", rotated)
+
+        assert lines == ["adopted into slot 1"]
+        assert block_real_keychain.data[_backup_key(1)] == rotated

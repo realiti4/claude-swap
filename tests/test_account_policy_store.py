@@ -482,7 +482,7 @@ class TestPolicySurvivesSlotReadd(PolicyStoreBase):
         self._park_with_policy(s, "2")
         self._make_live(temp_home, "account-2@example.test", 2)
 
-        s.add_account(slot=5)
+        s.add_account(slot=5, assume_yes=True)
 
         assert "2" not in (s._get_sequence_data() or {})["accounts"]
         assert s.account_policies()["5"] == AccountPolicy(threshold=85.0, priority=2)
