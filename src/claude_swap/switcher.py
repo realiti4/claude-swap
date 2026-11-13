@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import functools
 import json
 import logging
 import math
@@ -136,6 +137,15 @@ SETUP_TOKEN_SCOPES = oauth.SETUP_TOKEN_SCOPES
 # accounts never burst the shared usage endpoint from one IP in the same
 # instant (request hygiene; see issue #85).
 _FETCH_STAGGER_S = 0.25
+
+# POST bound for the collector's inactive-slot refresh. A timeout after the
+# request left spends the grant and loses its successor; one before costs a
+# retry, so this is longer than the 10 s default. The longer hold is on
+# `.consume-N.lock` only: contenders give up at 10 s with consume-busy.
+# shortcut: urlopen's timeout is per socket operation, so the pre-send phase
+# also gets 30 s; split connect and read bounds only if fleet logs show
+# pre-send stalls holding the consume lock.
+_COLLECTOR_REFRESH_TIMEOUT_S = 30.0
 
 # Slack allowed between two slots' reset instants before the lockstep
 # heuristic stops calling them the same window. The two slots are read by two
@@ -2729,7 +2739,12 @@ class ClaudeAccountSwitcher:
                 self._write_json(self.sequence_file, data)
 
     def consume_backup_grant(
-        self, account_num: str, email: str, snapshot: str
+        self,
+        account_num: str,
+        email: str,
+        snapshot: str,
+        *,
+        timeout_s: float | None = None,
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
@@ -2760,6 +2775,8 @@ class ClaudeAccountSwitcher:
         newer lineage); ``error`` carries the refresh failure unchanged. Every
         outcome carries ``consumed_fp`` — strike binding must follow the bytes
         the gate actually POSTed, which may differ from the caller's snapshot.
+
+        ``timeout_s`` bounds the POST; None leaves the refresh's own default.
 
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
         """
@@ -2792,8 +2809,9 @@ class ClaudeAccountSwitcher:
         # window where a second gate re-read the unchanged backup and POSTed
         # the same one-time-use grant (freshen vs collector). This dedicated
         # lock is contended ONLY by other gates — waiting on it is exactly
-        # the serialization wanted, and the POST is bounded (10 s), so a
-        # loser waits briefly or defers.
+        # the serialization wanted, and the POST is bounded (10 s; the
+        # collector passes `_COLLECTOR_REFRESH_TIMEOUT_S`), so a loser waits
+        # up to this lock's own timeout, then defers.
         consume_lock = FileLock(
             self.credentials_dir / f".consume-{account_num}.lock"
         )
@@ -2809,7 +2827,7 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
             outcome = self._consume_backup_grant_locked(
-                account_num, email, snapshot
+                account_num, email, snapshot, timeout_s=timeout_s
             )
         finally:
             consume_lock.release()
@@ -2845,7 +2863,11 @@ class ClaudeAccountSwitcher:
         return creds
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self,
+        account_num: str,
+        email: str,
+        snapshot: str,
+        timeout_s: float | None = None,
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
@@ -3239,7 +3261,8 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
         result = oauth.try_refresh_oauth_credentials(
-            refresh_input, slot=account_num
+            refresh_input, slot=account_num,
+            **({} if timeout_s is None else {"timeout_s": timeout_s}),
         )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
@@ -7566,7 +7589,10 @@ class ClaudeAccountSwitcher:
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=False,
-            refresh_via=self.consume_backup_grant,
+            refresh_via=functools.partial(
+                self.consume_backup_grant,
+                timeout_s=_COLLECTOR_REFRESH_TIMEOUT_S,
+            ),
             **self._probe_options(last_usage),
         )
         return FetchRecord(

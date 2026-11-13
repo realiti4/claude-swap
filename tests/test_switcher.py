@@ -18,6 +18,7 @@ import pytest
 from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import poll_policy
+from claude_swap import switcher as switcher_module
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -1573,7 +1574,11 @@ class TestFetchAccountUsageFromAnotherProfile:
             )
 
         assert record.usage == {"five_hour": {"pct": 5}}
-        assert mock_fetch.call_args.kwargs["refresh_via"] == switcher.consume_backup_grant
+        refresh_via = mock_fetch.call_args.kwargs["refresh_via"]
+        assert refresh_via.func == switcher.consume_backup_grant
+        assert refresh_via.keywords == {
+            "timeout_s": switcher_module._COLLECTOR_REFRESH_TIMEOUT_S
+        }
 
 
 class TestAdoptSessionCredential:
@@ -1956,7 +1961,7 @@ class TestListAccountsUsage:
                 refresh_via(account_num, email, credentials)
             return oauth.UsageOutcome(None)
 
-        def mock_gate(account_num, email, snapshot):
+        def mock_gate(account_num, email, snapshot, **kw):
             switcher._write_account_credentials(
                 account_num, email, refreshed_creds
             )
@@ -16211,6 +16216,26 @@ class TestConsumeGate:
         assert result.credentials == self._NEW
         assert s._read_account_credentials("1", "test@example.com") == self._NEW
 
+    @pytest.mark.parametrize(
+        "given,expected",
+        [(None, {"slot": "1"}), (7.0, {"slot": "1", "timeout_s": 7.0})],
+    )
+    def test_gate_hands_the_refresh_a_bound_only_when_given_one(
+        self, temp_home: Path, sample_sequence_data: dict, given, expected
+    ):
+        """No ``timeout_s`` leaves the refresh on its own default, so the pin,
+        the switch-time probe and freshen keep the bound they were written
+        against."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        extra = {} if given is None else {"timeout_s": given}
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)) as refresh:
+            s.consume_backup_grant("1", "test@example.com", self._OLD, **extra)
+
+        assert refresh.call_args.kwargs == expected
+
     def test_gate_cas_persist_detects_racing_writer(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -17088,6 +17113,42 @@ class TestProbeTargetCredentialReprobe:
         assert proven_401 is True
 
 
+@contextlib.contextmanager
+def _slow_token_endpoint(delay_s: float, successor: dict):
+    """A loopback token endpoint that answers 200 with ``successor`` only
+    after ``delay_s``. Yields its URL and the request bodies it received."""
+    import http.server
+    import threading
+
+    hits: list[dict] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            hits.append(json.loads(self.rfile.read(length)))
+            time.sleep(delay_s)
+            body = json.dumps(successor).encode()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass  # the client gave up before the answer
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1/oauth/token", hits
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 class TestInactiveRefreshRoutesThroughGate:
     """M2: the collector's inactive-account refresh consumes via the gate,
     not via a direct POST of its own snapshot."""
@@ -17117,8 +17178,9 @@ class TestInactiveRefreshRoutesThroughGate:
         })
         gate = {}
 
-        def mock_gate(num, email, snapshot):
+        def mock_gate(num, email, snapshot, **kw):
             gate["args"] = (num, email)
+            gate["kw"] = kw
             s._store._write_account_credentials(num, email, fresh)
             return oauth.RefreshOutcome(fresh, None)
 
@@ -17138,8 +17200,67 @@ class TestInactiveRefreshRoutesThroughGate:
             record = s._fetch_account_usage(info)
 
         assert gate["args"] == ("2", "b@example.com")
+        assert gate["kw"] == {"timeout_s": switcher_module._COLLECTOR_REFRESH_TIMEOUT_S}
         assert "called" not in direct
         assert record.error is None
+
+    def test_a_slow_token_response_still_lands_its_successor(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The server rotates the grant and answers after the gate's default
+        bound. Read as transient, the successor is lost and the slot keeps
+        the spent token; the collector's longer bound lands it. The bounds
+        are scaled down from 10 s and 30 s; the endpoint is a real loopback
+        server, so the timeout is the stdlib's own."""
+        import urllib.request
+
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-old", "refreshToken": "rt-old",
+                "expiresAt": 1000,
+            }
+        })
+        s._write_account_credentials("2", "b@example.com", expired)
+        real_refresh = oauth.try_refresh_oauth_credentials
+
+        def refresh_with_short_default(credentials, timeout_s=0.2, slot=None):
+            return real_refresh(credentials, timeout_s=timeout_s, slot=slot)
+
+        monkeypatch.setattr(
+            oauth, "try_refresh_oauth_credentials", refresh_with_short_default
+        )
+        monkeypatch.setattr(
+            "claude_swap.switcher._COLLECTOR_REFRESH_TIMEOUT_S", 5.0,
+            raising=False,
+        )
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+        rotated = {
+            "access_token": "sk-rotated", "refresh_token": "rt-rotated",
+            "expires_in": 3600,
+        }
+        with _slow_token_endpoint(0.5, rotated) as (url, hits):
+            def urlopen(req, *a, **kw):
+                if req.full_url != url:
+                    raise urllib.error.URLError("network blocked under test")
+                return direct(req, *a, **kw)
+
+            monkeypatch.setattr(oauth, "OAUTH_TOKEN_URL", url)
+            monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+            with patch.object(s, "_live_session_pids", return_value=[]), \
+                 patch("claude_swap.oauth.request_usage_data",
+                       return_value={"five_hour": {"utilization": 5}}):
+                s._fetch_account_usage((2, "b@example.com", "", "", False, expired, ""))
+
+        assert len(hits) == 1
+        stored = json.loads(s._read_account_credentials("2", "b@example.com"))
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-rotated"
 
 
 class TestRefusedAdoptionStaysReadOnly:
