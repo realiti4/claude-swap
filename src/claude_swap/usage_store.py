@@ -117,6 +117,38 @@ BACKOFF_CAP_S = 600.0
 # that is behaviour-preserving.
 BACKOFF_MAX_SHIFT = 32
 
+# A standing refusal is not a transient fault. The usage endpoint answers 403
+# for an identity whose credential it will not serve at all — most commonly a
+# setup-token account, which is inference-only server-side (see switcher.py on
+# setup-token scopes; `usage.headerProbe` is the opt-in way to read those). The
+# plain curve above treats it like a timeout and saturates at BACKOFF_CAP_S, so
+# the row re-asks a question that cannot be answered every ten minutes
+# forever: six requests/hour out of the measured ~28-30/hour identity budget
+# (poll_policy's module docstring), spent to learn nothing. Measured in the
+# wild on one machine, three managed accounts: consecutiveFailures 218 and 538
+# with lastError http-403, both rows still polling at the cap, alongside a
+# third row that had been pushed to http-429 — the budget those two were
+# spending is the budget the healthy row needed.
+#
+# This is NOT a dead token and earns no AUTH_DEAD_STRIKES quarantine. 403 is
+# the endpoint refusing a scope, so the credential may be perfectly good for
+# inference, and access can appear later (an org plan change, a re-login with
+# wider scopes). So the row keeps polling — just at a rate that matches how
+# often the answer can plausibly change. After this many consecutive refusals
+# the backoff floors at REFUSED_BACKOFF_S; any success resets
+# consecutiveFailures and the floor goes with it.
+REFUSED_STRIKES = 3
+# Deliberately under TRUST_MAX_AGE_S (3600s), the ceiling the PARK BOUND below
+# uses for non-429 waits. A floor at or above it could hold a row both
+# un-pollable (still in backoff) and unknown (trust elapsed) at once, which the
+# unhealthy-tick counter reads as a failing account and fails over on — the
+# exact overlap that bound exists to prevent. 1800s already cuts the cost from
+# six requests/hour to two and still notices recovery within half an hour.
+REFUSED_BACKOFF_S = 1800.0
+# Fetch errors that mean the endpoint refused this identity outright, rather
+# than failing to answer. Only these take the floor above.
+REFUSED_ERRORS = frozenset({"http-403"})
+
 # The usage endpoint enforces a request budget on non-first-party
 # User-Agents (proven 2026-07-11: an idle token, polling alone trips it;
 # poll_policy documents the measured shape — an hour-scale window, exact edge
@@ -590,12 +622,20 @@ def _failure_backoff_s(
     retry_after_s: float | None,
     *,
     rate_limited: bool = True,
+    refused: bool = False,
 ) -> float:
     """Seconds to stay in backoff after a failed fetch."""
     computed = min(
         BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
         BACKOFF_CAP_S,
     )
+    # A standing refusal (REFUSED_ERRORS) raises the ceiling for this row only;
+    # see REFUSED_STRIKES. Applied to `computed` rather than at each return so
+    # it holds on every arm below, and bounded there: a refusal is never
+    # `rate_limited`, so the PARK BOUND caps any Retry-After it carries at
+    # TRUST_MAX_AGE_S and the final `max(asked, computed)` cannot exceed it.
+    if refused and consecutive_failures >= REFUSED_STRIKES:
+        computed = max(computed, REFUSED_BACKOFF_S)
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
@@ -1172,6 +1212,7 @@ class UsageStore:
                     failures,
                     rec.retry_after_s,
                     rate_limited=rec.error == "http-429",
+                    refused=rec.error in REFUSED_ERRORS,
                 )
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no
