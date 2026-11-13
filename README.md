@@ -163,6 +163,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 - **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead. When that login holds no usable token any more (missing, or emptied by Claude Code after a failed refresh), the account launches in its session profile from its stored login instead, since plain `claude` would only stop at "Not logged in".
 - **Tokens.** A session refreshes its own copy of the account's token; once it exits, the credential it rotated is captured back into the account's stored backup before a switch, swap, move, or usage check uses it. While the session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail) — exit the session first, or pick another account.
 - **Usage.** While a session runs, its account's usage is read with the session's own credential, which cswap never refreshes. A read the server refuses shows as token expired, and isn't retried, until the session renews the credential on its next call.
+- **Scripting.** cswap writes its own launch notices to stderr, so stdout carries only what claude prints: `cswap run 2 -- -p "…" --output-format json | jq` works.
 
 </details>
 
