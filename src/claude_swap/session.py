@@ -52,6 +52,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,7 @@ from claude_swap.fsutil import (
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
+from claude_swap.oauth import ERROR_NOTES
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
@@ -383,7 +385,9 @@ def _may_have_credential_material(session_dir: Path) -> bool:
     return False
 
 
-def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
+def _artifacts_say_usable(
+    session_dir: Path, email: str, org_uuid: str, *, reseeded: bool
+) -> bool:
     """What local artifacts can say about a profile without running the probe.
 
     Upstream's probe-timeout fallback (#224 follow-up), lifted to a function
@@ -393,7 +397,22 @@ def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
 
     Deliberately NOT consulted for "unreachable". There the question is
     whether `claude` can be run at all, and no file on disk answers it.
+
+    ``reseeded`` is the caller saying a bootstrap just rewrote these files
+    from the BACKUP. It relaxes one clause only, below; whether to ask at all
+    is the caller's own decision.
     """
+    # A READABLE IDENTITY IS PART OF BEING USABLE, and only a re-seed
+    # excuses its absence. Every other signal here leans "present" -- an
+    # unreadable keychain entry reads as material, an unreadable identity as
+    # "no drift" -- so with nothing readable the profile passes on leniency
+    # alone. `reseeded` is the caller saying the artifacts are the BACKUP's,
+    # which is the only state in which that leniency has a premise.
+    # ponytail: a backup whose `oauthAccount` carries no `emailAddress` keeps
+    # the identity unreadable through every re-seed, so that profile re-seeds
+    # on each launch whose probe fails. Repair the backup, not this.
+    if not reseeded and read_session_identity(session_dir) is None:
+        return False
     return _may_have_credential_material(session_dir) and (
         not session_identity_drifted(session_dir, email, org_uuid)
     )
@@ -724,6 +743,14 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
     return env
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(msg: str) -> str:
+    """`msg` with SGR escapes removed, for a record a person reads later."""
+    return _ANSI_RE.sub("", msg)
+
+
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
@@ -746,6 +773,25 @@ class SessionManager:
         # asking, ``run.shareHistory`` in the settings file too.
         self._unlinkable_reported = False
         self._share_history_asked = False
+
+    def _warn(self, msg: str) -> None:
+        """Print for this terminal, log to survive the exec that clears it."""
+        warning(msg)
+        self._logger.warning(_plain(msg))
+
+    def _note(self, msg: str, *, dim: bool = True) -> None:
+        """`_warn` at INFO, for a line naming where the user's data went.
+
+        STYLED FOR THE TERMINAL, PLAIN FOR THE LOG. `dimmed` here rather than
+        at the call site, and `_plain` on the way to the logger, so the record
+        the README points a user at carries no escape sequences.
+
+        `dim=False` for a caller that carries its own styling: wrapping an
+        `accent(...)` span in `dimmed` dims it up to that span's own reset,
+        which is a visible change to a line this method only meant to record.
+        """
+        print(msg if not dim else dimmed(msg))
+        self._logger.info(_plain(msg))
 
     # -- launch ----------------------------------------------------------
 
@@ -811,12 +857,10 @@ class SessionManager:
             and self._default_login_signed_out()
         )
         if signed_out:
-            print(
-                dimmed(
-                    f"Account-{account_num} ({email}) is the default login, "
-                    "but that login holds no usable token; launching from "
-                    "the stored login in a session profile."
-                )
+            self._note(
+                f"Account-{account_num} ({email}) is the default login, "
+                "but that login holds no usable token; launching from "
+                "the stored login in a session profile."
             )
         if current is not None and current == (email, org_uuid) and not signed_out:
             if require_session:
@@ -828,11 +872,9 @@ class SessionManager:
                     "Switch the default login to another account first, "
                     "or run `claude` directly."
                 )
-            print(
-                dimmed(
-                    f"Account-{account_num} ({email}) is already the active "
-                    "default login — launching claude directly."
-                )
+            self._note(
+                f"Account-{account_num} ({email}) is already the active "
+                "default login — launching claude directly."
             )
             self._history_on_the_fast_path(
                 session_dir_for(self.switcher.backup_dir, account_num, email),
@@ -843,14 +885,21 @@ class SessionManager:
             env.pop("CLAUDE_CONFIG_DIR", None)
             self._exec(claude_bin, claude_args, env=env)
         if config_dir_preset:
-            warning(
+            msg = (
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
+            # run() sets this to a session profile, so a nested launch takes
+            # this branch every time. Only a value we did not write says the
+            # user's intent was overruled -- and only that is worth SAYING,
+            # not merely worth logging. Printing it either way left the
+            # nested-launch case print-only, which the screen blank erases.
+            if Path(config_dir_preset).parent != self.sessions_dir:
+                self._warn(msg)
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
-            warning(
+            self._warn(
                 f"Ignoring {', '.join(scrubbed)} for this session — it would "
                 f"override the selected account inside Claude Code."
             )
@@ -859,9 +908,13 @@ class SessionManager:
             identifier, share, requested_history
         )
 
-        print(
+        # RECORDED, not just printed. The blank erases this line too, and the
+        # only other log of which account launched fires on FIRST bootstrap --
+        # so every re-launch of an existing profile left no record at all.
+        self._note(
             f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
+            f"{muted('[session mode]')}",
+            dim=False,
         )
         env = {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
@@ -894,11 +947,9 @@ class SessionManager:
         if share_history:
             self._sync_items(session_dir, HISTORY_ITEMS, scope=HISTORY_ITEMS)
         else:
-            print(
-                dimmed(
-                    "   This launch uses the default login's chat history "
-                    "(~/.claude), not the account's own."
-                )
+            self._note(
+                "   This launch uses the default login's chat history "
+                "(~/.claude), not the account's own."
             )
 
     def _resolve_share_history(self, requested: bool | None) -> bool:
@@ -1059,6 +1110,21 @@ class SessionManager:
         # a second `cswap run` joining a live session must not invalidate
         # under the running claude (the marker survives for later).
         stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
+        if is_session_stale(session_dir) and not stale:
+            # THE DEFERRAL HAS NO END WHEN THE RECORDS CANNOT BE READ. The
+            # marker asks for a re-bootstrap and both readers of it require
+            # quiescence, so on an unreadable record the reuse path below
+            # serves the generation the marker exists to retire -- silently.
+            _live, _unreadable = scan_live_sessions(session_dir)
+            if _unreadable and not _live:
+                self._warn(
+                    f"Account-{account_num}'s session profile is flagged for "
+                    f"re-bootstrap but has {_unreadable} session record(s) "
+                    f"that could not be read, so the flag cannot be honoured "
+                    f"and this launch may serve a superseded credential. "
+                    f"Inspect {session_dir / 'sessions'} and remove or repair "
+                    f"them."
+                )
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
@@ -1128,8 +1194,13 @@ class SessionManager:
                     f"re-add it: cswap --add-account --slot {account_num}"
                 )
             if outcome.error is not None:
-                warning(
-                    f"Could not refresh the token for Account-{account_num}; "
+                # The kind picks the remedy and reaches no other record —
+                # oauth logs it at DEBUG. Render it, never raw: several
+                # kinds here are not failures ("consume-busy" retries next
+                # pass) and the bare kind would report one.
+                self._warn(
+                    f"Could not refresh the token for Account-{account_num} "
+                    f"({ERROR_NOTES.get(outcome.error, outcome.error)}); "
                     "continuing with the stored credentials."
                 )
 
@@ -1167,7 +1238,16 @@ class SessionManager:
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
-            self._bootstrap(session_dir, account_num, email, org_uuid)
+            # SAME RULE AS THE BRANCH ABOVE, and this arm is the one that
+            # runs when the probe merely FAILED -- a binary mid-update, a
+            # loaded machine, an in-session /login -- none of which means
+            # nothing is running in there. `_bootstrap` deletes the Keychain
+            # entry and overwrites `.credentials.json`, so under a live
+            # claude it costs that instance its session, and the raise below
+            # then tells the user the profile was left in place.
+            reseeded = profile_is_quiescent(session_dir)
+            if reseeded:
+                self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
@@ -1183,19 +1263,60 @@ class SessionManager:
             # follow-up). Only "unreachable" still stops: no local file can
             # tell us whether `claude` runs, and a session we cannot exec into
             # is not a session.
-            if verdict == "unknown" and _artifacts_say_usable(
-                session_dir, email, org_uuid
+            # THE RE-SEED IS THIS PROMOTION'S PREMISE, and the gate above can
+            # skip it. Without one these files are the profile's own, which
+            # the probe has already contradicted on this path -- readable or
+            # not. `reseeded=True` inside is that same fact excusing an
+            # identity the BACKUP cannot make readable.
+            if verdict == "unknown" and reseeded and _artifacts_say_usable(
+                session_dir, email, org_uuid, reseeded=True
             ):
                 verdict = "valid"
+            if verdict not in ("valid", "unreachable") and not reseeded:
+                # THE GATE'S OWN REASON, or the remedy below is one the user
+                # cannot act on -- so every verdict the GATE blocked lands
+                # here, not just "invalid". `unreachable` is not one: `claude`
+                # could not be spawned, which neither remedy below changes.
+                # An unreadable record makes every gate on this path defer,
+                # and nothing in cswap prunes a record -- so `--add-account`
+                # routes through the same chokepoint and repairs nothing, and
+                # `--remove-account` refuses for the same reason. Only the
+                # file itself.
+                _live, _unreadable = scan_live_sessions(session_dir)
+                if _unreadable:
+                    raise SessionError(
+                        f"Session profile for Account-{account_num} "
+                        f"({email}) could not be launched, and it has "
+                        f"{_unreadable} session record(s) that could not "
+                        f"be read, so it cannot be re-seeded either. "
+                        f"Inspect {session_dir / 'sessions'} and remove or "
+                        f"repair them, then retry."
+                    )
+                if _live:
+                    raise SessionError(
+                        f"Session profile for Account-{account_num} "
+                        f"({email}) could not be launched and a session-mode "
+                        f"Claude instance is live against it (PID "
+                        f"{', '.join(str(s.pid) for s in _live)}), so it "
+                        f"was left in place rather than re-seeded under a "
+                        f"running instance. Exit it, then retry."
+                    )
             if verdict in ("unknown", "unreachable"):
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) could "
                     f"not be verified: `claude auth status` did not run or did "
-                    f"not answer. The profile is left in place — check that "
-                    f"`claude` is on PATH, then retry."
+                    f"not answer in time. The profile is left in place — check "
+                    f"that `claude` is on PATH, and that the machine is not "
+                    f"too loaded for it to answer, then retry."
                 )
             if verdict != "valid":
-                self._cleanup_failed_session(session_dir)
+                # NEVER UNDER A LIVE CLAUDE, the rule every other
+                # invalidation site in this file already follows. The sweep
+                # deletes the seed and the identity out from under a running
+                # instance, and the marker it leaves makes the next launch
+                # invalidate again.
+                if profile_is_quiescent(session_dir):
+                    self._cleanup_failed_session(session_dir)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
                     f"validation. Log in with that account and re-add it: "
@@ -1307,10 +1428,48 @@ class SessionManager:
     def _cleanup_failed_session(self, session_dir: Path) -> None:
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone. The
-        # stale marker is a sibling, so rmtree does not take it.
+        # stale marker is a sibling, so the sweep below does not take it.
         delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
-        clear_session_stale(session_dir)
+        # NOT the whole directory. `HISTORY_ITEMS` is the account's own
+        # conversation history, kept per-account unless --share-history says
+        # otherwise, so it is user data and not a cswap-owned copy. A verdict
+        # of "invalid" is reachable from an upstream change alone -- a
+        # `claude auth status --json` that exits non-zero reads as invalid --
+        # and deleting the seed is what stops the profile being reused.
+        for child in session_dir.iterdir():
+            if child.name in HISTORY_ITEMS and not child.is_symlink():
+                continue
+            # THE ONLY COPY, and `_sync_sharing` can write it minutes before
+            # this runs: `_stash_displaced_mcp` refuses to reset a profile's
+            # MCP servers unless this file holds them, so taking it destroys
+            # what that refusal exists to preserve. NOT `is_file()` -- that
+            # swallows the stat error and answers False, deleting the only
+            # copy over a busy mount. A squatting directory survives instead,
+            # warned about by name every launch.
+            if child.name == MCP_DISPLACED_STASH and not child.is_symlink():
+                continue
+            # `sessions/` IS THE LIVENESS LEDGER, and `scan_sessions` reads
+            # nothing else. Taking it makes `profile_is_quiescent` answer
+            # True forever for this profile, so every guard that asks "is
+            # anything running against it" -- the removal, the swap, the
+            # move, the purge, and this file's own bootstrap gate -- goes
+            # blind on a profile a claude may still be using.
+            if child.name == "sessions" and not child.is_symlink():
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        # MARK, not clear. The profile survives now, so `_session_validity`
+        # no longer short-circuits on `not session_dir.is_dir()` the way it
+        # did when this removed the whole directory -- and on macOS the seed
+        # is not the only credential material: `delete_macos_keychain_entry`
+        # above swallows a locked keychain, so a later probe TIMEOUT falls to
+        # `_artifacts_say_usable`, where the surviving entry reads as present
+        # and the deleted `.claude.json` reads as "no drift". The marker is
+        # what still says "re-bootstrap, do not reuse"; the next successful
+        # bootstrap clears it.
+        mark_session_stale(session_dir)
 
     # -- validation ------------------------------------------------------
 
@@ -1398,7 +1557,9 @@ class SessionManager:
         be definitely absent (keychain-aware — claude migrates a macOS
         profile's credential into the keychain and deletes the plaintext seed,
         while stale invalidation deletes both) and the recorded identity must
-        not have drifted (in-session /login to another account). Anything
+        not have drifted (in-session /login to another account) — which
+        requires it to be READABLE, since reuse runs before any bootstrap and
+        an unreadable identity would otherwise pass as "no drift". Anything
         subtler still fails on first real use.
 
         ``"unreachable"`` answers False without consulting artifacts: the
@@ -1412,7 +1573,9 @@ class SessionManager:
         """
         verdict = self._session_validity(session_dir, email, org_uuid)
         if verdict == "unknown":
-            return _artifacts_say_usable(session_dir, email, org_uuid)
+            return _artifacts_say_usable(
+                session_dir, email, org_uuid, reseeded=False
+            )
         return verdict == "valid"
 
     # -- sharing ---------------------------------------------------------
@@ -1536,11 +1699,9 @@ class SessionManager:
                     # A link cswap never made, leading somewhere else: the
                     # user's own redirect, left alone like a directory of
                     # their own — and what it leads to is never touched.
-                    print(
-                        dimmed(
-                            f"Not sharing {name}: the session profile already "
-                            "has its own link."
-                        )
+                    self._note(
+                        f"Not sharing {name}: the session profile already "
+                        "has its own link."
                     )
                     continue
                 if in_place:
@@ -1559,11 +1720,9 @@ class SessionManager:
                     continue
             elif dest.exists() and name not in managed:
                 # Pre-existing user data in the profile — never touch it.
-                print(
-                    dimmed(
-                        f"Not sharing {name}: the session profile already has "
-                        "its own copy."
-                    )
+                self._note(
+                    f"Not sharing {name}: the session profile already has "
+                    "its own copy."
                 )
                 continue
 
@@ -1697,24 +1856,20 @@ class SessionManager:
         )
         line = f"share-history: {name} stays per-account on this Windows machine."
         if asked:
-            warning(line)
+            self._warn(line)
         else:
-            print(dimmed(line))
+            self._note(line)
         if name in _DIR_ITEMS:
-            print(
-                dimmed(
-                    "   A directory junction could not be made in the profile "
-                    "folder (not an NTFS volume?) — see the log."
-                )
+            self._note(
+                "   A directory junction could not be made in the profile "
+                "folder (not an NTFS volume?) — see the log."
             )
         else:
-            print(
-                dimmed(
-                    "   Windows lets cswap link a file only with Developer Mode "
-                    "on (Settings > System > For developers) or in an elevated "
-                    "terminal. Conversations (projects/) are shared through a "
-                    "junction, which needs neither."
-                )
+            self._note(
+                "   Windows lets cswap link a file only with Developer Mode "
+                "on (Settings > System > For developers) or in an elevated "
+                "terminal. Conversations (projects/) are shared through a "
+                "junction, which needs neither."
             )
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:
@@ -1892,11 +2047,9 @@ class SessionManager:
                 "leaving them in place."
             )
             return False
-        print(
-            dimmed(
-                "Session MCP servers now mirror your default profile; the "
-                f"profile's previous definitions were saved to {stash.name}."
-            )
+        self._note(
+            "Session MCP servers now mirror your default profile; the "
+            f"profile's previous definitions were saved to {stash.name}."
         )
         return True
 
@@ -1962,11 +2115,9 @@ class SessionManager:
                 self._logger.warning(
                     f"Could not lock {src.parent} to merge {dest.name}: {e}"
                 )
-                print(
-                    dimmed(
-                        f"Not sharing {dest.name}: the shared history could "
-                        "not be locked (see log)."
-                    )
+                self._note(
+                    f"Not sharing {dest.name}: the shared history could "
+                    "not be locked (see log)."
                 )
                 return False
         return self._seed_history_source(src, dest)
@@ -2028,11 +2179,9 @@ class SessionManager:
             self._report_deferral(session_dir, dest)
             return False
         if not self._seed_history_source(src, dest):
-            print(
-                dimmed(
-                    f"Not sharing {dest.name}: {src} could not be created "
-                    "(see log)."
-                )
+            self._note(
+                f"Not sharing {dest.name}: {src} could not be created "
+                "(see log)."
             )
             return False
         # The same target the generic loop links to (see its note on a
@@ -2047,11 +2196,9 @@ class SessionManager:
             self._make_link(link_target, staged)
         except OSError as e:
             self._logger.warning(f"Could not link {dest.name} into the session: {e}")
-            print(
-                dimmed(
-                    f"Not sharing {dest.name}: it could not be linked here "
-                    "(see log) — the account keeps its own."
-                )
+            self._note(
+                f"Not sharing {dest.name}: it could not be linked here "
+                "(see log) — the account keeps its own."
             )
             return False
         try:
@@ -2063,11 +2210,9 @@ class SessionManager:
             # account that has not migrated yet.
             self._discard_staged_link(staged)
             self._logger.warning(f"Could not merge {dest.name} into {src}: {e}")
-            print(
-                dimmed(
-                    f"Not sharing {dest.name}: merging the profile's "
-                    "existing history failed (see log)."
-                )
+            self._note(
+                f"Not sharing {dest.name}: merging the profile's "
+                "existing history failed (see log)."
             )
             return False
         try:
@@ -2088,20 +2233,16 @@ class SessionManager:
                     f"Failed to share {dest.name} into session: {rename_error}; "
                     f"then {e}"
                 )
-                print(
-                    dimmed(
-                        f"Merged the profile's existing {dest.name} into {src}, "
-                        "but linking it back failed (see log) — retrying on "
-                        "the next launch."
-                    )
+                self._note(
+                    f"Merged the profile's existing {dest.name} into {src}, "
+                    "but linking it back failed (see log) — retrying on "
+                    "the next launch."
                 )
                 return False
             self._discard_staged_link(staged)
-        print(
-            dimmed(
-                f"Merged the profile's existing {dest.name} into "
-                f"{src} — conversation history is now shared."
-            )
+        self._note(
+            f"Merged the profile's existing {dest.name} into "
+            f"{src} — conversation history is now shared."
         )
         return True
 
@@ -2147,47 +2288,39 @@ class SessionManager:
         if self._deferral_reported:
             return
         self._deferral_reported = True
-        warning(f"share-history: {account} keeps its own {dest.name} for now.")
+        self._warn(f"share-history: {account} keeps its own {dest.name} for now.")
         retry = self._sharing_relaunch_command(slot)
         if lock_busy:
             # Nothing to close; the only useful action is to retry once the
             # peer is done.
-            print(
-                dimmed(
-                    "   Another cswap launch is merging history into "
-                    "~/.claude right now."
-                )
+            self._note(
+                "   Another cswap launch is merging history into "
+                "~/.claude right now."
             )
-            print(dimmed(f"   Once it finishes, relaunch:  {retry}"))
+            self._note(f"   Once it finishes, relaunch:  {retry}")
         elif blockers:
             for live in blockers:
                 started = datetime.fromtimestamp(
                     live.started_at / 1000, tz=UTC
                 ).astimezone()
-                print(
-                    dimmed(
-                        f"   pid {live.pid}  {live.cwd}  "
-                        f"(since {started:%Y-%m-%d %H:%M})"
-                    )
+                self._note(
+                    f"   pid {live.pid}  {live.cwd}  "
+                    f"(since {started:%Y-%m-%d %H:%M})"
                 )
-            print(
-                dimmed(
-                    "   Sessions started here will not appear in "
-                    "`claude --resume` under other accounts."
-                )
+            self._note(
+                "   Sessions started here will not appear in "
+                "`claude --resume` under other accounts."
             )
-            print(dimmed(f"   Close them, then relaunch:  {retry}"))
+            self._note(f"   Close them, then relaunch:  {retry}")
         else:
             # Not quiescent, yet nobody to name: a record in the profile's
             # sessions/ could not be read, and "cannot tell" is never
             # treated as "nobody there".
-            print(
-                dimmed(
-                    "   A session record in this profile could not be read, "
-                    "so it may still be in use."
-                )
+            self._note(
+                "   A session record in this profile could not be read, "
+                "so it may still be in use."
             )
-            print(dimmed(f"   Close anything using it, then relaunch:  {retry}"))
+            self._note(f"   Close anything using it, then relaunch:  {retry}")
 
     def _sharing_relaunch_command(self, slot: str) -> str:
         """The ``cswap run`` that shares history next time, as the user would
@@ -2210,11 +2343,9 @@ class SessionManager:
             return
         if explicit_share_history(self.switcher.backup_dir) is not None:
             return
-        print(
-            dimmed(
-                "Chat history is shared between accounts by default now "
-                "(turn off: cswap config set run.shareHistory false)."
-            )
+        self._note(
+            "Chat history is shared between accounts by default now "
+            "(turn off: cswap config set run.shareHistory false)."
         )
 
     def _note_merge_progress(
@@ -2246,11 +2377,9 @@ class SessionManager:
         if not quarantined or run_dir is None:
             return
         noun = "file" if quarantined == 1 else "files"
-        print(
-            dimmed(
-                f"Kept {quarantined} conflicting history {noun} aside in "
-                f"{run_dir} — nothing was deleted."
-            )
+        self._note(
+            f"Kept {quarantined} conflicting history {noun} aside in "
+            f"{run_dir} — nothing was deleted."
         )
         self._logger.warning(
             f"History merge kept {quarantined} conflicting {noun} in {run_dir}"

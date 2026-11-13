@@ -208,6 +208,49 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
+# Error KINDS carrying a remedy. Every surface that shows one renders it
+# through here, so they describe the same state identically.
+ERROR_NOTES = {
+    "tls-cert": (
+        "the TLS certificate was refused — if a proxy re-signs traffic, "
+        "trust its CA in the OS certificate store or via SSL_CERT_FILE "
+        "(NODE_EXTRA_CA_CERTS is not read); otherwise check for a captive "
+        "portal or a wrong system clock"
+    ),
+    "store-unmirrored": (
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
+        "normal shell"
+    ),
+    "no_refresh_token": (
+        "this slot's stored credential carries no refresh token — log in as "
+        "this account again, then re-add the slot"
+    ),
+    "invalid_grant": (
+        "this slot's refresh lineage is dead — log in as this account "
+        "again, then re-add the slot"
+    ),
+    "invalid_client": (
+        "cswap's OAuth client was rejected — systemic, not this account"
+    ),
+    "consume-busy": (
+        "another cswap surface holds the slot — retries next pass"
+    ),
+    "stash-unreadable": (
+        "this slot's stashed successor is unreadable — unlock the keychain "
+        "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+    "oauth_not_allowed_for_organization": (
+        "this account's organization does not allow OAuth sign-in (a lapsed "
+        "plan or an org policy), so its usage cannot be read — renewing the "
+        "plan restores it"
+    ),
+    "setup-token": (
+        "setup-tokens cannot read the usage endpoint — "
+        "`cswap config set usage.headerProbe true` reads it from a 1-token request"
+    ),
+}
+
+
 @dataclass(frozen=True)
 class RefreshOutcome:
     """Result of a refresh-token grant attempt.
