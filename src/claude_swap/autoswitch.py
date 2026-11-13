@@ -1070,6 +1070,13 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        # A session model change (``apply_model``) lands here, between
+        # ticks, so every window read below is on one set of axes. New names
+        # get the typo guard again.
+        models = parse_model_names(settings.model)
+        if models != self._models:
+            self._models = models
+            self._model_check_done = not models
         priority_mode = settings.strategy == "priority-consume-first"
         state = self._read_state()
         if not self.dry_run:
@@ -2658,16 +2665,18 @@ class AutoSwitchEngine:
 
     def apply_threshold(self, threshold: float) -> None:
         """Session override from the TUI: retarget the trigger and poll
-        cadence mid-run. Threshold only — the model axes (and their derived
-        state) are fixed at construction. The frozen-settings swap is atomic
-        and each tick snapshots ``self.settings`` once, so no locking."""
+        cadence mid-run. Threshold only — the model axes have their own
+        override, ``apply_model``. The frozen-settings swap is atomic and
+        each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
         # Recomputed, not passed through: a per-account override may still be
         # lower than the new session global, and cadence follows the minimum.
         self.switcher.set_poll_policy_inputs(
             self._min_effective_threshold(),
             self.settings.weekly_threshold,
-            self._models,
+            # From the settings, not ``self._models``: a session model change
+            # (``apply_model``) is only adopted there by the next tick.
+            parse_model_names(self.settings.model),
         )
 
     def apply_strategy(self, strategy: str) -> None:
@@ -2684,6 +2693,26 @@ class AutoSwitchEngine:
                 f"(choose from {', '.join(AUTOSWITCH_STRATEGIES)})"
             )
         self.settings = replace(self.settings, strategy=strategy)
+
+    def apply_model(self, model: str | None) -> None:
+        """Session override from the TUI: change which per-model weekly
+        limits bind the switch decision mid-run (None or blank = none, the
+        account-wide 5h/7d windows only).
+
+        Unlike the strategy, the parsed names are engine state that a tick
+        reads many times, so they are not swapped here: the next tick adopts
+        them from its settings snapshot (see ``_tick_inner``), and one already
+        running finishes on the axes it started with. Poll planning is
+        re-pinned now, so collection covers the new windows without waiting
+        for that tick.
+        """
+        model = (model or "").strip() or None
+        self.settings = replace(self.settings, model=model)
+        self.switcher.set_poll_policy_inputs(
+            self._min_effective_threshold(),
+            self.settings.weekly_threshold,
+            parse_model_names(model),
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
