@@ -43,9 +43,10 @@ from tests.test_tui import (
 # (tests/test_login_expiry.py) only joins a row while its login is due, so
 # these fixtures, which carry no expiry, render without it.
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h 25% · 7d 10%"
+# The two mini goldens are the fixed-column compact row (PR #425), not the old one-line body.
+GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]  5h  25%  7d  10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h 25% · 7d 10%"
+GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  5h  25%  7d  10%  (disabled)"
 
 NOW = 1000.0
 

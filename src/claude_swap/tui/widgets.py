@@ -9,7 +9,7 @@ auto-switch trigger line), and stale-measurement dimming.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable, NamedTuple
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -235,8 +235,9 @@ def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
     account in a store that has never used the feature — that is what keeps
     those rows byte-identical to their pre-policy render.
 
-    ``gap`` is the leading separator each render path already uses for its own
-    badges (three spaces on the card, two on the minimized row).
+    ``gap`` is the leading separator the render path puts before its badges
+    (three spaces on the card; none on the compact row, whose marker field
+    joins its own).
     """
     badges: list[str] = []
     if acc.policy.threshold is not None:
@@ -361,88 +362,197 @@ def _end_mini(text: Text, acc: AccountSnapshot, form: str | None, now: float, pa
     return text
 
 
+_MINI_TAG_CAP = 24  # widest "[tag]" a compact row shows, brackets included
+_MINI_NOTE_CAP = 30  # widest note that widens the body column; longer is ellipsized
+_MINI_GAP = "  "
+
+
+class MiniWidths(NamedTuple):
+    """Column widths the compact rows share, from :func:`mini_widths`."""
+
+    name: int
+    tag: int
+    cells: dict[str, int]  # window label -> cell width, in display order
+    note: int  # widest sentinel / "usage unknown" note shown, capped
+    marker: int  # widest "(ahead) (disabled)" marker field shown
+
+
+def _fit(text: Text, width: int) -> Text:
+    text.truncate(width, overflow="ellipsis", pad=True)
+    return text
+
+
+def _mini_name(acc: AccountSnapshot, palette: Palette) -> Text:
+    name = Text()
+    if acc.alias:
+        name.append(acc.alias, style=f"bold {palette.accent}")
+        name.append(f" ({acc.email})", style=palette.foreground)
+    else:
+        name.append(acc.email, style=palette.foreground)
+    return name
+
+
+def _mini_tag(acc: AccountSnapshot, palette: Palette) -> Text:
+    tag = Text(acc.display_tag)
+    tag.truncate(_MINI_TAG_CAP - 2, overflow="ellipsis")
+    return Text.assemble("[", tag, "]", style=palette.muted)
+
+
+def _mini_marks(acc: AccountSnapshot, ahead: bool, palette: Palette) -> Text:
+    """The row's one trailing marker field: ``(ahead)``, ``(disabled)``, the
+    account's policy badges, then its subscription plan."""
+    marks = [Text("(ahead)", style=palette.sev_warn)] if ahead else []
+    if acc.disabled:
+        marks.append(Text("(disabled)", style=palette.muted))
+    marks.extend(Text(b, style=palette.muted) for b in _policy_badges(acc, ""))
+    plan = Text()
+    _append_plan(plan, acc, "", palette)
+    if plan:
+        marks.append(plan)
+    return Text(" ").join(marks)
+
+
+def _mini_body(
+    acc: AccountSnapshot, now: float, palette: Palette
+) -> tuple[dict[str, Text], Text | None, bool]:
+    """A compact row's window cells (label -> cell), or the note that stands in
+    for them when it has no window to show, and whether the weekly window is
+    ahead of pace (a row state, shown in the marker field, not in a cell)."""
+    sentinel = acc.usage.sentinel
+    if sentinel is not None:
+        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
+        return {}, Text(data.sentinel_label(sentinel), style=style), False
+    if acc.usage.last_error == "oauth_not_allowed_for_organization":  # lapsed plan
+        return {}, Text("no plan", style=palette.sev_warn), False
+    last_good = acc.usage.last_good
+    if not isinstance(last_good, dict):
+        last_good = {}
+    stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
+    cells: dict[str, Text] = {}
+    ahead = False
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = last_good.get(key)
+        if not window:
+            continue
+        if not isinstance(window.get("pct"), (int, float)):
+            # No figure: unknown, not 0%. Padded to the width of "NNN%".
+            cells[label] = Text.assemble(
+                (f"{label} ", palette.muted), (f"{'?':>4}", palette.muted)
+            )
+            continue
+        pct = float(window["pct"])
+        color = palette.severity(pct)
+        cell = Text(f"{label} ", style=palette.muted)
+        cell.append(f"{pct:3.0f}%", style=f"{color} dim" if stale else color)
+        # a window at/over 100% shows its reset; below it, 7d may be ahead of pace
+        if pct >= 100:
+            reset = data.reset_text(window, now)
+            if reset:
+                cell.append(f" ({reset})", style=palette.muted)
+        elif key == "seven_day":
+            result = pace.compute_pace(window, fetched_at=acc.usage.fetched_at)
+            ahead = bool(result and result.ahead)
+        cells[label] = cell
+    for window in last_good.get("scoped") or []:
+        if float(window["pct"]) >= 100:
+            name = window["name"]
+            cells[name] = Text(f"{name} (!)", style=palette.sev_crit)
+    if isinstance(last_good.get("rejected"), dict):  # a refused setup-token probe
+        cells["rejected"] = Text("rejected (!)", style=palette.sev_crit)
+    return cells, None if cells else Text("usage unknown", style=palette.muted), ahead
+
+
+def mini_widths(
+    accs: Iterable[AccountSnapshot],
+    now: float,
+    show_tag: Callable[[AccountSnapshot], bool] = lambda _acc: True,
+) -> MiniWidths:
+    """Column widths that fit every one of ``accs``, the compact rows shown.
+    The tag column fits the tags ``show_tag`` keeps, and is absent (0) when
+    none is."""
+    palette = Palette.DARK  # widths do not depend on style
+    name = tag = note = marker = 0
+    cells = {"5h": 0, "7d": 0}  # fixed order; scoped windows follow as seen
+    for acc in accs:
+        name = max(name, _mini_name(acc, palette).cell_len)
+        if show_tag(acc):
+            tag = max(tag, _mini_tag(acc, palette).cell_len)
+        row_cells, row_note, ahead = _mini_body(acc, now, palette)
+        for label, cell in row_cells.items():
+            cells[label] = max(cells.get(label, 0), cell.cell_len)
+        if row_note:
+            note = max(note, min(row_note.cell_len, _MINI_NOTE_CAP))
+        marker = max(marker, _mini_marks(acc, ahead, palette).cell_len)
+    return MiniWidths(name, tag, {k: w for k, w in cells.items() if w}, note, marker)
+
+
 def mini_account_text(
     acc: AccountSnapshot,
     now: float,
     *,
     palette: Palette = Palette.DARK,
+    widths: MiniWidths | None = None,
+    width: int | None = None,
     login: str | None = "full",
     show_tag: bool = True,
 ) -> Text:
-    """One minimized line for an inactive account.
+    """One minimized line for an inactive account, in fixed columns.
 
-    ``2  work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
-    colored; a window at/over 100% brings its reset countdown along, and a
-    maxed per-model window shows as ``Fable (!)``. Sentinel states show
-    their label instead. ``login`` is the form of the ``· re-login in …``
-    note that ends the row while the login is due (see ``LOGIN_FORMS``).
+    ``2  work@acme.dev  [personal]  5h  92%  7d  63%  Fable (!)  (ahead) (disabled)``
+    — slot, name, tag, one cell per window, then one marker field:
+    ``(ahead)`` (the weekly window is ahead of pace), ``(disabled)`` and
+    ``th 75%`` (a per-account threshold) and ``· Max 20x`` (the subscription
+    plan), any of them together.
+    Pcts only, severity colored; a window at/over 100% brings its reset
+    countdown along, a maxed per-model window shows as ``Fable (!)`` and a
+    refused setup-token probe as ``rejected (!)``. A
+    window the account lacks is a blank cell, and a sentinel state shows its
+    label in place of the cells (ellipsized past ``_MINI_NOTE_CAP`` and the
+    cells' width; the expanded card and the CLI carry the full text). Every
+    row's body is as wide as the wider of the cells and the longest such
+    note, so the marker field keeps one column.
+    ``widths`` (from :func:`mini_widths` over the rows shown) lines the
+    columns up across rows; alone, a row fits itself. ``show_tag=False``
+    blanks the tag cell (``ui.orgTag``), and the column itself goes when
+    ``widths`` has none. A row wider than
+    ``width`` is ellipsized before the marker field, which stays whole and
+    starts where the widest field shown would, so the markers still share
+    one column. ``login`` is the form of the ``· re-login in …`` note that
+    ends the row while the login is due (see ``LOGIN_FORMS``); it follows
+    the marker field, padded so the notes share one column, and is cut with
+    it, never before it.
     """
+    widths = widths or mini_widths([acc], now, lambda _acc: show_tag)
+    cells, note, ahead = _mini_body(acc, now, palette)
+    marks = _mini_marks(acc, ahead, palette)
+    grid = Text(_MINI_GAP).join(
+        _fit(cells.get(label) or Text(), width) for label, width in widths.cells.items()
+    )
+    fields = [_fit(_mini_name(acc, palette), widths.name)]
+    if widths.tag:  # a hidden tag is a blank cell, unless no row shows one
+        fields.append(_fit(_mini_tag(acc, palette) if show_tag else Text(), widths.tag))
+    fields.append(_fit(note or grid, max(grid.cell_len, widths.note)))
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
-    if acc.alias:
-        text.append(acc.alias, style=f"bold {palette.accent}")
-        text.append(f" ({acc.email})", style=palette.foreground)
-    else:
-        text.append(acc.email, style=palette.foreground)
-    if show_tag:
-        text.append(f"  [{acc.display_tag}]", style=palette.muted)
-    if acc.disabled:
-        text.append("  (disabled)", style=palette.muted)
-    for badge in _policy_badges(acc, "  "):
-        text.append(badge, style=palette.muted)
-    _append_plan(text, acc, "  ", palette)
-    text.append("   ")
-
-    sentinel = acc.usage.sentinel
-    if sentinel is not None:
-        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        text.append(data.sentinel_label(sentinel), style=style)
-        return _end_mini(text, acc, login, now, palette)
-
-    last_good = acc.usage.last_good
-    fetched_at = acc.usage.fetched_at
-    stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
-    parts = 0
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-        window = last_good.get(key) if isinstance(last_good, dict) else None
-        if not window:
-            continue
-        if parts:
-            text.append(" · ", style=palette.track)
-        if not isinstance(window.get("pct"), (int, float)):
-            # No figure: unknown, not 0%.
-            text.append(f"{label} ", style=palette.muted)
-            text.append("?", style=palette.muted)
-            parts += 1
-            continue
-        pct = float(window["pct"])
-        color = palette.severity(pct)
-        text.append(f"{label} ", style=palette.muted)
-        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
-        if pct >= 100:
-            reset = data.reset_text(window, now)
-            if reset:
-                text.append(f" ({reset})", style=palette.muted)
-        elif key == "seven_day":
-            result = pace.compute_pace(window, fetched_at=fetched_at)
-            if result and result.ahead:
-                text.append(" (ahead)", style=palette.sev_warn)
-        parts += 1
-    maxed = [
-        w["name"]
-        for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
-        if float(w["pct"]) >= 100
-    ]
-    if isinstance(last_good, dict) and isinstance(last_good.get("rejected"), dict):
-        maxed.append("rejected")  # a refused setup-token probe
-    for name in maxed:
-        if parts:
-            text.append(" · ", style=palette.track)
-        text.append(f"{name} (!)", style=palette.sev_crit)
-        parts += 1
-    if not parts:
-        text.append("usage unknown", style=palette.muted)
-    return _end_mini(text, acc, login, now, palette)
+    text.append(Text(_MINI_GAP).join(fields))
+    end = _end_mini(Text(), acc, login, now, palette)
+    marker_w = max(widths.marker, marks.cell_len)
+    if end:
+        marks = _fit(marks, marker_w)  # pad the marker field: the notes share a column
+    tail = Text.assemble(_MINI_GAP, marks) if marks else Text()
+    tail.append(end)
+    if not tail:
+        text.rstrip()
+    # a cut row reserves the widest marker field shown, so cut markers align too
+    reserve = (len(_MINI_GAP) + marker_w if marks else 0) + end.cell_len
+    if width is not None and text.cell_len + reserve > width:
+        room = width - reserve
+        if room < 1:  # no room for the marker: cut the whole row
+            tail, room = Text(), width
+        # blank padding is no content: the ellipsis marks a real cut only
+        text.rstrip()
+        text.truncate(room, overflow="ellipsis", pad=True)
+    return text.append(tail)
 
 
 class AccountsPanel(Static):
@@ -474,16 +584,17 @@ class AccountsPanel(Static):
         now = time.time()
         panel_width = self.size.width or 80
         width = panel_width - 2
+        inactive = [a for a in snap.accounts if not a.is_active and self._show_minis]
+        widths = mini_widths(inactive, now, app.tag_shown)
         # One login-note form for all the minis, so the rows that carry one
-        # read alike; the card's header also carries the plan and age, so it
-        # fits its own.
-        inactive = [acc for acc in snap.accounts if not acc.is_active and self._show_minis]
+        # read alike; only the row without a note is cut to the width, any
+        # other form fits whole or steps down, so usage is never cut for it.
         minis = iter(
             fit_login(
                 lambda login: [
                     mini_account_text(
-                        acc, now, palette=palette, login=login,
-                        show_tag=app.tag_shown(acc),
+                        acc, now, palette=palette, widths=widths, login=login,
+                        width=None if login else width, show_tag=app.tag_shown(acc),
                     )
                     for acc in inactive
                 ],
@@ -501,7 +612,7 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                blocks.append(next(minis))
+                blocks.append(next(minis))  # never wraps
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
