@@ -101,7 +101,7 @@ from claude_swap.settings import (
     load_ui_settings,
     load_usage_settings,
     parse_model_names,
-    settings_path,
+    settings_stamp,
 )
 from claude_swap.usage_store import (
     FetchRecord,
@@ -441,14 +441,17 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, weekly_threshold, models)) — see
+        # (settings mtimes, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
-            float | None, tuple[float, float | None, tuple[str, ...]]
+            tuple[float | None, float | None],
+            tuple[float, float | None, tuple[str, ...]],
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
-        # (settings mtime, the usage section) — see _usage_settings.
-        self._usage_settings_cache: tuple[float | None, UsageSettings] | None = None
+        # (settings mtimes, the usage section), see _usage_settings.
+        self._usage_settings_cache: tuple[
+            tuple[float | None, float | None], UsageSettings
+        ] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -2066,11 +2069,7 @@ class ClaudeAccountSwitcher:
         stat per pass)."""
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
-        path = settings_path(self.backup_dir)
-        try:
-            mtime: float | None = path.stat().st_mtime
-        except OSError:
-            mtime = None
+        mtime = settings_stamp(self.backup_dir)
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
@@ -2083,13 +2082,9 @@ class ClaudeAccountSwitcher:
         return inputs
 
     def _usage_settings(self) -> UsageSettings:
-        """The ``usage`` section of the settings file (reloaded only when it
-        changes — one stat per fetch)."""
-        path = settings_path(self.backup_dir)
-        try:
-            mtime: float | None = path.stat().st_mtime
-        except OSError:
-            mtime = None
+        """The ``usage`` section of the settings files (reloaded only when
+        either changes; two stats per fetch)."""
+        mtime = settings_stamp(self.backup_dir)
         cache = getattr(self, "_usage_settings_cache", None)
         if cache is not None and cache[0] == mtime:
             return cache[1]

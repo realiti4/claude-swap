@@ -1303,7 +1303,7 @@ class TestSetupTokenHeaderProbeWiring:
             assert mock_fetch.call_args.kwargs["scoped_probe"] is False
             set_setting(switcher.backup_dir, "usage.headerProbe", "true")
             # A same-second rewrite can keep the mtime; force a visible change.
-            path = settings_path(switcher.backup_dir)
+            path = settings_path(switcher.backup_dir).with_name("settings.local.json")
             os.utime(path, (time.time() + 5, time.time() + 5))
             switcher._fetch_account_usage(self._info())
             assert mock_fetch.call_args.kwargs["header_probe"] is True
@@ -1316,6 +1316,17 @@ class TestSetupTokenHeaderProbeWiring:
             assert mock_fetch.call_args.kwargs["scoped_probe"] is True
             # The stored reading rides along: it can pause the Fable probe.
             assert mock_fetch.call_args.kwargs["last_usage"] is stored
+
+    def test_an_overlay_write_is_seen_over_a_tracked_file(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        settings_path(switcher.backup_dir).write_text(
+            json.dumps({"usage": {"headerProbe": True}})
+        )
+        assert switcher._usage_settings().header_probe is True
+        # The write lands in settings.local.json; settings.json is untouched.
+        set_setting(switcher.backup_dir, "usage.headerProbe", "false")
+        assert switcher._usage_settings().header_probe is False
 
     def test_probe_is_paced_by_the_store(self, temp_home: Path):
         """One collect pass sends one probe; a second pass inside the serve
@@ -13941,7 +13952,7 @@ class TestPollPolicyInputsCarryTheWeeklyLine:
     ):
         import os
 
-        from claude_swap.settings import set_setting, settings_path
+        from claude_swap.settings import set_setting
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
@@ -13953,7 +13964,7 @@ class TestPollPolicyInputsCarryTheWeeklyLine:
         # A later edit is picked up through the mtime key (bumped explicitly
         # so a same-second rewrite cannot hide behind filesystem granularity).
         set_setting(switcher.backup_dir, "autoswitch.weeklyThreshold", "99")
-        path = settings_path(switcher.backup_dir)
+        path = switcher.backup_dir / "settings.local.json"
         later = path.stat().st_mtime + 5
         os.utime(path, (later, later))
         assert switcher._poll_policy_inputs() == (85.0, 99.0, ("Fable",))
