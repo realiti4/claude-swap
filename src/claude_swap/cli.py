@@ -1412,6 +1412,11 @@ def main() -> None:
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
 
+    if argv and argv[0] == "schedule":
+        from claude_swap.schedule import command
+        command(argv[1:])
+        return
+
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
         _run_command(argv[1:])
