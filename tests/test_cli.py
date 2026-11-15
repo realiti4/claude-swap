@@ -2597,3 +2597,51 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+class TestPersonAtTerminal:
+    """The main dispatch tells the switcher whether a person can answer a system
+    prompt; only then may the Keychain migration wait for the permission window."""
+
+    @staticmethod
+    def _run(argv: list[str], *, tty: bool) -> bool:
+        """Run ``cswap <argv>`` with stdin and stderr as terminals or not, and
+        return the ``interactive`` value the switcher was built with."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch.object(sys.stdin, "isatty", return_value=tty), \
+             patch.object(sys.stderr, "isatty", return_value=tty), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = {}
+            cli.main()
+        return switcher_cls.call_args.kwargs["interactive"]
+
+    def test_human_command_in_a_terminal(self):
+        assert self._run(["--list"], tty=True) is True
+
+    def test_json_in_a_terminal_is_not_a_person(self):
+        assert self._run(["--list", "--json"], tty=True) is False
+
+    def test_no_terminal_is_not_a_person(self):
+        assert self._run(["--list"], tty=False) is False
+
+    def test_either_stream_redirected_is_not_a_person(self):
+        args = cli.argparse.Namespace(json=False, menubar=False)
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(sys.stderr, "isatty", return_value=False):
+            assert cli._person_at_terminal(args) is False
+        with patch.object(sys.stdin, "isatty", return_value=False), \
+             patch.object(sys.stderr, "isatty", return_value=True):
+            assert cli._person_at_terminal(args) is False
+
+    def test_menubar_is_not_a_person(self):
+        args = cli.argparse.Namespace(json=False, menubar=True)
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(sys.stderr, "isatty", return_value=True):
+            assert cli._person_at_terminal(args) is False
+
+    def test_closed_stream_is_not_a_person(self):
+        args = cli.argparse.Namespace(json=False, menubar=False)
+        with patch.object(sys.stdin, "isatty", side_effect=ValueError("closed")):
+            assert cli._person_at_terminal(args) is False

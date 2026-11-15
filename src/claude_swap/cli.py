@@ -276,6 +276,23 @@ def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
             sys.exit(1)
 
 
+def _person_at_terminal(args: argparse.Namespace) -> bool:
+    """Whether a person is running this command and can answer a system prompt.
+
+    The switcher's ``interactive`` flag: it lets the macOS Keychain migration
+    wait for the permission window. False for ``--json`` (a program reads the
+    result, even from a terminal) and for the menu bar app (launchd runs it),
+    and otherwise true only when stdin and stderr are both terminals: stderr
+    carries the notice that says what the window is for.
+    """
+    if args.json or args.menubar:
+        return False
+    try:
+        return sys.stdin.isatty() and sys.stderr.isatty()
+    except (AttributeError, ValueError):  # a closed or replaced stream
+        return False
+
+
 def _map_command(argv: list[str]) -> None:
     """Handle `cswap map [NUM|EMAIL] [PATH]`.
 
@@ -1917,7 +1934,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # serializes it (so no command writes JSON to stdout itself).
     payload: dict | None = None
     try:
-        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        switcher = ClaudeAccountSwitcher(
+            debug=args.debug, interactive=_person_at_terminal(args)
+        )
 
         # Check for root (unless in container) - POSIX only
         if sys.platform != "win32":
