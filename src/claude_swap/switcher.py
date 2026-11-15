@@ -418,10 +418,14 @@ def _same_directory(left: Path, right: Path) -> bool:
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, interactive: bool = False):
         self.home = Path.home()
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
+        # A person is running this command at a terminal and can answer a system
+        # prompt. Only the macOS Keychain migration reads it, to wait for the
+        # permission window instead of timing out under it.
+        self.interactive = interactive
 
         # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
         # before any logger or directory setup writes to the new location.
