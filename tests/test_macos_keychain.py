@@ -518,6 +518,28 @@ def test_a_failed_exec_forgets_every_memoized_read(
     assert fake_security.execs == before + 1
 
 
+@pytest.mark.parametrize("op", [
+    lambda: macos_keychain.get_password(*_KEY),
+    lambda: macos_keychain.get_password(*_KEY, timeout=60.0),  # the person-waiting read
+    lambda: macos_keychain.set_password(*_KEY, "v"),
+    lambda: macos_keychain.delete_password(*_KEY),
+])
+def test_a_timeout_raises_keychain_timeout_and_forgets_every_memoized_read(
+    fake_security, kc_file, op
+):
+    fake_security.items[("svc", "other")] = "kept"
+    with macos_keychain.memo_reads():
+        macos_keychain.get_password("svc", "other")
+    expired = subprocess.TimeoutExpired(cmd="security", timeout=5)
+    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=expired):
+        with pytest.raises(macos_keychain.KeychainTimeout):
+            op()
+    before = fake_security.execs
+    with macos_keychain.memo_reads():
+        assert macos_keychain.get_password("svc", "other") == "kept"
+    assert fake_security.execs == before + 1
+
+
 def test_any_keychain_file_moving_drops_the_whole_memo(fake_security, kc_file):
     work = kc_file.with_name("work.keychain-db")  # a non-login default keychain
     work.write_bytes(b"kc")
