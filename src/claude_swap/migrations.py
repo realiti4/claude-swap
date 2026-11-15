@@ -110,12 +110,13 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     an item does not consult the ACL, so the cleanup never prompts. A failed
     delete leaves a harmless orphan behind (logged; ``purge`` sweeps it up).
 
-    The prompt asks for the login password, and it closes when the read's
-    ``security`` process is killed at its timeout (issue #589, macOS 15.7.7), so
-    the wrapper's default bound is too short to answer it. When a person is
-    running the command (``switcher.interactive``) and an attribute-only lookup
-    finds the legacy item, the read is announced on stderr and waits
-    ``_PROMPT_WAIT`` instead. The lookup only chooses the bound: an item it does
+    The prompt asks for the login password, and under the wrapper's default
+    bound the read's ``security`` process is usually killed before a person has
+    answered: the window closes with it on macOS 15.7.7 (issue #589) and stays
+    open with no reader left on 27.2.1 (measured). When a person is running the
+    command (``switcher.interactive``) and an attribute-only lookup finds the
+    legacy item, the read is announced on stderr and waits ``_PROMPT_WAIT``
+    instead. The lookup only chooses the bound: an item it does
     not find is still read, under the default bound, and that read decides
     whether the item is absent. A prompt left unanswered ends the attempt, so an
     unattended terminal waits once per run, not once per account; accounts
