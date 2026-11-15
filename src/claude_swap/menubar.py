@@ -1136,30 +1136,30 @@ def run(switcher) -> int:
                 None,
                 *account_items,
                 None,
-                rumps.MenuItem(self._t("Switch in account order"), callback=self._switch(None)),
-                rumps.MenuItem(self._t("Switch in order, skipping exhausted accounts"), callback=self._switch("next-available")),
-                rumps.MenuItem(self._t("Switch to account with most quota left"), callback=self._switch("best")),
+                rumps.MenuItem(self._t("Rotate to next"), callback=self._switch(None)),
+                rumps.MenuItem(self._t("Switch to best"), callback=self._switch("best")),
+                rumps.MenuItem(self._t("Next available"), callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
                 self._disable_menu(rumps),
                 self._remove_menu(rumps),
-                rumps.MenuItem(self._t("Save current Claude Code login"), callback=self.on_refresh_creds),
+                rumps.MenuItem(self._t("Refresh current credentials"), callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
                 self._settings_menu(rumps),
-                rumps.MenuItem(self._t("Refresh usage"), callback=self.on_refresh_now),
+                rumps.MenuItem(self._t("Refresh now"), callback=self.on_refresh_now),
                 rumps.MenuItem(self._t("Quit"), callback=self.on_quit),
             ]
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem(self._t("Add account"))
-            menu.add(rumps.MenuItem(self._t("Use current Claude Code login"), callback=self.on_add_login))
+            menu.add(rumps.MenuItem(self._t("From current login"), callback=self.on_add_login))
             if hasattr(self.switcher, "add_account_from_token"):
-                menu.add(rumps.MenuItem(self._t("Enter a setup token…"), callback=self.on_add_token))
+                menu.add(rumps.MenuItem(self._t("From setup-token…"), callback=self.on_add_token))
             return menu
 
         def _remove_menu(self, rumps):
-            menu = rumps.MenuItem(self._t("Remove from account list"))
+            menu = rumps.MenuItem(self._t("Remove account"))
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem(self._t("No managed accounts"), callback=None))
@@ -1172,7 +1172,7 @@ def run(switcher) -> int:
             return menu
 
         def _disable_menu(self, rumps):
-            menu = rumps.MenuItem(self._t("Accounts excluded from rotation"))
+            menu = rumps.MenuItem(self._t("Disable / enable account"))
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem(self._t("No managed accounts"), callback=None))
@@ -1191,7 +1191,7 @@ def run(switcher) -> int:
             return menu
 
         def _history_menu(self, rumps):
-            menu = rumps.MenuItem(self._t("Account switch history"))
+            menu = rumps.MenuItem(self._t("Switch history"))
             try:
                 text = log_path.read_text(encoding="utf-8")
             except OSError:
@@ -1203,7 +1203,7 @@ def run(switcher) -> int:
             else:
                 menu.add(rumps.MenuItem(self._t("No switches logged yet"), callback=None))
             menu.add(None)
-            menu.add(rumps.MenuItem(self._t("Show log in Finder"), callback=self.on_open_log))
+            menu.add(rumps.MenuItem(self._t("Open full log…"), callback=self.on_open_log))
             return menu
 
         def _settings_menu(self, rumps):
@@ -1214,14 +1214,14 @@ def run(switcher) -> int:
                 choice.state = int(self.settings.language == code)
                 language_menu.add(choice)
             menu.add(language_menu)
-            cards = rumps.MenuItem(self._t("Show account cards"), callback=self.on_toggle_cards)
+            cards = rumps.MenuItem(self._t("Account cards"), callback=self.on_toggle_cards)
             cards.state = int(self.settings.account_cards)
             menu.add(cards)
             name_item = rumps.MenuItem(self._t("Show account name in menu bar"), callback=self.on_toggle_name)
             name_item.state = 1 if self.settings.show_account_name else 0
             menu.add(name_item)
 
-            title_pct = rumps.MenuItem(self._t("Usage shown in menu bar"))
+            title_pct = rumps.MenuItem(self._t("Title percentage"))
             tp_labels = {"off": self._t("None"), "5h": self._t("Session (5h)"),
                          "7d": self._t("Weekly (7d)"), "both": self._t("Both (5h · 7d)")}
             for mode in TITLE_PCT_CHOICES:
@@ -1231,12 +1231,12 @@ def run(switcher) -> int:
             menu.add(title_pct)
 
             scoped_item = rumps.MenuItem(
-                self._t("Show model usage in menu bar"), callback=self.on_toggle_scoped
+                self._t("Show model limits in title"), callback=self.on_toggle_scoped
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
 
-            interval = rumps.MenuItem(self._t("Usage display refresh interval"))
+            interval = rumps.MenuItem(self._t("Refresh interval"))
             labels = {30: self._t("30 seconds"), 60: self._t("60 seconds"), 300: self._t("5 minutes")}
             for secs in REFRESH_CHOICES:
                 choice = rumps.MenuItem(labels[secs], callback=self._make_interval(secs))
@@ -1248,7 +1248,7 @@ def run(switcher) -> int:
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
 
-            threshold_menu = rumps.MenuItem(self._t("Usage threshold"))
+            threshold_menu = rumps.MenuItem(self._t("Auto-switch threshold"))
             current = self._threshold()
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
@@ -1304,7 +1304,7 @@ def run(switcher) -> int:
         def _make_remove(self, num):
             def cb(_sender):
                 if rumps.alert(
-                    title=self._t("Remove from account list"),
+                    title=self._t("Remove account"),
                     message=self._t("Remove account {num}?", num=num),
                     ok=self._t("Remove"),
                     cancel=self._t("Cancel"),

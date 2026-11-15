@@ -38,8 +38,6 @@ The service follows the `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` a
 If you switched it off under System Settings → General → Login Items & Extensions → Allow in the Background, `cswap menubar` still starts it when you ask, but says that macOS will not start it at login until you turn that back on.
 
 Under Settings → Language, choose English or 简体中文. The choice is saved
-with your menu bar preferences. Enable Settings → Show account cards to compare
+with your menu bar preferences. Enable Settings → Account cards to compare
 each account's session, weekly and model usage side by side. Each bar shows
 used quota. Click a card to switch to its account.
-
-The two ordered switch commands follow the same rotation. “Switch in order, skipping exhausted accounts” passes over accounts known to have reached a usage limit. An account with unknown usage can still be selected. “Switch to account with most quota left” ranks candidates by remaining quota. In “Accounts excluded from rotation”, a checkmark means the account is excluded.
