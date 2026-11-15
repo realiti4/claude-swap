@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from dataclasses import replace
@@ -31,7 +32,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, settings_path
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -1687,6 +1688,27 @@ class TestAdaptiveScheduler:
         assert "2" not in counts
         assert counts["3"] >= 1
 
+    def test_disabled_account_polled_after_switchable_candidates_without_escalating(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        h.switcher.set_account_disabled("3", True)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        # t0: switchable candidate 2 takes priority for the alternate slot.
+        self._tick(h, counts, usage)
+        assert counts == {"1": 1, "2": 1}
+        # t60: candidate 2 is not due yet, so disabled account 3 is polled
+        # for store-only display surfaces (menu bar, TUI auto screen).
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        # Escalation only refreshes switchable candidates, never disabled ones.
+        h.clock.advance(360)
+        usage["1"] = _usage(80)
+        self._tick(h, counts, usage)
+        assert counts == {"1": 2, "2": 2, "3": 1}
+
     def test_expired_active_enters_idle_hold_even_during_backoff(
         self, temp_home, monkeypatch
     ):
@@ -2235,6 +2257,32 @@ class TestRunLoop:
              patch.object(harness.engine._wake, "wait", return_value=None):
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 2
+
+    def test_loop_logs_settings_keys_nothing_reads_once(self, harness, caplog):
+        settings_path(harness.switcher.backup_dir).write_text(
+            json.dumps({"autoswitch": {"threshold": 98.0, "hysteresisPCT": 5}})
+        )
+        ticks = []
+
+        def fake_tick():
+            ticks.append(1)
+            if len(ticks) >= 3:
+                harness.engine.stop()
+            return TickOutcome.NO_ACTION
+
+        with patch.object(harness.engine, "tick", side_effect=fake_tick), \
+             patch.object(harness.engine._wake, "wait", return_value=None), \
+             caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert harness.engine.run_loop() == 0
+        assert len(ticks) == 3
+        assert [
+            message
+            for message in (r.getMessage() for r in caplog.records)
+            if message.startswith("settings.json:")
+        ] == [
+            "settings.json: 'autoswitch.hysteresisPCT' is not a key this version "
+            "reads, so it has no effect; did you mean autoswitch.hysteresisPct?"
+        ]
 
     def test_loop_survives_raising_tick(self, harness):
         calls = []
@@ -7138,9 +7186,11 @@ class TestWeeklyThreshold:
         # full refetch: a candidate that crossed its weekly line since the
         # snapshot must not be landed on.
         h = self._harness(temp_home, accounts=(1, 2, 3), strategy="consume-first")
+        # 7d 80% stored: room enough under the 97 line for consume-first to
+        # pick it on the snapshot, so the refetch is what must reject it.
         stored = {
             "1": _usage7(5, 50, _R_LATER),
-            "2": _usage7(5, 90, _R_SOON),
+            "2": _usage7(5, 80, _R_SOON),
             "3": _usage7(5, 50, _R_LATEST),
         }
         fresh = {**stored, "2": _usage7(5, 97, _R_SOON)}
@@ -7354,6 +7404,28 @@ class TestHeaderProbeReadings:
         outcome = harness.tick_with_usage({
             "1": _usage(95),
             "2": _header_usage(five_hour={"pct": 5.0}, seven_day={"pct": 5.0}),
+            "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_weekly_only_active_reading_does_not_fail_over(self, harness):
+        # No 5h header (Ultra): the 7d reading decides, not unknown three ticks.
+        for _ in range(3):
+            outcome = harness.tick_with_usage({
+                "1": _header_usage(seven_day={"pct": 50.0}),
+                "2": _usage(10),
+                "3": _usage(10),
+            })
+            assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"] * 3
+
+    def test_weekly_only_reading_is_a_target(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(95),
+            "2": _header_usage(seven_day={"pct": 0.0}),
             "3": _usage(40),
         })
         assert outcome is TickOutcome.SWITCHED

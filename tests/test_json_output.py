@@ -436,7 +436,7 @@ class TestStatusJson:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_active_account_usage", return_value=entry):
+             patch.object(switcher, "_active_account_usage", return_value=(entry, None)):
             payload = switcher.status(json_output=True)
 
         active = payload["active"]
@@ -802,6 +802,38 @@ class TestUsageFromJson:
         assert oauth.account_headroom(back) == 0.0
         partial = usage_from_json({"fiveHour": {"pct": 5}, "source": "headers"})
         assert oauth.account_headroom(partial) is None
+
+    def test_a_spent_fable_row_keeps_its_probe_pause(self):
+        """Without it the importing machine would ask Fable again on its
+        next poll, where the reading's own machine does not."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            "seven_day": {"pct": 40.0},
+            "scoped": [{
+                "name": "Fable", "pct": 100.0,
+                "resets_at": "2099-01-01T05:00:00+00:00",
+                "probe_after": "2099-01-01T04:00:00+00:00",
+            }],
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        exported = usage_to_json(internal)
+        assert exported["scoped"][0]["probeAfter"] == "2099-01-01T04:00:00+00:00"
+        back = usage_from_json(exported)
+        assert back["scoped"][0]["probe_after"] == "2099-01-01T04:00:00+00:00"
+        # A row with room carries no such field.
+        assert "probeAfter" not in usage_to_json(
+            {"scoped": [{"name": "Fable", "pct": 40.0}]}
+        )["scoped"][0]
+
+    @pytest.mark.parametrize("bad", [5, "soon", ""])
+    def test_an_unreadable_probe_pause_is_refused(self, bad):
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError, match="probeAfter"):
+            usage_from_json(
+                {"scoped": [{"name": "Fable", "pct": 100, "probeAfter": bad}]}
+            )
 
     def test_a_window_without_a_reset_keeps_its_pct(self):
         from claude_swap.json_output import usage_from_json

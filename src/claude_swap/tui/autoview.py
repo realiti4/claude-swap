@@ -31,12 +31,12 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.lines import binding_window
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel
+from claude_swap.tui.widgets import AccountsPanel, fit_login, login_segment
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -319,11 +319,13 @@ class AutoScreen(Screen):
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
+        candidates = [
+            acc for acc in snap.accounts
+            if acc.number != active_number and acc.switchable
+        ]
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
-        lines: dict[str, Text] = {}
-        for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
-                continue
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
+        for acc in candidates:
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
             )
@@ -333,9 +335,9 @@ class AutoScreen(Screen):
                 weekly,
                 scale=threshold,
             )
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            head, entry = Text(), Text()
+            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            head.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -357,13 +359,22 @@ class AutoScreen(Screen):
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
                 ranked.append((-binding.line_headroom, acc.number))
-            lines[acc.number] = entry
+            lines[acc.number] = (acc, head, entry)
 
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
-            text.append(lines[number])
+        order = [lines[number] for _pct, number in sorted(ranked)]
+        # The box has no width before its first layout; its CSS padding is 2 a side.
+        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
+        for row in fit_login(
+            lambda login: [
+                Text.assemble(head, tail, Text(login_segment(acc, login), style=palette.muted))
+                for acc, head, tail in order
+            ],
+            budget,
+        ):
+            text.append(row)
         return text

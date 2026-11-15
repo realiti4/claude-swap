@@ -23,6 +23,7 @@ ACTIVE_MAX = {
     "tier": "default_claude_max_20x",
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
+    "planDisplayName": None,
 }
 # Cancelled but still inside the paid period: indistinguishable from ACTIVE_MAX,
 # which is the whole reason renewal is not shown.
@@ -31,12 +32,30 @@ LAPSED = {
     "tier": "default_claude_ai",
     "billingType": "none",
     "subscriptionStatus": "canceled",
+    "planDisplayName": None,
 }
 TEAM = {
     "tier": "default_claude_max_5x",
     "organizationType": "claude_team",
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
+    "planDisplayName": None,
+}
+# Measured on an Enterprise seat (2026-11-07): the profile sends no plan name.
+ENTERPRISE = {
+    "tier": "default_claude_zero",
+    "organizationType": "claude_enterprise",
+    "billingType": "stripe_subscription_contracted",
+    "subscriptionStatus": "active",
+    "planDisplayName": None,
+}
+# A plan stored before the name was kept: no key at all, unlike a null one.
+UNNAMED = {"tier": "default_claude_max_5x"}
+# Ultra shares the Max 20x tier string; only the server's plan name separates it.
+ULTRA = {
+    "tier": "default_claude_max_20x",
+    "organizationType": "claude_max",
+    "planDisplayName": "Ultra",
 }
 
 
@@ -92,6 +111,17 @@ class TestFetchPlan:
         assert result.plan == TEAM
         assert (result.account_uuid, result.organization_uuid) == ("u", "o")
 
+    def test_keeps_the_plan_display_name(self):
+        payload = {
+            "organization": {
+                "rate_limit_tier": "default_claude_max_20x",
+                "organization_type": "claude_max",
+                "plan_display_name": "Ultra",
+            }
+        }
+        with patch("urllib.request.urlopen", return_value=_response(payload)):
+            assert subscription.fetch_plan("tok").plan == ULTRA
+
     def test_no_tier_is_no_answer(self):
         payload = {"organization": {"billing_type": "stripe_subscription"}}
         with patch("urllib.request.urlopen", return_value=_response(payload)):
@@ -108,10 +138,14 @@ class TestFetchPlan:
                 "rate_limit_tier": "default_claude_ai",
                 "subscription_status": None,
                 "billing_type": 3,
+                "plan_display_name": "",
             }
         }
         with patch("urllib.request.urlopen", return_value=_response(payload)):
-            assert subscription.fetch_plan("tok").plan == {"tier": "default_claude_ai"}
+            assert subscription.fetch_plan("tok").plan == {
+                "tier": "default_claude_ai",
+                "planDisplayName": None,
+            }
 
     @pytest.mark.parametrize(
         "error",
@@ -152,8 +186,50 @@ class TestFetchPlan:
 
 
 class TestPlanLabel:
-    def test_team_organization_wins_over_the_seat_tier(self):
-        assert subscription.plan_label(TEAM) == "Team"
+    @pytest.mark.parametrize(
+        "plan, label", [(TEAM, "Team"), (ENTERPRISE, "Enterprise")]
+    )
+    def test_organization_wins_over_the_seat_tier(self, plan, label):
+        assert subscription.plan_label(plan) == label
+        assert subscription.plan_label({**plan, "planDisplayName": "Ultra"}) == label
+
+    @pytest.mark.parametrize(
+        "tier, name, label",
+        [
+            ("default_claude_max_20x", "Ultra", "Ultra"),
+            ("default_claude_max_20x", "", "Max 20x"),
+            ("default_claude_max_20x", None, "Max 20x"),
+            ("default_claude_max_5x", "Max", "Max 5x"),
+            ("default_claude_max_5x", "", "Max 5x"),
+            ("default_claude_pro", "Pro", "Pro"),
+            (None, "Ultra", "Ultra"),
+        ],
+    )
+    def test_server_name_wins_unless_the_table_is_more_precise(
+        self, tier, name, label
+    ):
+        plan = {**ULTRA, "tier": tier, "planDisplayName": name}
+        assert subscription.plan_label(plan) == label
+
+    def test_pro_organization_wins_over_the_default_tier(self):
+        # A paying Pro subscription reports the default rate-limit bucket
+        # (``default_claude_ai``), the same value a lapsed account falls back
+        # to; the tier alone would print "Free" for a subscriber who pays.
+        plan = {
+            "tier": "default_claude_ai",
+            "organizationType": "claude_pro",
+            "billingType": "apple_subscription",
+        }
+        assert subscription.plan_label(plan) == "Pro"
+
+    def test_pro_organization_does_not_mask_a_lapse(self):
+        # The label is cosmetic; expiry still comes from is_expired() alone.
+        plan = {
+            "tier": "default_claude_ai",
+            "organizationType": "claude_pro",
+            "subscriptionStatus": "canceled",
+        }
+        assert subscription.is_expired(plan)
 
     @pytest.mark.parametrize(
         "tier, label",
@@ -210,9 +286,10 @@ class TestRecords:
     def test_missing_is_due(self):
         assert subscription.is_due(None, now=1000.0)
 
-    def test_fresh_is_not_due(self):
-        record = {"plan": TEAM, "fetchedAt": 1000.0}
-        assert not subscription.is_due(record, now=1000.0 + 60)
+    @pytest.mark.parametrize("plan, due", [(TEAM, False), (UNNAMED, True)])
+    def test_fresh_is_due_only_when_the_name_key_is_missing(self, plan, due):
+        record = {"plan": plan, "fetchedAt": 1000.0}
+        assert subscription.is_due(record, now=1000.0 + 60) is due
 
     def test_due_at_ttl(self):
         record = {"plan": TEAM, "fetchedAt": 1000.0}
@@ -236,8 +313,9 @@ class TestRecords:
         assert not subscription.valid_record(record)
         assert subscription.is_due(record, now=1000.0)
 
-    def test_a_live_retry_holds_an_overdue_record(self):
-        record = {"plan": TEAM, "fetchedAt": 0.0, "retryAt": 2000.0}
+    @pytest.mark.parametrize("plan", [TEAM, UNNAMED])
+    def test_a_live_retry_holds_an_overdue_record(self, plan):
+        record = {"plan": plan, "fetchedAt": 0.0, "retryAt": 2000.0}
         assert not subscription.is_due(record, now=1000.0)
 
     def test_a_passed_retry_does_not_hold_it(self):
@@ -459,6 +537,22 @@ class TestCollector:
         assert calls == ["live"]
         assert plans["1"]["plan"] == TEAM
         assert plans["1"]["fetchedAt"] == 1_000_000.0
+
+    def test_a_record_without_the_name_key_is_refetched_once(
+        self, switcher, monkeypatch
+    ):
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        key = subscription.identity_key("a@x", "o1")
+        switcher._subscription_store().save(
+            {key: {"plan": UNNAMED, "fetchedAt": 1_000_000.0}}
+        )
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
+        )
+        assert switcher._collect_subscription_plans(info)["1"]["plan"] == TEAM
+        switcher._collect_subscription_plans(info)
+        assert calls == ["live"]
 
     def test_a_fresh_record_is_served_without_a_call(self, switcher, monkeypatch):
         monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
@@ -720,10 +814,22 @@ class TestJson:
             "fetchedAt": "1970-01-01T00:00:00Z",
         }
 
-    def test_absent_source_fields_are_omitted_not_nulled(self):
-        row = self._row(
-            subscription_plan={"plan": {"tier": "default_claude_ai"}, "fetchedAt": 0.0}
+    def test_plan_display_name_is_emitted_when_kept(self):
+        row = self._row(subscription_plan={"plan": ULTRA, "fetchedAt": 0.0})
+        assert (row["plan"]["label"], row["plan"]["planDisplayName"]) == (
+            "Ultra",
+            "Ultra",
         )
+
+    @pytest.mark.parametrize(
+        "plan",
+        [
+            {"tier": "default_claude_ai"},
+            {"tier": "default_claude_ai", "planDisplayName": None},
+        ],
+    )
+    def test_absent_source_fields_are_omitted_not_nulled(self, plan):
+        row = self._row(subscription_plan={"plan": plan, "fetchedAt": 0.0})
         assert set(row["plan"]) == {"label", "tier", "expired", "fetchedAt"}
 
 
@@ -758,7 +864,8 @@ class TestListMarker:
 class TestSnapshotField:
     def test_appended_after_policy(self):
         names = [f.name for f in dataclasses.fields(AccountSnapshot)]
-        assert names[-1] == "subscription_plan"
+        # Immediately after `policy`; fields added since are appended after it,
+        # so "last" is no longer the right proxy (same as the policy test).
         assert names[names.index("subscription_plan") - 1] == "policy"
 
     def test_defaults_to_none(self):

@@ -7,7 +7,13 @@ import random
 import pytest
 
 from claude_swap import oauth
-from claude_swap.lines import BindingWindow, binding_window, line_headroom, window_line
+from claude_swap.lines import (
+    BindingWindow,
+    binding_window,
+    line_headroom,
+    line_room,
+    window_line,
+)
 
 
 def _usage7(pct5: float, pct7: float) -> dict:
@@ -209,3 +215,41 @@ class TestBindingWindowScale:
         windows = list(oauth.relevant_windows(_usage7(73.3, 94.0)))
         assert binding_window(windows, 55.5, 90.0, scale=90.0).label == "5h"
         assert binding_window(windows, 55.5, 90.0).label == "7d"
+
+
+class TestLineRoom:
+    """Points before the nearest line, each window in its own points."""
+
+    def test_each_window_against_its_own_line(self):
+        windows = list(oauth.relevant_windows(_usage7(80.0, 88.0)))
+        assert line_room(windows, 90.0, 98.0) == 10.0  # 5h 10 under, 7d 10 under
+        windows = list(oauth.relevant_windows(_usage7(50.0, 89.0)))
+        assert line_room(windows, 90.0, 98.0) == 9.0
+
+    def test_not_the_5h_scale(self):
+        # line_headroom - (100 - T) reads 10 real points under a 98 line as 9.18,
+        # and 8 under a 60 line (global 90) as 12.
+        windows = list(oauth.relevant_windows(_usage7(0.0, 88.0)))
+        b = binding_window(windows, 90.0, 98.0)
+        assert round(b.line_headroom - 10.0, 2) == 9.18
+        assert line_room(windows, 90.0, 98.0) == 10.0
+        windows = list(oauth.relevant_windows(_usage7(0.0, 52.0)))
+        b = binding_window(windows, 60.0, scale=90.0)
+        assert b.line_headroom - 10.0 == 12.0
+        assert line_room(windows, 60.0) == 8.0
+
+    def test_not_only_the_binding_window(self):
+        # 5h 81% has 9 points under its 90 line; 7d 88.5% has 9.5 under its 98
+        # line but reads 8.7 on the 5h scale, so the 7d window binds. The
+        # nearest line in real points is the 5h one.
+        windows = list(oauth.relevant_windows(_usage7(81.0, 88.5)))
+        b = binding_window(windows, 90.0, 98.0)
+        assert b.label == "7d"
+        assert line_room(windows, 90.0, 98.0) == 9.0  # the 5h window, 9 under
+
+    def test_negative_once_over(self):
+        windows = list(oauth.relevant_windows(_usage7(92.0, 10.0)))
+        assert line_room(windows, 90.0, 98.0) == -2.0
+
+    def test_no_window_is_none(self):
+        assert line_room([], 90.0, 98.0) is None

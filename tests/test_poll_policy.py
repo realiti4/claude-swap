@@ -433,3 +433,70 @@ class TestPerWindowUrgency:
             self._active(usage(80.0), usage(83.0), threshold=85.0, weekly_threshold=97.0)
             == 270.0
         )
+
+
+class TestScopedProbePause:
+    """When the header probe may ask about a spent per-model bucket again."""
+
+    NOW = 1_800_000_000.0
+
+    @staticmethod
+    def _iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    def test_waits_for_the_buckets_reset(self):
+        reset = self.NOW + 2 * 86400
+        assert poll_policy.scoped_probe_after(self.NOW, self._iso(reset), None) == reset
+
+    def test_a_retry_after_is_the_servers_own_deadline(self):
+        reset = self._iso(self.NOW + 2 * 86400)
+        assert poll_policy.scoped_probe_after(self.NOW, reset, 600.0) == self.NOW + 600
+
+    def test_never_past_the_buckets_reset(self):
+        reset = self.NOW + 300
+        assert poll_policy.scoped_probe_after(self.NOW, self._iso(reset), 600.0) == reset
+
+    @pytest.mark.parametrize("retry_after", [None, 0.0, -5.0])
+    def test_no_deadline_named_falls_back_to_a_bounded_wait(self, retry_after):
+        assert poll_policy.scoped_probe_after(self.NOW, None, retry_after) == (
+            self.NOW + poll_policy.SCOPED_PROBE_RETRY_S
+        )
+
+    def test_no_deadline_is_further_than_a_weekly_period(self):
+        cap = self.NOW + poll_policy.SCOPED_PROBE_MAX_PAUSE_S
+        far = self._iso(self.NOW + 400 * 86400)
+        assert poll_policy.scoped_probe_after(self.NOW, far, None) == cap
+        assert poll_policy.scoped_probe_after(self.NOW, None, 1e9) == cap
+
+    def _row(self, probe_after: float | None, resets_at: float | None = None) -> dict:
+        row: dict = {"name": "Fable", "pct": 100.0}
+        if probe_after is not None:
+            row["probe_after"] = self._iso(probe_after)
+        if resets_at is not None:
+            row["resets_at"] = self._iso(resets_at)
+        return row
+
+    def test_paused_until_the_deadline(self):
+        row = self._row(self.NOW + 600, self.NOW + 86400)
+        assert poll_policy.scoped_probe_paused(row, self.NOW)
+        assert poll_policy.scoped_probe_paused(row, self.NOW + 599)
+        assert not poll_policy.scoped_probe_paused(row, self.NOW + 600)
+
+    def test_a_row_without_a_reset_is_paused_on_its_deadline_alone(self):
+        assert poll_policy.scoped_probe_paused(self._row(self.NOW + 600), self.NOW)
+
+    def test_a_row_with_room_is_never_paused(self):
+        assert not poll_policy.scoped_probe_paused(
+            self._row(None, self.NOW + 86400), self.NOW
+        )
+
+    def test_not_paused_past_the_rows_own_reset(self):
+        row = self._row(self.NOW + 3600, self.NOW + 60)
+        assert not poll_policy.scoped_probe_paused(row, self.NOW + 61)
+
+    def test_a_deadline_this_module_would_not_write_pauses_nothing(self):
+        far = self._row(self.NOW + poll_policy.SCOPED_PROBE_MAX_PAUSE_S + 1)
+        assert not poll_policy.scoped_probe_paused(far, self.NOW)
+        assert not poll_policy.scoped_probe_paused(
+            {"name": "Fable", "pct": 100.0, "probe_after": 5}, self.NOW
+        )

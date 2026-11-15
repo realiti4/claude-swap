@@ -39,7 +39,9 @@ from tests.test_tui import (
 # through the same ``make_account`` fixture used below.  Only the header row and
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
-# instead (see ``test_the_card_bar_rows_are_untouched``).
+# instead (see ``test_the_card_bar_rows_are_untouched``).  The re-login note
+# (tests/test_login_expiry.py) only joins a row while its login is due, so
+# these fixtures, which carry no expiry, render without it.
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
 GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h 25% · 7d 10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"

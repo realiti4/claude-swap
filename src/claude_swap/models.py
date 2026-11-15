@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -220,6 +221,15 @@ class AccountInfo:
         }
 
 
+def org_tag_shown(mode: str, email: str, emails: Sequence[str]) -> bool:
+    """Whether a per-account listing draws ``email``'s org tag under ``ui.orgTag``.
+
+    ``on`` always, ``off`` never, ``auto`` only when another managed account
+    (``emails`` lists every one, ``email`` included) has the same email.
+    """
+    return mode == "on" or (mode == "auto" and emails.count(email) > 1)
+
+
 @dataclass(frozen=True)
 class AccountSnapshot:
     """One managed account as seen by interactive UIs (the TUI).
@@ -247,6 +257,10 @@ class AccountSnapshot:
     #: None for a slot whose plan has never been fetched. Defaulted for the
     #: same reason as ``policy``.
     subscription_plan: dict | None = None
+    # Stored refresh token's expiry (epoch seconds), or None when missing/
+    # unreadable; see oauth.login_expires_at_epoch. Feeds the "re-login in
+    # 5d 12h" note every account view shows while the login is due.
+    login_expires_at: float | None = None
 
     @property
     def display_tag(self) -> str:
