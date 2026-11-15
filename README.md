@@ -268,7 +268,7 @@ Session-mode profiles (`cswap run`) live under the backup directory in `sessions
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
-The log file, `claude-swap.log`, is in the backup directory too. It rotates at 1 MB and keeps three older copies. Add `--debug` to a command (for example `cswap list --debug`) to also print the debug log to the terminal, which helps when reporting a problem.
+The log file, `claude-swap.log`, is in the backup directory too. Add `--debug` to a command (`cswap list --debug`) to record debug detail and print it to the terminal.
 
 ## Menu bar (macOS)
 
