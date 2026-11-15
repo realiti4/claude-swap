@@ -1138,7 +1138,7 @@ def run(switcher) -> int:
                 None,
                 rumps.MenuItem(self._t("Rotate to next"), callback=self._switch(None)),
                 rumps.MenuItem(self._t("Switch to best"), callback=self._switch("best")),
-                rumps.MenuItem(self._t("Next available"), callback=self._switch("next-available")),
+                rumps.MenuItem(self._t("Switch to next (skip exhausted accounts)"), callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
                 self._disable_menu(rumps),

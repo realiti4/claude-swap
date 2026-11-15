@@ -13,7 +13,7 @@ ZH = {
     'Account cards': '账号卡片',
     'Rotate to next': '切换到下一个账号',
     'Switch to best': '切换到剩余额度最多的账号',
-    'Next available': '下一个可用账号',
+    'Switch to next (skip exhausted accounts)': '切换到下一个账号（跳过额度已用尽的账号）',
     'Refresh current credentials': '刷新当前凭据',
     'Refresh now': '立即刷新',
     'Quit': '退出',
