@@ -967,3 +967,18 @@ def test_format_title_attention_prefix():
     assert menubar.format_title(None, None, settings, attention=True) == "⚠ ⇄"
     assert menubar.format_title("loc@papaya.asia", _USAGE, settings, attention=True).startswith("⚠ ⇄ ")
     assert not menubar.format_title("loc@papaya.asia", _USAGE, settings).startswith("⚠")
+
+
+def test_chinese_menu_health_and_saved_display_preferences(tmp_path):
+    from claude_swap.menubar import MenuBarSettings, health_label
+
+    path = tmp_path / "menu.json"
+    MenuBarSettings(language="zh-Hans", account_cards=True).save(path)
+    settings = MenuBarSettings.load(path)
+    assert settings.account_cards
+    message, attention = health_label(
+        auto_enabled=True, engine_running=True, usage_age=120,
+        refresh_interval=60, language=settings.language,
+    )
+    assert message == "自动切换运行中 · 用量更新于2分前"
+    assert not attention
