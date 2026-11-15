@@ -1316,6 +1316,14 @@ def try_fetch_usage_for_account(
     the ``"setup-token"`` error and no request is sent. ``scoped_probe`` and
     ``last_usage`` (the account's stored reading) only shape that probe, see
     :func:`_usage_from_probe`.
+
+    With ``header_probe`` the active account is read the same way. Claude
+    Code calls the usage endpoint on that account itself, and its calls
+    draw on the same budget as cswap's: measured with Claude Code 2.1.325,
+    after requests sent as ``claude-cli`` drew a 429, the next request as
+    ``claude-swap`` drew a 429 with the same Retry-After. With several
+    sessions open, endpoint polls of the active account keep hitting 429
+    and its reading goes stale, while the headers have no such budget.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -1323,11 +1331,10 @@ def try_fetch_usage_for_account(
     if not access_token:
         return UsageOutcome(None, error="no-access-token")
 
-    if is_setup_token(oauth):
-        if header_probe:
-            return _usage_from_probe(
-                access_token, context, scoped_probe, last_usage
-            )
+    setup_token = is_setup_token(oauth)
+    if header_probe and (setup_token or is_active):
+        return _usage_from_probe(access_token, context, scoped_probe, last_usage)
+    if setup_token:
         return UsageOutcome(None, error="setup-token")
 
     working_credentials = credentials
