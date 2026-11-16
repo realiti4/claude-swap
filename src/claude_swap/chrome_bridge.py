@@ -51,7 +51,7 @@ import threading
 import time
 from pathlib import Path
 
-from claude_swap.chrome_session import ChromeVault, is_supported
+from claude_swap.chrome_session import is_supported
 from claude_swap.credentials import looks_like_api_key
 
 _logger = logging.getLogger("claude-swap")
@@ -132,58 +132,43 @@ def _tls_context() -> ssl.SSLContext:
 
 
 def _active_account(backup_root: Path) -> dict | None:
-    """The current cswap account's tokens+uuid, or None if unavailable."""
+    """The current account's Claude Code identity + live OAuth token, or None.
+
+    Everything comes from Claude Code itself: the account (uuid/email) from
+    ``~/.claude.json`` ``oauthAccount`` and the access token from the live
+    credential Claude Code keeps refreshed. The bridge only accepts a token whose
+    scopes allow ``client_type: claude-code`` (the extension's ChromeVault token
+    is rejected with ``scope_not_allowed``), so the relay does not use the vault.
+    """
     try:
         data = json.loads((Path(backup_root) / "sequence.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        data = {}
     num = data.get("activeAccountNumber")
-    if num is None:
-        return None
-    session = ChromeVault(backup_root).get(str(num))
-    if session is None:
-        return None
-    return {"num": str(num), "token": _claude_code_token(str(num), session.email) or session.access_token,
-            "uuid": session.account_uuid, "email": session.email}
-
-
-def _token_belongs_to(email: str) -> bool:
-    """True when Claude Code's live credential is this account's."""
     try:
-        data = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
+        account = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount") or {}
     except (OSError, json.JSONDecodeError):
-        return False
-    live_email = (data.get("oauthAccount") or {}).get("emailAddress")
-    return live_email is not None and live_email.lower() == email.lower()
-
-
-def _claude_code_token(num: str, email: str | None) -> str | None:
-    """The account's Claude Code OAuth access token.
-
-    The bridge rejects the extension-scoped ChromeVault token for
-    ``client_type: claude-code`` (``scope_not_allowed``); it must be the token
-    Claude Code itself holds for that account. None when unavailable.
-    """
-    if not email:
         return None
+    uuid, email = account.get("accountUuid"), account.get("emailAddress")
+    if not uuid:
+        return None
+    token = _live_claude_code_token()
+    if not token:
+        return None
+    return {"num": str(num) if num is not None else "?", "token": token, "uuid": uuid, "email": email}
+
+
+def _live_claude_code_token() -> str | None:
+    """Claude Code's live OAuth access token (Keychain / credentials file)."""
     try:
         from .switcher import ClaudeAccountSwitcher
 
-        switcher = ClaudeAccountSwitcher()
-        # The active account's live Keychain credential is what Claude Code keeps
-        # refreshed (8h access tokens); the per-account backup can lag behind it.
-        live = switcher._read_credentials()
-        candidates = [live] if _token_belongs_to(email) else []
-        candidates.append(switcher.read_account_credentials(num, email))
-        for raw in candidates:
-            if not raw or looks_like_api_key(raw):
-                continue
-            token = json.loads(raw).get("claudeAiOauth", {}).get("accessToken")
-            if token:
-                return token
-        return None
+        raw = ClaudeAccountSwitcher()._read_credentials()
+        if not raw or looks_like_api_key(raw):
+            return None
+        return json.loads(raw).get("claudeAiOauth", {}).get("accessToken") or None
     except Exception as e:  # noqa: BLE001
-        _logger.warning("chrome-bridge: cannot read Claude Code token for account %s: %s", num, e)
+        _logger.warning("chrome-bridge: cannot read Claude Code token: %s", e)
         return None
 
 

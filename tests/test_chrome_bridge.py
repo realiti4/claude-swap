@@ -48,12 +48,27 @@ def test_frame_roundtrip_large_payload():
         b.close()
 
 
-def test_active_account_reads_sequence_and_vault(tmp_path):
+def test_active_account_reads_claude_code_identity_and_live_token(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"accountUuid": "uuid-2", "emailAddress": "two@x"}}))
     (tmp_path / "sequence.json").write_text(json.dumps({"activeAccountNumber": 2}))
+    monkeypatch.setattr(cb.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(cb, "_live_claude_code_token", lambda: "live-at")
+    # The extension's vault token must not be used (bridge rejects its scopes).
     cs.ChromeVault(tmp_path).put("2", cs.ChromeSession(
-        access_token="at", refresh_token="rt", account_uuid="uuid-2", email="two@x"))
+        access_token="vault-at", refresh_token="rt", account_uuid="uuid-vault", email="two@x"))
     acct = cb._active_account(tmp_path)
-    assert acct == {"num": "2", "token": "at", "uuid": "uuid-2", "email": "two@x"}
+    assert acct == {"num": "2", "token": "live-at", "uuid": "uuid-2", "email": "two@x"}
+
+
+def test_active_account_none_without_claude_code_login(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(cb.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(cb, "_live_claude_code_token", lambda: "live-at")
+    assert cb._active_account(tmp_path) is None
 
 
 def test_active_account_none_when_missing(tmp_path):
