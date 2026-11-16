@@ -79,13 +79,17 @@ class AccountUsageCard(A.NSView):
             right_edge -= 60
             label(state, right_edge, 11, 60, 10, ORANGE, right=True)
             right_edge -= 6
+        small_font = A.NSFont.systemFontOfSize_(10)
+        email_width = max(0, right_edge - email_x)
         if d['expiry']:
+            attrs = {A.NSFontAttributeName: small_font}
             expiry = A.NSString.stringWithString_(d['expiry'])
-            width = expiry.sizeWithAttributes_({A.NSFontAttributeName: A.NSFont.systemFontOfSize_(10)}).width + 2
-            right_edge -= width
-            label(expiry, right_edge, 11, width, 10, ORANGE)
-            right_edge -= 8
-        label(d['email'], email_x, 11, max(0, right_edge - email_x), 10, secondary)
+            email = A.NSString.stringWithString_(d['email'])
+            expiry_width = expiry.sizeWithAttributes_(attrs).width + 2
+            email_width = min(email.sizeWithAttributes_(attrs).width + 2,
+                              max(0, email_width - expiry_width - 6))
+            label(expiry, email_x + email_width + 6, 11, expiry_width, 10, ORANGE)
+        label(d['email'], email_x, 11, email_width, 10, secondary)
         usage = d['usage']
         if not isinstance(usage, dict):
             label(str(usage or tr('Usage unavailable')), 19, 42, w - 48, 12, ORANGE)
@@ -96,15 +100,15 @@ class AccountUsageCard(A.NSView):
         models = usage.get('scoped') or []
         gap = 14
         available = w - 38
-        model_width = 64 if models else 0
+        model_width = 40 if models else 0
         col = (available - gap - (model_width + gap if models else 0)) / 2
         for i, scoped in enumerate(models):
             model = _rolled_weekly_window(scoped, now) or {}
             value = model.get('pct')
             text = f'{value:.0f}%' if isinstance(value, (float, int)) else '—'
             x = w - 19 - model_width
-            label(scoped.get('name') or tr('Model'), x, 32 + 35 * i, model_width, 10, secondary)
-            label(text, x, 47 + 35 * i, model_width, 11, secondary, bold=True)
+            label(scoped.get('name') or tr('Model'), x, 32 + 35 * i, model_width, 10, secondary, right=True)
+            label(text, x, 47 + 35 * i, model_width, 11, secondary, bold=True, right=True)
         for i, (name, window, threshold) in enumerate(windows):
             x = 19 + i * (col + gap)
             y = 32
@@ -146,7 +150,7 @@ def attach_card(item, owner, num, email, active, usage, alias, disabled,
                   tr("Sign in again in {time}", time=duration(owner.settings.language, time_left)))
     count = len(usage.get('scoped') or []) if isinstance(usage, dict) else 0
     height = max(81, 33 + count * 35)
-    view = AccountUsageCard.alloc().initWithFrame_(((0, 0), (380, height)))
+    view = AccountUsageCard.alloc().initWithFrame_(((0, 0), (354, height)))
     view.setAutoresizingMask_(A.NSViewWidthSizable)
     view.owner = weakref.ref(owner)
     view.data = dict(num=num, email=email, active=active, usage=usage,

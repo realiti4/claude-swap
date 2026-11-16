@@ -26,7 +26,7 @@ def test_draw_account_without_alias(language, tmp_path):
     view = item._menuitem.view()
     assert view.data["name"] == ("Account 1" if language == "en" else "账号 1")
     assert view.data["expiry"]
-    assert view.frame().size == (380, 81)
+    assert view.frame().size == (354, 81)
     host = appkit.NSView.alloc().initWithFrame_(((0, 0), (540, 94)))
     host.addSubview_(view)
     assert view.frame().size.width == 540
