@@ -216,7 +216,9 @@ class DailySchedule:
         if "attempt_count" not in record:
             record["attempt_count"] = 1 if record.get("attempted_at") else 0
             self.save()
-        attempts = record["attempt_count"]
+        record.setdefault("cycle_number", 1)
+        record.setdefault("cycle_attempt_count", record["attempt_count"])
+        attempts = record["cycle_attempt_count"]
         data = account.usage.last_good or {}
         window = data.get("five_hour") or {}
         reset_value = window.get("resets_at")
@@ -238,8 +240,26 @@ class DailySchedule:
         if (record.get("status") in ("activated", "already_active")
                 and record.get("confirmed_sample_at") and confirmed_reset is not None
                 and now >= confirmed_reset):
-            # Catch-up fills missed activations, not completed windows.
-            return
+            if not fresh or fetched <= confirmed_reset or not (idle or active):
+                return
+            history = record.setdefault("completed_cycles", [])
+            history.append({k: record[k] for k in (
+                "cycle_number", "cycle_attempt_count", "status", "attempted_at",
+                "actual_resets_at", "confirmed_at", "confirmed_sample_at", "model",
+            ) if k in record})
+            record.update(status="pending", cycle_number=record["cycle_number"] + 1,
+                          cycle_attempt_count=0, cycle_due_at=iso(confirmed_reset),
+                          attempted_at=None, completed_at=None, confirmation_after=None,
+                          actual_resets_at=None, confirmed_at=None, confirmed_sample_at=None,
+                          retry_at=0, error=None, reset_offset_seconds=None, model=None,
+                          late_seconds=None)
+            attempts = 0
+            self.event("window_expired", f"Account {account.number}: checking next five-hour window")
+            if active:
+                record.update(status="already_active", actual_resets_at=reset_value,
+                              confirmed_at=iso(now), confirmed_sample_at=iso(fetched))
+                self.save()
+                return
         if attempts:
             if not post_request:
                 # Neither headers nor a cached pre-request reading can resolve
@@ -275,7 +295,7 @@ class DailySchedule:
             self.save()
             return
         if active:
-            if abs(reset - end) <= 300:
+            if abs(reset - end) <= 300 or record.get("confirmed_sample_at"):
                 record.update(status="already_active", error=None,
                               confirmed_at=iso(now), confirmed_sample_at=iso(fetched))
             else:
@@ -289,8 +309,8 @@ class DailySchedule:
             return
         if attempts >= MAX_ATTEMPTS:
             if record.get("status") != "attempt_limit":
-                record.update(status="attempt_limit", error="daily_attempt_limit")
-                self.event("activation_limit", f"Account {account.number}: daily activation attempt limit reached")
+                record.update(status="attempt_limit", error="window_attempt_limit")
+                self.event("activation_limit", f"Account {account.number}: window activation attempt limit reached")
             return
         attempted = timestamp(record.get("attempted_at"))
         retry_at = max(record.get("retry_at", 0), (attempted + RETRY_SECONDS) if attempted is not None else 0)
@@ -318,12 +338,11 @@ class DailySchedule:
                 record.update(status="unavailable", error="usage_unavailable")
                 self.save()
                 return
-            # Persist the claim immediately before network I/O. Failed, rejected
-            # and interrupted sends all consume the same daily attempt budget.
             record.update(status="activating", attempted_at=iso(now), error=None,
-                          attempt_count=attempts + 1, confirmation_after=now, model=ACTIVATION_MODEL,
+                          attempt_count=record["attempt_count"] + 1, cycle_attempt_count=attempts + 1,
+                          confirmation_after=now, model=ACTIVATION_MODEL,
                           retry_at=now + RETRY_SECONDS,
-                          late_seconds=max(0, round(now - start)))
+                          late_seconds=max(0, round(now - (timestamp(record.get("cycle_due_at")) or start))))
             self.event("activation_attempt", f"Account {account.number}: sending activation request {attempts + 1}/{MAX_ATTEMPTS}")
             raw = self.probe(token_data["accessToken"])
             finished = self.clock()
@@ -348,13 +367,13 @@ class DailySchedule:
             if retry and retry.isdigit():
                 retry_seconds = max(RETRY_SECONDS, int(retry))
             record["retry_at"] = self.clock() + retry_seconds
-            if record.get("attempt_count", 0) > attempts:
+            if record.get("cycle_attempt_count", 0) > attempts:
                 record["confirmation_after"] = self.clock()
             self.event("activation_failed", f"Account {account.number}: HTTP {exc.code}")
         except Exception as exc:
             record.update(status="failed", error=type(exc).__name__)
             record["retry_at"] = max(record.get("retry_at", 0), self.clock() + RETRY_SECONDS)
-            if record.get("attempt_count", 0) > attempts:
+            if record.get("cycle_attempt_count", 0) > attempts:
                 record["confirmation_after"] = self.clock()
             self.event("activation_failed", f"Account {account.number}: request unavailable")
         self.save()
@@ -468,7 +487,8 @@ class DailySchedule:
                          "slot": {"start": f"{start:02}:00", "end": f"{end:02}:00", "timezone": TIMEZONE},
                          "activation": {k: v for k, v in self.state["activations"].get(f"{day}:{account.number}", {"status": "pending"}).items()
                                         if k in {"status", "attempted_at", "actual_resets_at", "error", "late_seconds",
-                                                 "attempt_count", "retry_at", "confirmed_at", "confirmed_sample_at", "reset_offset_seconds", "model"}}})
+                                                 "attempt_count", "retry_at", "confirmed_at", "confirmed_sample_at", "reset_offset_seconds", "model",
+                                                 "cycle_number", "cycle_attempt_count", "cycle_due_at"}}})
         atomic_write_json(self.root / "schedule-status.json", {
             "schemaVersion": 1, "updated_at": iso(now), "active_account_id": snap.active_number,
             "accounts": rows, "scheduler": {"enabled": True, "timezone": TIMEZONE,

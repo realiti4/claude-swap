@@ -540,7 +540,7 @@ def test_false_legacy_success_is_retried_after_original_slot_ends(tmp_path, monk
     probe.assert_called_once()
 
 
-def test_confirmed_window_naturally_expiring_preserves_history(tmp_path, monkeypatch):
+def test_confirmed_window_expiry_starts_next_cycle_and_preserves_history(tmp_path, monkeypatch):
     rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
     service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
     service.tick()
@@ -552,9 +552,12 @@ def test_confirmed_window_naturally_expiring_preserves_history(tmp_path, monkeyp
     clock.return_value = at(12, 1)
     endpoint_sample(rows[0], at(12, 1))
     service.tick()
-    assert record["status"] == "activated"
-    assert record["actual_resets_at"] == schedule.iso(at(12))
-    assert probe.call_count == 1
+    assert record["status"] == "request_accepted"
+    assert record["actual_resets_at"] is None
+    assert probe.call_count == 2
+    assert record["cycle_number"] == 2
+    assert record["cycle_attempt_count"] == 1
+    assert record["completed_cycles"][0]["actual_resets_at"] == schedule.iso(at(12))
 
 
 def test_legacy_matching_reset_gets_endpoint_confirmation_marker(tmp_path, monkeypatch):
@@ -572,7 +575,7 @@ def test_legacy_matching_reset_gets_endpoint_confirmation_marker(tmp_path, monke
     probe.assert_not_called()
 
 
-def test_confirmed_window_expiring_inside_slot_does_not_start_second_window(tmp_path, monkeypatch):
+def test_confirmed_window_expiring_inside_slot_starts_second_window(tmp_path, monkeypatch):
     rows = [account(1, active=True), account(2), account(3)]
     service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
     service.tick()
@@ -584,9 +587,10 @@ def test_confirmed_window_expiring_inside_slot_does_not_start_second_window(tmp_
     clock.return_value = at(11, 59) + 30
     endpoint_sample(rows[0], clock.return_value)
     service.tick()
-    assert record["status"] == "activated"
-    assert record["actual_resets_at"] == schedule.iso(at(11, 59))
-    assert probe.call_count == 1
+    assert record["status"] == "request_accepted"
+    assert record["cycle_number"] == 2
+    assert record["late_seconds"] == 30
+    assert probe.call_count == 2
 
 
 def test_catch_up_does_not_switch_back_to_missed_account_or_repeat_on_restart(tmp_path, monkeypatch):
@@ -625,7 +629,7 @@ def test_failed_catch_up_does_not_block_other_due_accounts(tmp_path, monkeypatch
     assert "2026-11-13:3" not in service.state["activations"]
 
 
-def test_already_active_window_is_not_restarted_after_expiry(tmp_path, monkeypatch):
+def test_already_active_window_is_renewed_after_expiry(tmp_path, monkeypatch):
     rows = [account(1, active=True, reset=schedule.iso(at(12))),
             account(2, disabled=True), account(3, disabled=True)]
     service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
@@ -634,5 +638,104 @@ def test_already_active_window_is_not_restarted_after_expiry(tmp_path, monkeypat
     clock.return_value = at(13)
     endpoint_sample(rows[0], at(13))
     service.tick()
+    probe.assert_called_once()
+    assert service.state["activations"]["2026-11-13:1"]["status"] == "request_accepted"
+
+
+def test_four_successful_cycles_are_not_limited_by_daily_attempt_count(tmp_path, monkeypatch):
+    rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
+    service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
+    for hour in (7, 12, 17, 22):
+        clock.return_value = at(hour) + 1
+        endpoint_sample(rows[0], clock.return_value)
+        service.tick()
+        clock.return_value = at(hour, 1)
+        endpoint_sample(rows[0], at(hour, 1), reset=schedule.iso(at(hour) + 18000), pct=0.1)
+        service.tick()
+    record = service.state["activations"]["2026-11-13:1"]
+    assert probe.call_count == 4
+    assert record["attempt_count"] == 4
+    assert record["cycle_attempt_count"] == 1
+    assert record["cycle_number"] == 4
+    assert len(record["completed_cycles"]) == 3
+    assert record["status"] == "activated"
+
+
+def test_new_cycle_retry_budget_survives_restart(tmp_path, monkeypatch):
+    rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
+    service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
+    service.tick()
+    clock.return_value = at(7, 1)
+    endpoint_sample(rows[0], at(7, 1), reset=schedule.iso(at(12)), pct=0.1)
+    service.tick()
+    counts = []
+    for minute in (0, 6, 12, 18):
+        endpoint_sample(rows[0], at(12, minute) + 1)
+        service, _, _, _, retry = harness(tmp_path, monkeypatch, rows, now=at(12, minute) + 1,
+                                        probe=Mock(side_effect=TimeoutError("FAKE_TOKEN")))
+        service.tick()
+        counts.append(retry.call_count)
+    assert counts == [1, 1, 1, 0]
+    record = service.state["activations"]["2026-11-13:1"]
+    assert record["attempt_count"] == 4
+    assert record["cycle_attempt_count"] == 3
+    assert record["cycle_number"] == 2
+    assert record["error"] == "window_attempt_limit"
+
+
+@pytest.mark.parametrize("kind", ["pre_reset", "stale", "headers", "unknown"])
+def test_expiry_needs_fresh_idle_proof_before_renewal(tmp_path, monkeypatch, kind):
+    rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
+    service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
+    service.tick()
+    clock.return_value = at(7, 1)
+    endpoint_sample(rows[0], at(7, 1), reset=schedule.iso(at(12)), pct=0.1)
+    service.tick()
+    clock.return_value = at(12, 1)
+    endpoint_sample(rows[0], at(11, 59) if kind == "pre_reset" else at(12, 1),
+                    source=schedule.oauth.USAGE_SOURCE_HEADERS if kind == "headers" else None,
+                    age=301 if kind == "stale" else 0,
+                    pct=None if kind == "unknown" else 0)
+    service.tick()
+    assert probe.call_count == 1
+    assert service.state["activations"]["2026-11-13:1"]["cycle_number"] == 1
+
+
+def test_external_next_window_is_adopted_without_extra_inference(tmp_path, monkeypatch):
+    rows = [account(1, active=True, reset=schedule.iso(at(12))),
+            account(2, disabled=True), account(3, disabled=True)]
+    service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
+    service.tick()
+    clock.return_value = at(13)
+    endpoint_sample(rows[0], at(13), reset=schedule.iso(at(17)), pct=5)
+    service.tick()
     probe.assert_not_called()
-    assert service.state["activations"]["2026-11-13:1"]["status"] == "already_active"
+    record = service.state["activations"]["2026-11-13:1"]
+    assert record["cycle_number"] == 2
+    assert record["actual_resets_at"] == schedule.iso(at(17))
+    assert record["status"] == "already_active"
+    clock.return_value = at(17, 1)
+    endpoint_sample(rows[0], at(17, 1))
+    service.tick()
+    probe.assert_called_once()
+    assert record["cycle_number"] == 3
+
+
+def test_renewal_stops_at_midnight_and_resumes_at_next_daily_start(tmp_path, monkeypatch):
+    rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
+    service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows, now=at(22))
+    service.tick()
+    clock.return_value = at(22, 1)
+    endpoint_sample(rows[0], at(22, 1), reset=schedule.iso(at(0, day=14)), pct=0.1)
+    service.tick()
+    for hour in (0, 6):
+        clock.return_value = at(hour, day=14)
+        endpoint_sample(rows[0], clock.return_value)
+        service.tick()
+    assert probe.call_count == 1
+    assert "2026-11-14:1" not in service.state["activations"]
+    clock.return_value = at(7, day=14)
+    endpoint_sample(rows[0], clock.return_value)
+    service.tick()
+    assert probe.call_count == 2
+    assert service.state["activations"]["2026-11-14:1"]["cycle_number"] == 1
