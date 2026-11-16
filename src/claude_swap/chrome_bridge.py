@@ -216,9 +216,27 @@ def _relay_connection(down: socket.socket, backup_root: Path, ctx: ssl.SSLContex
         return
     head = req.decode("latin1", "replace")
     key = ""
+    origin = None
+    host = ""
     for line in head.split("\r\n"):
-        if line.lower().startswith("sec-websocket-key:"):
+        lower = line.lower()
+        if lower.startswith("sec-websocket-key:"):
             key = line.split(":", 1)[1].strip()
+        elif lower.startswith("origin:"):
+            origin = line.split(":", 1)[1].strip()
+        elif lower.startswith("host:"):
+            host = line.split(":", 1)[1].strip()
+    # Only native Claude Code clients may use the relay: browsers always send an
+    # Origin on WebSocket handshakes (blocks cross-site WebSocket hijacking), and
+    # a non-loopback Host means DNS rebinding.
+    if origin is not None or host.rsplit(":", 1)[0] not in ("127.0.0.1", "localhost", "[::1]"):
+        _logger.warning("chrome-bridge: rejected handshake (origin=%r, host=%r)", origin, host)
+        try:
+            down.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+        except OSError:
+            pass
+        down.close()
+        return
     accept = base64.b64encode(hashlib.sha1((key + _WS_MAGIC).encode()).digest()).decode()
     down.sendall((
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
