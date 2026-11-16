@@ -1,7 +1,7 @@
 """Daily quota-window activation and strict 99% failover.
 
-The provider owns reset times. A one-token Messages request starts an idle
-window; it cannot move an existing window. Claims persist before network I/O,
+The provider owns reset times. A small Messages request attempts to start an
+idle window; it cannot move an existing window. Claims persist before network I/O,
 so restarts wait before retrying ambiguous requests. A process-lifetime lock
 serializes this service only; account writes use the switcher's normal locks.
 """
@@ -37,6 +37,10 @@ THRESHOLD = 99.0
 INTERVAL = 15
 RETRY_SECONDS = 300
 MAX_AGE = 300
+MAX_ATTEMPTS = 3
+ACTIVATION_MODEL = oauth.USAGE_PROBE_MODEL
+ACTIVATION_MAX_TOKENS = 16
+ACTIVATION_PROMPT = "Reply with OK."
 
 
 def iso(ts):
@@ -110,11 +114,39 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def activation_request(token):
-    """A bounded one-output-token request to the fixed Anthropic endpoint."""
+    """Validate a bounded Messages response; headers never prove activation."""
     opener = urllib.request.build_opener(NoRedirect())
-    with opener.open(oauth._probe_request(token, oauth.USAGE_PROBE_MODEL), timeout=20) as response:
-        response.read(65536)
+    request = oauth._probe_request(token, ACTIVATION_MODEL)
+    body = json.loads(request.data)
+    body.update(max_tokens=ACTIVATION_MAX_TOKENS,
+                messages=[{"role": "user", "content": ACTIVATION_PROMPT}])
+    request.data = json.dumps(body).encode()
+    with opener.open(request, timeout=20) as response:
+        body = response.read(65537)
+        if len(body) > 65536:
+            raise ValueError("invalid_message_response")
+        message = json.loads(body)
+        usage = message.get("usage") if isinstance(message, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if (not isinstance(message, dict) or message.get("type") != "message"
+                or message.get("role") != "assistant" or not isinstance(usage, dict)
+                or type(usage.get("input_tokens")) is not int or usage["input_tokens"] < 0
+                or type(usage.get("output_tokens")) is not int or usage["output_tokens"] <= 0
+                or not isinstance(content, list)
+                or not any(isinstance(part, dict) and part.get("type") == "text"
+                           and isinstance(part.get("text"), str) and part["text"].strip()
+                           for part in content)):
+            raise ValueError("invalid_message_response")
         return oauth.parse_unified_ratelimit_headers(response.headers)
+
+
+def activation_percentages(account, now):
+    """The activation request uses Haiku, independent of failover model policy."""
+    data = account.usage.last_good or {}
+    scoped = data.get("scoped") or []
+    models = ("Haiku",) if any(isinstance(row, dict) and str(row.get("name", "")).lower() == "haiku"
+                               for row in scoped) else ()
+    return percentages(account, now, models)
 
 
 class ScheduledSwitcher(ClaudeAccountSwitcher):
@@ -151,43 +183,96 @@ class DailySchedule:
     def event(self, kind, detail):
         self.last_event = {"kind": kind, "at": iso(self.clock()), "detail": detail}
         self.save()
+        # Events contain only fixed descriptions and slot numbers. Never log
+        # credentials, exception messages, response bodies or account identities.
+        try:
+            fd = os.open(self.root / "schedule-events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as stream:
+                (self.root / "schedule-events.jsonl").chmod(0o600)
+                stream.write(json.dumps(self.last_event, ensure_ascii=True) + "\n")
+        except OSError:
+            # A diagnostic-log failure must not erase a persisted send claim.
+            pass
 
     def matches(self, account):
         return self.config.get("identities", {}).get(account.number) == identity(account)
 
     def activate(self, account, start, end):
         now = self.clock()
+        in_slot = start <= now < end
         day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
         key = f"{day}:{account.number}"
-        entries = self.state["activations"]
-        record = entries.setdefault(key, {"status": "pending", "attempted_at": None,
-                                          "actual_resets_at": None, "error": None})
-        if record["status"] in ("activated", "already_active", "request_accepted"):
-            if record["status"] == "request_accepted":
-                measured = (account.usage.last_good or {}).get("five_hour", {}).get("resets_at")
-                reset = timestamp(measured)
-                attempted = timestamp(record.get("attempted_at"))
-                if reset and attempted and reset > attempted + 60 and (account.usage.fetched_at or 0) >= attempted:
-                    record.update(status="activated", actual_resets_at=measured)
-                    self.save()
+        if not in_slot and key not in self.state["activations"]:
             return
-        if now < record.get("retry_at", 0):
-            return
+        record = self.state["activations"].setdefault(key, {
+            "status": "pending", "attempted_at": None,
+            "actual_resets_at": None, "error": None, "attempt_count": 0,
+        })
+        # Older claims were persisted before network I/O. Count them as an
+        # attempt even when no completion was recorded, to bound restart retries.
+        if "attempt_count" not in record:
+            record["attempt_count"] = 1 if record.get("attempted_at") else 0
+            self.save()
+        attempts = record["attempt_count"]
         data = account.usage.last_good or {}
-        reset_value = data.get("five_hour", {}).get("resets_at")
+        window = data.get("five_hour") or {}
+        reset_value = window.get("resets_at")
         reset = timestamp(reset_value)
+        values = activation_percentages(account, now)
+        fetched = account.usage.fetched_at
+        fresh = (values is not None and data.get("source") != oauth.USAGE_SOURCE_HEADERS
+                 and fetched is not None and 0 <= now - fetched <= MAX_AGE
+                 and account.usage.age_s is not None and account.usage.age_s <= MAX_AGE)
+        after = record.get("confirmation_after")
+        if after is None:
+            after = timestamp(record.get("completed_at")) or timestamp(record.get("attempted_at"))
+        post_request = fresh and (after is None or fetched > after)
+        active = reset is not None and reset > now
+        # A missing reset is idle only with a measured zero. An expired reset
+        # needs a sample taken after the reset (checked by percentages()).
+        idle = fresh and not active and window.get("pct") == 0 and (not reset_value or reset is not None)
+        if attempts:
+            confirmed_reset = timestamp(record.get("actual_resets_at"))
+            if (record.get("status") == "activated"
+                    and record.get("confirmed_sample_at") and confirmed_reset is not None
+                    and now >= confirmed_reset):
+                # A verified window naturally ending is historical success,
+                # not evidence that the activation request failed.
+                return
+            if not post_request:
+                # Neither headers nor a cached pre-request reading can resolve
+                # an ambiguous request. Keep the claim without sending again.
+                return
+            if active:
+                if (record.get("status") != "activated" or record.get("actual_resets_at") != reset_value
+                        or not record.get("confirmed_sample_at")):
+                    record.update(status="activated", error=None, actual_resets_at=reset_value,
+                                  confirmed_at=iso(now), confirmed_sample_at=iso(fetched),
+                                  reset_offset_seconds=round(reset - end))
+                    self.event("activated", f"Account {account.number}: endpoint usage confirmed an active window; reset offset {round(reset - end)}s")
+                return
+            if not idle:
+                record.update(status="unavailable", error="usage_unavailable")
+                self.save()
+                return
+            if record.get("status") in ("activated", "request_accepted", "activating", "already_active"):
+                record.update(status="unconfirmed", actual_resets_at=reset_value,
+                              error="window_not_started", confirmed_at=None, confirmed_sample_at=None)
+                self.event("activation_unconfirmed", f"Account {account.number}: endpoint usage shows no active window")
+        elif record.get("status") == "already_active" and not fresh:
+            return
+        if not in_slot:
+            return
+        if not fresh:
+            record.update(status="unavailable", error="usage_unavailable")
+            self.save()
+            return
         record["actual_resets_at"] = reset_value
-        # Do not infer an idle window from an unavailable or stale response.
-        values = percentages(account, now, self.models)
-        if values is None:
-            record.update(status="unavailable", error="usage_unavailable", retry_at=now + 60)
-            self.save()
-            return
         if max(values) >= THRESHOLD:
-            record.update(status="unavailable", error="quota_at_threshold", retry_at=now + 60)
+            record.update(status="unavailable", error="quota_at_threshold")
             self.save()
             return
-        if reset is not None and reset > now:
+        if active:
             if abs(reset - end) <= 300:
                 record.update(status="already_active", error=None)
             else:
@@ -195,11 +280,19 @@ class DailySchedule:
                               retry_at=min(reset + 5, now + RETRY_SECONDS))
             self.save()
             return
-        # Persist the claim BEFORE sending: an interrupted/ambiguous response
-        # is not a reason to send one request every service restart.
-        record.update(status="activating", attempted_at=iso(now), error=None,
-                      retry_at=now + RETRY_SECONDS)
-        self.save()
+        if not idle:
+            record.update(status="unavailable", error="usage_unavailable")
+            self.save()
+            return
+        if attempts >= MAX_ATTEMPTS:
+            if record.get("status") != "attempt_limit":
+                record.update(status="attempt_limit", error="daily_attempt_limit")
+                self.event("activation_limit", f"Account {account.number}: daily activation attempt limit reached")
+            return
+        attempted = timestamp(record.get("attempted_at"))
+        retry_at = max(record.get("retry_at", 0), (attempted + RETRY_SECONDS) if attempted is not None else 0)
+        if now < retry_at:
+            return
         try:
             if not account.is_active:
                 verdict = self.freshener._freshen_target(account.number, account.email)
@@ -213,24 +306,53 @@ class DailySchedule:
             token_data = oauth.extract_oauth_data(row[5]) if row else None
             if not token_data or not token_data.get("accessToken"):
                 raise RuntimeError("credential_unavailable")
-            raw = self.probe(token_data["accessToken"])
-            actual_reset = raw.get("five_hour", {}).get("resets_at")
-            confirmed = (timestamp(actual_reset) is not None
-                         and timestamp(actual_reset) > max(now + 60, reset or 0))
-            record.update(status="activated" if confirmed else "request_accepted", error=None, completed_at=iso(self.clock()),
-                          actual_resets_at=actual_reset,
+            now = self.clock()
+            if not start <= now < end:
+                record.update(status="missed", error="slot_ended")
+                self.event("activation_missed", f"Account {account.number}: target window ended before the request")
+                return
+            if now - fetched > MAX_AGE:
+                record.update(status="unavailable", error="usage_unavailable")
+                self.save()
+                return
+            # Persist the claim immediately before network I/O. Failed, rejected
+            # and interrupted sends all consume the same daily attempt budget.
+            record.update(status="activating", attempted_at=iso(now), error=None,
+                          attempt_count=attempts + 1, confirmation_after=now,
+                          retry_at=now + RETRY_SECONDS,
                           late_seconds=max(0, round(now - start)))
-            self.event("activated" if confirmed else "request_accepted",
-                       f"Account {account.number}: one-token request accepted" + ("; reset confirmed" if confirmed else "; reset unconfirmed"))
+            self.event("activation_attempt", f"Account {account.number}: sending activation request {attempts + 1}/{MAX_ATTEMPTS}")
+            raw = self.probe(token_data["accessToken"])
+            finished = self.clock()
+            record.update(completed_at=iso(finished), confirmation_after=finished)
+            if not isinstance(raw, dict):
+                raise ValueError("invalid_probe_response")
+            if "rejected" in raw:
+                record.update(status="failed", error="request_rejected")
+                rejected = raw.get("rejected") or {}
+                rejected_reset = timestamp(rejected.get("resets_at")) if isinstance(rejected, dict) else None
+                if rejected_reset is not None:
+                    record["retry_at"] = max(record["retry_at"], rejected_reset)
+                self.event("activation_failed", f"Account {account.number}: activation request rejected")
+            else:
+                record.update(status="request_accepted", error=None, actual_resets_at=None)
+                self.event("request_accepted", f"Account {account.number}: request accepted; awaiting endpoint usage confirmation")
         except urllib.error.HTTPError as exc:
             # Never persist exception text or response bodies (may contain auth).
             record.update(status="failed", error=f"http_{exc.code}")
             retry = exc.headers.get("Retry-After") if exc.headers else None
+            retry_seconds = RETRY_SECONDS
             if retry and retry.isdigit():
-                record["retry_at"] = now + max(RETRY_SECONDS, int(retry))
+                retry_seconds = max(RETRY_SECONDS, int(retry))
+            record["retry_at"] = self.clock() + retry_seconds
+            if record.get("attempt_count", 0) > attempts:
+                record["confirmation_after"] = self.clock()
             self.event("activation_failed", f"Account {account.number}: HTTP {exc.code}")
         except Exception as exc:
             record.update(status="failed", error=type(exc).__name__)
+            record["retry_at"] = max(record.get("retry_at", 0), self.clock() + RETRY_SECONDS)
+            if record.get("attempt_count", 0) > attempts:
+                record["confirmation_after"] = self.clock()
             self.event("activation_failed", f"Account {account.number}: request unavailable")
         self.save()
 
@@ -250,12 +372,13 @@ class DailySchedule:
 
     def tick(self):
         self.error = None
-        now = self.clock()
         snap = self.source.take()
+        now = self.clock()
         accounts = {a.number: a for a in snap.accounts}
         due = None
         eligible = []
         available = []
+        day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
         for number, start_hour, end_hour in SLOTS:
             account = accounts.get(number)
             if account is None or not self.matches(account):
@@ -270,8 +393,9 @@ class DailySchedule:
                     eligible.append(account)
             if start <= now < end:
                 due = account
-                if account.switchable and not account.disabled:
-                    self.activate(account, start, end)
+            if (account.switchable and not account.disabled
+                    and (start <= now < end or f"{day}:{number}" in self.state["activations"])):
+                self.activate(account, start, end)
         current = accounts.get(snap.active_number)
         if current is not None and not self.matches(current):
             self.error = self.error or "active_account_not_bound_to_schedule"
@@ -340,7 +464,8 @@ class DailySchedule:
                          "status": status, "error": ("identity_mismatch" if status == "identity_mismatch" else "usage_unavailable") if status != "ok" else None,
                          "slot": {"start": f"{start:02}:00", "end": f"{end:02}:00", "timezone": TIMEZONE},
                          "activation": {k: v for k, v in self.state["activations"].get(f"{day}:{account.number}", {"status": "pending"}).items()
-                                        if k in {"status", "attempted_at", "actual_resets_at", "error", "late_seconds"}}})
+                                        if k in {"status", "attempted_at", "actual_resets_at", "error", "late_seconds",
+                                                 "attempt_count", "retry_at", "confirmed_at", "confirmed_sample_at", "reset_offset_seconds"}}})
         atomic_write_json(self.root / "schedule-status.json", {
             "schemaVersion": 1, "updated_at": iso(now), "active_account_id": snap.active_number,
             "accounts": rows, "scheduler": {"enabled": True, "timezone": TIMEZONE,
