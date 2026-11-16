@@ -3029,10 +3029,12 @@ class AutoSwitchEngine:
                 policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
             )
 
+        own_bars: Mapping[str, float] = self._bars
+
         def _over_own(num: str) -> bool:
             """A veto like `_capped`: a peer at or over its OWN threshold is
             never entered, by any trigger or regime."""
-            return over_own_threshold(num, usage, settings, self._models, self._bars)
+            return over_own_threshold(num, usage, settings, self._models, own_bars)
 
         # -- candidate selection ------------------------------------------
         switchable = self.switcher.switchable_account_numbers()
@@ -3274,6 +3276,16 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             trigger = "failover"
+            # T3500: a failover has not read the active, so it holds rather than land
+            # over a line. A peer with no threshold of its own reads at the strategy's
+            # bar (97 under `dynamic`), so the veto above now covers every peer.
+            own_bars = {n: self._bars.get(n, bar) for n in eligible}
+            vetoed = [num for num in eligible if _over_own(num)]
+            self._veto_note = _vetoed_clause(vetoed, own_bars)
+            candidates = [num for num in eligible if num not in vetoed]
+            oauth_candidates = [
+                n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+            ]
 
         if (
             trigger in _COOLDOWN_GATED_TRIGGERS
@@ -3933,7 +3945,7 @@ class AutoSwitchEngine:
             # The fresh rows may have carried a candidate past its cap.
             fresh = [n for n in oauth_candidates if _capped(n) is None]
             vetoed += [n for n in fresh if _over_own(n)]
-            self._veto_note = _vetoed_clause(vetoed, thresholds)
+            self._veto_note = _vetoed_clause(vetoed, own_bars)
             oauth_candidates = [n for n in fresh if not _over_own(n)]
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
@@ -5006,8 +5018,7 @@ class AutoSwitchEngine:
         # in that state the landing rule is dropped and every strategy ranks
         # by the most room left before a limit: RAW headroom, `100 - max pct`
         # over the 5h, 7d and configured per-model windows, whatever lines
-        # they carry. Not on a failover (T3500): it holds rather than land
-        # over a line.
+        # they carry.
         #
         # Not by soonest reset. Ranking a nearly spent account ahead of one
         # with room because its window rolls over first lands on it at 98-99%,
@@ -5252,12 +5263,6 @@ class AutoSwitchEngine:
                 if binding is not None
                 else (100.0 - h) >= cand_bar
             )
-            if over and trigger == "failover":
-                # T3500: a failover skips the landing gate below, never the line.
-                # A blind active reads as failover; the first peer to read again
-                # sat at 99% under `dynamic`'s 97 bar and was taken.
-                reasons[num] = "over the switch threshold"
-                continue
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now)
                 if consume_first or weekly_first
@@ -5278,10 +5283,10 @@ class AutoSwitchEngine:
                 or (trigger == "at-limit" and not about_to_wall)
             ):
                 # Landing must be healthy: an account at/over any of its own
-                # lines would re-trigger on the very next tick. At-limit is an
-                # escape that skips this whole block (any account with real
-                # headroom beats a blocked one); failover skips it too, but
-                # never lands over a line (T3500, above).
+                # lines would re-trigger on the very next tick. At-limit and failover
+                # are escapes that skip this whole block — any account with real
+                # headroom beats a blocked or dead one. Failover's candidates were
+                # already cut to those under their line at selection (T3500).
                 #
                 # AT-LIMIT ONLY WHEN `about_to_wall` IS FALSE ON THIS AXIS.
                 # `about_to_wall` is axis-local (computed from the
@@ -5483,7 +5488,7 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order. weekly-first
                 # keeps `best`'s headroom order for the at-limit and failover
-                # escapes, which may land on accounts over their lines.
+                # escapes; only the at-limit one may land over a line (T3500).
                 key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
                 key_axis[num] = "soonest reset"
             elif not dynamic_landing:

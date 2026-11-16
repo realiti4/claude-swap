@@ -94,8 +94,9 @@ def test_failover_also_obeys_the_cutoffs(temp_home):
 
 
 def test_failover_re_ranked_after_the_refetch_obeys_the_cutoffs(temp_home):
-    # The stored snapshot ranks #2 under its line; the pre-switch refetch reads every
-    # peer over it. The re-rank holds (T3500: a failover never lands over a line).
+    # Pins existing behaviour (green before T3500; priority's strict ranker already
+    # refuses): the stored snapshot ranks #2 under its line, the pre-switch refetch
+    # reads every peer over it, and the failover holds on the fresh read.
     h = fleet(temp_home, unhealthy_ticks=1)
     stored = {**usage(h), "1": None}
     fresh = {**usage(h, pcts=(0, 95, 95, 99)), "1": None}
