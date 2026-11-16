@@ -3,6 +3,7 @@ import time
 import weakref
 
 import AppKit as A
+from objc import super
 
 from claude_swap.menubar_locale import duration
 
@@ -37,6 +38,15 @@ def label(text, x, y, width, size=11, ink=None, bold=False, right=False):
 
 
 class AccountUsageCard(A.NSView):
+    def viewDidMoveToSuperview(self):
+        super(AccountUsageCard, self).viewDidMoveToSuperview()
+        parent = self.superview()
+        if parent is not None:
+            frame = self.frame()
+            available = parent.bounds().size.width - frame.origin.x
+            if available > frame.size.width:
+                self.setFrameSize_((available, frame.size.height))
+
     def isFlipped(self):
         return True
 
@@ -52,17 +62,29 @@ class AccountUsageCard(A.NSView):
         active = d['active']
         h = self.bounds().size.height
         secondary = A.NSColor.secondaryLabelColor()
-        surface = BLUE.colorWithAlphaComponent_(.085) if active else A.NSColor.labelColor().colorWithAlphaComponent_(.035)
+        surface = BLUE.colorWithAlphaComponent_(.16) if active else A.NSColor.labelColor().colorWithAlphaComponent_(.035)
         box(((7, 2), (w - 14, h - 4)), surface, 10)
+        if active:
+            box(((10, 12), (3, h - 24)), BLUE, 1.5)
         label(d['name'], 21, 10, 98, 14, bold=True)
-        label(d['email'], 122, 13, w - 210, 10, secondary)
+        right_edge = w - 21
         rejected = isinstance(d['usage'], dict) and d['usage'].get('rejected')
         state = tr('Rejected') if rejected else tr('Disabled') if d['disabled'] else tr('Active') if active else ''
         if state:
             tone = ORANGE if rejected or d['disabled'] else BLUE
-            badge_width = 68 if rejected else 47
-            box(((w - badge_width - 20, 10), (badge_width, 18)), tone.colorWithAlphaComponent_(.12), 9)
-            label(state, w - badge_width - 12, 12, badge_width - 8, 10, tone, True)
+            if active and not rejected and not d['disabled']:
+                state = '✓ ' + state
+            badge_width = 70
+            box(((w - badge_width - 20, 10), (badge_width, 18)), tone if active else tone.colorWithAlphaComponent_(.12), 9)
+            label(state, w - badge_width - 12, 12, badge_width - 8, 10, A.NSColor.whiteColor() if active else tone, True)
+            right_edge -= badge_width + 8
+        if d['expiry']:
+            expiry = A.NSString.stringWithString_(d['expiry'])
+            width = expiry.sizeWithAttributes_({A.NSFontAttributeName: A.NSFont.systemFontOfSize_(10)}).width + 2
+            right_edge -= width
+            label(expiry, right_edge, 13, width, 10, ORANGE)
+            right_edge -= 8
+        label(d['email'], 122, 13, max(0, right_edge - 122), 10, secondary)
         usage = d['usage']
         if not isinstance(usage, dict):
             label(str(usage or tr('Usage unavailable')), 24, 63, w - 48, 12, ORANGE)
@@ -94,8 +116,6 @@ class AccountUsageCard(A.NSView):
             text = (tr("Resets in {time}", time=duration(d["language"], reset))
                     if reset else tr("No reset time") if valid else tr("No data"))
             label(text, x, y + 29, col, 10, A.NSColor.secondaryLabelColor())
-        if d['expiry']:
-            label(d['expiry'], 24, self.bounds().size.height - 22, w - 48, 10, ORANGE)
 
     def mouseUp_(self, event):
         if not A.NSPointInRect(self.convertPoint_fromView_(event.locationInWindow(), None), self.bounds()):
@@ -119,8 +139,9 @@ def attach_card(item, owner, num, email, active, usage, alias, disabled,
                   tr("Sign in again in {time}", time=duration(owner.settings.language, time_left)))
     count = 2 + (len(usage.get('scoped') or []) if isinstance(usage, dict) else 0)
     extra_rows = max(0, (count - 1) // 3)
-    height = 94 + extra_rows * 58 + (22 if expiry else 0)
+    height = 94 + extra_rows * 58
     view = AccountUsageCard.alloc().initWithFrame_(((0, 0), (470, height)))
+    view.setAutoresizingMask_(A.NSViewWidthSizable)
     view.owner = weakref.ref(owner)
     view.data = dict(num=num, email=email, active=active, usage=usage,
                      language=owner.settings.language, name=alias or tr('Account {num}', num=num), disabled=disabled, expiry=expiry,
