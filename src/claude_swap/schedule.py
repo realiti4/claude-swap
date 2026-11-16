@@ -199,10 +199,13 @@ class DailySchedule:
 
     def activate(self, account, start, end):
         now = self.clock()
-        in_slot = start <= now < end
         day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
+        target_day = datetime.fromtimestamp(start, ZoneInfo(TIMEZONE)).date().isoformat()
+        if day != target_day:
+            return
+        eligible = now >= start
         key = f"{day}:{account.number}"
-        if not in_slot and key not in self.state["activations"]:
+        if not eligible and key not in self.state["activations"]:
             return
         record = self.state["activations"].setdefault(key, {
             "status": "pending", "attempted_at": None,
@@ -231,14 +234,13 @@ class DailySchedule:
         # A missing reset is idle only with a measured zero. An expired reset
         # needs a sample taken after the reset (checked by percentages()).
         idle = fresh and not active and window.get("pct") == 0 and (not reset_value or reset is not None)
+        confirmed_reset = timestamp(record.get("actual_resets_at"))
+        if (record.get("status") in ("activated", "already_active")
+                and record.get("confirmed_sample_at") and confirmed_reset is not None
+                and now >= confirmed_reset):
+            # Catch-up fills missed activations, not completed windows.
+            return
         if attempts:
-            confirmed_reset = timestamp(record.get("actual_resets_at"))
-            if (record.get("status") == "activated"
-                    and record.get("confirmed_sample_at") and confirmed_reset is not None
-                    and now >= confirmed_reset):
-                # A verified window naturally ending is historical success,
-                # not evidence that the activation request failed.
-                return
             if not post_request:
                 # Neither headers nor a cached pre-request reading can resolve
                 # an ambiguous request. Keep the claim without sending again.
@@ -261,7 +263,7 @@ class DailySchedule:
                 self.event("activation_unconfirmed", f"Account {account.number}: endpoint usage shows no active window")
         elif record.get("status") == "already_active" and not fresh:
             return
-        if not in_slot:
+        if not eligible:
             return
         if not fresh:
             record.update(status="unavailable", error="usage_unavailable")
@@ -274,7 +276,8 @@ class DailySchedule:
             return
         if active:
             if abs(reset - end) <= 300:
-                record.update(status="already_active", error=None)
+                record.update(status="already_active", error=None,
+                              confirmed_at=iso(now), confirmed_sample_at=iso(fetched))
             else:
                 record.update(status="waiting_reset", error="existing_window_cannot_be_moved",
                               retry_at=min(reset + 5, now + RETRY_SECONDS))
@@ -307,9 +310,9 @@ class DailySchedule:
             if not token_data or not token_data.get("accessToken"):
                 raise RuntimeError("credential_unavailable")
             now = self.clock()
-            if not start <= now < end:
-                record.update(status="missed", error="slot_ended")
-                self.event("activation_missed", f"Account {account.number}: target window ended before the request")
+            if (now < start or datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat() != day):
+                record.update(status="missed", error="schedule_day_changed")
+                self.event("activation_missed", f"Account {account.number}: schedule date changed before the request")
                 return
             if now - fetched > MAX_AGE:
                 record.update(status="unavailable", error="usage_unavailable")
@@ -394,7 +397,7 @@ class DailySchedule:
             if start <= now < end:
                 due = account
             if (account.switchable and not account.disabled
-                    and (start <= now < end or f"{day}:{number}" in self.state["activations"])):
+                    and (now >= start or f"{day}:{number}" in self.state["activations"])):
                 self.activate(account, start, end)
         current = accounts.get(snap.active_number)
         if current is not None and not self.matches(current):

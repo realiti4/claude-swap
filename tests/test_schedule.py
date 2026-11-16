@@ -47,14 +47,14 @@ def harness(tmp_path, monkeypatch, rows, now=None, probe=None):
     return service, switcher, freshener, clock, probe
 
 
-@pytest.mark.parametrize("hour,expected", [(0,None),(6,None),(7,"1"),(11,"1"),(12,"2"),(16,"2"),(17,"3"),(21,"3"),(22,None)])
-def test_only_current_slot_receives_inference(tmp_path, monkeypatch, hour, expected):
+@pytest.mark.parametrize("hour,expected", [(0,[]),(6,[]),(7,["1"]),(11,["1"]),(12,["1","2"]),(16,["1","2"]),(17,["1","2","3"]),(21,["1","2","3"]),(22,["1","2","3"])])
+def test_all_due_accounts_receive_inference_without_starting_future_accounts(tmp_path, monkeypatch, hour, expected):
     rows = [account(1), account(2, active=True), account(3)]
     service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(hour))
     service.tick()
     attempts = [key.split(":")[-1] for key, rec in service.state["activations"].items() if rec.get("attempted_at")]
-    assert attempts == ([] if expected is None else [expected])
-    assert probe.call_count == (0 if expected is None else 1)
+    assert attempts == expected
+    assert probe.call_count == len(expected)
 
 
 def test_restart_does_not_repeat_success(tmp_path, monkeypatch):
@@ -393,26 +393,26 @@ def test_missing_unrelated_fable_reading_does_not_block_haiku_activation(tmp_pat
     assert service.state["activations"]["2026-11-13:1"]["status"] == "request_accepted"
 
 
-def test_slot_is_rechecked_after_snapshot_work(tmp_path, monkeypatch):
-    # The snapshot begins in slot 1 and finishes after all three slots. A
-    # stale tick timestamp must not authorize a request to slot 1.
+def test_date_is_rechecked_after_snapshot_work(tmp_path, monkeypatch):
+    # The snapshot crosses midnight. Yesterday's slots must not be sent
+    # using the timestamp from before the blocking snapshot.
     rows = [account(1, active=True), account(2), account(3)]
     service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows, now=at(11, 59))
     snap = service.source.take.return_value
     def slow_snapshot(*args, **kwargs):
-        clock.return_value = at(22)
+        clock.return_value = at(0, day=14)
         return snap
     service.source.take.side_effect = slow_snapshot
     service.tick()
     probe.assert_not_called()
 
 
-def test_slot_is_rechecked_after_credential_collection(tmp_path, monkeypatch):
+def test_date_is_rechecked_after_credential_collection(tmp_path, monkeypatch):
     rows = [account(1, active=True), account(2), account(3)]
     service, switcher, _, clock, probe = harness(tmp_path, monkeypatch, rows, now=at(11, 59))
     credential_rows = switcher._build_accounts_info.return_value
     def slow_credentials():
-        clock.return_value = at(12)
+        clock.return_value = at(0, day=14)
         return credential_rows
     switcher._build_accounts_info.side_effect = slow_credentials
     service.tick()
@@ -527,7 +527,7 @@ def test_endpoint_can_confirm_after_target_slot_ends(tmp_path, monkeypatch):
     assert probe.call_count == 1
 
 
-def test_false_legacy_success_is_revoked_outside_slot_without_retry(tmp_path, monkeypatch):
+def test_false_legacy_success_is_retried_after_original_slot_ends(tmp_path, monkeypatch):
     rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
     (tmp_path / "schedule-state.json").write_text(json.dumps({"activations": {
         "2026-11-13:1": {"status": "activated", "attempted_at": schedule.iso(at()),
@@ -535,8 +535,8 @@ def test_false_legacy_success_is_revoked_outside_slot_without_retry(tmp_path, mo
                             "actual_resets_at": schedule.iso(at(12))}}}))
     service, _, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(12, 1))
     service.tick()
-    assert service.state["activations"]["2026-11-13:1"]["status"] == "unconfirmed"
-    probe.assert_not_called()
+    assert service.state["activations"]["2026-11-13:1"]["status"] == "request_accepted"
+    probe.assert_called_once()
 
 
 def test_confirmed_window_naturally_expiring_preserves_history(tmp_path, monkeypatch):
@@ -586,3 +586,52 @@ def test_confirmed_window_expiring_inside_slot_does_not_start_second_window(tmp_
     assert record["status"] == "activated"
     assert record["actual_resets_at"] == schedule.iso(at(11, 59))
     assert probe.call_count == 1
+
+
+def test_catch_up_does_not_switch_back_to_missed_account_or_repeat_on_restart(tmp_path, monkeypatch):
+    rows = [account(1), account(2, active=True), account(3)]
+    service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(13))
+    service.tick()
+    assert probe.call_count == 2
+    assert service.state["activations"]["2026-11-13:1"]["late_seconds"] == 6 * 3600
+    switcher.switch_to.assert_not_called()
+    restarted, _, _, _, probe2 = harness(tmp_path, monkeypatch, rows, now=at(13))
+    restarted.tick()
+    probe2.assert_not_called()
+
+
+def test_crossing_slot_end_during_credentials_still_sends_catch_up(tmp_path, monkeypatch):
+    rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
+    service, switcher, _, clock, probe = harness(tmp_path, monkeypatch, rows, now=at(11, 59))
+    credential_rows = switcher._build_accounts_info.return_value
+    def slow_credentials():
+        clock.return_value = at(12)
+        return credential_rows
+    switcher._build_accounts_info.side_effect = slow_credentials
+    service.tick()
+    probe.assert_called_once()
+    assert service.state["activations"]["2026-11-13:1"]["attempted_at"] == schedule.iso(at(12))
+
+
+def test_failed_catch_up_does_not_block_other_due_accounts(tmp_path, monkeypatch):
+    rows = [account(1), account(2, active=True), account(3)]
+    probe = Mock(side_effect=[TimeoutError("FAKE_TOKEN"), {}])
+    service, _, _, _, _ = harness(tmp_path, monkeypatch, rows, now=at(13), probe=probe)
+    service.tick()
+    assert probe.call_count == 2
+    assert service.state["activations"]["2026-11-13:1"]["status"] == "failed"
+    assert service.state["activations"]["2026-11-13:2"]["status"] == "request_accepted"
+    assert "2026-11-13:3" not in service.state["activations"]
+
+
+def test_already_active_window_is_not_restarted_after_expiry(tmp_path, monkeypatch):
+    rows = [account(1, active=True, reset=schedule.iso(at(12))),
+            account(2, disabled=True), account(3, disabled=True)]
+    service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
+    service.tick()
+    assert service.state["activations"]["2026-11-13:1"]["status"] == "already_active"
+    clock.return_value = at(13)
+    endpoint_sample(rows[0], at(13))
+    service.tick()
+    probe.assert_not_called()
+    assert service.state["activations"]["2026-11-13:1"]["status"] == "already_active"
