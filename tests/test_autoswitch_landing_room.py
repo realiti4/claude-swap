@@ -580,8 +580,8 @@ class TestFailoverNeverLandsOverTheLine:
         assert h.engine._unhealthy_ticks == 0
 
     def test_the_other_peers_being_unreadable_does_not_open_it(self, temp_home):
-        # The incident's shape: one peer reads (over), the rest stay unreadable, so
-        # nothing is left to compare and the existing no-comparison hold names it.
+        # The incident's shape: one peer reads (over), the rest stay unreadable. That
+        # exit is `no-comparison`, as T3465 pins it (every_hold_names_a_vetoed_peer).
         h = _fleet(temp_home, 3, strategy="dynamic", threshold=90.0)
         outcome = _fail_over(h, {"1": None, "2": _usage7(10, 99, _R_LATER), "3": None})
         _held_in_place(h, outcome, "Account-2 (line 97%)", reason="no-comparison")
