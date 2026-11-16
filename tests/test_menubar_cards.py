@@ -21,12 +21,12 @@ def test_draw_account_without_alias(language, tmp_path):
     appkit.NSApplication.sharedApplication()
     item = rumps.MenuItem("Example")
     attach_card(item, owner, 1, "person@example.com", True,
-                {"seven_day": {"pct": 91}}, None, False, time.time() + 86400, False,
+                {"seven_day": {"pct": 91}, "scoped": [{"name": "Fable", "pct": 24}]}, None, False, time.time() + 86400, False,
                 load_settings(tmp_path))
     view = item._menuitem.view()
     assert view.data["name"] == ("Account 1" if language == "en" else "账号 1")
     assert view.data["expiry"]
-    assert view.frame().size.height == 94
+    assert view.frame().size == (380, 81)
     host = appkit.NSView.alloc().initWithFrame_(((0, 0), (540, 94)))
     host.addSubview_(view)
     assert view.frame().size.width == 540

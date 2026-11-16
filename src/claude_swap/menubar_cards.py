@@ -66,41 +66,48 @@ class AccountUsageCard(A.NSView):
         box(((7, 2), (w - 14, h - 4)), surface, 10)
         if active:
             box(((10, 12), (3, h - 24)), BLUE, 1.5)
-        label(d['name'], 21, 10, 98, 14, bold=True)
-        right_edge = w - 21
+        title = ('✓ ' if active else '') + d['name']
+        font = A.NSFont.boldSystemFontOfSize_(13)
+        title_width = min(110, A.NSString.stringWithString_(title).sizeWithAttributes_(
+            {A.NSFontAttributeName: font}).width + 2)
+        label(title, 19, 9, title_width, 13, BLUE if active else None, True)
+        email_x = 19 + title_width + 8
+        right_edge = w - 19
         rejected = isinstance(d['usage'], dict) and d['usage'].get('rejected')
-        state = tr('Rejected') if rejected else tr('Disabled') if d['disabled'] else tr('Active') if active else ''
-        if state:
-            tone = ORANGE if rejected or d['disabled'] else BLUE
-            if active and not rejected and not d['disabled']:
-                state = '✓ ' + state
-            badge_width = 70
-            box(((w - badge_width - 20, 10), (badge_width, 18)), tone if active else tone.colorWithAlphaComponent_(.12), 9)
-            label(state, w - badge_width - 12, 12, badge_width - 8, 10, A.NSColor.whiteColor() if active else tone, True)
-            right_edge -= badge_width + 8
+        if rejected or d['disabled']:
+            state = tr('Rejected') if rejected else tr('Disabled')
+            right_edge -= 60
+            label(state, right_edge, 11, 60, 10, ORANGE, right=True)
+            right_edge -= 6
         if d['expiry']:
             expiry = A.NSString.stringWithString_(d['expiry'])
             width = expiry.sizeWithAttributes_({A.NSFontAttributeName: A.NSFont.systemFontOfSize_(10)}).width + 2
             right_edge -= width
-            label(expiry, right_edge, 13, width, 10, ORANGE)
+            label(expiry, right_edge, 11, width, 10, ORANGE)
             right_edge -= 8
-        label(d['email'], 122, 13, max(0, right_edge - 122), 10, secondary)
+        label(d['email'], email_x, 11, max(0, right_edge - email_x), 10, secondary)
         usage = d['usage']
         if not isinstance(usage, dict):
-            label(str(usage or tr('Usage unavailable')), 24, 63, w - 48, 12, ORANGE)
+            label(str(usage or tr('Usage unavailable')), 19, 42, w - 48, 12, ORANGE)
             return
         now = time.time()
         windows = [(tr('5 hours'), usage.get('five_hour'), d['threshold']),
                    (tr('Weekly'), _rolled_weekly_window(usage.get('seven_day'), now), d['weekly'])]
-        for scoped in usage.get('scoped') or []:
-            windows.append((scoped.get('name', tr('Model')), _rolled_weekly_window(scoped, now), None))
-        if len(windows) < 3:
-            windows.append((tr('Model quota'), None, None))
-        col = (w - 42 - 36) / 3
-        # Additional scoped models expand the card vertically rather than disappearing.
+        models = usage.get('scoped') or []
+        gap = 14
+        available = w - 38
+        model_width = 64 if models else 0
+        col = (available - gap - (model_width + gap if models else 0)) / 2
+        for i, scoped in enumerate(models):
+            model = _rolled_weekly_window(scoped, now) or {}
+            value = model.get('pct')
+            text = f'{value:.0f}%' if isinstance(value, (float, int)) else '—'
+            x = w - 19 - model_width
+            label(scoped.get('name') or tr('Model'), x, 32 + 35 * i, model_width, 10, secondary)
+            label(text, x, 47 + 35 * i, model_width, 11, secondary, bold=True)
         for i, (name, window, threshold) in enumerate(windows):
-            x = 21 + (i % 3) * (col + 18)
-            y = 39 + (i // 3) * 58
+            x = 19 + i * (col + gap)
+            y = 32
             value = window.get('pct') if isinstance(window, dict) else None
             valid = isinstance(value, (int, float))
             tint = RED if valid and value >= (threshold or 97) else ORANGE if valid and value >= 80 else BLUE if i == 0 else GREEN
@@ -137,10 +144,9 @@ def attach_card(item, owner, num, email, active, usage, alias, disabled,
         time_left = expiry.removeprefix("re-login in ")
         expiry = (tr("Sign in again") if time_left == expiry else
                   tr("Sign in again in {time}", time=duration(owner.settings.language, time_left)))
-    count = 2 + (len(usage.get('scoped') or []) if isinstance(usage, dict) else 0)
-    extra_rows = max(0, (count - 1) // 3)
-    height = 94 + extra_rows * 58
-    view = AccountUsageCard.alloc().initWithFrame_(((0, 0), (470, height)))
+    count = len(usage.get('scoped') or []) if isinstance(usage, dict) else 0
+    height = max(81, 33 + count * 35)
+    view = AccountUsageCard.alloc().initWithFrame_(((0, 0), (380, height)))
     view.setAutoresizingMask_(A.NSViewWidthSizable)
     view.owner = weakref.ref(owner)
     view.data = dict(num=num, email=email, active=active, usage=usage,
@@ -152,5 +158,7 @@ def attach_card(item, owner, num, email, active, usage, alias, disabled,
     view.setAccessibilityElement_(True)
     view.setAccessibilityLabel_(item.title)
     view.setAccessibilityRole_(A.NSAccessibilityButtonRole)
+    # Keep the native menu from measuring the full text fallback as a row title.
+    item._menuitem.setTitle_(str(num))
     item._menuitem.setView_(view)
     item._account_card = view
