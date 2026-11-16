@@ -38,7 +38,7 @@ INTERVAL = 15
 RETRY_SECONDS = 300
 MAX_AGE = 300
 MAX_ATTEMPTS = 3
-ACTIVATION_MODEL = oauth.USAGE_PROBE_MODEL
+ACTIVATION_MODEL = "claude-sonnet-5-5"
 ACTIVATION_MAX_TOKENS = 16
 ACTIVATION_PROMPT = "Reply with OK."
 
@@ -141,10 +141,10 @@ def activation_request(token):
 
 
 def activation_percentages(account, now):
-    """The activation request uses Haiku, independent of failover model policy."""
+    """The activation request uses Sonnet, independent of failover model policy."""
     data = account.usage.last_good or {}
     scoped = data.get("scoped") or []
-    models = ("Haiku",) if any(isinstance(row, dict) and str(row.get("name", "")).lower() == "haiku"
+    models = ("Sonnet",) if any(isinstance(row, dict) and str(row.get("name", "")).lower() == "sonnet"
                                for row in scoped) else ()
     return percentages(account, now, models)
 
@@ -321,7 +321,7 @@ class DailySchedule:
             # Persist the claim immediately before network I/O. Failed, rejected
             # and interrupted sends all consume the same daily attempt budget.
             record.update(status="activating", attempted_at=iso(now), error=None,
-                          attempt_count=attempts + 1, confirmation_after=now,
+                          attempt_count=attempts + 1, confirmation_after=now, model=ACTIVATION_MODEL,
                           retry_at=now + RETRY_SECONDS,
                           late_seconds=max(0, round(now - start)))
             self.event("activation_attempt", f"Account {account.number}: sending activation request {attempts + 1}/{MAX_ATTEMPTS}")
@@ -468,7 +468,7 @@ class DailySchedule:
                          "slot": {"start": f"{start:02}:00", "end": f"{end:02}:00", "timezone": TIMEZONE},
                          "activation": {k: v for k, v in self.state["activations"].get(f"{day}:{account.number}", {"status": "pending"}).items()
                                         if k in {"status", "attempted_at", "actual_resets_at", "error", "late_seconds",
-                                                 "attempt_count", "retry_at", "confirmed_at", "confirmed_sample_at", "reset_offset_seconds"}}})
+                                                 "attempt_count", "retry_at", "confirmed_at", "confirmed_sample_at", "reset_offset_seconds", "model"}}})
         atomic_write_json(self.root / "schedule-status.json", {
             "schemaVersion": 1, "updated_at": iso(now), "active_account_id": snap.active_number,
             "accounts": rows, "scheduler": {"enabled": True, "timezone": TIMEZONE,

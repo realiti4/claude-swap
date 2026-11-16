@@ -384,7 +384,7 @@ def test_rejected_quota_headers_cannot_report_accepted_request(tmp_path, monkeyp
     assert record["error"]
 
 
-def test_missing_unrelated_fable_reading_does_not_block_haiku_activation(tmp_path, monkeypatch):
+def test_missing_unrelated_fable_reading_does_not_block_sonnet_activation(tmp_path, monkeypatch):
     rows = [account(1, active=True), account(2), account(3)]
     service, _, _, _, probe = harness(tmp_path, monkeypatch, rows)
     service.models = ("Fable",)
@@ -443,6 +443,7 @@ def test_activation_request_accepts_real_message_shape(monkeypatch):
     request = opener.open.call_args.args[0]
     assert request.full_url == schedule.oauth.USAGE_PROBE_URL
     body = json.loads(request.data)
+    assert body["model"] == "claude-sonnet-5-5"
     assert body["max_tokens"] == 16
     assert body["messages"] == [{"role": "user", "content": "Reply with OK."}]
 
@@ -494,9 +495,9 @@ def test_credential_identity_change_cannot_receive_request(tmp_path, monkeypatch
     assert service.state["activations"]["2026-11-13:1"]["attempt_count"] == 0
 
 
-def test_haiku_scoped_exhaustion_prevents_haiku_activation(tmp_path, monkeypatch):
+def test_sonnet_scoped_exhaustion_prevents_sonnet_activation(tmp_path, monkeypatch):
     rows = [account(1, active=True), account(2), account(3)]
-    rows[0].usage.last_good["scoped"] = [{"name": "Haiku", "pct": 99}]
+    rows[0].usage.last_good["scoped"] = [{"name": "Sonnet", "pct": 99}]
     service, _, _, _, probe = harness(tmp_path, monkeypatch, rows)
     service.tick()
     probe.assert_not_called()
