@@ -5488,7 +5488,7 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order. weekly-first
                 # keeps `best`'s headroom order for the at-limit and failover
-                # escapes; only the at-limit one may land over a line (T3500).
+                # escapes, which may land on accounts over their lines.
                 key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
                 key_axis[num] = "soonest reset"
             elif not dynamic_landing:
