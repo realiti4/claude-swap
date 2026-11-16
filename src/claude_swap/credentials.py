@@ -329,6 +329,24 @@ def merge_shared_credential_fields(
     return json.dumps(composed)
 
 
+IDENTITY_ID_KEYS = frozenset({"accountUuid", "organizationUuid"})
+
+
+def without_identity_ids(credentials: str) -> str:
+    """Drop the ids a newer Claude Code stamps on ``claudeAiOauth``.
+
+    It prefers them over ``~/.claude.json`` ``oauthAccount``, so ids carried
+    in from another login would name a second identity. Anything else is
+    returned as given.
+    """
+    data = _credential_object(credentials) or {}
+    login = data.get("claudeAiOauth")
+    if not isinstance(login, dict) or IDENTITY_ID_KEYS.isdisjoint(login):
+        return credentials
+    data["claudeAiOauth"] = {k: v for k, v in login.items() if k not in IDENTITY_ID_KEYS}
+    return json.dumps(data)
+
+
 def approved_form(api_key: str) -> str:
     """The value Claude Code stores in ``customApiKeyResponses.approved``.
 
@@ -1139,6 +1157,7 @@ class CredentialStore:
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
+        credentials = without_identity_ids(credentials)
         keychain_usable = self._use_keychain()
         default_store = keychain_usable and _active_store_is_the_default_secure_store()
         # The Keychain answers and the file is where this profile's write

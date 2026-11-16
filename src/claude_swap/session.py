@@ -63,6 +63,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import without_identity_ids
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -1297,7 +1298,7 @@ class SessionManager:
             os.chmod(session_dir, 0o700)
 
         creds_path = session_dir / ".credentials.json"
-        atomic_write_text(creds_path, creds)
+        atomic_write_text(creds_path, without_identity_ids(creds))
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The

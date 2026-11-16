@@ -476,6 +476,68 @@ class TestActiveWriteStaysOnOneProfile:
         assert store._read_credentials() == TARGET_SLOT_CREDS
 
 
+class TestActiveWriteDropsStampedIdentityIds:
+    """``~/.claude.json`` ``oauthAccount`` is the one identity the client reads.
+
+    A Claude Code that stamps ``accountUuid``/``organizationUuid`` onto the
+    credential prefers them, so ids carried over from another login would
+    name a different account than ``oauthAccount`` once a slot is activated.
+    """
+
+    STAMPED = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-stamped",
+            "refreshToken": "rt-stamped",
+            "expiresAt": 9999999999000,
+            "scopes": ["user:profile"],
+            "accountUuid": "acct-from-another-login",
+            "organizationUuid": "org-from-another-login",
+        },
+        "mcpOAuth": {"srv": {"accessToken": "mcp"}},
+    })
+
+    def test_the_ids_never_reach_the_keychain_item_or_the_refreshed_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        seed = tmp_path / ".claude" / ".credentials.json"
+        seed.parent.mkdir()
+        seed.write_text("{}", encoding="utf-8")  # a present file is refreshed too
+
+        CredentialStore(_Host(tmp_path / "backups"))._write_credentials(self.STAMPED)
+
+        expected = json.loads(self.STAMPED)
+        del expected["claudeAiOauth"]["accountUuid"]
+        del expected["claudeAiOauth"]["organizationUuid"]
+        item = block_real_keychain.data[
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+        ]
+        assert json.loads(item) == expected
+        assert seed.read_text(encoding="utf-8") == item
+
+    @pytest.mark.parametrize(
+        "blob",
+        [
+            "not json at all",
+            json.dumps({"mcpOAuth": {}, "accountUuid": "top-level-stays"}),
+            json.dumps({"claudeAiOauth": "opaque", "accountUuid": "x"}),
+        ],
+    )
+    def test_a_blob_without_a_claude_login_dict_is_written_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain, blob
+    ):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(blob)
+
+        assert store._read_credentials() == blob
+
+
 class TestExplicitDefaultProfileKeepsTheOtherLogin:
     """``CLAUDE_CONFIG_DIR`` naming ``~/.claude`` puts two Keychain items in play.
 
