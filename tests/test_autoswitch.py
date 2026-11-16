@@ -8681,11 +8681,10 @@ class TestEveryAccountAboveThreshold:
         assert sw.trigger == "at-limit"
         assert h.active_number() == 3
 
-    def test_a_failover_ranks_by_room_when_every_candidate_is_above(
-        self, temp_home
-    ):
-        """Failover cannot read the active, so the candidates alone decide
-        whether nothing sits below the line."""
+    def test_a_failover_holds_when_every_candidate_is_above(self, temp_home):
+        """Failover cannot read the active, and never lands over a line (T3500),
+        every candidate above included: the room ranking above is the at-limit
+        escape's, and a failover holds."""
         h = self._fleet(temp_home, 3, strategy="consume-first")
         outcome = None
         for _ in range(3):  # unhealthy_ticks default is 3
@@ -8695,10 +8694,9 @@ class TestEveryAccountAboveThreshold:
                 "3": _usage7(91, 50, _R_LATEST),
             })
             h.clock.advance(60.0)
-        assert outcome is TickOutcome.SWITCHED
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "failover"
-        assert h.active_number() == 3
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
 
     def test_a_failover_with_a_healthy_candidate_keeps_its_strategy(
         self, temp_home

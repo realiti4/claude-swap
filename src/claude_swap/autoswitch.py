@@ -5006,7 +5006,8 @@ class AutoSwitchEngine:
         # in that state the landing rule is dropped and every strategy ranks
         # by the most room left before a limit: RAW headroom, `100 - max pct`
         # over the 5h, 7d and configured per-model windows, whatever lines
-        # they carry.
+        # they carry. Not on a failover (T3500): it holds rather than land
+        # over a line.
         #
         # Not by soonest reset. Ranking a nearly spent account ahead of one
         # with room because its window rolls over first lands on it at 98-99%,
@@ -5251,6 +5252,12 @@ class AutoSwitchEngine:
                 if binding is not None
                 else (100.0 - h) >= cand_bar
             )
+            if over and trigger == "failover":
+                # T3500: a failover skips the landing gate below, never the line.
+                # A blind active reads as failover; the first peer to read again
+                # sat at 99% under `dynamic`'s 97 bar and was taken.
+                reasons[num] = "over the switch threshold"
+                continue
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now)
                 if consume_first or weekly_first
@@ -5271,9 +5278,10 @@ class AutoSwitchEngine:
                 or (trigger == "at-limit" and not about_to_wall)
             ):
                 # Landing must be healthy: an account at/over any of its own
-                # lines would re-trigger on the very next tick. At-limit and failover
-                # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one.
+                # lines would re-trigger on the very next tick. At-limit is an
+                # escape that skips this whole block (any account with real
+                # headroom beats a blocked one); failover skips it too, but
+                # never lands over a line (T3500, above).
                 #
                 # AT-LIMIT ONLY WHEN `about_to_wall` IS FALSE ON THIS AXIS.
                 # `about_to_wall` is axis-local (computed from the

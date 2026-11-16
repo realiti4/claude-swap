@@ -22,7 +22,18 @@ Two separate faults:
 
 from __future__ import annotations
 
-from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent, TickOutcome
+from unittest.mock import patch
+
+import pytest
+
+from claude_swap.autoswitch import (
+    AllExhaustedEvent,
+    AutoSwitchEngine,
+    NoSwitchEvent,
+    SwitchEvent,
+    TickOutcome,
+)
+from claude_swap.settings import AutoSwitchSettings
 from tests.test_autoswitch import _R_LATER, _R_LATEST, _R_SOON, EngineHarness, _usage7
 
 
@@ -516,3 +527,124 @@ class TestRoomWithoutAWindow:
             now=h.clock.now,
         )
         assert ordered == ["2", "3"]
+
+
+def _fail_over(h: EngineHarness, usage: dict):
+    """Tick ``unhealthy_ticks`` times with the active unreadable, the last one
+    being the failover decision; ``h.events`` holds that tick's events only."""
+    for i in range(h.settings.unhealthy_ticks):
+        if i == h.settings.unhealthy_ticks - 1:
+            h.events.clear()
+        outcome = h.tick_with_usage(usage)
+        h.clock.advance(60.0)
+    return outcome
+
+
+def _held_in_place(h: EngineHarness, outcome: TickOutcome) -> None:
+    """The designed hold: no switch, `no-qualifying-candidate`, ordinary cadence."""
+    assert outcome is TickOutcome.BLOCKED
+    assert h.active_number() == 1
+    assert not any(isinstance(e, SwitchEvent) for e in h.events)
+    (event,) = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+    assert event.reason == "no-qualifying-candidate"
+    # Not `all-exhausted`'s reset-length sleep, not the long blocked wait.
+    assert h.engine._sleep_until_ts is None
+    assert not h.engine._blocked_wait_long
+    assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
+
+
+class TestFailoverNeverLandsOverTheLine:
+    """A failover leaves an active it cannot read, and still never lands on a peer
+    at or over its own line: its own switch threshold, else the strategy's bar (97
+    under `dynamic`). Measured 2026-11-16: a host egress loss read the active as
+    `usage unknown (network)` for three ticks, the first peer to read again sat at
+    7d 99% with no threshold of its own, and the engine moved onto it."""
+
+    def test_a_blind_active_holds_when_the_only_readable_peer_is_over_the_dynamic_bar(
+        self, temp_home
+    ):
+        h = _fleet(temp_home, 3, strategy="dynamic", threshold=90.0)
+        usage = {"1": None, "2": _usage7(10, 99, _R_LATER), "3": None}
+        _held_in_place(h, _fail_over(h, usage))
+        # The network returns: the active reads again and the counter clears.
+        h.events.clear()
+        assert h.tick_with_usage({**usage, "1": _usage7(50, 20, _R_LATER)}) is (
+            TickOutcome.NO_ACTION
+        )
+        assert h.engine._unhealthy_ticks == 0
+
+    @pytest.mark.parametrize(
+        "strategy, line", [("dynamic", 97.0), ("best", 90.0), ("consume-first", 90.0)]
+    )
+    @pytest.mark.parametrize("window", ["five_hour", "seven_day"])
+    @pytest.mark.parametrize("below, taken", [(0.0, False), (1.0, True)])
+    def test_a_peer_exactly_at_the_line_is_refused_and_just_under_it_is_taken(
+        self, temp_home, strategy, line, window, below, taken
+    ):
+        h = _fleet(temp_home, 2, strategy=strategy, threshold=90.0)
+        peer = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _R_LATER},
+        }
+        peer[window] = {"pct": line - below, "resets_at": _R_LATER}
+        outcome = _fail_over(h, {"1": None, "2": peer})
+        if taken:
+            assert outcome is TickOutcome.SWITCHED
+            assert _switches(h) == [("failover", 2)]
+        else:
+            _held_in_place(h, outcome)
+
+    def test_the_model_gated_pass_refuses_a_peer_over_the_line_on_the_pinned_model(
+        self, temp_home
+    ):
+        h = _fleet(temp_home, 2, strategy="best", threshold=90.0, model="Fable")
+        _held_in_place(h, _fail_over(h, {"1": None, "2": _fable(1, 3, 99, _R_LATER)}))
+
+    @pytest.mark.parametrize("seven, taken", [(98.0, False), (50.0, True)])
+    def test_the_five_hour_seven_day_retry_refuses_it_too(self, temp_home, seven, taken):
+        # Fable 100 empties the model-gated pass and binds the whole fleet, so the
+        # retry ranks on 5h/7d alone, where 98 is over dynamic's 97 and 50 is not.
+        h = _fleet(temp_home, 2, strategy="dynamic", threshold=99.0, model="Fable")
+        outcome = _fail_over(h, {"1": None, "2": _fable(10, seven, 100, _R_LATER)})
+        if taken:
+            assert outcome is TickOutcome.SWITCHED
+            assert h.active_number() == 2
+        else:
+            # The model-gated read still has it spent, so the exit is the
+            # all-exhausted wait, which is what a base fleet at Fable 100 gets.
+            assert outcome is TickOutcome.BLOCKED
+            assert h.active_number() == 1
+            assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "best", "consume-first"])
+    @pytest.mark.parametrize("under_freshens", [True, False])
+    def test_with_one_peer_over_and_one_under_only_the_under_one_is_tried(
+        self, temp_home, strategy, under_freshens
+    ):
+        h = _fleet(temp_home, 3, strategy=strategy, threshold=90.0)
+        tried = []
+
+        def freshen(num, email):
+            tried.append(num)
+            return "ok" if under_freshens else "transient"
+
+        with patch.object(h.engine, "_freshen_target", side_effect=freshen):
+            outcome = _fail_over(h, {
+                "1": None,
+                "2": _usage7(10, 99, _R_SOON),
+                "3": _usage7(10, 60, _R_LATER),
+            })
+        assert tried == ["3"]
+        assert (outcome is TickOutcome.SWITCHED) is under_freshens
+        assert h.active_number() == (3 if under_freshens else 1)
+
+    def test_the_refusal_names_its_reason(self):
+        reasons: dict[str, str] = {}
+        ordered, *_ = AutoSwitchEngine._rank_candidates_pass(
+            models=(), trigger="failover", consume_first=True, oauth_candidates=["2"],
+            no_return=None, usage={"2": _usage7(10, 99, _R_LATER)}, headroom={"2": 1.0},
+            current="1", active_headroom=None, now=1_000_000.0, reasons=reasons,
+            settings=AutoSwitchSettings(strategy="dynamic"),
+        )
+        assert ordered == []
+        assert reasons == {"2": "over the switch threshold"}
