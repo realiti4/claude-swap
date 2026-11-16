@@ -3277,10 +3277,16 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
             # T3500: a failover has not read the active, so it holds rather than land
-            # over a line. A peer with no threshold of its own reads at the strategy's
-            # bar (97 under `dynamic`), so the veto above now covers every peer.
+            # over a line, a peer's strategy bar (97 under `dynamic`) included. A peer
+            # spent on 5h/7d is left to the ranking's "at its limit" refusal, so an
+            # exhausted fleet is still reported as one (read unmodeled: `dynamic`'s
+            # model retry ranks on that axis).
             own_bars = {n: self._bars.get(n, bar) for n in eligible}
-            vetoed = [num for num in eligible if _over_own(num)]
+            spent = {
+                n for n, h in _headroom_by_account(usage, ()).items()
+                if h is not None and h <= 0
+            }
+            vetoed = [n for n in eligible if n not in spent and _over_own(n)]
             self._veto_note = _vetoed_clause(vetoed, own_bars)
             candidates = [num for num in eligible if num not in vetoed]
             oauth_candidates = [
@@ -5285,8 +5291,8 @@ class AutoSwitchEngine:
                 # Landing must be healthy: an account at/over any of its own
                 # lines would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one. Failover's candidates were
-                # already cut to those under their line at selection (T3500).
+                # headroom beats a blocked or dead one. Failover's over-line candidates
+                # with room were already cut at selection (T3500).
                 #
                 # AT-LIMIT ONLY WHEN `about_to_wall` IS FALSE ON THIS AXIS.
                 # `about_to_wall` is axis-local (computed from the

@@ -641,16 +641,36 @@ class TestFailoverNeverLandsOverTheLine:
         assert _switches(h) == [("failover", 2)]
 
     @pytest.mark.parametrize("strategy", ["dynamic", "best", "consume-first"])
-    def test_every_readable_peer_spent_is_the_designed_hold_not_all_exhausted(
+    def test_every_readable_peer_spent_is_still_reported_as_an_exhausted_fleet(
         self, temp_home, strategy
     ):
+        # A spent peer is the ranking's "at its limit" refusal, not the veto: the
+        # active is unread, so no recovery margin admits it, whatever resets it holds.
         h = _fleet(temp_home, 3, strategy=strategy, threshold=90.0)
         usage = {
             "1": None,
             "2": _usage7(100, 100, _R_SOON),
             "3": _usage7(100, 100, _R_LATER),
         }
-        _held_in_place(h, _fail_over(h, usage), "at or over its own threshold")
+        outcome = _fail_over(h, usage)
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    @pytest.mark.parametrize(
+        "strategy, line", [("dynamic", 97.0), ("best", 90.0), ("consume-first", 90.0)]
+    )
+    def test_a_spent_peer_beside_an_over_line_one_with_room_is_still_the_hold(
+        self, temp_home, strategy, line
+    ):
+        h = _fleet(temp_home, 3, strategy=strategy, threshold=90.0)
+        usage = {
+            "1": None,
+            "2": _usage7(100, 100, _R_SOON),
+            "3": _usage7(10, 99, _R_LATER),
+        }
+        _held_in_place(h, _fail_over(h, usage), f"Account-3 (line {line:g}%)")
 
     @pytest.mark.parametrize("strategy", ["dynamic", "best", "consume-first"])
     @pytest.mark.parametrize("under_freshens", [True, False])

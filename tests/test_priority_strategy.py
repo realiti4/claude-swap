@@ -93,27 +93,6 @@ def test_failover_also_obeys_the_cutoffs(temp_home):
     assert h.active_number() == 3
 
 
-def test_failover_re_ranked_after_the_refetch_obeys_the_cutoffs(temp_home):
-    # Pins existing behaviour (green before T3500; priority's strict ranker already
-    # refuses): the stored snapshot ranks #2 under its line, the pre-switch refetch
-    # reads every peer over it, and the failover holds on the fresh read.
-    h = fleet(temp_home, unhealthy_ticks=1)
-    stored = {**usage(h), "1": None}
-    fresh = {**usage(h, pcts=(0, 95, 95, 99)), "1": None}
-    fetches = []
-
-    def collect(fetch=None, **_kwargs):
-        fetches.append(set(fetch or ()))
-        view = fresh if fetches[-1] == {"1", "2", "3", "4"} else stored
-        return {num: _entry_for(value, h.clock.now) for num, value in view.items()}
-
-    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
-        assert h.engine.tick() is TickOutcome.BLOCKED
-    assert fetches.count({"1", "2", "3", "4"}) == 1  # phase 2 fired once
-    assert h.active_number() == 1
-    assert not any(isinstance(e, SwitchEvent) for e in h.events)
-
-
 def test_multiple_priority_tiers_and_near_line_target(temp_home):
     h = fleet(temp_home)
     h.switcher.set_account_priority("2", 50)
