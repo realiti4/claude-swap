@@ -142,8 +142,27 @@ def _active_account(backup_root: Path) -> dict | None:
     session = ChromeVault(backup_root).get(str(num))
     if session is None:
         return None
-    return {"num": str(num), "token": session.access_token,
+    return {"num": str(num), "token": _claude_code_token(str(num), session.email) or session.access_token,
             "uuid": session.account_uuid, "email": session.email}
+
+
+def _claude_code_token(num: str, email: str | None) -> str | None:
+    """The account's Claude Code OAuth access token.
+
+    The bridge rejects the extension-scoped ChromeVault token for
+    ``client_type: claude-code`` (``scope_not_allowed``); it must be the token
+    Claude Code itself holds for that account. None when unavailable.
+    """
+    if not email:
+        return None
+    try:
+        from .switcher import ClaudeAccountSwitcher
+
+        raw = ClaudeAccountSwitcher().read_account_credentials(num, email)
+        return json.loads(raw).get("claudeAiOauth", {}).get("accessToken") if raw else None
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("chrome-bridge: cannot read Claude Code token for account %s: %s", num, e)
+        return None
 
 
 def _open_upstream(uuid: str, token: str, ctx: ssl.SSLContext) -> socket.socket | None:
