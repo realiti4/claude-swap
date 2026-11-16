@@ -290,17 +290,18 @@ class DailySchedule:
             self.save()
             return
         record["actual_resets_at"] = reset_value
+        if active and (abs(reset - end) <= 300 or record.get("confirmed_sample_at")):
+            record.update(status="already_active", error=None,
+                          confirmed_at=iso(now), confirmed_sample_at=iso(fetched))
+            self.save()
+            return
         if max(values) >= THRESHOLD:
             record.update(status="unavailable", error="quota_at_threshold")
             self.save()
             return
         if active:
-            if abs(reset - end) <= 300 or record.get("confirmed_sample_at"):
-                record.update(status="already_active", error=None,
-                              confirmed_at=iso(now), confirmed_sample_at=iso(fetched))
-            else:
-                record.update(status="waiting_reset", error="existing_window_cannot_be_moved",
-                              retry_at=min(reset + 5, now + RETRY_SECONDS))
+            record.update(status="waiting_reset", error="existing_window_cannot_be_moved",
+                          retry_at=min(reset + 5, now + RETRY_SECONDS))
             self.save()
             return
         if not idle:

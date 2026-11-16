@@ -739,3 +739,43 @@ def test_renewal_stops_at_midnight_and_resumes_at_next_daily_start(tmp_path, mon
     service.tick()
     assert probe.call_count == 2
     assert service.state["activations"]["2026-11-14:1"]["cycle_number"] == 1
+
+
+def test_adopted_window_exhaustion_keeps_confirmation_for_renewal(tmp_path, monkeypatch):
+    rows = [account(1, active=True, reset=schedule.iso(at(12))),
+            account(2, disabled=True), account(3, disabled=True)]
+    service, _, _, clock, probe = harness(tmp_path, monkeypatch, rows)
+    service.tick()
+    clock.return_value = at(13)
+    endpoint_sample(rows[0], at(13), reset=schedule.iso(at(17)), pct=5)
+    service.tick()
+    clock.return_value = at(13, 1)
+    endpoint_sample(rows[0], at(13, 1), reset=schedule.iso(at(17)), pct=100)
+    service.tick()
+    record = service.state["activations"]["2026-11-13:1"]
+    assert record["status"] == "already_active"
+    probe.assert_not_called()
+    clock.return_value = at(17, 1)
+    endpoint_sample(rows[0], at(17, 1))
+    service.tick()
+    probe.assert_called_once()
+    assert record["cycle_number"] == 3
+    assert record["cycle_attempt_count"] == 1
+    assert len(record["completed_cycles"]) == 2
+
+
+def test_attempt_limit_with_obsolete_confirmation_cannot_reset_budget(tmp_path, monkeypatch):
+    rows = [account(1, active=True), account(2, disabled=True), account(3, disabled=True)]
+    (tmp_path / "schedule-state.json").write_text(json.dumps({"activations": {
+        "2026-11-13:1": {"status": "attempt_limit", "attempt_count": 3,
+                            "cycle_number": 1, "cycle_attempt_count": 3,
+                            "attempted_at": schedule.iso(at(7, 12)),
+                            "completed_at": schedule.iso(at(7, 12)),
+                            "actual_resets_at": schedule.iso(at(12)),
+                            "confirmed_sample_at": schedule.iso(at(7, 1))}}}))
+    service, _, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(12, 1))
+    service.tick()
+    probe.assert_not_called()
+    record = service.state["activations"]["2026-11-13:1"]
+    assert record["cycle_number"] == 1
+    assert record["cycle_attempt_count"] == 3
