@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 
 from claude_swap.chrome_session import ChromeVault, is_supported
+from claude_swap.credentials import looks_like_api_key
 
 _logger = logging.getLogger("claude-swap")
 
@@ -146,6 +147,16 @@ def _active_account(backup_root: Path) -> dict | None:
             "uuid": session.account_uuid, "email": session.email}
 
 
+def _token_belongs_to(email: str) -> bool:
+    """True when Claude Code's live credential is this account's."""
+    try:
+        data = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    live_email = (data.get("oauthAccount") or {}).get("emailAddress")
+    return live_email is not None and live_email.lower() == email.lower()
+
+
 def _claude_code_token(num: str, email: str | None) -> str | None:
     """The account's Claude Code OAuth access token.
 
@@ -158,8 +169,19 @@ def _claude_code_token(num: str, email: str | None) -> str | None:
     try:
         from .switcher import ClaudeAccountSwitcher
 
-        raw = ClaudeAccountSwitcher().read_account_credentials(num, email)
-        return json.loads(raw).get("claudeAiOauth", {}).get("accessToken") if raw else None
+        switcher = ClaudeAccountSwitcher()
+        # The active account's live Keychain credential is what Claude Code keeps
+        # refreshed (8h access tokens); the per-account backup can lag behind it.
+        live = switcher._read_credentials()
+        candidates = [live] if _token_belongs_to(email) else []
+        candidates.append(switcher.read_account_credentials(num, email))
+        for raw in candidates:
+            if not raw or looks_like_api_key(raw):
+                continue
+            token = json.loads(raw).get("claudeAiOauth", {}).get("accessToken")
+            if token:
+                return token
+        return None
     except Exception as e:  # noqa: BLE001
         _logger.warning("chrome-bridge: cannot read Claude Code token for account %s: %s", num, e)
         return None
