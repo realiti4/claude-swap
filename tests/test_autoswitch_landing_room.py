@@ -32,7 +32,14 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
 )
-from tests.test_autoswitch import _R_LATER, _R_LATEST, _R_SOON, EngineHarness, _usage7
+from tests.test_autoswitch import (
+    _R_LATER,
+    _R_LATEST,
+    _R_SOON,
+    EngineHarness,
+    _header_usage,
+    _usage7,
+)
 
 
 def _harness(temp_home, n: int = 3) -> EngineHarness:
@@ -657,6 +664,22 @@ class TestFailoverNeverLandsOverTheLine:
         assert h.active_number() == 1
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
         assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_a_spent_peer_returning_sooner_is_never_a_failover_target(self, temp_home):
+        # `dynamic`'s 5h/7d retry reads a header-probe active (no Fable window, so
+        # unread under the model) on the unmodeled axis, where it is spent with a
+        # reset: the margin that admits a spent peer returning sooner opens there.
+        # A failover never has a provable return for an active it cannot read.
+        h = _fleet(temp_home, 3, strategy="dynamic", threshold=90.0, model="Fable")
+        usage = {
+            "1": _header_usage(
+                five_hour={"pct": 100.0, "resets_at": _R_LATEST},
+                seven_day={"pct": 100.0, "resets_at": _R_LATEST},
+            ),
+            "2": _fable(10, 50, 100, _R_LATER),
+            "3": _usage7(100, 100, _R_SOON),
+        }
+        _held_in_place(h, _fail_over(h, usage), "Account-2 (line 97%)")
 
     @pytest.mark.parametrize(
         "strategy, line", [("dynamic", 97.0), ("best", 90.0), ("consume-first", 90.0)]

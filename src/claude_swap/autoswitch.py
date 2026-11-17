@@ -5238,10 +5238,15 @@ class AutoSwitchEngine:
                 # thing the cap forbids, so with every peer over its lines a
                 # spent one is admitted whenever it returns (the all-above
                 # key below orders them soonest return first).
+                #
+                # NEVER ON FAILOVER (T3500): the active was not read, so there is
+                # no provable return to beat, and the 5h/7d retry's unmodeled
+                # reading of a header-probe active can still show one.
                 if not (
                     (all_above and trigger == "weekly-capped")
                     or (
                         all_above
+                        and trigger != "failover"
                         and (active_headroom or 0.0) <= 0
                         and best_candidate_headroom <= SPENT_HEADROOM_PCT
                         and active_recovery_ts != float("inf")
