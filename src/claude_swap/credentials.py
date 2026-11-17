@@ -1470,15 +1470,18 @@ class CredentialStore:
         Holds the refresh pair then ``.storage-write.lock`` (Claude Code's own
         nesting) and writes only when a fresh re-read still equals the bytes
         read, so a login that landed in between is never overwritten. Skipped
-        for a degraded read and a macOS custom profile (the write would move
-        its login from the Keychain to the file). A failure keeps the original
-        bytes and is logged once per generation.
+        for a degraded read and a macOS custom profile. On the Keychain route
+        it writes the item alone, never through ``_write_oauth_credentials``
+        or ``_kc_call``: their failure arm moves the login into the plaintext
+        file and flips routing, and a pass that only observed must do neither.
+        A failure keeps the original bytes and is logged once per generation.
         """
         creds = active.value or ""
         stripped = _drop_stamped_ids(creds)
         if stripped == creds or active.degraded or active.keychain_unavailable:
             return creds
-        if self._use_keychain() and not _active_store_is_the_default_secure_store():
+        keychain = self._use_keychain()
+        if keychain and not _active_store_is_the_default_secure_store():
             return creds
         try:
             with (
@@ -1489,8 +1492,15 @@ class CredentialStore:
                     again = self._read_active_credentials()
                 if again.value != creds or again.degraded:
                     return creds
-                self._write_oauth_credentials(stripped)
-        except (ClaudeSwitchError, OSError) as e:
+                if keychain:
+                    macos_keychain.set_password(
+                        CLAUDE_CODE_KEYCHAIN_SERVICE,
+                        macos_keychain.keychain_account_name(),
+                        stripped,
+                    )
+                else:
+                    self._write_active_credentials_file(stripped)
+        except (ClaudeSwitchError, *macos_keychain.KEYCHAIN_ERRORS) as e:
             self._log_detected_login(
                 creds, slot=None,
                 outcome=f"ids left in the live store: {type(e).__name__}",

@@ -5715,7 +5715,9 @@ class ClaudeAccountSwitcher:
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
-    def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
+    def _build_accounts_info(
+        self, *, read_only: bool = False
+    ) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
 
         Shared by list_accounts and the usage-aware switch helpers so the active
@@ -5782,7 +5784,7 @@ class ClaudeAccountSwitcher:
                     active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
-                if not self._suppress_login_restore_write:
+                if not (read_only or self._suppress_login_restore_write):
                     creds = self._store._strip_stamped_ids_from_live(active)
             else:
                 # Display read cache: this value feeds sentinels, token-status
@@ -9033,7 +9035,7 @@ class ClaudeAccountSwitcher:
             self._first_run_setup()
             return None
 
-        accounts_info = self._build_accounts_info()
+        accounts_info = self._build_accounts_info(read_only=read_only)
         entries = self._collect_usage_entries(
             accounts_info, fetch=fetch, read_only=read_only
         )

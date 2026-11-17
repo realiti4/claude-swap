@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from claude_swap import credentials, macos_keychain
+from claude_swap.exceptions import ClaudeCodeLockTimeout
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -41,6 +42,10 @@ def _active_switcher(temp_home: Path, creds: dict):
     return s, live
 
 
+def _no_lock(**_kw):
+    raise AssertionError("this pass must take no lock")
+
+
 def test_a_pass_that_reads_stamped_ids_drops_them_from_the_live_store(temp_home: Path):
     stamped = _login(**IDS)
     s, live = _active_switcher(temp_home, stamped)
@@ -58,9 +63,6 @@ def test_a_pass_that_reads_no_ids_takes_no_lock_and_writes_nothing(temp_home: Pa
     before = live.read_text(encoding="utf-8")
     os.utime(live, (time.time() - 3600,) * 2)
     mtime = live.stat().st_mtime
-
-    def _no_lock(**_kw):
-        raise AssertionError("a pass with no ids must not take a lock")
 
     monkeypatch.setattr(credentials, "claude_credentials_lock", _no_lock)
     monkeypatch.setattr(credentials, "claude_storage_write_lock", _no_lock)
@@ -110,3 +112,61 @@ def test_the_adopt_sync_writes_the_file_without_ids_and_still_stamps_the_mirror(
     monkeypatch.setattr(s._store, "_write_active_credentials_file", writes.append)
     s._store._sync_active_credentials_file_to_adopted_login(adopted, slot="1", email=EMAIL)
     assert writes == [], "an unchanged adopt must not rewrite the file"
+
+
+def test_a_read_only_list_takes_no_lock_and_writes_nothing(temp_home: Path, monkeypatch):
+    s, live = _active_switcher(temp_home, _login(**IDS))
+    before = live.read_text(encoding="utf-8")
+    monkeypatch.setattr(credentials, "claude_credentials_lock", _no_lock)
+    monkeypatch.setattr(credentials, "claude_storage_write_lock", _no_lock)
+
+    s.list_accounts(json_output=True, read_only=True)
+
+    assert live.read_text(encoding="utf-8") == before
+
+
+def test_a_lock_that_stays_held_leaves_the_ids_and_the_pass_runs_on_the_original_bytes(
+    temp_home: Path, monkeypatch,
+):
+    s, live = _active_switcher(temp_home, _login(**IDS))
+    before = live.read_text(encoding="utf-8")
+
+    @contextmanager
+    def _held(**_kw):
+        raise ClaudeCodeLockTimeout("held")
+        yield
+
+    monkeypatch.setattr(credentials, "claude_storage_write_lock", _held)
+
+    row = s._build_accounts_info()[0]
+
+    assert live.read_text(encoding="utf-8") == before
+    assert row[5] == before
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_the_keychain_route_writes_the_item_only_and_a_failed_write_leaves_the_ids_in_place(
+    temp_home: Path, block_real_keychain, monkeypatch, write_fails: bool,
+):
+    s, live = _active_switcher(temp_home, _login())
+    live.unlink()
+    s.platform = Platform.MACOS
+    key = (credentials.CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+    stamped = json.dumps(_login(**IDS))
+    block_real_keychain.data[key] = stamped
+    if write_fails:
+        def _refused(*_a):
+            raise macos_keychain.KeychainError("no GUI session")
+        monkeypatch.setattr(macos_keychain, "set_password", _refused)
+
+    row = s._build_accounts_info()[0]
+
+    assert not live.exists(), "an observed login must never be moved into the plaintext file"
+    store = s._store
+    assert store._keychain_usable_cache is not False and not store._pinned_to_oauth_file
+    if write_fails:
+        assert block_real_keychain.data[key] == stamped
+        assert row[5] == stamped
+    else:
+        assert json.loads(block_real_keychain.data[key]) == _login()
+        assert json.loads(row[5]) == _login()
