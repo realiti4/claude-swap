@@ -14056,3 +14056,77 @@ class TestSalvageCopyMode:
         assert salvage.read_bytes() == config_path.read_bytes()
         assert salvage.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob("*.tmp"))
+
+
+class TestConfiguredUsageCadence:
+    def setup_switcher(self):
+        from claude_swap.settings import set_setting
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.activeIntervalSeconds", "120")
+        set_setting(switcher.backup_dir, "usage.candidateIntervalSeconds", "300")
+        clock = [1_000_000.0]
+        switcher._usage_store = UsageStore(switcher.backup_dir / "cache", clock=lambda: clock[0])
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+        infos = [(n, f"account{n}@example.com", "", "", n == 1, creds, "") for n in (1, 2, 3)]
+        return switcher, clock, infos
+
+    def test_collector_fetches_active_at_two_minutes_and_others_at_five(self, temp_home):
+        switcher, clock, infos = self.setup_switcher()
+        calls = []
+
+        def fetch(rows, pre):
+            calls.append([str(row[0]) for row in rows])
+            return {str(row[0]): FetchRecord(usage={"five_hour": {"pct": 10}}) for row in rows}
+
+        with patch.object(switcher, "_run_usage_fetches", side_effect=fetch):
+            switcher._collect_usage_entries(infos)
+            assert calls == [["1", "2", "3"]]
+            clock[0] += 119
+            switcher._collect_usage_entries(infos)
+            assert len(calls) == 1
+            clock[0] += 1
+            switcher._collect_usage_entries(infos)
+            assert calls[-1] == ["1"]
+            clock[0] += 61
+            switcher._collect_usage_entries(infos, fetch={"1", "2", "3"})
+            assert len(calls) == 2
+            clock[0] += 59
+            switcher._collect_usage_entries(infos)
+            assert calls[-1] == ["1"]
+            clock[0] += 60
+            switcher._collect_usage_entries(infos)
+            assert calls == [["1", "2", "3"], ["1"], ["1"], ["2", "3"]]
+
+    def test_collector_replans_all_roles_without_network_on_store_only(self, temp_home):
+        switcher, clock, infos = self.setup_switcher()
+        identities = {str(row[0]): (row[1], "") for row in infos}
+        anchor = clock[0]
+        switcher._usage_store.record(
+            {n: FetchRecord(usage={"five_hour": {"pct": 10}}) for n in identities}, identities,
+            plans={n: (anchor + 600, 600) for n in identities},
+        )
+        with patch.object(switcher, "_run_usage_fetches") as fetch:
+            entries = switcher._collect_usage_entries(infos, fetch=set())
+            assert [entries[n].poll_interval_s for n in identities] == [120, 300, 300]
+            clock[0] += 100
+            switched = [(*row[:4], row[0] == 2, *row[5:]) for row in infos]
+            entries = switcher._collect_usage_entries(switched, fetch=set())
+            assert [entries[n].next_poll_at for n in identities] == [anchor + 300, anchor + 120, anchor + 300]
+            fetch.assert_not_called()
+
+    def test_settings_changed_during_fetch_apply_after_lease_completion(self, temp_home):
+        from claude_swap.settings import set_setting
+
+        switcher, clock, infos = self.setup_switcher()
+
+        def fetch(rows, pre):
+            set_setting(switcher.backup_dir, "usage.activeIntervalSeconds", "300")
+            return {str(row[0]): FetchRecord(usage={"five_hour": {"pct": 10}}) for row in rows}
+
+        with patch.object(switcher, "_run_usage_fetches", side_effect=fetch):
+            switcher._collect_usage_entries(infos)
+        entries = switcher._collect_usage_entries(infos, fetch=set())
+        assert entries["1"].poll_interval_s == 300
+        assert entries["1"].next_poll_at == clock[0] + 300

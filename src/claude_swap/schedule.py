@@ -8,6 +8,7 @@ serializes this service only; account writes use the switcher's normal locks.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -27,7 +28,7 @@ from claude_swap import oauth, subscription
 from claude_swap.autoswitch import AutoSwitchEngine
 from claude_swap.locking import FileLock
 from claude_swap.paths import get_backup_root
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, load_settings, parse_model_names, UsageSettings
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, load_settings, parse_model_names
 from claude_swap.snapshot_source import SnapshotSource
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -194,7 +195,7 @@ class ScheduledSwitcher(ClaudeAccountSwitcher):
     """Scheduling polls never initiate inference, even if a UI opts into probes."""
 
     def _usage_settings(self):
-        return UsageSettings(header_probe=False, fable_probe=False)
+        return replace(super()._usage_settings(), header_probe=False, fable_probe=False)
 
 
 class DailySchedule:

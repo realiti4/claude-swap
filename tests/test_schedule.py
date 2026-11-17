@@ -237,10 +237,19 @@ def test_provider_governed_extended_trust_is_preserved():
     assert schedule.percentages(row) == [10,20]
 
 
-def test_polling_explicitly_disables_inference_probes():
-    settings = schedule.ScheduledSwitcher._usage_settings(None)
+def test_polling_explicitly_disables_inference_probes(temp_home):
+    from claude_swap.settings import set_setting
+
+    switcher = schedule.ScheduledSwitcher()
+    switcher._setup_directories()
+    for key, value in (("headerProbe", "true"), ("fableProbe", "true"),
+                       ("activeIntervalSeconds", "120"), ("candidateIntervalSeconds", "300")):
+        set_setting(switcher.backup_dir, f"usage.{key}", value)
+    settings = switcher._usage_settings()
     assert not settings.header_probe
     assert not settings.fable_probe
+    assert settings.active_interval_seconds == 120
+    assert settings.candidate_interval_seconds == 300
 
 
 def test_success_without_reset_reports_unconfirmed(tmp_path, monkeypatch):

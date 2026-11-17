@@ -1944,3 +1944,102 @@ class TestAdopt:
         store.adopt({"2": (USAGE, 0.0)}, IDENT)
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
         assert (row["email"], row["organizationUuid"]) == IDENT["2"]
+
+
+class TestFixedPolling:
+    def seed(self, store, clock):
+        store.record({num: FetchRecord(usage=USAGE) for num in IDENT}, IDENT,
+                     plans={num: (clock.now + 600, 600) for num in IDENT})
+
+    def reserve(self, store, nums=IDENT, intervals=None, respect=True):
+        return store.reserve(nums, IDENT, respect_plans=respect,
+                             fixed_intervals=intervals or {"1": 120, "2": 300})
+
+    @pytest.mark.parametrize("respect", [True, False])
+    def test_active_due_at_120_candidate_only_at_300(self, store, clock, respect):
+        self.seed(store, clock)
+        assert self.reserve(store, respect=respect) == {}
+        clock.advance(119)
+        assert self.reserve(store, respect=respect) == {}
+        clock.advance(1)
+        assert set(self.reserve(store, respect=respect)) == {"1"}
+        clock.advance(61)
+        assert self.reserve(store, ["2"], respect=respect) == {}
+        clock.advance(118)
+        assert self.reserve(store, ["2"], respect=respect) == {}
+        clock.advance(1)
+        assert set(self.reserve(store, ["2"], respect=respect)) == {"2"}
+
+    def test_role_change_replans_both_accounts_from_last_sample(self, store, clock):
+        self.seed(store, clock)
+        anchor = clock.now
+        self.reserve(store, [])
+        clock.advance(100)
+        self.reserve(store, [], {"1": 300, "2": 120})
+        entries = store.entries(IDENT)
+        assert entries["1"].next_poll_at == anchor + 300
+        assert entries["2"].next_poll_at == anchor + 120
+        clock.advance(20)
+        assert set(self.reserve(store, intervals={"1": 300, "2": 120})) == {"2"}
+
+    def test_restart_keeps_deadlines_and_only_one_collector_wins(self, store, clock):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        self.seed(store, clock)
+        self.reserve(store, [])
+        clock.advance(120)
+        gate = Barrier(2)
+
+        def collect():
+            other = UsageStore(store.path.parent, clock=clock)
+            gate.wait()
+            return self.reserve(other)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: collect(), range(2)))
+        assert sorted(len(result) for result in results) == [0, 1]
+        assert set().union(*results) == {"1"}
+
+    def test_unset_restores_default_ttl(self, store, clock):
+        self.seed(store, clock)
+        self.reserve(store, [])
+        clock.advance(120)
+        assert self.reserve(store, intervals={"1": None, "2": None}) == {}
+        clock.advance(61)
+        assert set(self.reserve(store, intervals={"1": None, "2": None})) == {"1", "2"}
+
+    def test_replan_does_not_overwrite_live_fetch(self, store, clock):
+        claims = self.reserve(store)
+        assert set(claims) == {"1", "2"}
+        assert self.reserve(store, intervals={"1": 300, "2": 120}) == {}
+        store.record({num: FetchRecord(usage=USAGE) for num in IDENT}, IDENT, claims,
+                     plans={"1": (clock.now + 120, 120), "2": (clock.now + 300, 300)})
+        self.reserve(store, [], {"1": 300, "2": 120})
+        assert store.entries(IDENT)["2"].next_poll_at == clock.now + 120
+
+    def test_fixed_schedule_retains_429_backoff_and_recovery(self, store, clock):
+        self.seed(store, clock)
+        self.reserve(store, [])
+        clock.advance(300)
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=3600)}, IDENT)
+        deadline = store.entries(IDENT)["1"].backoff_until
+        clock.now = deadline - 1
+        assert self.reserve(store, ["1"], {"1": 300, "2": 120}) == {}
+        assert store.entries(IDENT)["1"].backoff_until == deadline
+        clock.now = deadline
+        claims = self.reserve(store, ["1"])
+        assert set(claims) == {"1"}
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims,
+                     plans={"1": (clock.now + 540, 540)})
+        self.reserve(store, [], {"1": 300, "2": 120})
+        assert store.entries(IDENT)["1"].next_poll_at == clock.now + 540
+
+    @pytest.mark.parametrize("guard", ["heldUntil", "backoffUntil", "authDeadStrikes"])
+    def test_fixed_cadence_keeps_other_fetch_guards(self, store, clock, guard):
+        self.seed(store, clock)
+        store._mutate(IDENT, ["1"], lambda n, row: row.update(
+            {guard: usage_store.AUTH_DEAD_STRIKES if guard == "authDeadStrikes" else clock.now + 1000}
+        ))
+        clock.advance(300)
+        assert self.reserve(store, ["1"]) == {}

@@ -500,3 +500,22 @@ class TestScopedProbePause:
         assert not poll_policy.scoped_probe_paused(
             {"name": "Fable", "pct": 100.0, "probe_after": 5}, self.NOW
         )
+
+
+class TestFixedCadence:
+    @pytest.mark.parametrize("interval", [120.0, 300.0])
+    @pytest.mark.parametrize("old,new", [(10, 10), (70, 85), (100, 100)])
+    @pytest.mark.parametrize("rng", [lambda: 0.0, lambda: 1.0])
+    def test_fixed_cadence_has_no_decay_urgent_or_jitter(self, interval, old, new, rng):
+        assert _plan(
+            is_active=True, fixed_interval_s=interval, prev_interval_s=600,
+            prev_usage=_usage(old), new_usage=_usage(new), rng=rng,
+        ) == (NOW + interval, interval)
+
+    def test_fixed_cadence_retains_congestion_control(self):
+        assert _plan(fixed_interval_s=120, recent_429=True) == (NOW + 360, 360)
+        assert _plan(fixed_interval_s=300, prev_interval_s=600, recent_429=True) == (NOW + 900, 900)
+
+    def test_fixed_cadence_observes_imminent_reset(self):
+        reset = datetime.fromtimestamp(NOW + 30, timezone.utc).isoformat()
+        assert _plan(fixed_interval_s=300, new_usage=_usage(100, reset)) == (NOW + 90, 300)
