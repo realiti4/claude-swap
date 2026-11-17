@@ -44,6 +44,9 @@ ACTIVATION_MAX_TOKENS = 16
 ACTIVATION_PROMPT = "Reply with OK."
 WEEKLY_RESET_TIE_SECONDS = 1800
 SELECTION_COOLDOWN_SECONDS = 600
+FIVE_HOUR_RESERVE_THRESHOLD = 80.0
+ALLOCATION_MIN_HOURS = 0.25
+ALLOCATION_SWITCH_GAIN = 1.2
 
 
 def iso(ts):
@@ -160,19 +163,31 @@ def weekly_reset(account, now):
 
 
 def rank_available(accounts, now, eligible, models):
-    known = [(weekly_reset(a, now), a) for a in accounts if weekly_reset(a, now) is not None]
-    known.sort(key=lambda item: item[0])
-    ranked = []
-    while known:
-        end = known[0][0] + WEEKLY_RESET_TIE_SECONDS
-        group = [a for reset, a in known if reset <= end]
-        group.sort(key=lambda a: (percentages(a, now, models)[1],
-                                  percentages(a, now, models)[0], int(a.number)))
-        ranked.extend(group)
-        known = [(reset, a) for reset, a in known if reset > end]
+    metrics = {a.number: allocation_metrics(a, now, models) for a in accounts}
+    ranked = sorted((a for a in accounts if metrics[a.number] is not None),
+                    key=lambda a: (metrics[a.number]["reserve"], -metrics[a.number]["score"],
+                                   weekly_reset(a, now), int(a.number)))
     ranked.extend(sorted((a for a in accounts if weekly_reset(a, now) is None),
                          key=lambda a: (a not in eligible, max(percentages(a, now, models)), int(a.number))))
     return ranked
+
+
+def allocation_metrics(account, now, models):
+    reset = weekly_reset(account, now)
+    values = percentages(account, now, models)
+    if reset is None or values is None or max(values) >= THRESHOLD:
+        return None
+    data = account.usage.decision_value()
+    five_reset = timestamp((data.get("five_hour") or {}).get("resets_at"))
+    last_cycle = reset <= (five_reset if five_reset is not None and five_reset > now else now + 5 * 3600)
+    hours = max(ALLOCATION_MIN_HOURS, (reset - now) / 3600)
+    required = (THRESHOLD - values[1]) / hours
+    headroom = (THRESHOLD - values[0]) / THRESHOLD
+    return {"weekly_remaining_pct": 100 - values[1], "weekly_budget_pct": THRESHOLD - values[1],
+            "hours_to_weekly_reset": (reset - now) / 3600,
+            "required_weekly_pct_per_hour": required, "five_hour_headroom_pct": THRESHOLD - values[0],
+            "score": required * headroom, "reserve": values[0] >= FIVE_HOUR_RESERVE_THRESHOLD and not last_cycle,
+            "last_five_hour_cycle": last_cycle}
 
 
 class ScheduledSwitcher(ClaudeAccountSwitcher):
@@ -472,7 +487,10 @@ class DailySchedule:
         self.selection = {"policy": "weekly_expiry", "reason": "waiting_usage",
                           "preferred_account_id": None, "preferred_weekly_resets_at": None,
                           "ranked_account_ids": [], "cooldown_seconds": SELECTION_COOLDOWN_SECONDS,
-                          "deadline_tolerance_seconds": WEEKLY_RESET_TIE_SECONDS}
+                          "deadline_tolerance_seconds": WEEKLY_RESET_TIE_SECONDS,
+                          "allocation": "remaining_per_hour_with_five_hour_headroom",
+                          "reserve_threshold": FIVE_HOUR_RESERVE_THRESHOLD,
+                          "minimum_score_gain": ALLOCATION_SWITCH_GAIN, "allocation_accounts": []}
         current = accounts.get(snap.active_number)
         if current is not None and not self.matches(current):
             self.error = self.error or "active_account_not_bound_to_schedule"
@@ -488,6 +506,9 @@ class DailySchedule:
         self.selection["hold_until"] = iso(hold_until) if hold_until > now else None
         ranked = rank_available(available, now, eligible, self.models)
         self.selection["ranked_account_ids"] = [a.number for a in ranked]
+        metrics = {a.number: allocation_metrics(a, now, self.models) for a in ranked}
+        self.selection["allocation_accounts"] = [{"id": a.number, **metrics[a.number]}
+                                                 for a in ranked if metrics[a.number] is not None]
         if ranked:
             self.selection["preferred_account_id"] = ranked[0].number
             self.selection["preferred_weekly_resets_at"] = iso(weekly_reset(ranked[0], now))
@@ -500,7 +521,7 @@ class DailySchedule:
                     continue
                 reason = "usage reached 99%"
                 if weekly_reset(account, now) is not None:
-                    reason += "; earliest available 7d reset"
+                    reason += "; weekly quota allocation"
                 elif account not in eligible:
                     reason += "; future slot used early, actual reset may shift"
                 if self.switch(account, reason):
@@ -511,23 +532,34 @@ class DailySchedule:
             return
         known = [a for a in ranked if weekly_reset(a, now) is not None]
         if known:
-            earliest = min(weekly_reset(a, now) for a in known)
+            best = known[0]
+            best_metrics = metrics[best.number]
             current_reset = weekly_reset(current, now) if current in available else None
-            if current_reset is not None and current_reset <= earliest + WEEKLY_RESET_TIE_SECONDS:
-                self.selection.update(reason="current_earliest_group", preferred_account_id=current.number,
+            current_metrics = metrics.get(current.number) if current is not None else None
+            if (current_metrics is not None
+                    and current_metrics["reserve"] <= best_metrics["reserve"]
+                    and current_metrics["score"] * ALLOCATION_SWITCH_GAIN >= best_metrics["score"]):
+                same_deadline = abs(current_reset - weekly_reset(best, now)) <= WEEKLY_RESET_TIE_SECONDS
+                self.selection.update(reason="current_earliest_group" if same_deadline else "allocation_balanced",
+                                      preferred_account_id=current.number,
                                       preferred_weekly_resets_at=iso(current_reset))
                 return
             if current in available and now < hold_until:
                 self.selection["reason"] = "selection_cooldown"
                 return
-            self.selection["reason"] = "earliest_weekly_reset"
+            self.selection["reason"] = "weekly_quota_allocation"
             for account in known:
                 if account.is_active:
                     continue
                 reset = weekly_reset(account, now)
-                if current_reset is not None and reset >= current_reset:
-                    continue
-                if self.switch(account, "earliest available 7d reset"):
+                candidate = metrics[account.number]
+                if current_metrics is not None:
+                    if candidate["reserve"] > current_metrics["reserve"]:
+                        continue
+                    if (candidate["reserve"] == current_metrics["reserve"]
+                            and candidate["score"] <= current_metrics["score"] * ALLOCATION_SWITCH_GAIN):
+                        continue
+                if self.switch(account, "weekly quota allocation; expiry and 5h headroom"):
                     self.selection.update(preferred_account_id=account.number, preferred_weekly_resets_at=iso(reset))
                     return
             self.selection["reason"] = "weekly_selection_blocked"
@@ -643,7 +675,7 @@ def manage_launch_agent(root, *, uninstall=False):
 
 def command(argv):
     parser = argparse.ArgumentParser(prog="cswap schedule", description=__doc__)
-    parser.add_argument("--configure", action="store_true", help="Bind slots 1/2/3 for 07:00 activation and earliest-7d-reset selection")
+    parser.add_argument("--configure", action="store_true", help="Bind slots 1/2/3 for 07:00 activation and balanced weekly quota allocation")
     parser.add_argument("--once", action="store_true", help="Run one activation/failover/snapshot tick")
     parser.add_argument("--install", action="store_true", help="Install and start the macOS login agent")
     parser.add_argument("--uninstall", action="store_true", help="Stop and remove only this login agent")
@@ -663,7 +695,7 @@ def command(argv):
         if len(selected) != 3:
             parser.error("exactly slots 1, 2, 3 must exist")
         atomic_write_json(config_path, {"schemaVersion": 1, "enabled": True, "identities": selected})
-        print("Configured all slots for 07:00 activation in Asia/Shanghai; earliest 7d reset selection; threshold 99%.")
+        print("Configured all slots for 07:00 activation in Asia/Shanghai; weekly quota allocation with 5h headroom; threshold 99%.")
         return
     config = load_json(config_path)
     if config.get("enabled") is not True or len(config.get("identities", {})) != 3:

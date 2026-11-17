@@ -825,7 +825,7 @@ def test_attempt_limit_with_obsolete_confirmation_cannot_reset_budget(tmp_path, 
 @pytest.mark.parametrize("hour", [7,12,17,23])
 def test_weekly_expiry_overrides_selection_slots_without_extra_inference(tmp_path, monkeypatch, hour):
     rows = [account(1, active=True, weekly_reset=schedule.iso(at(day=19)), reset=schedule.iso(at(day=14))),
-            account(2, weekly=80, weekly_reset=schedule.iso(at(day=14)), reset=schedule.iso(at(day=14))),
+            account(2, weekly=40, weekly_reset=schedule.iso(at(day=14)), reset=schedule.iso(at(day=14))),
             account(3, weekly_reset=schedule.iso(at(day=16)), reset=schedule.iso(at(day=14)))]
     service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(hour))
     service.tick()
@@ -836,20 +836,20 @@ def test_weekly_expiry_overrides_selection_slots_without_extra_inference(tmp_pat
     assert saved["scheduler"]["selection"]["ranked_account_ids"] == ["2","3","1"]
 
 
-def test_weekly_priority_keeps_earliest_account_at_selection_boundary(tmp_path, monkeypatch):
+def test_nearly_consumed_weekly_account_does_not_starve_other_balances(tmp_path, monkeypatch):
     rows = [account(1, active=True, weekly=98, weekly_reset=schedule.iso(at(day=14))),
-            account(2, weekly=10, weekly_reset=schedule.iso(at(day=18))),
-            account(3, weekly_reset=schedule.iso(at(day=19)))]
+            account(2, weekly=10, weekly_reset=schedule.iso(at(day=18)), reset=schedule.iso(at(17))),
+            account(3, weekly_reset=schedule.iso(at(day=19)), reset=schedule.iso(at(17)))]
     service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows, now=at(12))
     service.select_account(service.source.take())
-    switcher.switch_to.assert_not_called()
-    assert service.selection["reason"] == "current_earliest_group"
+    switcher.switch_to.assert_called_once_with("2", json_output=True)
+    assert service.selection["reason"] == "weekly_quota_allocation"
 
 
 @pytest.mark.parametrize("minutes", [0,1,29,30])
 def test_near_equal_weekly_deadlines_keep_current_account(tmp_path, monkeypatch, minutes):
-    rows = [account(1, active=True, weekly=90, weekly_reset=schedule.iso(at(day=14)+minutes*60)),
-            account(2, weekly=10, weekly_reset=schedule.iso(at(day=14))), account(3)]
+    rows = [account(1, active=True, weekly=20, weekly_reset=schedule.iso(at(day=14)+minutes*60)),
+            account(2, weekly=20, weekly_reset=schedule.iso(at(day=14))), account(3)]
     service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
     service.select_account(service.source.take())
     switcher.switch_to.assert_not_called()
@@ -868,11 +868,11 @@ def test_equivalent_deadlines_choose_more_weekly_quota_on_failover(tmp_path, mon
 def test_failover_prefers_earliest_weekly_reset_over_largest_quota(tmp_path, monkeypatch):
     rows = [account(1, active=True, pct=99),
             account(2, weekly=10, weekly_reset=schedule.iso(at(day=18))),
-            account(3, weekly=98, weekly_reset=schedule.iso(at(day=14)))]
+            account(3, weekly=98, weekly_reset=schedule.iso(at(7,15)))]
     service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
     service.select_account(service.source.take())
     switcher.switch_to.assert_called_once_with("3", json_output=True)
-    assert "7d reset" in service.last_event["detail"]
+    assert "weekly quota allocation" in service.last_event["detail"]
 
 
 @pytest.mark.parametrize("bad", [dict(pct=99),dict(weekly=99),dict(age=301),dict(disabled=True),
@@ -1024,7 +1024,7 @@ def test_new_weekly_cycle_moves_priority_to_next_deadline(tmp_path, monkeypatch)
 
 
 def test_priority_chooses_more_quota_inside_earliest_group(tmp_path, monkeypatch):
-    rows = [account(1, active=True, weekly_reset=schedule.iso(at(day=14)+31*60)),
+    rows = [account(1, active=True, weekly=70, weekly_reset=schedule.iso(at(day=14)+31*60)),
             account(2, weekly=80, weekly_reset=schedule.iso(at(day=14))),
             account(3, weekly=20, weekly_reset=schedule.iso(at(day=14)+29*60))]
     service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
@@ -1045,3 +1045,76 @@ def test_credential_refresh_crossing_weekly_reset_rejects_old_sample(tmp_path, m
     freshener._freshen_target.side_effect = refresh
     service.select_account(service.source.take())
     switcher.switch_to.assert_called_once_with("3",json_output=True)
+
+
+def test_required_weekly_pace_uses_remaining_budget_and_deadline():
+    row = account(1, pct=50, weekly=39, weekly_reset=schedule.iso(at(day=14)))
+    metrics = schedule.allocation_metrics(row, at(), ())
+    assert metrics["required_weekly_pct_per_hour"] == pytest.approx(60/24)
+    assert metrics["score"] == pytest.approx((60/24)*(49/99))
+
+
+def test_five_hour_consumption_spreads_work_before_exhaustion(tmp_path, monkeypatch):
+    rows = [account(1, active=True, pct=75, weekly_reset=schedule.iso(at(day=14))),
+            account(2, weekly_reset=schedule.iso(at(day=16))), account(3, disabled=True)]
+    service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_called_once_with("2",json_output=True)
+
+
+def test_spare_five_hour_capacity_precedes_reserve_quota(tmp_path, monkeypatch):
+    rows = [account(1, active=True, pct=80, reset=schedule.iso(at(12)), weekly_reset=schedule.iso(at(day=14))),
+            account(2, weekly=98, weekly_reset=schedule.iso(at(day=19))), account(3, disabled=True)]
+    service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_called_once_with("2",json_output=True)
+
+
+def test_last_five_hour_cycle_can_spend_reserve_before_weekly_expiry(tmp_path, monkeypatch):
+    rows = [account(1, active=True, pct=90, reset=schedule.iso(at(12)), weekly_reset=schedule.iso(at(11))),
+            account(2, weekly_reset=schedule.iso(at(day=19))), account(3, disabled=True)]
+    service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_not_called()
+    metrics = service.selection["allocation_accounts"][0]
+    assert metrics["last_five_hour_cycle"]
+    assert not metrics["reserve"]
+
+
+def test_reserve_quota_stays_usable_when_no_spare_capacity_exists(tmp_path, monkeypatch):
+    rows = [account(1, active=True, pct=99),
+            account(2, pct=90, weekly_reset=schedule.iso(at(day=14))),
+            account(3, pct=80, weekly_reset=schedule.iso(at(day=19)))]
+    service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_called_once_with("2",json_output=True)
+
+
+def test_weekly_consumption_changes_distribution_without_waiting_for_99(tmp_path, monkeypatch):
+    rows = [account(1, active=True, weekly=20, weekly_reset=schedule.iso(at(day=14))),
+            account(2, weekly=20, weekly_reset=schedule.iso(at(day=15))), account(3, disabled=True)]
+    service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_not_called()
+    rows[0].usage.last_good["seven_day"]["pct"] = 80
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_called_once_with("2",json_output=True)
+
+
+def test_small_allocation_advantage_does_not_churn_accounts(tmp_path, monkeypatch):
+    rows = [account(1, active=True, weekly=30, weekly_reset=schedule.iso(at(day=14))),
+            account(2, weekly=20, weekly_reset=schedule.iso(at(day=14))), account(3, disabled=True)]
+    service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_not_called()
+    assert service.selection["preferred_account_id"] == "1"
+
+
+def test_imminent_weekly_expiry_accelerates_small_remaining_budget(tmp_path, monkeypatch):
+    rows = [account(1, active=True, weekly=20, weekly_reset=schedule.iso(at(day=19))),
+            account(2, weekly=98, weekly_reset=schedule.iso(at(7,5))), account(3, disabled=True)]
+    service, switcher, _, _, _ = harness(tmp_path, monkeypatch, rows)
+    service.select_account(service.source.take())
+    switcher.switch_to.assert_called_once_with("2",json_output=True)
+    metrics = service.selection["allocation_accounts"][0]
+    assert metrics["required_weekly_pct_per_hour"] == 4
