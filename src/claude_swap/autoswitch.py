@@ -3280,13 +3280,18 @@ class AutoSwitchEngine:
             # over a line, a peer's strategy bar (97 under `dynamic`) included. A peer
             # spent on 5h/7d is left to the ranking's "at its limit" refusal, so an
             # exhausted fleet is still reported as one (read unmodeled: `dynamic`'s
-            # model retry ranks on that axis).
+            # model retry ranks on that axis). The veto reads both axes: a header probe
+            # with no window for the model is unknown on `self._models`, not on `()`.
             own_bars = {n: self._bars.get(n, bar) for n in eligible}
             spent = {
                 n for n, h in _headroom_by_account(usage, ()).items()
                 if h is not None and h <= 0
             }
-            vetoed = [n for n in eligible if n not in spent and _over_own(n)]
+            vetoed = [
+                n for n in eligible if n not in spent and (
+                    _over_own(n) or over_own_threshold(n, usage, settings, (), own_bars)
+                )
+            ]
             self._veto_note = _vetoed_clause(vetoed, own_bars)
             candidates = [num for num in eligible if num not in vetoed]
             oauth_candidates = [

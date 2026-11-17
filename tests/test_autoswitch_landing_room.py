@@ -641,6 +641,25 @@ class TestFailoverNeverLandsOverTheLine:
         outcome = _fail_over(h, {"1": None, "2": _fable(10, seven, 100, _R_LATER)})
         _held_in_place(h, outcome, "Account-2 (line 97%)")
 
+    @pytest.mark.parametrize("model", ["Fable", "all"])
+    def test_a_header_probe_peer_over_the_bar_on_5h_7d_is_refused_beside_a_walled_one(
+        self, temp_home, model
+    ):
+        # #2 is walled only on the model window, which binds the whole fleet, so
+        # `dynamic` retries the ranking on 5h/7d (`models=()`). #3 is a header probe
+        # with no window for the model (unknown there, always so for `all`), but on
+        # the retry's axis it reads 99% 7d: over the 97 bar, never a failover landing.
+        h = _fleet(temp_home, 3, strategy="dynamic", threshold=90.0, model=model)
+        usage = {
+            "1": None,
+            "2": _fable(10, 50, 100, _R_LATER),
+            "3": _header_usage(
+                five_hour={"pct": 10.0},
+                seven_day={"pct": 99.0, "resets_at": _R_LATER},
+            ),
+        }
+        _held_in_place(h, _fail_over(h, usage), "Account-3 (line 97%)")
+
     def test_a_peer_with_room_on_the_pinned_model_is_taken(self, temp_home):
         h = _fleet(temp_home, 2, strategy="dynamic", threshold=99.0, model="Fable")
         outcome = _fail_over(h, {"1": None, "2": _fable(10, 50, 50, _R_LATER)})
