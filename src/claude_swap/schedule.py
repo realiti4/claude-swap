@@ -33,6 +33,7 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 
 TIMEZONE = "Asia/Shanghai"
 SLOTS = (("1", 7, 12), ("2", 12, 17), ("3", 17, 22))
+ACTIVATION_START_HOUR = 7
 THRESHOLD = 99.0
 INTERVAL = 15
 RETRY_SECONDS = 300
@@ -402,6 +403,7 @@ class DailySchedule:
         eligible = []
         available = []
         day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
+        activation_start, activation_end = boundaries(now, ACTIVATION_START_HOUR, ACTIVATION_START_HOUR + 5)
         for number, start_hour, end_hour in SLOTS:
             account = accounts.get(number)
             if account is None or not self.matches(account):
@@ -417,8 +419,8 @@ class DailySchedule:
             if start <= now < end:
                 due = account
             if (account.switchable and not account.disabled
-                    and (now >= start or f"{day}:{number}" in self.state["activations"])):
-                self.activate(account, start, end)
+                    and (now >= activation_start or f"{day}:{number}" in self.state["activations"])):
+                self.activate(account, activation_start, activation_end)
         current = accounts.get(snap.active_number)
         if current is not None and not self.matches(current):
             self.error = self.error or "active_account_not_bound_to_schedule"
@@ -493,6 +495,7 @@ class DailySchedule:
         atomic_write_json(self.root / "schedule-status.json", {
             "schemaVersion": 1, "updated_at": iso(now), "active_account_id": snap.active_number,
             "accounts": rows, "scheduler": {"enabled": True, "timezone": TIMEZONE,
+            "activation_start": f"{ACTIVATION_START_HOUR:02}:00",
             "threshold": THRESHOLD, "last_event": self.last_event, "error": self.error}})
 
 
@@ -547,7 +550,7 @@ def manage_launch_agent(root, *, uninstall=False):
 
 def command(argv):
     parser = argparse.ArgumentParser(prog="cswap schedule", description=__doc__)
-    parser.add_argument("--configure", action="store_true", help="Bind slots 1/2/3 to 07/12/17 Asia/Shanghai")
+    parser.add_argument("--configure", action="store_true", help="Bind slots 1/2/3 for 07:00 activation and 07/12/17 account selection")
     parser.add_argument("--once", action="store_true", help="Run one activation/failover/snapshot tick")
     parser.add_argument("--install", action="store_true", help="Install and start the macOS login agent")
     parser.add_argument("--uninstall", action="store_true", help="Stop and remove only this login agent")
@@ -567,7 +570,7 @@ def command(argv):
         if len(selected) != 3:
             parser.error("exactly slots 1, 2, 3 must exist")
         atomic_write_json(config_path, {"schemaVersion": 1, "enabled": True, "identities": selected})
-        print("Configured slots 1/2/3 at 07:00/12:00/17:00 Asia/Shanghai; threshold 99%.")
+        print("Configured all slots for 07:00 activation; selection at 07:00/12:00/17:00 Asia/Shanghai; threshold 99%.")
         return
     config = load_json(config_path)
     if config.get("enabled") is not True or len(config.get("identities", {})) != 3:

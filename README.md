@@ -142,7 +142,7 @@ The exact rules (margins, landing, polling cadence, tier handling) are in [docs/
 
 ### Daily quota windows
 
-`cswap schedule --configure` binds accounts 1/2/3 to 07:00/12:00/17:00 Asia/Shanghai; `cswap schedule --install` enables the macOS login agent with usage-confirmed activation, renewal until midnight and 99% failover. See [daily schedule rules and actual-reset limits](docs/daily-schedule.md).
+`cswap schedule --configure` binds accounts 1/2/3 for shared 07:00 activation and separate 07:00/12:00/17:00 account selection in Asia/Shanghai; `cswap schedule --install` enables the macOS login agent with usage-confirmed activation, renewal until midnight and 99% failover. See [daily schedule rules and actual-reset limits](docs/daily-schedule.md).
 
 ### Run multiple accounts at the same time (session mode)
 

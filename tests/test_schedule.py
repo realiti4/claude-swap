@@ -14,8 +14,10 @@ def at(hour=7, minute=0, day=13):
     return datetime.fromisoformat(f"2026-11-{day:02}T{hour:02}:{minute:02}:00+08:00").timestamp()
 
 
-def account(number, *, pct=0, weekly=20, active=False, age=0, reset=None,
+def account(number, *, pct=0, weekly=20, active=False, age=0, reset=...,
             sentinel=None, disabled=False):
+    if reset is ...:
+        reset = None if str(number) == "1" else schedule.iso(at(12))
     data = {"five_hour": {"pct": pct, "resets_at": reset},
             "seven_day": {"pct": weekly, "resets_at": None}}
     usage = SimpleNamespace(age_s=age, sentinel=sentinel, last_good=data,
@@ -47,14 +49,53 @@ def harness(tmp_path, monkeypatch, rows, now=None, probe=None):
     return service, switcher, freshener, clock, probe
 
 
-@pytest.mark.parametrize("hour,expected", [(0,[]),(6,[]),(7,["1"]),(11,["1"]),(12,["1","2"]),(16,["1","2"]),(17,["1","2","3"]),(21,["1","2","3"]),(22,["1","2","3"])])
+@pytest.mark.parametrize("hour,expected", [(0,[]),(6,[]),(7,["1","2","3"]),(11,["1","2","3"]),(12,["1","2","3"]),(16,["1","2","3"]),(17,["1","2","3"]),(21,["1","2","3"]),(22,["1","2","3"])])
 def test_all_due_accounts_receive_inference_without_starting_future_accounts(tmp_path, monkeypatch, hour, expected):
-    rows = [account(1), account(2, active=True), account(3)]
+    rows = [account(1, reset=None), account(2, active=True, reset=None), account(3, reset=None)]
     service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(hour))
     service.tick()
     attempts = [key.split(":")[-1] for key, rec in service.state["activations"].items() if rec.get("attempted_at")]
     assert attempts == expected
     assert probe.call_count == len(expected)
+
+
+def test_seven_am_activation_uses_each_accounts_own_credential(tmp_path, monkeypatch):
+    rows = [account(1, active=True, reset=None), account(2, reset=None), account(3, reset=None)]
+    service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows)
+    credentials = []
+    for row in switcher._build_accounts_info.return_value:
+        item = list(row)
+        item[5] = json.dumps({"claudeAiOauth": {"accessToken": f"TEST_TOKEN_{row[0]}"}})
+        credentials.append(tuple(item))
+    switcher._build_accounts_info.return_value = credentials
+    service.tick()
+    assert [call.args[0] for call in probe.call_args_list] == ["TEST_TOKEN_1", "TEST_TOKEN_2", "TEST_TOKEN_3"]
+    switcher.switch_to.assert_not_called()
+    assert all(record["attempted_at"] == schedule.iso(at()) for record in service.state["activations"].values())
+    assert json.loads((tmp_path / "schedule-status.json").read_text())["scheduler"]["activation_start"] == "07:00"
+
+
+@pytest.mark.parametrize("hour,current,target", [(7,3,"1"),(12,1,"2"),(17,2,"3")])
+def test_account_selection_remains_independent_of_shared_activation_time(tmp_path, monkeypatch, hour, current, target):
+    rows = [account(n, active=n == current, reset=None) for n in (1,2,3)]
+    service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(hour))
+    service.tick()
+    assert probe.call_count == 3
+    switcher.switch_to.assert_called_once_with(target, json_output=True)
+
+
+def test_morning_catch_up_only_starts_accounts_without_a_window(tmp_path, monkeypatch):
+    rows = [account(1, active=True, reset=schedule.iso(at(12))),
+            account(2, reset=None), account(3, reset=None)]
+    service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(10,21))
+    service.tick()
+    assert probe.call_count == 2
+    assert service.state["activations"]["2026-11-13:1"]["status"] == "already_active"
+    for number in ("2","3"):
+        record = service.state["activations"][f"2026-11-13:{number}"]
+        assert record["status"] == "request_accepted"
+        assert record["late_seconds"] == at(10,21) - at(7)
+    switcher.switch_to.assert_not_called()
 
 
 def test_restart_does_not_repeat_success(tmp_path, monkeypatch):
@@ -594,7 +635,7 @@ def test_confirmed_window_expiring_inside_slot_starts_second_window(tmp_path, mo
 
 
 def test_catch_up_does_not_switch_back_to_missed_account_or_repeat_on_restart(tmp_path, monkeypatch):
-    rows = [account(1), account(2, active=True), account(3)]
+    rows = [account(1), account(2, active=True, reset=None), account(3, disabled=True)]
     service, switcher, _, _, probe = harness(tmp_path, monkeypatch, rows, now=at(13))
     service.tick()
     assert probe.call_count == 2
@@ -619,7 +660,7 @@ def test_crossing_slot_end_during_credentials_still_sends_catch_up(tmp_path, mon
 
 
 def test_failed_catch_up_does_not_block_other_due_accounts(tmp_path, monkeypatch):
-    rows = [account(1), account(2, active=True), account(3)]
+    rows = [account(1), account(2, active=True, reset=None), account(3, disabled=True)]
     probe = Mock(side_effect=[TimeoutError("FAKE_TOKEN"), {}])
     service, _, _, _, _ = harness(tmp_path, monkeypatch, rows, now=at(13), probe=probe)
     service.tick()
