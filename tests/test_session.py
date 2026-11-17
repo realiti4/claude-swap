@@ -448,6 +448,25 @@ class TestBootstrap:
         assert ((session_dir / ".credentials.json").stat().st_mode & 0o777) == 0o600
         assert ((session_dir / ".claude.json").stat().st_mode & 0o777) == 0o600
 
+    def test_stamped_identity_ids_are_not_seeded_into_the_profile(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """The profile's own ``oauthAccount`` is the identity; ids stamped on
+        the stored credential by another login must not outrank it."""
+        stamped = json.loads(CREDS)
+        stamped["claudeAiOauth"].update(accountUuid="a", organizationUuid="o")
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, json.dumps(stamped), attributed=True
+        )
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(None, "transient"),
+        )
+
+        session_dir, _, _ = manager.setup_session("2", share=False)
+
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
     def test_reuse_skips_refresh_and_writes(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
     ):
@@ -473,25 +492,6 @@ class TestBootstrap:
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
-
-    def test_stamped_identity_ids_are_not_seeded_into_the_profile(
-        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
-    ):
-        """The profile's own ``oauthAccount`` is the identity; ids stamped on
-        the stored credential by another login must not outrank it."""
-        stamped = json.loads(CREDS)
-        stamped["claudeAiOauth"].update(accountUuid="a", organizationUuid="o")
-        seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, json.dumps(stamped), attributed=True
-        )
-        monkeypatch.setattr(
-            ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(None, "transient"),
-        )
-
-        session_dir, _, _ = manager.setup_session("2", share=False)
-
-        assert (session_dir / ".credentials.json").read_text() == CREDS
 
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
