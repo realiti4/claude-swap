@@ -1,8 +1,8 @@
 # Daily quota windows
 
-`cswap schedule` starts all three accounts at **07:00** each day in `Asia/Shanghai`, then renews each expired window until midnight. Default-account selection follows a separate rotation:
+`cswap schedule` starts all three accounts at **07:00** each day in `Asia/Shanghai`, then renews each expired window until midnight. Default-account selection prioritizes the earliest usable seven-day reset. Fixed selection times apply only when no available account has a trustworthy future seven-day reset:
 
-| Account slot | Activation start | Default-account selection |
+| Account slot | Activation start | Selection fallback |
 |---|---|---|
 | 1 | 07:00 | 07:00–12:00 |
 | 2 | 07:00 | 12:00–17:00 |
@@ -30,13 +30,19 @@ Regular usage polling explicitly disables inference-based header probes in this 
 
 ## Automatic switching
 
-At **99% or higher**, the scheduler switches the default Claude Code account to an available account below 99%. Both the shared five-hour and seven-day windows bind. Model-specific windows bind only when selected by the existing `autoswitch.model` setting; by default they are displayed but do not make the entire account unavailable. It prefers accounts whose selection slot has already started, then chooses the most remaining quota. If none qualify, an account with a later selection slot can be selected early. **99% failover takes priority over scheduled account selection**. Selection slots do not delay the shared 07:00 activation start, and the UI shows the provider's actual reset.
+The default account uses **earliest seven-day expiry first**, at any time of day. Among enabled accounts below 99% in every applicable quota, the scheduler prefers the earliest future `seven_day.resets_at`. This priority overrides 07:00/12:00/17:00 selection slots. It concentrates ordinary work on quota that will expire first; it does not generate extra work to consume quota. Full consumption cannot be guaranteed without enough real workload or when the five-hour limit blocks further use. The 99% cutoff remains in effect.
+
+Reset times within **30 minutes of the earliest deadline** form an equivalent group. If the current account is usable and in that group, it stays selected. When a new account is needed, the group with the earliest deadline comes first; within a group, more remaining seven-day quota wins, followed by more remaining five-hour quota and then slot number. This avoids switches caused by small provider timestamp changes and percentage updates. An unknown, invalid or expired weekly reset never outranks a known future deadline. If every available weekly reset is unknown, the original selection-slot rules are the fallback.
+
+Normal priority changes have a **10-minute minimum hold** after an automatic switch or an observed manual switch. The hold persists across service restarts. Reaching **99% or higher** in the shared five-hour, shared seven-day, or configured model quota bypasses the hold and selects the next available account using the same weekly ranking. An unavailable current account also does not hold up a known usable candidate. When an earlier-expiring account's five-hour quota recovers, it regains priority after the hold. After a weekly reset, fresh provider usage determines the new order. A refused credential is skipped; a failed priority switch does not move a usable current account to a later deadline.
+
+Both the shared five-hour and seven-day windows bind. Model-specific windows bind only when selected by the existing `autoswitch.model` setting; by default they are displayed but do not make the entire account unavailable. Shared 07:00 activation and midnight renewal limits are independent of weekly selection.
 
 Targets must have decision-grade usage, matching configured identities, valid finite utilization, an enabled OAuth account, and credentials that the upstream refresh gate can safely freshen. A live isolated session, failed refresh, disabled account, unknown usage or an expired reset from an old sample prevents selection. All unavailable means no switch; the status reports that condition. No production account is deliberately exhausted to test failover.
 
 The service checks every 15 seconds. Actual usage fetches follow upstream's adaptive polling and server backoff, so this is a **sampled threshold**, not a guarantee that a busy request cannot cross 100% between samples. Upstream can trust deliberately older samples under bounded conditions; the display marks samples older than 300 seconds as stale even when the usage store still trusts them for a decision.
 
-Each scheduled slot is selected once. Subsequent manual or threshold-driven switches are respected until a new slot begins. Credential writes use upstream's transaction and token refresh paths. Upstream documents that running Claude Code instances on macOS may take about 30 seconds to reread the Keychain; the scheduler does not terminate them. `cswap run` isolated profiles and external API-token overrides do not follow the default account switch.
+When weekly deadlines are unavailable, each fallback selection slot is selected once. With weekly deadlines available, a manual selection is held for 10 minutes before normal weekly priority resumes; quota exhaustion or unavailability can end the hold sooner. Credential writes use upstream's transaction and token refresh paths. Upstream documents that running Claude Code instances on macOS may take about 30 seconds to reread the Keychain; the scheduler does not terminate them. `cswap run` isolated profiles and external API-token overrides do not follow the default account switch.
 
 ## Files and display integration
 
@@ -45,13 +51,13 @@ All files live under the normal backup root (`~/.claude-swap-backup` on macOS):
 | File | Purpose |
 |---|---|
 | `schedule.json` | Enabled flag and hashes binding slots to account identities |
-| `schedule-state.json` | Persisted activation attempts, cycle history, retry counts, confirmation state and last selected slot |
+| `schedule-state.json` | Persisted activation attempts, cycle history, retry counts, confirmation state, last selected slot and persistent selection hold |
 | `schedule-status.json` | Atomic, sanitized display snapshot |
 | `schedule-events.jsonl` | Sanitized activation and switching events; no credentials or response bodies |
 | `schedule-refresh.request` | A display may touch this file; the next 15-second check consumes it |
 | `.schedule.lock` | Process-ownership lock; only one scheduler runs |
 | `schedule.stdout.log`, `schedule.stderr.log` | Login-agent output |
 
-The display snapshot has `schemaVersion: 1`, UTC `updated_at`, `active_account_id`, an `accounts` array, and `scheduler`. Account rows contain a slot ID, alias, masked email, subscription label, sampled quota percentages, raw provider reset times, sampling timestamp, selection slot and activation status. The scheduler exposes `activation_start: "07:00"` separately from selection slots. Activation records also expose the requested model, total daily attempt count, current cycle number and attempt count, cycle due time, retry deadline, confirmation timestamps and confirmed reset offset from the target end when present. They never contain tokens, raw credentials or account UUIDs. Model rows use `seven_day_sonnet`, `seven_day_opus`, `seven_day_fable` or `seven_day_haiku` when present. A display must age the global heartbeat independently of per-account samples; a stopped service cannot keep its own `enabled` flag current.
+The display snapshot has `schemaVersion: 1`, UTC `updated_at`, `active_account_id`, an `accounts` array, and `scheduler`. Account rows contain a slot ID, alias, masked email, subscription label, sampled quota percentages, raw provider reset times, sampling timestamp, selection slot and activation status. The scheduler exposes `activation_start: "07:00"` separately from selection slots. Its `selection` object reports the weekly policy, decision reason, preferred account and weekly reset, ranked available account IDs, last change, hold deadline, and the 600-second hold and 1800-second deadline tolerance. Slot fields remain the selection fallback, not a prediction of weekly priority. Activation records also expose the requested model, total daily attempt count, current cycle number and attempt count, cycle due time, retry deadline, confirmation timestamps and confirmed reset offset from the target end when present. They never contain tokens, raw credentials or account UUIDs. Model rows use `seven_day_sonnet`, `seven_day_opus`, `seven_day_fable` or `seven_day_haiku` when present. A display must age the global heartbeat independently of per-account samples; a stopped service cannot keep its own `enabled` flag current.
 
 The refresh file never bypasses provider rate limits or starts inference. The process-ownership lock is independent of account/usage transaction locks; no account lock is held during the activation request. The active account store, backup stores and refresh-token successors remain owned by upstream modules.

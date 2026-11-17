@@ -42,6 +42,8 @@ MAX_ATTEMPTS = 3
 ACTIVATION_MODEL = "claude-sonnet-5-5"
 ACTIVATION_MAX_TOKENS = 16
 ACTIVATION_PROMPT = "Reply with OK."
+WEEKLY_RESET_TIE_SECONDS = 1800
+SELECTION_COOLDOWN_SECONDS = 600
 
 
 def iso(ts):
@@ -150,6 +152,29 @@ def activation_percentages(account, now):
     return percentages(account, now, models)
 
 
+def weekly_reset(account, now):
+    data = account.usage.decision_value()
+    window = data.get("seven_day") if isinstance(data, dict) else None
+    reset = timestamp(window.get("resets_at")) if isinstance(window, dict) else None
+    return reset if reset is not None and reset > now else None
+
+
+def rank_available(accounts, now, eligible, models):
+    known = [(weekly_reset(a, now), a) for a in accounts if weekly_reset(a, now) is not None]
+    known.sort(key=lambda item: item[0])
+    ranked = []
+    while known:
+        end = known[0][0] + WEEKLY_RESET_TIE_SECONDS
+        group = [a for reset, a in known if reset <= end]
+        group.sort(key=lambda a: (percentages(a, now, models)[1],
+                                  percentages(a, now, models)[0], int(a.number)))
+        ranked.extend(group)
+        known = [(reset, a) for reset, a in known if reset > end]
+    ranked.extend(sorted((a for a in accounts if weekly_reset(a, now) is None),
+                         key=lambda a: (a not in eligible, max(percentages(a, now, models)), int(a.number))))
+    return ranked
+
+
 class ScheduledSwitcher(ClaudeAccountSwitcher):
     """Scheduling polls never initiate inference, even if a UI opts into probes."""
 
@@ -170,6 +195,7 @@ class DailySchedule:
         self.state.setdefault("activations", {})
         self.last_event = self.state.get("last_event")
         self.error = None
+        self.selection = {}
         self.model_setting = load_settings(self.root).model
         self.models = parse_model_names(self.model_setting)
         self.freshener = AutoSwitchEngine(
@@ -384,9 +410,19 @@ class DailySchedule:
         if self.freshener._freshen_target(account.number, account.email) != "ok":
             self.event("switch_blocked", f"Account {account.number}: credential unavailable")
             return False
+        values = percentages(account, self.clock(), self.models)
+        if values is None or max(values) >= THRESHOLD:
+            self.event("switch_blocked", f"Account {account.number}: usage no longer available")
+            return False
         try:
             result = self.switcher.switch_to(account.number, json_output=True)
             if result and result.get("switched"):
+                self.state["selection_active_account"] = account.number
+                self.state["selection_changed_at"] = iso(self.clock())
+                self.selection.update(preferred_account_id=account.number,
+                                      preferred_weekly_resets_at=iso(weekly_reset(account, self.clock())),
+                                      last_changed_at=self.state["selection_changed_at"],
+                                      hold_until=iso(self.clock() + SELECTION_COOLDOWN_SECONDS))
                 self.event("switched", f"Account {account.number}: {reason}")
                 return True
             return bool(result and result.get("reason") == "already-active")
@@ -399,11 +435,26 @@ class DailySchedule:
         snap = self.source.take()
         now = self.clock()
         accounts = {a.number: a for a in snap.accounts}
+        day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
+        activation_start, activation_end = boundaries(now, ACTIVATION_START_HOUR, ACTIVATION_START_HOUR + 5)
+        for number, _, _ in SLOTS:
+            account = accounts.get(number)
+            if account is None or not self.matches(account):
+                self.error = "configured_account_missing_or_changed"
+                continue
+            if (account.switchable and not account.disabled
+                    and (now >= activation_start or f"{day}:{number}" in self.state["activations"])):
+                self.activate(account, activation_start, activation_end)
+        self.select_account(self.source.take(store_only=True))
+        self.publish(self.source.take(store_only=True))
+
+    def select_account(self, snap):
+        now = self.clock()
+        accounts = {a.number: a for a in snap.accounts}
         due = None
         eligible = []
         available = []
         day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
-        activation_start, activation_end = boundaries(now, ACTIVATION_START_HOUR, ACTIVATION_START_HOUR + 5)
         for number, start_hour, end_hour in SLOTS:
             account = accounts.get(number)
             if account is None or not self.matches(account):
@@ -418,30 +469,74 @@ class DailySchedule:
                     eligible.append(account)
             if start <= now < end:
                 due = account
-            if (account.switchable and not account.disabled
-                    and (now >= activation_start or f"{day}:{number}" in self.state["activations"])):
-                self.activate(account, activation_start, activation_end)
+        self.selection = {"policy": "weekly_expiry", "reason": "waiting_usage",
+                          "preferred_account_id": None, "preferred_weekly_resets_at": None,
+                          "ranked_account_ids": [], "cooldown_seconds": SELECTION_COOLDOWN_SECONDS,
+                          "deadline_tolerance_seconds": WEEKLY_RESET_TIE_SECONDS}
         current = accounts.get(snap.active_number)
         if current is not None and not self.matches(current):
             self.error = self.error or "active_account_not_bound_to_schedule"
-            self.publish(snap)
             return
+        if self.state.get("selection_active_account") != snap.active_number:
+            if "selection_active_account" in self.state:
+                self.state["selection_changed_at"] = iso(now)
+            self.state["selection_active_account"] = snap.active_number
+            self.save()
+        changed_at = timestamp(self.state.get("selection_changed_at"))
+        hold_until = changed_at + SELECTION_COOLDOWN_SECONDS if changed_at is not None else 0
+        self.selection["last_changed_at"] = iso(changed_at)
+        self.selection["hold_until"] = iso(hold_until) if hold_until > now else None
+        ranked = rank_available(available, now, eligible, self.models)
+        self.selection["ranked_account_ids"] = [a.number for a in ranked]
+        if ranked:
+            self.selection["preferred_account_id"] = ranked[0].number
+            self.selection["preferred_weekly_resets_at"] = iso(weekly_reset(ranked[0], now))
         values = percentages(current, now, self.models) if current else None
         if current and values is not None and max(values) >= THRESHOLD:
-            candidates = sorted((a for a in available if not a.is_active),
-                                key=lambda a: (a not in eligible, max(percentages(a, now, self.models)), int(a.number)))
+            self.selection["reason"] = "usage_reached_99"
             switched = False
-            for account in candidates:
+            for account in ranked:
+                if account.is_active:
+                    continue
                 reason = "usage reached 99%"
-                if account not in eligible:
+                if weekly_reset(account, now) is not None:
+                    reason += "; earliest available 7d reset"
+                elif account not in eligible:
                     reason += "; future slot used early, actual reset may shift"
                 if self.switch(account, reason):
                     switched = True
                     break
             if not switched:
                 self.event("all_unavailable", "No available account with fresh usage below 99%")
-        elif due and due in eligible and not due.is_active:
-            day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
+            return
+        known = [a for a in ranked if weekly_reset(a, now) is not None]
+        if known:
+            earliest = min(weekly_reset(a, now) for a in known)
+            current_reset = weekly_reset(current, now) if current in available else None
+            if current_reset is not None and current_reset <= earliest + WEEKLY_RESET_TIE_SECONDS:
+                self.selection.update(reason="current_earliest_group", preferred_account_id=current.number,
+                                      preferred_weekly_resets_at=iso(current_reset))
+                return
+            if current in available and now < hold_until:
+                self.selection["reason"] = "selection_cooldown"
+                return
+            self.selection["reason"] = "earliest_weekly_reset"
+            for account in known:
+                if account.is_active:
+                    continue
+                reset = weekly_reset(account, now)
+                if current_reset is not None and reset >= current_reset:
+                    continue
+                if self.switch(account, "earliest available 7d reset"):
+                    self.selection.update(preferred_account_id=account.number, preferred_weekly_resets_at=iso(reset))
+                    return
+            self.selection["reason"] = "weekly_selection_blocked"
+            return
+        self.selection["reason"] = "scheduled_fallback"
+        if current in available and now < hold_until:
+            self.selection["reason"] = "selection_cooldown"
+            return
+        if due and due in eligible and not due.is_active:
             selected = f"{day}:{due.number}"
             # Select the scheduled slot once. A subsequent manual/failover
             # switch is respected rather than being undone on every tick.
@@ -449,11 +544,8 @@ class DailySchedule:
                 self.state["selected_slot"] = selected
                 self.save()
         elif due and due.is_active:
-            day = datetime.fromtimestamp(now, ZoneInfo(TIMEZONE)).date().isoformat()
             self.state["selected_slot"] = f"{day}:{due.number}"
             self.save()
-        snap = self.source.take(store_only=True)
-        self.publish(snap)
 
     def publish(self, snap):
         now = self.clock()
@@ -496,6 +588,7 @@ class DailySchedule:
             "schemaVersion": 1, "updated_at": iso(now), "active_account_id": snap.active_number,
             "accounts": rows, "scheduler": {"enabled": True, "timezone": TIMEZONE,
             "activation_start": f"{ACTIVATION_START_HOUR:02}:00",
+            "selection": self.selection,
             "threshold": THRESHOLD, "last_event": self.last_event, "error": self.error}})
 
 
@@ -550,7 +643,7 @@ def manage_launch_agent(root, *, uninstall=False):
 
 def command(argv):
     parser = argparse.ArgumentParser(prog="cswap schedule", description=__doc__)
-    parser.add_argument("--configure", action="store_true", help="Bind slots 1/2/3 for 07:00 activation and 07/12/17 account selection")
+    parser.add_argument("--configure", action="store_true", help="Bind slots 1/2/3 for 07:00 activation and earliest-7d-reset selection")
     parser.add_argument("--once", action="store_true", help="Run one activation/failover/snapshot tick")
     parser.add_argument("--install", action="store_true", help="Install and start the macOS login agent")
     parser.add_argument("--uninstall", action="store_true", help="Stop and remove only this login agent")
@@ -570,7 +663,7 @@ def command(argv):
         if len(selected) != 3:
             parser.error("exactly slots 1, 2, 3 must exist")
         atomic_write_json(config_path, {"schemaVersion": 1, "enabled": True, "identities": selected})
-        print("Configured all slots for 07:00 activation; selection at 07:00/12:00/17:00 Asia/Shanghai; threshold 99%.")
+        print("Configured all slots for 07:00 activation in Asia/Shanghai; earliest 7d reset selection; threshold 99%.")
         return
     config = load_json(config_path)
     if config.get("enabled") is not True or len(config.get("identities", {})) != 3:
