@@ -190,13 +190,20 @@ def test_a_newer_plaintext_login_is_never_written_over_the_keychain_item(
 
 
 @pytest.mark.parametrize("file_present", [True, False])
-def test_a_keychain_strip_bumps_a_present_credentials_file_mtime_and_never_creates_it(
-    temp_home: Path, block_real_keychain, file_present: bool,
+def test_a_keychain_strip_stamps_a_present_credentials_file_to_the_item_mdat_and_never_creates_it(
+    temp_home: Path, block_real_keychain, monkeypatch, file_present: bool,
 ):
-    s, live = _active_switcher(temp_home, _login(access="sk-other-lineage"))
+    # The file holds another lineage with a far-apart refresh stamp: a mtime later than
+    # the item's mdat would make `_fresher_plaintext_login` serve it as the live login.
+    s, live = _active_switcher(
+        temp_home, _login(access="sk-other-lineage", refreshTokenExpiresAt=9_000_000_000_000))
     s.platform = Platform.MACOS
     key = (credentials.CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
-    block_real_keychain.data[key] = json.dumps(_login(**IDS))
+    kc_login = _login(refreshTokenExpiresAt=1_000_000_000_000)
+    block_real_keychain.data[key] = json.dumps({**kc_login, "claudeAiOauth": {
+        **kc_login["claudeAiOauth"], **IDS}})
+    mdat = float(int(time.time()) - 1)  # the strip's write lands in a later second
+    monkeypatch.setattr(macos_keychain, "item_modified_at", lambda service, account: mdat)
     before = live.read_bytes()
     old = time.time() - 3600
     os.utime(live, (old, old))
@@ -205,8 +212,9 @@ def test_a_keychain_strip_bumps_a_present_credentials_file_mtime_and_never_creat
 
     s._build_accounts_info()
 
-    assert json.loads(block_real_keychain.data[key]) == _login()
-    if file_present:  # CC re-reads on an mtime change; the other lineage's bytes stay
-        assert live.stat().st_mtime > old + 3000 and live.read_bytes() == before
+    assert json.loads(block_real_keychain.data[key]) == kc_login
+    if file_present:  # CC re-reads on an mtime change; the bytes stay, the file never looks newer
+        assert live.stat().st_mtime == pytest.approx(mdat, abs=1e-3) and live.read_bytes() == before
+        assert json.loads(s._store._read_active_credentials().value) == kc_login
     else:
         assert not live.exists()

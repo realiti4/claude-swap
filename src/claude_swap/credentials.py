@@ -1473,9 +1473,9 @@ class CredentialStore:
         overwritten. The Keychain route writes the item alone, never through
         ``_write_oauth_credentials`` or ``_kc_call``: their failure arm moves
         the login into the plaintext file and flips routing; an existing
-        ``.credentials.json`` only has its mtime touched. Skipped for a
-        degraded read and a macOS custom profile. A failure keeps the original
-        bytes and is logged once per generation.
+        ``.credentials.json`` only has its mtime set to the item's mdat. Skipped
+        for a degraded read and a macOS custom profile. A failure keeps the
+        original bytes and is logged once per generation.
         """
         creds = active.value or ""
         stripped = _drop_stamped_ids(creds)
@@ -1500,16 +1500,20 @@ class CredentialStore:
                 if keychain:
                     macos_keychain.set_password(*item, stripped)
                     # Claude Code drops its memoized login only on a file mtime
-                    # change; the file may hold another lineage, so touch, never write.
-                    try:
-                        os.utime(get_credentials_path())
-                    except FileNotFoundError:
-                        pass
-                    except OSError as e:
-                        self._host._logger.warning(
-                            f"Could not touch .credentials.json after the strip ({e}); "
-                            "a running session may keep the ids until restart"
-                        )
+                    # change; the file may hold another lineage, so never write it.
+                    # Stamp it to the item's mdat as the adopt sync does: "now" would
+                    # outrun the item and `_fresher_plaintext_login` would serve it.
+                    mdat = self._active_oauth_keychain_mdat()
+                    if mdat is not None:
+                        try:
+                            os.utime(get_credentials_path(), (mdat, mdat))
+                        except FileNotFoundError:
+                            pass
+                        except OSError as e:
+                            self._host._logger.warning(
+                                f"Could not stamp .credentials.json after the strip ({e}); "
+                                "a running session may keep the ids until restart"
+                            )
                 else:
                     self._write_active_credentials_file(stripped)
         except (ClaudeSwitchError, *macos_keychain.KEYCHAIN_ERRORS) as e:
