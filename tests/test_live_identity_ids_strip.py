@@ -187,3 +187,26 @@ def test_a_newer_plaintext_login_is_never_written_over_the_keychain_item(
     assert row[5] == newer, "the active read must have served the plaintext file here"
     assert block_real_keychain.data[key] == older, "file-sourced bytes were written into the Keychain"
     assert live.read_text(encoding="utf-8") == newer
+
+
+@pytest.mark.parametrize("file_present", [True, False])
+def test_a_keychain_strip_bumps_a_present_credentials_file_mtime_and_never_creates_it(
+    temp_home: Path, block_real_keychain, file_present: bool,
+):
+    s, live = _active_switcher(temp_home, _login(access="sk-other-lineage"))
+    s.platform = Platform.MACOS
+    key = (credentials.CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+    block_real_keychain.data[key] = json.dumps(_login(**IDS))
+    before = live.read_bytes()
+    old = time.time() - 3600
+    os.utime(live, (old, old))
+    if not file_present:
+        live.unlink()
+
+    s._build_accounts_info()
+
+    assert json.loads(block_real_keychain.data[key]) == _login()
+    if file_present:  # CC re-reads on an mtime change; the other lineage's bytes stay
+        assert live.stat().st_mtime > old + 3000 and live.read_bytes() == before
+    else:
+        assert not live.exists()
