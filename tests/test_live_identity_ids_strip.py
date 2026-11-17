@@ -170,3 +170,20 @@ def test_the_keychain_route_writes_the_item_only_and_a_failed_write_leaves_the_i
     else:
         assert json.loads(block_real_keychain.data[key]) == _login()
         assert json.loads(row[5]) == _login()
+
+
+def test_a_newer_plaintext_login_is_never_written_over_the_keychain_item(
+    temp_home: Path, block_real_keychain,
+):
+    older = json.dumps(_login(access="sk-old", refreshTokenExpiresAt=5, expiresAt=1000, **IDS))
+    newer = json.dumps(_login(access="sk-new", refreshTokenExpiresAt=5, expiresAt=2000, **IDS))
+    s, live = _active_switcher(temp_home, json.loads(newer))
+    s.platform = Platform.MACOS
+    key = (credentials.CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+    block_real_keychain.data[key] = older
+
+    row = s._build_accounts_info()[0]
+
+    assert row[5] == newer, "the active read must have served the plaintext file here"
+    assert block_real_keychain.data[key] == older, "file-sourced bytes were written into the Keychain"
+    assert live.read_text(encoding="utf-8") == newer

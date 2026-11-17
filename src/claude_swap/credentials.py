@@ -1468,13 +1468,13 @@ class CredentialStore:
         cswap only observes a login Claude Code wrote, and every other observe
         path ends in a slot backup, so the ids would stay live until a switch.
         Holds the refresh pair then ``.storage-write.lock`` (Claude Code's own
-        nesting) and writes only when a fresh re-read still equals the bytes
-        read, so a login that landed in between is never overwritten. Skipped
-        for a degraded read and a macOS custom profile. On the Keychain route
-        it writes the item alone, never through ``_write_oauth_credentials``
-        or ``_kc_call``: their failure arm moves the login into the plaintext
-        file and flips routing, and a pass that only observed must do neither.
-        A failure keeps the original bytes and is logged once per generation.
+        nesting) and writes only when a fresh re-read of the store it writes
+        still equals the bytes read, so a login that landed in between is never
+        overwritten. The Keychain route writes the item alone, never through
+        ``_write_oauth_credentials`` or ``_kc_call``: their failure arm moves
+        the login into the plaintext file and flips routing. Skipped for a
+        degraded read and a macOS custom profile. A failure keeps the original
+        bytes and is logged once per generation.
         """
         creds = active.value or ""
         stripped = _drop_stamped_ids(creds)
@@ -1483,6 +1483,7 @@ class CredentialStore:
         keychain = self._use_keychain()
         if keychain and not _active_store_is_the_default_secure_store():
             return creds
+        item = (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
         try:
             with (
                 claude_credentials_lock(timeout=_STRIP_LOCK_TIMEOUT_S),
@@ -1490,14 +1491,13 @@ class CredentialStore:
             ):
                 with macos_keychain.fresh_reads():
                     again = self._read_active_credentials()
-                if again.value != creds or again.degraded:
+                    # That read can serve a newer plaintext login, and a
+                    # Keychain write replaces the item, not the file.
+                    stored = macos_keychain.get_password(*item) if keychain else again.value
+                if again.degraded or again.value != creds or stored != creds:
                     return creds
                 if keychain:
-                    macos_keychain.set_password(
-                        CLAUDE_CODE_KEYCHAIN_SERVICE,
-                        macos_keychain.keychain_account_name(),
-                        stripped,
-                    )
+                    macos_keychain.set_password(*item, stripped)
                 else:
                     self._write_active_credentials_file(stripped)
         except (ClaudeSwitchError, *macos_keychain.KEYCHAIN_ERRORS) as e:
