@@ -711,7 +711,7 @@ class TestCollector:
     ):
         info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
-        monkeypatch.setattr(switcher, "_build_accounts_info", lambda: info)
+        monkeypatch.setattr(switcher, "_build_accounts_info", lambda **_kw: info)
         monkeypatch.setattr(
             subscription, "fetch_plan", lambda t, *a, **k: pytest.fail("network")
         )
