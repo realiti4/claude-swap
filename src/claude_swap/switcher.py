@@ -5782,6 +5782,8 @@ class ClaudeAccountSwitcher:
                     active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
+                if not self._suppress_login_restore_write:
+                    creds = self._store._strip_stamped_ids_from_live(active)
             else:
                 # Display read cache: this value feeds sentinels, token-status
                 # lines and the usage GET. Nothing writes or POSTs it — the

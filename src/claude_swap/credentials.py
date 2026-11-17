@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple, Protocol
 
 from claude_swap import macos_keychain, oauth
+from claude_swap.claude_locks import claude_credentials_lock, claude_storage_write_lock
 from claude_swap.exceptions import (
     ClaudeSwitchError,
     CredentialError,
@@ -281,6 +282,24 @@ def _credential_object(credentials: str | None) -> dict | None:
     except (json.JSONDecodeError, TypeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+# The two ids a newer Claude Code stamps on ``claudeAiOauth``. It reads them
+# ahead of ``~/.claude.json`` ``oauthAccount``, so a login carrying them names
+# a second identity.
+_STAMPED_ID_KEYS = ("accountUuid", "organizationUuid")
+# Bound on each lock the observed-login strip takes: the next pass retries.
+_STRIP_LOCK_TIMEOUT_S = 2.0
+
+
+def _drop_stamped_ids(credentials: str) -> str:
+    """``credentials`` without the stamped ids; anything else as given."""
+    data = _credential_object(credentials)
+    login = data.get("claudeAiOauth") if data else None
+    if not isinstance(login, dict) or not any(k in login for k in _STAMPED_ID_KEYS):
+        return credentials
+    data["claudeAiOauth"] = {k: v for k, v in login.items() if k not in _STAMPED_ID_KEYS}
+    return json.dumps(data)
 
 
 # The credential object's siblings of claudeAiOauth are not uniformly owned:
@@ -1115,7 +1134,7 @@ class CredentialStore:
         """Atomically write Claude Code's plaintext active-credentials file."""
         cred_file = get_credentials_path()
         cred_file.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(cred_file, credentials)
+        atomic_write_text(cred_file, _drop_stamped_ids(credentials))
 
     def _delete_active_keychain_entry(self) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
@@ -1442,6 +1461,46 @@ class CredentialStore:
                 "a running session may not hot-reload until restart"
             )
 
+    def _strip_stamped_ids_from_live(self, active: ActiveCredentials) -> str:
+        """The live login ``active`` was read as, with the stamped ids dropped
+        from the live store first when it carries them.
+
+        cswap only observes a login Claude Code wrote, and every other observe
+        path ends in a slot backup, so the ids would stay live until a switch.
+        Holds the refresh pair then ``.storage-write.lock`` (Claude Code's own
+        nesting) and writes only when a fresh re-read still equals the bytes
+        read, so a login that landed in between is never overwritten. Skipped
+        for a degraded read and a macOS custom profile (the write would move
+        its login from the Keychain to the file). A failure keeps the original
+        bytes and is logged once per generation.
+        """
+        creds = active.value or ""
+        stripped = _drop_stamped_ids(creds)
+        if stripped == creds or active.degraded or active.keychain_unavailable:
+            return creds
+        if self._use_keychain() and not _active_store_is_the_default_secure_store():
+            return creds
+        try:
+            with (
+                claude_credentials_lock(timeout=_STRIP_LOCK_TIMEOUT_S),
+                claude_storage_write_lock(timeout=_STRIP_LOCK_TIMEOUT_S),
+            ):
+                with macos_keychain.fresh_reads():
+                    again = self._read_active_credentials()
+                if again.value != creds or again.degraded:
+                    return creds
+                self._write_oauth_credentials(stripped)
+        except (ClaudeSwitchError, OSError) as e:
+            self._log_detected_login(
+                creds, slot=None,
+                outcome=f"ids left in the live store: {type(e).__name__}",
+            )
+            return creds
+        self._log_detected_login(
+            creds, slot=None, outcome="stripped the stamped ids from the live store",
+        )
+        return stripped
+
     # Cap on `_log_detected_login`'s dedup set. Generous for a single
     # long-lived TUI/daemon process (a handful of accounts, a handful of
     # outcomes each) -- never expected to fill under ordinary use.
@@ -1569,6 +1628,8 @@ class CredentialStore:
             secure_dir = Path(secure_env) if secure_env else get_default_claude_config_home()
             if secure_dir.resolve() != get_claude_config_home().resolve():
                 return
+        # Compared and stamped below in the form the file is written in.
+        credentials = _drop_stamped_ids(credentials)
         current = None
         try:
             if self._fresher_plaintext_login(
