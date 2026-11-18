@@ -6,11 +6,16 @@ disable-model-invocation: true
 
 # Handoff
 
-Thinking from one Claude organization cannot be reused after `cswap switch`, so
-write down what the next session needs to know.
+With some models, thinking from one Claude organization cannot be reused after
+`cswap switch` to another, so write down what the next session needs to know.
 
 1. Target file: the path given as the argument (`$ARGUMENTS`) if any. Otherwise
-   run `echo ${XDG_STATE_HOME:-~/.local/state}/claude-handoff/$(pwd | tr / -).md`.
+   run `printenv XDG_STATE_HOME` and `pwd` as two separate plain commands (no
+   `${...}` or `$(...)`, which the permission check may block). The path is
+   `<state>/claude-handoff/<cwd>.md`, where `<state>` is that value (or
+   `~/.local/state` if it is empty) and `<cwd>` is the `pwd` output with every
+   `/` replaced by `-`. If either command is not allowed to run, stop and ask
+   for the path instead of guessing: a note in the wrong place is never read.
 2. Write that file (overwrite it; the Write tool creates the directory) with
    these sections, short and concrete:
    - **Goal**: what we are trying to achieve
