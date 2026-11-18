@@ -405,6 +405,148 @@ class TestPolicySurvivesRenumber(PolicyStoreBase):
         assert "2" not in (s._get_sequence_data() or {})["accounts"]
 
 
+class TestCarriedSettings:
+    """`_carried_settings` is the one list of what a `--slot` rebuild keeps."""
+
+    def test_copies_only_the_user_set_fields(self):
+        record = {
+            "email": "a@example.test", "uuid": "u", "organizationUuid": "",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+            "kind": "api_key",
+            "alias": "work", "disabled": True, "threshold": 85.0, "priority": 2,
+        }
+        assert ClaudeAccountSwitcher._carried_settings(record) == {
+            "alias": "work", "disabled": True, "threshold": 85.0, "priority": 2,
+        }
+
+    def test_absent_keys_stay_absent(self):
+        """The setters pop a cleared setting; a copy must not reintroduce one."""
+        assert ClaudeAccountSwitcher._carried_settings({"email": "a@example.test"}) == {}
+        assert ClaudeAccountSwitcher._carried_settings({"threshold": None}) == {}
+        assert ClaudeAccountSwitcher._carried_settings(None) == {}
+
+
+class TestPolicySurvivesSlotReadd(PolicyStoreBase):
+    """`add --slot N` / `add-token --slot N` on the account already in N (or
+    moving it there) rebuild the record wholesale; the user's settings on it
+    ride along, the same way #358 made the alias and the disabled flag do.
+
+    Only a same-identity prior record is read. Overwriting a slot with a
+    different account ends that slot's lineage and the newcomer starts on the
+    global policy.
+    """
+
+    @staticmethod
+    def _make_live(temp_home: Path, email: str, num: int) -> None:
+        """Point the live login at a seeded account."""
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-live-{num}", "refreshToken": f"rt-live-{num}"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}
+        }))
+
+    def _park_with_policy(self, s: ClaudeAccountSwitcher, num: str) -> None:
+        s.set_alias(num, "work")
+        s.set_account_disabled(num, True)
+        s.set_account_threshold(num, 85.0)
+        s.set_account_priority(num, 2)
+
+    def test_every_setter_written_key_is_carried(self, temp_home: Path):
+        """Whatever the four setters put on a record is exactly what a rebuild
+        keeps, so a new per-account setting cannot be added to one side only."""
+        s = self._fleet(temp_home, count=1)
+        before = dict(self._record(s, "1"))
+        self._park_with_policy(s, "1")
+        record = self._record(s, "1")
+        written = {k: v for k, v in record.items() if k not in before}
+        assert written, "the setters wrote nothing"
+        assert ClaudeAccountSwitcher._carried_settings(record) == written
+
+    def test_slot_refresh_keeps_threshold_and_priority(self, temp_home: Path):
+        s = self._fleet(temp_home, count=2)
+        self._park_with_policy(s, "2")
+        self._make_live(temp_home, "account-2@example.test", 2)
+
+        s.add_account(slot=2)
+
+        record = self._record(s, "2")
+        assert record["threshold"] == pytest.approx(85.0)
+        assert record["priority"] == 2
+        assert record["alias"] == "work" and record["disabled"] is True
+        assert s.account_policies()["2"] == AccountPolicy(threshold=85.0, priority=2)
+
+    def test_slot_migration_keeps_threshold_and_priority(self, temp_home: Path):
+        s = self._fleet(temp_home, count=2)
+        self._park_with_policy(s, "2")
+        self._make_live(temp_home, "account-2@example.test", 2)
+
+        s.add_account(slot=5)
+
+        assert "2" not in (s._get_sequence_data() or {})["accounts"]
+        assert s.account_policies()["5"] == AccountPolicy(threshold=85.0, priority=2)
+        assert self._record(s, "5")["alias"] == "work"
+
+    def test_explicit_alias_still_wins_over_the_carried_one(self, temp_home: Path):
+        s = self._fleet(temp_home, count=2)
+        self._park_with_policy(s, "2")
+        self._make_live(temp_home, "account-2@example.test", 2)
+
+        s.add_account(slot=2, alias="renamed")
+
+        record = self._record(s, "2")
+        assert record["alias"] == "renamed"
+        assert record["threshold"] == pytest.approx(85.0)
+
+    def test_displacing_a_different_account_does_not_inherit_policy(
+        self, temp_home: Path,
+    ):
+        s = self._fleet(temp_home, count=2)
+        self._park_with_policy(s, "2")
+        self._make_live(temp_home, "account-1@example.test", 1)
+
+        s.add_account(slot=2, assume_yes=True)
+
+        record = self._record(s, "2")
+        assert record["email"] == "account-1@example.test"
+        assert not (set(record) & set(ClaudeAccountSwitcher.USER_ACCOUNT_SETTINGS))
+        assert s.account_policies()["2"] == AccountPolicy()
+
+    def test_token_slot_refresh_keeps_threshold_and_priority(self, temp_home: Path):
+        s = self._setup(temp_home)
+        s.add_account_from_token("token-v1", slot=3)
+        self._park_with_policy(s, "3")
+
+        s.add_account_from_token("token-v2", slot=3)
+
+        assert s.account_policies()["3"] == AccountPolicy(threshold=85.0, priority=2)
+        record = self._record(s, "3")
+        assert record["alias"] == "work" and record["disabled"] is True
+
+    def test_token_slot_migration_keeps_threshold_and_priority(self, temp_home: Path):
+        s = self._setup(temp_home)
+        s.add_account_from_token("token-v1", slot=3)
+        email = self._record(s, "3")["email"]
+        self._park_with_policy(s, "3")
+
+        s.add_account_from_token("token-v1", email, slot=6)
+
+        assert "3" not in (s._get_sequence_data() or {})["accounts"]
+        assert s.account_policies()["6"] == AccountPolicy(threshold=85.0, priority=2)
+
+    def test_token_displacement_does_not_inherit_policy(self, temp_home: Path):
+        s = self._setup(temp_home)
+        s.add_account_from_token("token-v1", "old@example.test", slot=4)
+        self._park_with_policy(s, "4")
+
+        s.add_account_from_token("token-v2", "new@example.test", slot=4, assume_yes=True)
+
+        record = self._record(s, "4")
+        assert record["email"] == "new@example.test"
+        assert not (set(record) & set(ClaudeAccountSwitcher.USER_ACCOUNT_SETTINGS))
+
+
 class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
     """The `--json` half of `TestSnapshotCarriesPolicy`, asserted at the caller
     instead of the helper.

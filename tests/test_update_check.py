@@ -808,3 +808,131 @@ class TestRunSelfUpgradeWindows:
         assert "uv tool upgrade claude-swap" in err
         assert "pipx upgrade claude-swap" in err
         assert "pip install --upgrade claude-swap" in err
+
+
+# --- build identity + the menu bar restart after an upgrade ------------------
+
+
+class _Dist:
+    def __init__(self, direct_url):
+        self._direct_url = direct_url
+
+    def read_text(self, name):
+        assert name == "direct_url.json"
+        return self._direct_url
+
+
+class TestInstallIdentity:
+    def test_git_install_carries_its_commit(self):
+        from claude_swap import update_check
+
+        direct = json.dumps({"url": "https://x/y.git", "vcs_info": {"vcs": "git", "commit_id": "3fec656abc"}})
+        with patch("importlib.metadata.distribution", return_value=_Dist(direct)):
+            identity = update_check.install_identity()
+        assert identity["source"] == "3fec656abc"
+        assert identity["version"] == update_check.__version__ if hasattr(update_check, "__version__") else True
+        assert update_check.describe_identity(identity).endswith("(3fec656)")
+
+    def test_pypi_install_has_no_source(self):
+        from claude_swap import update_check
+
+        with patch("importlib.metadata.distribution", return_value=_Dist(None)):
+            identity = update_check.install_identity()
+        assert identity["source"] is None
+        assert "(" not in update_check.describe_identity(identity)
+
+    def test_unreadable_metadata_is_not_fatal(self):
+        from importlib.metadata import PackageNotFoundError
+
+        from claude_swap import update_check
+
+        with patch("importlib.metadata.distribution", side_effect=PackageNotFoundError("claude-swap")):
+            assert update_check.install_identity()["source"] is None
+        assert update_check.describe_identity(None) == "unknown"
+
+
+_OLD_BUILD = {"version": "0.27.2", "source": None}
+_NEW_BUILD = {"version": "0.28.0", "source": None}
+
+
+@patch("claude_swap.update_check.sys.platform", "darwin")
+class TestUpgradeRestartsARunningMenuBar:
+
+    def _launchd(self, monkeypatch, pid):
+        calls = []
+        monkeypatch.setattr("claude_swap.launch_agent.service_pid", lambda *a, **k: pid)
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.kickstart", lambda *a, **k: calls.append(k)
+        )
+        return calls
+
+    def test_restarts_a_running_service_when_the_build_changed(self, monkeypatch, capsys):
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        assert calls == [{"restart": True}]
+        assert "Menu bar restarted onto 0.28.0 (was pid 4242)" in capsys.readouterr().out
+
+    def test_leaves_a_quit_service_quit(self, monkeypatch):
+        # Only a running instance is touched: a deliberate Quit stays quit.
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, None)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        assert calls == []
+
+    def test_does_nothing_when_the_build_did_not_change_or_is_unknown(self, monkeypatch):
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _OLD_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: None)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        assert calls == []
+
+    def test_a_same_version_git_install_still_counts_as_changed(self, monkeypatch):
+        from claude_swap import update_check
+
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(
+            update_check,
+            "_installed_identity_on_disk",
+            lambda: {"version": "1.0.0b1", "source": "bbbbbbb"},
+        )
+        update_check._restart_menubar_if_rebuilt({"version": "1.0.0b1", "source": "aaaaaaa"})
+        assert calls == [{"restart": True}]
+
+    def test_a_failed_restart_is_a_warning_not_a_failed_upgrade(self, monkeypatch, capsys):
+        from claude_swap import update_check
+        from claude_swap.exceptions import ClaudeSwitchError
+
+        monkeypatch.setattr("claude_swap.launch_agent.service_pid", lambda *a, **k: 4242)
+
+        def boom(*a, **k):
+            raise ClaudeSwitchError("launchctl kickstart failed (exit 3)")
+
+        monkeypatch.setattr("claude_swap.launch_agent.kickstart", boom)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        update_check._restart_menubar_if_rebuilt(_OLD_BUILD)
+        captured = capsys.readouterr()
+        assert "not restarted" in captured.out + captured.err
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_run_self_upgrade_wires_the_restart_in(self, mock_detect, mock_run, monkeypatch, capsys):
+        from claude_swap import update_check
+
+        mock_run.return_value = MagicMock(returncode=0)
+        calls = self._launchd(monkeypatch, 4242)
+        monkeypatch.setattr(update_check, "install_identity", lambda: _OLD_BUILD)
+        monkeypatch.setattr(update_check, "_installed_identity_on_disk", lambda: _NEW_BUILD)
+        with patch("claude_swap.update_check._installed_version_on_disk", return_value="0.28.0"):
+            assert run_self_upgrade("0.27.2") == 0
+        assert calls == [{"restart": True}]
+        out = capsys.readouterr().out
+        assert "claude-swap upgraded: 0.27.2 -> 0.28.0" in out
+        assert "Menu bar restarted" in out

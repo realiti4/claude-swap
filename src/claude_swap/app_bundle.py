@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -79,6 +80,25 @@ def bundle_dir(backup_dir: Path, applications: Path = APPLICATIONS_DIR) -> Path:
 def bundle_path(backup_dir: Path, applications: Path = APPLICATIONS_DIR) -> Path:
     """Where the wrapper bundle lives for this install."""
     return bundle_dir(backup_dir, applications) / BUNDLE_DIRNAME
+
+
+def remove(backup_dir: Path, applications: Path | None = None) -> list[Path]:
+    """Delete the wrapper bundle wherever an earlier run may have put it.
+
+    Both homes are tried, not just the one :func:`bundle_path` would pick now:
+    ``/Applications`` may have been writable when the bundle was built and not
+    be any more, or the other way round. ``applications`` is read at call time
+    so tests can point it elsewhere. Returns the paths that existed and went.
+    """
+    if applications is None:
+        applications = APPLICATIONS_DIR
+    removed: list[Path] = []
+    for home in (applications, Path(backup_dir)):
+        candidate = home / BUNDLE_DIRNAME
+        if candidate.is_dir():
+            shutil.rmtree(candidate)
+            removed.append(candidate)
+    return removed
 
 
 def in_bundle(executable: Path | None = None) -> bool:

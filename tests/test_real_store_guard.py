@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import paths, session
+from claude_swap import cache, paths, session, update_check
 from claude_swap.models import Platform
 from tests import conftest
 
@@ -574,8 +574,8 @@ def test_arbitrary_claude_config_dir_is_not_dropped_by_the_hint_prefilter(
         # while Linux/macOS passed, because their tmp roots do not collide.
         #
         # Unfreezing the specs first is the fix rather than catching the
-        # exception: the guard must stay armed for the assertion above, and a
-        # bare `except Exception` in cleanup is how a real refusal gets hidden.
+        # exception: the guard must stay armed for the assertion above, and an
+        # `except BaseException` in cleanup is how a real refusal gets hidden.
         monkeypatch.undo()
         shutil.rmtree(root_dir, ignore_errors=True)
 
@@ -759,6 +759,31 @@ def test_mkdir_exist_ok_true_does_not_swallow_the_refusal(
     # proving the guard is armed (isolates "swallowed" from "never fired").
     with pytest.raises(conftest.RealStoreWriteBlocked):
         (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
+
+
+def test_a_broad_except_exception_does_not_swallow_the_refusal(
+    tmp_path: Path, monkeypatch
+):
+    """``except Exception`` is the containment src uses most, and it ate the
+    refusal the way ``except OSError`` once did: the guard fired, the caller
+    absorbed it and carried on. Narrowing those in src is refused (the consume
+    paths' last defence), so the refusal must not be an ``Exception`` at all."""
+    stand_in_root = tmp_path / "claude-swap"
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        try:
+            (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
+        except Exception:
+            pass
+
+
+def test_the_update_check_cache_path_is_not_the_frozen_real_cache():
+    """``update_check.CACHE_PATH`` is frozen at import, so ``temp_home``
+    never redirected it: ``main()`` tried to write the REAL
+    ``<backup root>/cache`` whenever it was stale, and ``check_for_update``'s
+    own ``except Exception`` hid the refusal."""
+    assert update_check.CACHE_PATH.parent != cache.CACHE_DIR
 
 
 def test_a_relative_candidate_that_already_carries_a_hint_is_still_joined(
