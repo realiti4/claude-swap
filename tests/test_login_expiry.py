@@ -219,7 +219,7 @@ class TestCardAndMiniRow:
         header = widgets.account_card_text(acc, 100, now=now).plain.splitlines()[0]
         assert header.endswith("· Max 20x   re-login in 5h 7m")
         mini = widgets.mini_account_text(acc, now).plain
-        assert mini == " 2  dev (a@example.com)  [personal]  · Max 20x   5h 25% · 7d 10% · re-login in 5h 7m"
+        assert mini == " 2  dev (a@example.com)  [personal]  5h  25%  7d  10%  · Max 20x · re-login in 5h 7m"
 
     def test_quarantined_card_says_it_once(self):
         now = time.time()
@@ -241,6 +241,24 @@ class TestCardAndMiniRow:
         now = time.time()
         acc = _replace_login(make_account(2), now - 60)
         assert widgets.mini_account_text(acc, now).plain.endswith(" · re-login needed")
+
+    def test_note_ends_a_sentinel_row_too(self):
+        now = time.time()
+        acc = _replace_login(make_account(2, entry=make_entry(sentinel=USAGE_NO_CREDENTIALS)), now + 5 * 3600 + 7 * 60)
+        assert widgets.mini_account_text(acc, now).plain.endswith(" · re-login in 5h 7m")
+
+    def test_notes_share_a_column_and_a_cut_row_keeps_its_note(self):
+        now = time.time()
+        due = now + 5 * 3600 + 7 * 60
+        plain = _replace_login(make_account(2, email="a@example.com"), due)
+        marked = _replace_login(make_account(3, email="b@example.com", disabled=True), due)
+        widths = widgets.mini_widths([plain, marked], now)
+        rows = [widgets.mini_account_text(acc, now, widths=widths).plain for acc in (plain, marked)]
+        assert rows[0].index("re-login") == rows[1].index("re-login")
+        assert rows[1].endswith("(disabled) · re-login in 5h 7m")
+        cut = widgets.mini_account_text(plain, now, widths=widths, width=cell_len(rows[0]) - 6).plain
+        assert cell_len(cut) == cell_len(rows[0]) - 6
+        assert "…" in cut and cut.endswith(" " * 12 + " · re-login in 5h 7m")  # the blank marker field, then the note
 
 
 def _seven(expires_at: float | None) -> list[AccountSnapshot]:
@@ -305,7 +323,7 @@ class TestDashboardFit:
         assert size.height == len(lines)
         minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
         assert len(minis) == 6
-        assert all(line.endswith("5h 25% · 7d 10% · re-login in 5d") for line in minis)
+        assert all(line.endswith("5h  25%  7d  10% · re-login in 5d") for line in minis)
 
     @pytest.mark.asyncio
     async def test_due_note_goes_before_usage_does(self, tmp_path):
