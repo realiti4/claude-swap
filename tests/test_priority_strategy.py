@@ -353,7 +353,7 @@ class TestPriorityCli(PolicyCliBase):
         self._main(["priority"])
         out = capsys.readouterr().out
         assert "account-2@example.test" in out and "100" in out
-        assert load_settings(s.backup_dir).strategy == "best"
+        assert load_settings(s.backup_dir).strategy == "consume-first"  # this branch's default
         self._main(["priority", "2", "--unset"])
         assert "priority" not in self._record(s, "2")
         before = s.sequence_file.read_bytes()
@@ -399,3 +399,25 @@ def test_priority_strategy_uses_existing_configurable_cutoffs(tmp_path):
     assert settings.threshold == 85
     assert settings.weekly_threshold == 99.9
 
+
+def test_a_disabled_active_holds_no_rank_to_defend(temp_home):
+    """`disabled-active` leaves under priority too: the disabled slot is
+    outside `switchable_account_numbers()`, so it is not an eligible active."""
+    h = fleet(temp_home)
+    h.switcher.set_account_disabled("1", True)
+    assert h.tick_with_usage(usage(h)) is TickOutcome.SWITCHED
+    assert h.active_number() == 2
+
+
+def test_a_stale_probe_pick_does_not_rename_a_priority_switch(temp_home):
+    """`_last_probe_num` is the side channel of the last consume-first rank. A
+    priority rank never rewrites it, so a pick left from an earlier tick under
+    another strategy must not name this switch a probe (and arm a probe
+    cooldown on the account)."""
+    h = fleet(temp_home)
+    h.engine._last_probe_num = "2"
+    assert h.tick_with_usage(usage(h, pcts=(90, 10, 10, 10))) is TickOutcome.SWITCHED
+    assert h.active_number() == 2
+    sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+    assert sw.trigger == "proactive"  # the active is over its line; never "probe"
+    assert not h.engine._read_state()["probeCooldown"]
