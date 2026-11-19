@@ -2464,6 +2464,112 @@ class TestSessionThreshold:
         assert {"1", "2", "3"} not in self._collect_fetch_sets(harness, 99.9)
 
 
+class TestSessionStrategy:
+    """apply_strategy(): the TUI's mid-run strategy override (s key)."""
+
+    @staticmethod
+    def _usage() -> dict:
+        # Below threshold everywhere; only the weekly reset order differs.
+        # `best` holds (nothing beats the active by the hysteresis margin),
+        # while consume-first moves to #2, whose weekly window resets sooner.
+        # Built per call: _usage7 / _R_* are defined further down the module.
+        return {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(20, 20, _R_SOON),
+            "3": _usage7(20, 20, _R_LATEST),
+        }
+
+    def test_next_tick_decides_with_the_new_strategy(self, harness):
+        assert harness.engine.settings.strategy == "best"
+        harness.engine.apply_strategy("consume-first")
+        assert harness.engine.settings.strategy == "consume-first"
+        outcome = harness.tick_with_usage(self._usage())
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_back_to_best_stops_the_consume_first_move(self, temp_home):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine.apply_strategy("best")
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_rejects_an_unknown_strategy(self, harness):
+        with pytest.raises(ValueError, match="next-available"):
+            harness.engine.apply_strategy("next-available")
+        assert harness.engine.settings.strategy == "best"
+
+
+class TestSessionModel:
+    """apply_model(): the TUI's mid-run model-watch override (m key)."""
+
+    @staticmethod
+    def _harness(temp_home, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first", **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _usage() -> dict:
+        # #2's weekly window resets soonest, so consume-first wants it, but
+        # its Fable weekly limit is spent. #3 resets after the active.
+        spent = _usage7(20, 20, _R_SOON)
+        spent["scoped"] = [{"name": "Fable", "pct": 100.0}]
+        return {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": spent,
+            "3": _usage7(20, 20, _R_LATEST),
+        }
+
+    def test_without_a_model_watch_the_spent_account_is_the_target(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_next_tick_skips_an_account_whose_model_limit_is_spent(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine.apply_model("all")
+        assert h.engine.settings.model == "all"
+        assert h.tick_with_usage(self._usage()) is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_turning_the_watch_off_restores_the_account_wide_decision(self, temp_home):
+        h = self._harness(temp_home, model="Fable")
+        h.engine.apply_model(None)
+        assert h.engine.settings.model is None
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_poll_planning_follows_the_new_models(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine.apply_model("Fable, Opus")
+        assert h.switcher._poll_policy_inputs()[2] == ("Fable", "Opus")
+        h.engine.apply_model("  ")  # blank is "off", same as None
+        assert h.engine.settings.model is None
+        assert h.switcher._poll_policy_inputs()[2] == ()
+
+    def test_a_threshold_change_before_the_next_tick_keeps_the_new_models(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        h.engine.apply_model("Fable")
+        h.engine.apply_threshold(80.0)
+        assert h.switcher._poll_policy_inputs()[2] == ("Fable",)
+
+    def test_a_new_name_is_checked_against_the_accounts_again(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine.apply_model("Fabel")
+        h.tick_with_usage(self._usage())
+        warnings = [e for e in h.events if e.kind == "config-warning"]
+        assert len(warnings) == 1 and "Fabel" in warnings[0].message
+
+
 class TestPctLabel:
     def test_whole_numbers_drop_the_decimal(self):
         assert pct_label(90.0) == "90"
