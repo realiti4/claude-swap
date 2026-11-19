@@ -12,6 +12,8 @@ from claude_swap.usage_store import (
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
     RATE_LIMIT_TRUST_MAX_AGE_S,
+    REFUSED_BACKOFF_S,
+    REFUSED_STRIKES,
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
@@ -316,6 +318,76 @@ class TestBackoff:
 
     def test_backoff_cap(self):
         assert usage_store._failure_backoff_s(50, None) == BACKOFF_CAP_S
+
+    def test_a_standing_refusal_backs_off_past_the_cap(self):
+        # 403 means the endpoint will not serve this identity at all (a
+        # setup-token account, typically). The plain curve treats that like a
+        # timeout and re-asks every BACKOFF_CAP_S forever — six requests/hour
+        # of the measured identity budget spent on a question that cannot be
+        # answered. Measured in the wild at consecutiveFailures 218 and 538.
+        assert usage_store._failure_backoff_s(50, None, refused=True) == (
+            REFUSED_BACKOFF_S
+        ), "a refused row must back off past the transient-failure cap"
+        assert usage_store._failure_backoff_s(50, None) == BACKOFF_CAP_S, (
+            "and the floor must not leak into ordinary failures"
+        )
+
+    def test_the_refusal_floor_waits_for_its_strikes(self):
+        # Early refusals keep the plain curve: a single 403 is not yet evidence
+        # of a standing refusal, and the first strikes are cheap (30s, 60s).
+        for n in range(1, REFUSED_STRIKES):
+            assert usage_store._failure_backoff_s(n, None, refused=True) == (
+                usage_store._failure_backoff_s(n, None)
+            ), f"strike {n} is below REFUSED_STRIKES and must not take the floor"
+        assert usage_store._failure_backoff_s(REFUSED_STRIKES, None, refused=True) == (
+            REFUSED_BACKOFF_S
+        )
+
+    def test_the_refusal_floor_stays_inside_the_park_bound(self):
+        # The floor must never hold a row un-pollable past the ceiling its own
+        # trust uses (TRUST_MAX_AGE_S for non-429 waits), or the row goes
+        # un-pollable and unknown together and the unhealthy-tick counter reads
+        # that as a failing account. Holds for every Retry-After a refusal
+        # could carry — `_classify_usage_error` parses the header for any
+        # HTTPError code, 403 included.
+        #
+        # `rate_limited=False` is not a convenience here: REFUSED_ERRORS and
+        # "http-429" are disjoint, so `record()` can never set both flags. The
+        # 429 arms cap at BACKOFF_CAP_S and would cut the floor, which is
+        # exactly why the floor may live on `computed` without touching them.
+        assert REFUSED_BACKOFF_S < TRUST_MAX_AGE_S
+        assert "http-429" not in usage_store.REFUSED_ERRORS
+        for ask in (None, 0.0, 300.0, 3600.0, 99999.0):
+            wait = usage_store._failure_backoff_s(
+                50, ask, rate_limited=False, refused=True
+            )
+            assert REFUSED_BACKOFF_S <= wait <= TRUST_MAX_AGE_S, (
+                f"ask={ask} left the park bound"
+            )
+
+    def test_a_refused_row_is_not_quarantined_as_a_dead_token(self, store, clock):
+        # 403 is the endpoint refusing a scope, not the server rejecting the
+        # grant: the credential may be fine for inference and can gain access
+        # later. So the row backs off; it must not earn a dead-token strike.
+        for _ in range(REFUSED_STRIKES + 1):
+            store.record({"1": FetchRecord(error="http-403")}, IDENT)
+            clock.advance(REFUSED_BACKOFF_S + 1)
+        entry = store.entries(IDENT)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert not entry.token_dead()
+
+    def test_a_success_lifts_the_refusal_floor(self, store, clock):
+        for _ in range(REFUSED_STRIKES):
+            store.record({"1": FetchRecord(error="http-403")}, IDENT)
+            clock.advance(REFUSED_BACKOFF_S + 1)
+        store.record({"1": FetchRecord(usage={})}, IDENT)
+        assert store.entries(IDENT)["1"].consecutive_failures == 0
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.backoff_until == pytest.approx(clock.now + BACKOFF_BASE_S), (
+            "a refused row that recovered starts its next refusal from the "
+            "bottom of the curve, not from the floor"
+        )
 
     def test_huge_failure_count_does_not_overflow(self):
         # A permanently failing account increments consecutiveFailures forever;
