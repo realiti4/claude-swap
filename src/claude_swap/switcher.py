@@ -4299,6 +4299,7 @@ class ClaudeAccountSwitcher:
         # record belonging to the SAME account is read: a displaced occupant's
         # lineage ends with it, and the newcomer must not inherit its state.
         carried: dict = {}
+        existing_org_name = ""
         if slot is not None:
             prior = data.get("accounts", {}).get(account_num) or {}
             if (
@@ -4306,8 +4307,10 @@ class ClaudeAccountSwitcher:
                 and prior.get("organizationUuid", "") == current_org_uuid
             ):
                 carried = self._carried_settings(prior)
+                existing_org_name = prior.get("organizationName") or ""
             if migrate_from:
                 carried.update(self._carried_settings(data["accounts"][migrate_from]))
+                existing_org_name = data["accounts"][migrate_from].get("organizationName") or existing_org_name
 
         if alias is not None:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -4389,7 +4392,7 @@ class ClaudeAccountSwitcher:
             "email": current_email,
             "uuid": account_uuid,
             "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
+            "organizationName": existing_org_name or organization_name,
             "added": get_timestamp(),
         }
         if alias is not None:
@@ -4402,7 +4405,7 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        tag = self._get_display_tag(current_email, organization_name, organization_uuid)
+        tag = self._get_display_tag(current_email, existing_org_name or organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
@@ -4524,6 +4527,7 @@ class ClaudeAccountSwitcher:
 
         displace_slot = None
         migrate_from = None
+        existing_org_name = ""
 
         if slot is not None:
             if slot < 1:
@@ -4533,6 +4537,8 @@ class ClaudeAccountSwitcher:
 
             if self._account_exists(email, ""):
                 old_num = self._find_account_slot(data, email, "")
+                if old_num:
+                    existing_org_name = data["accounts"][old_num].get("organizationName") or ""
                 if old_num and old_num != account_num:
                     migrate_from = old_num
 
@@ -4615,7 +4621,7 @@ class ClaudeAccountSwitcher:
             "email": email,
             "uuid": "",
             "organizationUuid": "",
-            "organizationName": "",
+            "organizationName": existing_org_name,
             "added": get_timestamp(),
         }
         if is_api_key:
