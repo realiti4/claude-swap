@@ -768,6 +768,9 @@ class SessionManager:
         terminal to one account per session needs the isolation guaranteed,
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
+
+        Notices on the way are printed plainly. `cswap run` sends them to
+        stderr, because stdout is claude's (``cli._run_launch``).
         """
         claude_bin = shutil.which("claude")
         if not claude_bin:

@@ -182,6 +182,21 @@ class TestUiSettings:
         with pytest.raises(ConfigError, match="dark, light"):
             set_setting(tmp_path, "ui.theme", "purple")
 
+    def test_org_tag_defaults_auto_round_trips_and_ignores_bad_values(
+        self, tmp_path: Path
+    ):
+        assert load_ui_settings(tmp_path).org_tag == "auto"
+        assert set_setting(tmp_path, "ui.orgTag", "off") == "off"
+        assert load_ui_settings(tmp_path).org_tag == "off"
+        with pytest.raises(ConfigError, match="auto, on, off"):
+            set_setting(tmp_path, "ui.orgTag", "sometimes")
+        raw = {"ui": {"orgTag": "no", "theme": "light"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(theme="light")
+        raw = {"ui": {"orgTag": "on", "theme": "purple"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(org_tag="on")
+
 
 class TestRunSettings:
     def test_missing_file_defaults_to_shared_history(self, tmp_path: Path):
@@ -268,6 +283,30 @@ class TestUsageSettings:
         assert load_usage_settings(tmp_path).header_probe is True
         assert unset_setting(tmp_path, "usage.headerProbe") is True
         assert load_usage_settings(tmp_path).header_probe is False
+
+    def test_fable_probe_is_an_opt_in_of_its_own(self, tmp_path: Path):
+        # Agreeing to a Haiku token is not agreeing to spend Fable quota.
+        assert set_setting(tmp_path, "usage.headerProbe", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, fable_probe=False
+        )
+        assert set_setting(tmp_path, "usage.fableProbe", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, fable_probe=True
+        )
+        assert unset_setting(tmp_path, "usage.fableProbe") is True
+        assert load_usage_settings(tmp_path).fable_probe is False
+
+    def test_a_non_bool_key_does_not_take_the_other_one_down(
+        self, tmp_path: Path, caplog
+    ):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": True, "fableProbe": "yes"}})
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            loaded = load_usage_settings(tmp_path)
+        assert loaded == UsageSettings(header_probe=True, fable_probe=False)
+        assert "usage.fableProbe must be true or false" in caplog.text
 
 
 class TestSettingSpecs:
@@ -384,6 +423,15 @@ class TestEffectiveSettings:
         assert by_key["autoswitch.intervalSeconds"] is False
 
 
+def _settings_warnings(caplog) -> list[str]:
+    """The settings.json lines in the captured log, and no one else's."""
+    return [
+        message
+        for message in (r.getMessage() for r in caplog.records)
+        if message.startswith("settings.json:")
+    ]
+
+
 class TestUnrecognizedKeys:
     """A key nothing reads stays in the file and changes nothing;
     `unrecognized_keys` is what names it."""
@@ -432,11 +480,18 @@ class TestUnrecognizedKeys:
         [
             ("Strategy", "strategy"),
             ("treshold", "threshold"),
-            ("hysteresis", "hysteresisPct"),
             ("models", "model"),
-            # Shares a word with a real key, or is merely short: not a typo.
+            ("weekly_threshold", "weeklyThreshold"),
+            # A shortened name, as the `cswap auto` flags spell these two.
+            ("interval", "intervalSeconds"),
+            ("cooldown", "cooldownSeconds"),
+            ("hysteresis", "hysteresisPct"),
+            # Shares a word with a real key, or is too short to mean one.
             ("graceSeconds", None),
+            ("holdSeconds", None),
+            ("maxThreshold", None),
             ("order", None),
+            ("th", None),
         ],
     )
     def test_suggestion_only_for_a_near_miss(self, tmp_path: Path, written, meant):
@@ -446,6 +501,27 @@ class TestUnrecognizedKeys:
         (item,) = unrecognized_keys(tmp_path)
         assert item.dotted == f"autoswitch.{written}"
         assert item.suggestion == (f"autoswitch.{meant}" if meant else None)
+
+    def test_setting_written_flat_at_the_top_level_is_told_where_it_belongs(
+        self, tmp_path: Path
+    ):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch.threshold": 80}))
+        (item,) = unrecognized_keys(tmp_path)
+        assert item == UnrecognizedKey("autoswitch.threshold", "autoswitch.threshold")
+        assert item.describe() == (
+            "'autoswitch.threshold' is not a key this version reads, so it has "
+            "no effect; it belongs inside 'autoswitch' as 'threshold'"
+        )
+        assert load_settings(tmp_path) == AutoSwitchSettings()
+
+    def test_key_is_quoted_so_stray_whitespace_shows(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"threshold ": 80, "a\nb": 1}})
+        )
+        spaced, broken = (item.describe() for item in unrecognized_keys(tmp_path))
+        assert spaced.startswith("'autoswitch.threshold ' is not a key")
+        assert spaced.endswith("did you mean autoswitch.threshold?")
+        assert "\n" not in broken
 
     def test_every_registered_key_is_recognized(self, tmp_path: Path):
         raw: dict = {"schemaVersion": 1}
@@ -472,10 +548,10 @@ class TestUnrecognizedKeys:
         }))
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             log_unrecognized_keys(tmp_path)
-        assert [r.getMessage() for r in caplog.records] == [
-            "settings.json: autoswitch.hysteresisPCT is not a key this version "
+        assert _settings_warnings(caplog) == [
+            "settings.json: 'autoswitch.hysteresisPCT' is not a key this version "
             "reads, so it has no effect; did you mean autoswitch.hysteresisPct?",
-            "settings.json: autoswitch.futureKnob is not a key this version "
+            "settings.json: 'autoswitch.futureKnob' is not a key this version "
             "reads, so it has no effect",
         ]
 
@@ -491,18 +567,7 @@ class TestUnrecognizedKeys:
             load_update_settings(tmp_path)
             load_usage_settings(tmp_path)
             effective_settings(tmp_path)
-        assert caplog.records == []
-
-    def test_unrecognized_keys_survive_a_write(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({
-            "futureSection": {"x": 1},
-            "autoswitch": {"hysteresisPCT": 5},
-        }))
-        set_setting(tmp_path, "autoswitch.threshold", "80")
-        assert [item.dotted for item in unrecognized_keys(tmp_path)] == [
-            "futureSection",
-            "autoswitch.hysteresisPCT",
-        ]
+        assert _settings_warnings(caplog) == []
 
 
 class TestMergedWithCli:
