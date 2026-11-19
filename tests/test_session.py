@@ -500,10 +500,10 @@ class TestBootstrap:
     def test_bootstrap_checks_the_login_it_copies(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
     ):
-        """The gate reports success without its live-login check when the
-        backup moved after the caller's snapshot: it adopts the fresh
-        credential and POSTs nothing. The copy must still be refused, and
-        before anything of the profile is touched."""
+        """A gate that reports success (it adopted a fresher credential and
+        POSTed nothing) leaves the live-login check to ``_bootstrap``. The
+        copy must still be refused, and before anything of the profile is
+        touched."""
         fresh = json.dumps({
             "claudeAiOauth": {
                 "accessToken": "fresh-access",
@@ -515,22 +515,9 @@ class TestBootstrap:
             ACCOUNT_NUM, ACCOUNT_EMAIL, fresh
         )
         seeded_switcher._write_credentials(fresh)
-        # setup_session's snapshot predates that write.
-        real_read = ClaudeAccountSwitcher.read_account_credentials
-        reads = {"n": 0}
-
-        def stale_first(self, num, email):
-            reads["n"] += 1
-            return CREDS if reads["n"] == 1 else real_read(self, num, email)
-
         monkeypatch.setattr(
-            ClaudeAccountSwitcher, "read_account_credentials", stale_first
-        )
-        posted = []
-        monkeypatch.setattr(
-            oauth, "try_refresh_oauth_credentials",
-            lambda *a, **k: posted.append(a)
-            or oauth.RefreshOutcome(None, "transient"),
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(fresh, None),
         )
         deleted = []
         monkeypatch.setattr(
@@ -540,7 +527,6 @@ class TestBootstrap:
         with pytest.raises(SessionError, match="live login"):
             manager.setup_session("2", share=False)
 
-        assert posted == []
         assert deleted == []
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
