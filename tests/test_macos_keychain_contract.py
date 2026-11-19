@@ -97,7 +97,7 @@ class TestBackupCredentialsSecurity:
         with patch("claude_swap.credentials.macos_keychain") as mock_kc:
             mock_kc.get_password.return_value = "old-generation"
             macos_switcher._write_account_credentials(
-                "2", "alice@example.com", "secret-token"
+                "2", "alice@example.com", "secret-token", attributed=True
             )
 
             mock_kc.set_password.assert_has_calls([
