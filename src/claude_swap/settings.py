@@ -120,6 +120,9 @@ class UsageSettings:
     headers of a 1-output-token Haiku request instead. Each probe is a real,
     if tiny, request against that account's quota, sent at the normal poll
     cadence, so it is opt-in; off leaves such accounts at "usage unavailable".
+    The active account is read the same way, because Claude Code's own usage
+    calls exhaust the endpoint budget it shares with cswap (see
+    :func:`oauth.try_fetch_usage_for_account`).
 
     ``fable_probe``: those headers report Fable's weekly limit only on a
     Fable response, so also send a 1-output-token Fable request per poll and
@@ -228,7 +231,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "usage", "headerProbe", "header_probe", "bool",
-            help="Read setup-token usage from a 1-token Haiku request's rate-limit headers (opt-in: uses quota)",
+            help="Read setup-token and active-account usage from a 1-token Haiku request's rate-limit headers (opt-in: uses quota)",
         ),
         SettingSpec(
             "usage", "fableProbe", "fable_probe", "bool",

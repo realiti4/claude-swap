@@ -1732,6 +1732,35 @@ class TestSetupTokenHeaderProbe:
         assert outcome.error == "http-429"
         assert [c.full_url for c in calls] == [self.USAGE_URL]
 
+    @staticmethod
+    def _login_creds():
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "a", "refreshToken": "r", "expiresAt": future_ms,
+            "scopes": ["user:inference", "user:profile"],
+        }})
+
+    def test_active_login_probes_instead_of_the_endpoint(self):
+        """Claude Code's own usage calls exhaust the endpoint budget of the
+        account it runs on, so the active login is read from the headers."""
+        fake, calls = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake, creds=self._login_creds(), is_active=True)
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert outcome.usage["source"] == oauth.USAGE_SOURCE_HEADERS
+        assert [c.full_url for c in calls] == [oauth.USAGE_PROBE_URL]
+
+    def test_active_login_without_the_opt_in_uses_the_endpoint(self):
+        fake, calls = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(
+            fake, creds=self._login_creds(), header_probe=False, is_active=True
+        )
+        assert outcome.error == "http-429"
+        assert [c.full_url for c in calls] == [self.USAGE_URL]
+
 
 class TestHeaderReadingDecisions:
     """A header-probe reading gates decisions only when it carries every
