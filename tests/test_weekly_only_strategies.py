@@ -62,7 +62,9 @@ def test_auto_skips_exhausted_weekly_and_unknown_candidates(temp_home, strategy)
 
 
 def test_weekly_only_holds_below_the_weekly_switch_line(temp_home):
-    h = _harness(temp_home, threshold=90, weekly_threshold=97)
+    # `best` is pinned: this branch's default, consume-first, words the
+    # no-switch detail by reset order, not by the weekly line.
+    h = _harness(temp_home, threshold=90, weekly_threshold=97, strategy="best")
     outcome = h.tick_with_usage({
         "1": _weekly(h, 95),
         "2": _weekly(h, 20),

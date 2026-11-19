@@ -184,7 +184,7 @@ class TestCliList:
     def test_quarantined_block_says_it_once(self):
         now = time.time()
         lines = _usage_entry_lines(UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED), now - 60)
-        assert lines[0].startswith("re-login needed")
+        assert lines[0].startswith("re-login may be needed")
         assert len(lines) == 1
 
     def test_age_note_stays_on_the_last_usage_row(self):
@@ -202,6 +202,15 @@ class TestCliList:
 
 PLAN = {"plan": {"tier": "default_claude_max_20x"}, "fetchedAt": time.time()}
 
+# No reset times: this branch's chips carry a countdown (`5h(⟳1h59m):25%`),
+# which would pass the dashboard's 74 columns and rot a literal row, so the
+# cases that fit a width or pin a row read `5h:25%`.
+_CHIPS = UsageEntry(
+    last_good={"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}},
+    fetched_at=time.time() - 5.0,
+    age_s=5.0,
+)
+
 
 class TestCardAndMiniRow:
     def test_nothing_while_the_login_is_not_due(self):
@@ -213,13 +222,15 @@ class TestCardAndMiniRow:
     def test_note_ends_the_header_and_the_mini_row(self):
         now = time.time()
         acc = _replace_login(
-            dataclasses.replace(make_account(2, email="a@example.com", alias="dev"), subscription_plan=PLAN),
+            dataclasses.replace(
+                make_account(2, email="a@example.com", alias="dev", entry=_CHIPS), subscription_plan=PLAN
+            ),
             now + 5 * 3600 + 7 * 60,
         )
         header = widgets.account_card_text(acc, 100, now=now).plain.splitlines()[0]
         assert header.endswith("· Max 20x   re-login in 5h 7m")
         mini = widgets.mini_account_text(acc, now).plain
-        assert mini == " 2  dev (a@example.com)  [personal]  · Max 20x   5h 25% · 7d 10% · re-login in 5h 7m"
+        assert mini == " 2  dev (a@example.com)  [personal]  · Max 20x   5h:25% · 7d:10% · re-login in 5h 7m"
 
     def test_quarantined_card_says_it_once(self):
         now = time.time()
@@ -228,7 +239,7 @@ class TestCardAndMiniRow:
         )
         lines = widgets.account_card_text(acc, 100, now=now).plain.splitlines()
         assert "re-login" not in lines[0]
-        assert lines[1].lstrip().startswith("⚠ re-login needed")
+        assert lines[1].lstrip().startswith("⚠ re-login may be needed")
         mini = widgets.mini_account_text(acc, now).plain
         assert mini.count("re-login") == 1
 
@@ -247,7 +258,10 @@ def _seven(expires_at: float | None) -> list[AccountSnapshot]:
     """Seven `developerN@example.com` slots, the active one on a plan."""
     accounts = [
         _replace_login(
-            make_account(n, active=n == 1, email=f"developer{n}@example.com", alias="work" if n in (1, 2) else ""),
+            make_account(
+                n, active=n == 1, email=f"developer{n}@example.com",
+                alias="work" if n in (1, 2) else "", entry=_CHIPS,
+            ),
             expires_at,
         )
         for n in range(1, 8)
@@ -259,10 +273,12 @@ def _seven(expires_at: float | None) -> list[AccountSnapshot]:
 def _mixed(expires_at: float | None) -> list[AccountSnapshot]:
     """One long address and five short ones under a long organisation tag."""
     accounts = [
-        make_account(1, active=True, email="developer1@example.com"),
-        make_account(2, email="developer-with-long-name2@example.com"),
+        make_account(1, active=True, email="developer1@example.com", entry=_CHIPS),
+        make_account(2, email="developer-with-long-name2@example.com", entry=_CHIPS),
     ] + [
-        dataclasses.replace(make_account(n, email=f"a{n}@example.com"), org_name="Example Engineering Team")
+        dataclasses.replace(
+            make_account(n, email=f"a{n}@example.com", entry=_CHIPS), org_name="Example Engineering Team"
+        )
         for n in range(3, 8)
     ]
     return [_replace_login(acc, expires_at) for acc in accounts]
@@ -305,7 +321,7 @@ class TestDashboardFit:
         assert size.height == len(lines)
         minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
         assert len(minis) == 6
-        assert all(line.endswith("5h 25% · 7d 10% · re-login in 5d") for line in minis)
+        assert all(line.endswith("5h:25% · 7d:10% · re-login in 5d") for line in minis)
 
     @pytest.mark.asyncio
     async def test_due_note_goes_before_usage_does(self, tmp_path):
@@ -356,12 +372,14 @@ class TestNextBest:
         ]
         plain, _width = await _candidates(tmp_path, accounts, (100, 40))
         assert "re-login" not in plain
-        assert "   2  a@example.com  5h " in plain  # the name is not padded
+        bare, _width = await _candidates(tmp_path, [_replace_login(acc, None) for acc in accounts], (100, 40))
+        assert plain == bare  # the rows a snapshot without any expiry renders
 
     @pytest.mark.asyncio
     async def test_due_note_ends_the_row_and_steps_down_when_narrow(self, tmp_path, fake_engine):
         # 40-column addresses at 80 columns: the full note overflows the
-        # 76-column row, the short one fits, and the usage figure stays.
+        # 76-column row, the short one fits, and the usage figure stays. (This
+        # branch's chips are wider, so the address is cut as well.)
         expires = time.time() + DUE
         accounts = [make_account(1, active=True, email="active@example.com")] + [
             _replace_login(make_account(n, email=f"{'x' * 27}{n}@example.com"), expires) for n in (2, 3)
@@ -370,7 +388,7 @@ class TestNextBest:
         rows = [line for line in plain.splitlines() if "re-login" in line]
         assert len(rows) == 2
         assert all(cell_len(row) <= width for row in rows)
-        assert all(row.endswith("% used  re-login in 5d") for row in rows)
+        assert all(row.endswith("10%  re-login in 5d") for row in rows)
 
 
 # ---------------------------------------------------------------------------
