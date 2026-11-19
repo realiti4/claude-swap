@@ -140,6 +140,10 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 The exact rules (margins, landing, polling cadence, tier handling) are in [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md).
 
+### Daily quota windows
+
+`cswap schedule --configure` binds accounts 1/2/3 for shared 07:00 activation in Asia/Shanghai and weekly quota allocation based on expiry and five-hour headroom; `cswap schedule --install` enables the macOS login agent with usage-confirmed activation, renewal until midnight and 99% failover. See [daily schedule rules and actual-reset limits](docs/daily-schedule.md).
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.

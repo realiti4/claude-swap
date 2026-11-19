@@ -5776,6 +5776,12 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
+        usage_settings = self._usage_settings()
+        fixed_intervals = {
+            num: (usage_settings.active_interval_seconds if info[4]
+                  else usage_settings.candidate_interval_seconds)
+            for num, info in info_by_num.items()
+        }
         if fetch is None:
             # Repair reset-parked plans written by releases that stopped
             # polling exhausted accounts until their advertised reset. The
@@ -5787,6 +5793,8 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                fixed_intervals=fixed_intervals,
+                models=models,
             )
         else:
             claims = store.reserve(
@@ -5794,7 +5802,10 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                fixed_intervals=fixed_intervals,
+                models=models,
             )
+        entries = store.entries(identities, models)
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
         # collector's claim, poll-plan gate — must still surface the expired
@@ -5825,7 +5836,7 @@ class ClaudeAccountSwitcher:
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims], pre
             )
-            plans = self._plans_after_fetch(records, pre, info_by_num)
+            plans = self._plans_after_fetch(records, pre, info_by_num, fixed_intervals)
             accepted = store.record(records, identities, claims, plans)
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
@@ -5965,6 +5976,7 @@ class ClaudeAccountSwitcher:
         records: dict[str, FetchRecord],
         pre: dict[str, UsageEntry],
         info_by_num: dict[str, tuple],
+        fixed_intervals: dict[str, float | None] | None = None,
     ) -> dict[str, tuple[float | None, float | None]]:
         """Build successful-fetch cadence updates for atomic outcome commit.
 
@@ -5973,6 +5985,7 @@ class ClaudeAccountSwitcher:
         """
         now = self._usage_store.clock()
         threshold, weekly_threshold, models = self._poll_policy_inputs()
+        usage_settings = self._usage_settings()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -5989,6 +6002,9 @@ class ClaudeAccountSwitcher:
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                fixed_interval_s=(fixed_intervals.get(num) if fixed_intervals is not None
+                                  else usage_settings.active_interval_seconds if info_by_num[num][4]
+                                  else usage_settings.candidate_interval_seconds),
             )
         return plans
 
@@ -6004,6 +6020,10 @@ class ClaudeAccountSwitcher:
         contract: the switch this rides on has already committed, so a cache
         hiccup here must not surface as a switch failure."""
         try:
+            usage_settings = self._usage_settings()
+            if (usage_settings.active_interval_seconds is not None
+                    or usage_settings.candidate_interval_seconds is not None):
+                return
             identities = {number: (email, org_uuid or "")}
             now = self._usage_store.clock()
             # No models needed: only fetched_at/next_poll_at is read here.
