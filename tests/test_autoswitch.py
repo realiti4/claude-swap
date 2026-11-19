@@ -7137,10 +7137,14 @@ class TestOneRemedyPerKindAcrossEverySurface:
         from claude_swap.autoswitch import _SYSTEMIC_KINDS
         from claude_swap.oauth import _DETERMINISTIC_REFRESH_ERRORS
 
-        assert set(_SYSTEMIC_KINDS) == set(_DETERMINISTIC_REFRESH_ERRORS), (
+        # `live-login` is deterministic for the refresh (no retry through the
+        # usage endpoint) but one candidate's skip for the tick
+        # (`skip-live-login`), never a systemic cause to report.
+        deterministic = set(_DETERMINISTIC_REFRESH_ERRORS) - {"live-login"}
+        assert set(_SYSTEMIC_KINDS) == deterministic, (
             "a kind is systemic on one side and not the other: "
-            f"only oauth={sorted(set(_DETERMINISTIC_REFRESH_ERRORS) - set(_SYSTEMIC_KINDS))} "
-            f"only autoswitch={sorted(set(_SYSTEMIC_KINDS) - set(_DETERMINISTIC_REFRESH_ERRORS))}"
+            f"only oauth={sorted(deterministic - set(_SYSTEMIC_KINDS))} "
+            f"only autoswitch={sorted(set(_SYSTEMIC_KINDS) - deterministic)}"
         )
 
 
