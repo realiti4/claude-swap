@@ -3148,12 +3148,13 @@ class ClaudeAccountSwitcher:
                 if live_holds is None:
                     # Whether the live login holds this grant cannot be
                     # told. Same rule as an unreadable backup above: defer,
-                    # nothing consumed.
+                    # nothing consumed. Registered kind, not `transient`
+                    # (a bare one falls through to a 401 shown as "(network?)").
                     self._logger.info(
                         "Live credential unreadable; deferring account "
                         "%s's backup refresh to the next pass.", account_num,
                     )
-                    return oauth.RefreshOutcome(None, "transient")
+                    return oauth.RefreshOutcome(None, "live-store-unreadable")
                 if live_holds:
                     # A grant the live login also holds is Claude Code's to
                     # renew. This gate saves the successor to the slot's

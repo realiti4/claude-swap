@@ -16418,7 +16418,9 @@ class TestConsumeGate:
             result = s.consume_backup_grant("1", "test@example.com", self._OLD)
 
         post.assert_not_called()
-        assert result.error == "transient"
+        # Not upstream's `transient`: that is not a deterministic kind, so the
+        # collector would spend a 401 on it and autoswitch would say "(network?)".
+        assert result.error == "live-store-unreadable"
         assert result.credentials is None
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
