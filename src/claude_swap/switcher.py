@@ -340,6 +340,10 @@ ERROR_NOTES = {
         "the live credential store already holds this slot's lineage — "
         "refreshes once another account is switched to"
     ),
+    "live-login": (
+        "the live login is this account's, so Claude Code renews it — "
+        "switch to this account to realign"
+    ),
     "oauth_not_allowed_for_organization": (
         "this account's organization does not allow OAuth sign-in (a lapsed "
         "plan or an org policy), so its usage cannot be read — renewing the "
@@ -2769,7 +2773,9 @@ class ClaudeAccountSwitcher:
 
         The body below is the sequence: adopt a stashed successor and re-read
         under the slot lock, POST outside it, then CAS on the refresh-token
-        fingerprint and either persist or stash. A consumed generation is
+        fingerprint and either persist or stash. A grant the live login also
+        holds is not POSTed (``live-login``): its successor would reach the
+        backup only. A consumed generation is
         never discarded — a stash is adopted by the next pass — and the gate
         never raises after the grant is consumed, since callers run in the
         never-raises collect pass.
@@ -3137,6 +3143,40 @@ class ClaudeAccountSwitcher:
                     # replaces the credential (`cswap add`), which is
                     # exactly the re-login window this gate exists to close.
                     return oauth.RefreshOutcome(None, "lineage-condemned")
+
+                live_holds = self._live_login_holds(refresh_input)
+                if live_holds is None:
+                    # Whether the live login holds this grant cannot be
+                    # told. Same rule as an unreadable backup above: defer,
+                    # nothing consumed.
+                    self._logger.info(
+                        "Live credential unreadable; deferring account "
+                        "%s's backup refresh to the next pass.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "transient")
+                if live_holds:
+                    # A grant the live login also holds is Claude Code's to
+                    # renew. This gate saves the successor to the slot's
+                    # backup only, so POSTing it leaves the live store on a
+                    # spent refresh token, which the token endpoint rejects
+                    # on re-presentation (see ``_fetch_active_usage``). A
+                    # slot arrives here as inactive with the live login's
+                    # grant when ``~/.claude.json`` names another account
+                    # than the one the live credential belongs to, or when a
+                    # switch activated it after this pass decided it was
+                    # inactive.
+                    #
+                    # Its own kind, not ``transient``: a caller that carries
+                    # on with the stored credential after a failed refresh
+                    # (``cswap run`` seeding a profile) would hand a second
+                    # Claude Code the same grant.
+                    self._logger.info(
+                        "Account %s's stored login is the live login; "
+                        "leaving its renewal to Claude Code.", account_num,
+                    )
+                    return oauth.RefreshOutcome(
+                        None, "live-login", None, consumed_fp
+                    )
 
                 # Never POST a refresh grant the LIVE credential store
                 # currently holds. `_adopt_login_into_slot` never moves
@@ -3537,6 +3577,29 @@ class ClaudeAccountSwitcher:
         return oauth.RefreshOutcome(
             outcome_creds, None, result.token_account, consumed_fp
         )
+
+    def _live_login_holds(self, credentials: str) -> bool | None:
+        """Whether the live store holds the refresh token in ``credentials``.
+
+        True on an exact match. False when ``credentials`` carry no refresh
+        token, or the live store was read and holds another credential or
+        none. None when the live store could not be read for certain: a read
+        error, an unreadable Keychain, or a Keychain failure that a fallback
+        file covered, whose bytes may be an older generation than the one
+        Claude Code holds. Never raises.
+        """
+        if not (oauth.extract_oauth_data(credentials) or {}).get("refreshToken"):
+            return False
+        try:
+            live = self._read_active_credentials()
+        except Exception:
+            self._logger.debug("live credential read failed", exc_info=True)
+            return None
+        if live.value is None or live.keychain_unavailable or live.degraded:
+            return None
+        return bool(live.value) and oauth.credential_fingerprint(
+            live.value
+        ) == oauth.credential_fingerprint(credentials)
 
     def _retire_stash_entry(self, entry_id: str, account_num: str) -> None:
         """Drop one stash entry as housekeeping. Never fatal.

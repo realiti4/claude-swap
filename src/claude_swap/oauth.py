@@ -1574,11 +1574,12 @@ def fetch_usage(access_token: str) -> dict | None:
 # `consume-busy` belongs here for a reason the other two make obvious only in
 # hindsight: the retry re-enters the same gate, finds it still held, and the
 # distinct kind arrives as generic "refresh-failed" — hiding it, and spending a
-# guaranteed 401 per pass to learn nothing.
+# guaranteed 401 per pass to learn nothing. `live-login` is the gate declining
+# a grant the live login also holds; the retry would be declined the same way.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
     "stash-write-failed", "identity-unreadable", "lineage-condemned",
-    "live-store-unreadable", "live-store-current",
+    "live-store-unreadable", "live-store-current", "live-login",
 )
 
 
