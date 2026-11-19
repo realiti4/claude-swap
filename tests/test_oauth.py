@@ -2237,6 +2237,26 @@ class TestConsumeBusyIsDeterministic:
         assert out.error == "consume-busy", out.error
         usage.assert_not_called()
 
+    def test_a_grant_left_to_the_live_login_does_not_spend_a_doomed_request(self):
+        """The gate declines a grant the live login holds. The token in hand
+        is still expired, and the retry after its 401 would be declined the
+        same way."""
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(None, "live-login"),
+            )
+        assert out.error == "live-login", out.error
+        assert out.struck_fp is None
+        usage.assert_not_called()
+
     def test_every_deterministic_kind_has_a_note(self):
         """The reason these kinds stay distinct is the note they carry.
 
