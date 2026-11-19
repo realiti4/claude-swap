@@ -50,7 +50,7 @@ def fetch_outcome(monkeypatch):
         response.read.return_value = json.dumps(payload).encode()
         response.__enter__.return_value = response
 
-        def urlopen(request, timeout):
+        def urlopen(request, timeout, context=None):
             assert request.full_url == "https://api.anthropic.com/api/oauth/usage"
             if error is not None:
                 raise error

@@ -15,8 +15,13 @@ from rich.cells import cell_len
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import oauth, pace, subscription
-from claude_swap.json_output import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
+from claude_swap import oauth, pace, pin, subscription
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+)
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.printer import format_age
@@ -178,6 +183,30 @@ def usage_rows(
     return rows
 
 
+def pin_is_broken(acc: AccountSnapshot) -> bool:
+    """Whether pinning to ``acc`` currently cannot produce a bearer.
+
+    Only the states where the pinned account genuinely has no usable
+    credential count. ``token expired`` deliberately does not: the proxy
+    refreshes that itself, and flagging it would cry wolf on the normal case.
+    ``keychain unavailable`` is a read problem on THIS process, not evidence
+    about the credential, so it is left alone too — a warning that fires on
+    "I could not look" teaches people to ignore warnings.
+    """
+    # An API-key account can never produce one: `sk-ant-api…` is not OAuth
+    # JSON, so the provider returns None for every request and each one fails
+    # open. `kind` rather than the sentinel — the sentinel is derived and reads
+    # something else entirely for an unreadable backup blob or a locked macOS
+    # keychain, while `kind` is the same fact set_pin refuses on.
+    if getattr(acc, "kind", None) == "api_key":
+        return True
+    return acc.usage.sentinel in (
+        USAGE_NO_CREDENTIALS,      # nothing stored for the slot
+        USAGE_RELOGIN_REQUIRED,    # refresh lineage dead; only a human fixes it
+        USAGE_FOREIGN_CREDENTIAL,  # the stored credential is another account's
+    )
+
+
 # Login-note forms, fullest first: "re-login in 5d 12h", "re-login in 5d",
 # nothing. A row carries one only while its login is due
 # (``oauth.login_time_left``), so most rows read as if there were no note.
@@ -254,6 +283,7 @@ def account_card_text(
     weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    cloud_pinned: bool = False,
     show_tag: bool = True,
     login: str | None = "full",
 ) -> Text:
@@ -261,7 +291,13 @@ def account_card_text(
     tick is the switch line that row is judged against: ``threshold`` on the
     5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
     per-model rows, which reset weekly. ``login`` is the form of the re-login
-    note that ends the header while the login is due (see ``LOGIN_FORMS``)."""
+    note that ends the header while the login is due (see ``LOGIN_FORMS``).
+
+    ``cloud_pinned`` marks the account that owns the claude.ai-side assets
+    (Remote Control sessions, Artifacts). It is independent of ``is_active``
+    — inference follows the active account while those stay pinned — so both
+    badges can appear, on different accounts or the same one.
+    """
     now = now if now is not None else time.time()
 
     text = Text()
@@ -275,6 +311,19 @@ def account_card_text(
         text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
+    if cloud_pinned:
+        # Same marker shape as "● active" — the two are sibling states of one
+        # account, and a lone glyph read as decoration next to the usage
+        # figures rather than as a label.
+        text.append("   ○ cloud", style=f"bold {palette.sev_warn}")
+        if pin_is_broken(acc):
+            # The pin is FAIL-OPEN: an account that cannot mint a bearer sends
+            # RC and Artifacts back to whichever account is active, silently.
+            # The account's own row already says "re-login needed", but the
+            # cloud marker looked healthy right next to it — so the one place
+            # that claims "your claude.ai side lives here" was the one place
+            # not admitting it no longer does.
+            text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "   "):
@@ -367,6 +416,7 @@ def mini_account_text(
     *,
     palette: Palette = Palette.DARK,
     login: str | None = "full",
+    cloud_pinned: bool = False,
     show_tag: bool = True,
 ) -> Text:
     """One minimized line for an inactive account.
@@ -386,6 +436,12 @@ def mini_account_text(
         text.append(acc.email, style=palette.foreground)
     if show_tag:
         text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if cloud_pinned:
+        # Labelled, like the full card: a bare glyph sitting between the
+        # org tag and the usage figures read as decoration, not as a state.
+        text.append("  ○ cloud", style=f"bold {palette.sev_warn}")
+        if pin_is_broken(acc):
+            text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
@@ -453,10 +509,26 @@ class AccountsPanel(Static):
     def __init__(self, *, show_minis: bool = True, id: str | None = None) -> None:
         super().__init__(id=id)
         self._show_minis = show_minis
+        self._pinned_identity: "tuple[str, str] | None" = None
 
     def on_mount(self) -> None:
-        self.watch(self.app, "snapshot", lambda _snap: self.refresh(layout=True))
+        self.watch(self.app, "snapshot", lambda _snap: self._resolve_and_refresh())
+        # THEME ONLY REPAINTS. The pin did not move, so re-resolving it here
+        # would put the package lookup back on a path that is not a snapshot.
         self.watch(self.app, "theme", lambda _t: self.refresh(layout=True))
+
+    def _resolve_and_refresh(self) -> None:
+        """Ask the pin ONCE per snapshot, like AccountCard's owner does.
+
+        `render()` used to ask it. That is one call per repaint rather than
+        the N `AccountCard` was making, so the arithmetic is milder — but the
+        argument in that class's docstring is about WHEN `render()` fires, not
+        how many widgets fire it: resize and reflow, not the 3s poll. This
+        widget already watched `snapshot`, so the answer had a place to live
+        and simply was not put there.
+        """
+        self._pinned_identity = pin.pinned_identity(self.app.switcher)
+        self.refresh(layout=True)
 
     def render(self) -> Text:
         app: "CswapApp" = self.app  # type: ignore[assignment]
@@ -474,6 +546,9 @@ class AccountsPanel(Static):
         now = time.time()
         panel_width = self.size.width or 80
         width = panel_width - 2
+        def is_pinned(acc: AccountSnapshot) -> bool:
+            return pin.account_is_pinned(self._pinned_identity, acc.email, acc.org_uuid)
+
         # One login-note form for all the minis, so the rows that carry one
         # read alike; the card's header also carries the plan and age, so it
         # fits its own.
@@ -483,7 +558,7 @@ class AccountsPanel(Static):
                 lambda login: [
                     mini_account_text(
                         acc, now, palette=palette, login=login,
-                        show_tag=app.tag_shown(acc),
+                        cloud_pinned=is_pinned(acc), show_tag=app.tag_shown(acc),
                     )
                     for acc in inactive
                 ],
@@ -497,7 +572,8 @@ class AccountsPanel(Static):
                     fitted_card_text(
                         acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
-                        palette=palette, show_tag=app.tag_shown(acc),
+                        palette=palette, cloud_pinned=is_pinned(acc),
+                        show_tag=app.tag_shown(acc),
                     )
                 )
             elif self._show_minis:
@@ -517,15 +593,31 @@ class AccountsPanel(Static):
 
 
 class AccountCard(Static):
-    """One account rendered full-size (used by the switch screen's list)."""
+    """One account rendered full-size (used by the switch screen's list).
 
-    def __init__(self, acc: AccountSnapshot, *, threshold: float | None = None) -> None:
+    ``cloud_pinned`` IS HANDED IN, not asked for. This used to call
+    ``pin.pinned_identity`` from ``render()``, which is per-widget and not on the
+    poll: it fires on every repaint, resize and reflow, so N accounts cost N
+    package resolutions per frame (measured 450us each with the extra absent,
+    the majority case). Steady state that is 0.15% of a 3s tick and would not
+    be worth a line, but a held arrow key repaints at key-repeat rate and the
+    same work becomes ~13% of a core. The panel beside this already resolves
+    it once per render and passes it down; this is the same fact, resolved
+    once per SNAPSHOT one frame further up.
+    """
+
+    def __init__(
+        self, acc: AccountSnapshot, *, threshold: float | None = None,
+        cloud_pinned: bool = False,
+    ) -> None:
         super().__init__()
         self._acc = acc
         self._threshold = threshold
+        self._cloud_pinned = cloud_pinned
 
-    def set_account(self, acc: AccountSnapshot) -> None:
+    def set_account(self, acc: AccountSnapshot, *, cloud_pinned: bool = False) -> None:
         self._acc = acc
+        self._cloud_pinned = cloud_pinned
         self.refresh(layout=True)
 
     def render(self) -> Text:
@@ -533,6 +625,7 @@ class AccountCard(Static):
         return fitted_card_text(
             self._acc, width, width, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
+            cloud_pinned=self._cloud_pinned,
             show_tag=self.app.tag_shown(self._acc),
         )
 
@@ -540,15 +633,15 @@ class AccountCard(Static):
 class AccountItem(ListItem):
     """ListView row wrapping an :class:`AccountCard`; remembers its slot."""
 
-    def __init__(self, acc: AccountSnapshot) -> None:
-        super().__init__(AccountCard(acc))
+    def __init__(self, acc: AccountSnapshot, *, cloud_pinned: bool = False) -> None:
+        super().__init__(AccountCard(acc, cloud_pinned=cloud_pinned))
         self.number = acc.number
         self.email = acc.email
 
-    def set_account(self, acc: AccountSnapshot) -> None:
+    def set_account(self, acc: AccountSnapshot, *, cloud_pinned: bool = False) -> None:
         self.number = acc.number
         self.email = acc.email
-        self.query_one(AccountCard).set_account(acc)
+        self.query_one(AccountCard).set_account(acc, cloud_pinned=cloud_pinned)
 
 
 class MenuItem(ListItem):
