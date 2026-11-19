@@ -66,6 +66,10 @@ class KeychainError(Exception):
     """A ``security`` invocation failed for a reason other than "not found"."""
 
 
+class KeychainTimeout(KeychainError):
+    """A ``security`` invocation did not finish within its time limit."""
+
+
 # The exceptions a Keychain operation may raise that callers should treat as
 # "Keychain unusable" (→ fall back to file storage) rather than a programming
 # bug: a wrapper failure (KeychainError, incl. a converted timeout), a raw
@@ -106,23 +110,29 @@ def _quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def get_password(service: str, account: str) -> str | None:
+def get_password(
+    service: str, account: str, timeout: float | None = None
+) -> str | None:
     """Return the stored password, or ``None`` if no such item exists (rc 44).
 
     Raises :class:`KeychainError` on any other non-zero exit (locked / denied /
-    unavailable) or a timeout, so a genuine miss is not confused with a transient
-    failure.
+    unavailable) and :class:`KeychainTimeout` on a timeout, so a genuine miss is
+    not confused with a transient failure.
+
+    ``timeout`` replaces the default bound for a read that waits on a person
+    (see :func:`claude_swap.migrations.migrate_macos_keyring_to_security`).
     """
+    limit = _TIMEOUT if timeout is None else timeout
     try:
         result = spawn.run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
             capture_output=True,
             text=True,
-            timeout=_TIMEOUT,
+            timeout=limit,
         )
     except subprocess.TimeoutExpired as e:
-        raise KeychainError(
-            f"security find-generic-password timed out after {_TIMEOUT}s"
+        raise KeychainTimeout(
+            f"security find-generic-password timed out after {limit}s"
         ) from e
     if result.returncode == 0:
         # `-w` prints the value followed by one newline; strip exactly that so
@@ -163,7 +173,8 @@ def set_password(service: str, account: str, password: str) -> None:
 
     Prefers ``security -i`` stdin so the secret stays out of argv; falls back to
     argv only for payloads that would overflow the stdin line buffer. Raises
-    :class:`KeychainError` on a non-zero exit or a timeout.
+    :class:`KeychainError` on a non-zero exit and :class:`KeychainTimeout` on a
+    timeout.
     """
     hex_value = password.encode("utf-8").hex()
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
@@ -194,7 +205,7 @@ def set_password(service: str, account: str, password: str) -> None:
                 timeout=_TIMEOUT,
             )
     except subprocess.TimeoutExpired as e:
-        raise KeychainError(
+        raise KeychainTimeout(
             f"security add-generic-password timed out after {_TIMEOUT}s"
         ) from e
     if result.returncode != 0:
@@ -207,7 +218,8 @@ def set_password(service: str, account: str, password: str) -> None:
 def delete_password(service: str, account: str) -> None:
     """Delete a generic-password item. rc 44 (already absent) counts as success.
 
-    Raises :class:`KeychainError` on any other non-zero exit or a timeout.
+    Raises :class:`KeychainError` on any other non-zero exit and
+    :class:`KeychainTimeout` on a timeout.
     """
     try:
         result = spawn.run(
@@ -217,7 +229,7 @@ def delete_password(service: str, account: str) -> None:
             timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
-        raise KeychainError(
+        raise KeychainTimeout(
             f"security delete-generic-password timed out after {_TIMEOUT}s"
         ) from e
     if result.returncode in (0, _NOT_FOUND_RC):
