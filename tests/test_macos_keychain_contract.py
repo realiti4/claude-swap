@@ -782,7 +782,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
 
         seen: dict = {}
 
-        def spy(info, rejected_fp=None):
+        def spy(info, rejected_fp=None, last_usage=None):
             seen["degraded"] = s._active_verdict().degraded
             return FetchRecord(error="timeout")
 
