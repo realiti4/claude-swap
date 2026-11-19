@@ -183,3 +183,22 @@ def test_normalize_path_applies_normcase(monkeypatch, tmp_path: Path):
 
     assert calls, "normalize_path did not call os.path.normcase"
     assert key == key.lower(), "normcase result was not applied to the key"
+
+
+def test_write_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypatch):
+    """A Ctrl-C mid-write is not an OSError; the temp must still be removed.
+    Injected at fsync, the one call in the sequence only the writer makes."""
+    import pytest
+
+    store = MappingStore(tmp_path / "backup")
+    store._write({"seed": {}})
+
+    def interrupt(fd):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("claude_swap.fsutil.os.fsync", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        store._write({})
+    assert not list(store.path.parent.glob("*.tmp"))
+    # The previous content survived the interrupted write.
+    assert '"seed"' in store.path.read_text(encoding="utf-8")

@@ -59,6 +59,17 @@ TOUCH_INTERVAL_S = 3.0
 # Note this is a PER-LOCK budget: claude_credentials_lock acquires two locks
 # sequentially, so its worst case is ~2x this value.
 DEFAULT_TIMEOUT_S = 9.0
+# A short back-off after an arm declines, so the retry loop cannot spin hot.
+_DECLINE_BACKOFF_S = 0.05
+# A stale-lock takeover is a stat followed by an rmdir, and two waiters that
+# both saw the same dead holder could each run it: the second rmdir then hit
+# the first waiter's fresh lock (#420). Takeovers are serialized through this
+# sibling directory and re-check staleness inside it. Claude Code never looks
+# at it, so the lock protocol itself is unchanged.
+TAKEOVER_SUFFIX = ".takeover"
+# The takeover directory is held for one stat + rmdir; older than this, its
+# holder died mid-takeover.
+TAKEOVER_STALENESS_S = 5.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -80,6 +91,60 @@ def config_lock_dir() -> Path:
     """Lock directory guarding the global config file (``~/.claude.json.lock``)."""
     path = get_global_config_path()
     return path.parent / (path.name + ".lock")
+
+
+def _nap(want: float, start: float, timeout: float) -> None:
+    """Sleep at most what is LEFT of the budget, never a full jitter draw.
+
+    The deadline is checked at the top of the loop, so a sleep longer than the
+    remainder would run to completion first and the raise would land late.
+    Clamping to the remainder rather than to `timeout` keeps that true on the
+    SECOND retry too -- `min(want, timeout)` is a no-op once most of the
+    budget is already spent.
+
+    Never negative: an expired budget sleeps zero and the caller's next
+    deadline check raises, which is the same instant either way.
+    """
+    left = timeout - (time.monotonic() - start)
+    if left > 0:
+        time.sleep(min(want, left))
+
+
+def _remove_if_still_stale(lock_dir: Path, staleness: float) -> bool:
+    """Remove ``lock_dir`` if it is still stale, under the takeover directory.
+
+    Returns True if this call removed it. False means another waiter is mid-
+    takeover, the lock was already gone or retaken, or it can't be removed.
+    """
+    takeover = lock_dir.with_name(lock_dir.name + TAKEOVER_SUFFIX)
+    try:
+        os.mkdir(takeover)
+    except FileExistsError:
+        try:
+            if time.time() - os.lstat(takeover).st_mtime > TAKEOVER_STALENESS_S:
+                try:
+                    os.rmdir(takeover)  # its holder died mid-takeover
+                except NotADirectoryError:
+                    os.unlink(takeover)  # a file or symlink; not ours to keep
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+    try:
+        # Re-check inside: the waiter before us may already have removed the
+        # dead lock and taken a fresh one at the same path.
+        if time.time() - os.stat(lock_dir).st_mtime <= staleness:
+            return False
+        os.rmdir(lock_dir)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.rmdir(takeover)
+        except OSError:
+            pass
 
 
 @contextmanager
@@ -117,25 +182,52 @@ def proper_lockfile(
         try:
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
-            continue  # holder released between mkdir and stat; retry now
-        if time.time() - held_mtime > staleness:
-            # Dead holder per the protocol: remove and retake. Losing the
-            # rmdir/mkdir race to another waiter just means looping again.
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                time.sleep(0.05)  # can't remove it either; don't spin hot
+            # BACK OFF HERE TOO. A dangling symlink at the lock path answers
+            # FileExistsError to mkdir and FileNotFoundError to stat, so this
+            # arm can repeat for the whole budget.
+            _nap(_DECLINE_BACKOFF_S, start, timeout)
             continue
-        time.sleep(0.25 + random.random() * 0.25)
+        if time.time() - held_mtime > staleness:
+            # Dead holder per the protocol: remove and retake. Declining --
+            # a peer retook it, or the corpse could not be removed -- must
+            # not spin hot, and must not sleep past the deadline.
+            if not _remove_if_still_stale(lock_dir, staleness):
+                _nap(_DECLINE_BACKOFF_S, start, timeout)
+            continue
+        _nap(0.25 + random.random() * 0.25, start, timeout)
 
     stop_touching = threading.Event()
+    warned = False
+    last_ok = time.time()
 
     def _touch() -> None:
+        nonlocal warned, last_ok
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             try:
                 os.utime(lock_dir)
-            except OSError:
-                return  # lock stolen/removed; nothing left to keep alive
+                # THE LATCH IS PER FREEZE, NOT PER HOLD: a refresh that lands
+                # ends the episode the warning describes, so the next freeze
+                # is a new fact and the takeover it precedes needs saying.
+                last_ok, warned = time.time(), False
+            except FileNotFoundError:
+                return  # gone; nothing left to keep alive
+            except OSError as e:
+                # Transient, so stay armed: absence is terminal and every
+                # other errno is not. Re-checking the path to tell them apart
+                # is a second syscall that can fail the same way, and from
+                # 3.14 one that reads absence out of a permission error.
+                #
+                # WARN ONLY ONCE THE SENTENCE IS TRUE. It describes a freeze
+                # that outlives `staleness`; firing on the first failure
+                # announced imminent theft over a lock that stayed fresh.
+                if not warned and time.time() - last_ok > staleness:
+                    warned = True
+                    _logger.warning(
+                        "Could not refresh %s (%s); its mtime stops advancing, "
+                        "so a waiter may take it over as stale",
+                        lock_dir,
+                        e,
+                    )
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()

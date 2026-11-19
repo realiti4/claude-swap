@@ -17,10 +17,9 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.models import get_timestamp
 
 SCHEMA_VERSION = 1
@@ -118,25 +117,11 @@ class MappingStore:
         return best
 
     def _write(self, mappings: dict[str, dict]) -> None:
-        """Atomically write the mappings file (tempfile + os.replace)."""
+        """Atomically write the mappings file (temp beside it + rename)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if sys.platform != "win32":
             os.chmod(self.path.parent, 0o700)
         payload = json.dumps(
             {"schemaVersion": SCHEMA_VERSION, "mappings": mappings}, indent=2
         )
-        fd, tmp = tempfile.mkstemp(
-            dir=str(self.path.parent), prefix=".mappings-", suffix=".tmp"
-        )
-        try:
-            if sys.platform != "win32":
-                os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            replace_with_retry(tmp, self.path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(self.path, payload)
