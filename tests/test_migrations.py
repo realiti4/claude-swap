@@ -17,7 +17,7 @@ import pytest
 
 from claude_swap import migrations
 from claude_swap.exceptions import MigrationIncomplete
-from claude_swap.macos_keychain import KeychainError
+from claude_swap.macos_keychain import KeychainError, KeychainTimeout
 from claude_swap.migrations import run_migrations
 from claude_swap.models import Platform
 from claude_swap.switcher import KEYRING_SERVICE, ClaudeAccountSwitcher
@@ -345,3 +345,187 @@ class TestMacosKeyringToSecurity:
         keychain_reads.reset_mock()
         run_migrations(switcher)
         assert _legacy_reads(keychain_reads) == []
+
+
+# ---------------------------------------------------------------------------
+# Waiting for the Keychain permission window
+# ---------------------------------------------------------------------------
+
+EMAIL_B = "b@example.com"
+EMAIL_C = "c@example.com"
+LEGACY_USER_B = f"account-2-{EMAIL_B}"
+LEGACY_USER_C = f"account-3-{EMAIL_C}"
+THREE_ACCOUNTS = {
+    "1": {"email": EMAIL},
+    "2": {"email": EMAIL_B},
+    "3": {"email": EMAIL_C},
+}
+
+
+def _legacy_timeouts(spy: MagicMock) -> list[float | None]:
+    """The ``timeout`` each legacy read asked for; ``None`` is a read that passed
+    none, so the wrapper's default bound applies."""
+    return [
+        c.kwargs.get("timeout")
+        for c in spy.call_args_list
+        if c.args[0] == KEYRING_SERVICE
+    ]
+
+
+class TestKeychainPromptWait:
+    """A legacy read waits for the Keychain permission window only when a person
+    is running the command and the legacy item is known to exist; every other
+    read keeps the wrapper's default bound."""
+
+    def test_person_at_terminal_gets_one_notice_and_the_long_wait(
+        self, temp_home, block_real_keychain, keychain_reads, capsys
+    ):
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        switcher.interactive = True
+        _seed_sequence(switcher, {"1": {"email": EMAIL}, "2": {"email": EMAIL_B}})
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER, "one")
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER_B, "two")
+
+        assert migrations.migrate_macos_keyring_to_security(switcher) is True
+
+        assert _legacy_timeouts(keychain_reads) == [migrations._PROMPT_WAIT] * 2
+        assert capsys.readouterr().err.count("Always Allow") == 1
+        assert switcher._read_account_credentials("1", EMAIL) == "one"
+        assert switcher._read_account_credentials("2", EMAIL_B) == "two"
+
+    def test_other_callers_keep_the_default_bound_and_get_no_notice(
+        self, temp_home, block_real_keychain, keychain_reads, capsys
+    ):
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        assert switcher.interactive is False
+        _seed_sequence(switcher, {"1": {"email": EMAIL}})
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER, "sekret")
+
+        assert migrations.migrate_macos_keyring_to_security(switcher) is True
+
+        legacy_calls = [
+            c for c in keychain_reads.call_args_list if c.args[0] == KEYRING_SERVICE
+        ]
+        assert [c.args[1] for c in legacy_calls] == [LEGACY_USER]
+        assert all("timeout" not in c.kwargs for c in legacy_calls)
+        assert "Always Allow" not in capsys.readouterr().err
+
+    def test_no_legacy_item_means_no_notice_and_no_long_wait(
+        self, temp_home, block_real_keychain, keychain_reads, capsys
+    ):
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        switcher.interactive = True
+        _seed_sequence(switcher, {"1": {"email": EMAIL}})
+
+        assert migrations.migrate_macos_keyring_to_security(switcher) is True
+
+        assert _legacy_reads(keychain_reads) == [LEGACY_USER, LEGACY_NONE_USER]
+        assert _legacy_timeouts(keychain_reads) == [None, None]
+        assert "Always Allow" not in capsys.readouterr().err
+
+    def test_failed_lookup_still_reads_and_migrates_the_item(
+        self, temp_home, block_real_keychain, keychain_reads, monkeypatch
+    ):
+        """``item_exists`` answers False for a failed lookup too, so it only picks
+        the bound: the read itself decides whether the item is absent."""
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        switcher.interactive = True
+        _seed_sequence(switcher, {"1": {"email": EMAIL}})
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER, "sekret")
+        monkeypatch.setattr(
+            migrations.macos_keychain, "item_exists", lambda service, account: False
+        )
+
+        assert migrations.migrate_macos_keyring_to_security(switcher) is True
+
+        assert _legacy_timeouts(keychain_reads) == [None]
+        assert switcher._read_account_credentials("1", EMAIL) == "sekret"
+
+    def test_unanswered_prompt_ends_the_attempt_and_keeps_earlier_work(
+        self, temp_home, block_real_keychain, keychain_reads
+    ):
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        switcher.interactive = True
+        _seed_sequence(switcher, THREE_ACCOUNTS)
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER, "one")
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER_B, "two")
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER_C, "three")
+
+        def second_prompt_unanswered(service, account, timeout=None):
+            if (service, account) == (KEYRING_SERVICE, LEGACY_USER_B):
+                raise KeychainTimeout("timed out")
+            return block_real_keychain.get_password(service, account)
+
+        keychain_reads.side_effect = second_prompt_unanswered
+
+        with pytest.raises(MigrationIncomplete, match="2 account.*cswap list"):
+            migrations.migrate_macos_keyring_to_security(switcher)
+
+        # The third account is never read: no second window, no second wait.
+        assert _legacy_reads(keychain_reads) == [LEGACY_USER, LEGACY_USER_B]
+        # The answered one moved; the other two are intact in the legacy service.
+        assert switcher._read_account_credentials("1", EMAIL) == "one"
+        assert block_real_keychain.get_password(KEYRING_SERVICE, LEGACY_USER) is None
+        assert block_real_keychain.get_password(KEYRING_SERVICE, LEGACY_USER_B) == "two"
+        assert block_real_keychain.get_password(KEYRING_SERVICE, LEGACY_USER_C) == "three"
+
+    def test_unanswered_prompt_leaves_the_migration_unmarked(
+        self, temp_home, block_real_keychain, keychain_reads
+    ):
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        switcher.interactive = True
+        _seed_sequence(switcher, {"1": {"email": EMAIL}})
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER, "sekret")
+        keychain_reads.side_effect = KeychainTimeout("timed out")
+
+        run_migrations(switcher)  # logs the incomplete run, never raises
+
+        state_file = switcher.backup_dir / ".migrations.json"
+        if state_file.exists():
+            applied = json.loads(state_file.read_text()).get("applied", {})
+            assert "macos_keyring_to_security" not in applied
+        assert block_real_keychain.get_password(KEYRING_SERVICE, LEGACY_USER) == "sekret"
+
+    def test_denied_prompt_moves_on_to_the_next_account(
+        self, temp_home, block_real_keychain, keychain_reads
+    ):
+        """Only a timeout ends the attempt: a refusal returns at once, so the
+        next account is still tried, and the message names no window to approve."""
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        switcher.interactive = True
+        _seed_sequence(switcher, {"1": {"email": EMAIL}, "2": {"email": EMAIL_B}})
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER, "one")
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER_B, "two")
+
+        def first_denied(service, account, timeout=None):
+            if (service, account) == (KEYRING_SERVICE, LEGACY_USER):
+                raise KeychainError("denied")
+            return block_real_keychain.get_password(service, account)
+
+        keychain_reads.side_effect = first_denied
+
+        with pytest.raises(MigrationIncomplete) as raised:
+            migrations.migrate_macos_keyring_to_security(switcher)
+
+        assert "cswap list" not in str(raised.value)
+        assert switcher._read_account_credentials("2", EMAIL_B) == "two"
+
+    def test_timeout_without_a_person_still_tries_every_account(
+        self, temp_home, block_real_keychain, keychain_reads
+    ):
+        switcher = _make_switcher(temp_home, Platform.MACOS)
+        _seed_sequence(switcher, {"1": {"email": EMAIL}, "2": {"email": EMAIL_B}})
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER, "one")
+        block_real_keychain.set_password(KEYRING_SERVICE, LEGACY_USER_B, "two")
+
+        def legacy_times_out(service, account):
+            if service == KEYRING_SERVICE:
+                raise KeychainTimeout("timed out")
+            return block_real_keychain.get_password(service, account)
+
+        keychain_reads.side_effect = legacy_times_out
+
+        with pytest.raises(MigrationIncomplete, match="2 account.*cswap list"):
+            migrations.migrate_macos_keyring_to_security(switcher)
+
+        assert _legacy_reads(keychain_reads) == [LEGACY_USER, LEGACY_USER_B]

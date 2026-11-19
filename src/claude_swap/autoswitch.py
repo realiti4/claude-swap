@@ -61,7 +61,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    log_unrecognized_keys,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -806,9 +811,10 @@ class AutoSwitchEngine:
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
         account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
-        touches the slot's *backup* store; the active credential belongs to
-        Claude Code.
+        trouble — try again next tick), ``"skip-live-session"`` or
+        ``"skip-live-login"`` (the live login already holds this slot's
+        grant). Only ever touches the slot's *backup* store; the active
+        credential belongs to Claude Code.
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
@@ -855,6 +861,11 @@ class AutoSwitchEngine:
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
+        if outcome.error == "live-login":
+            # The live login already holds this slot's grant, so the gate
+            # left it to Claude Code. Not network trouble and not a dead
+            # token: pass over the candidate for this tick.
+            return "skip-live-login"
         if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
             # refuses identically and keeps refusing until something outside
@@ -1626,7 +1637,7 @@ class AutoSwitchEngine:
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            if status == "skip-live-session":
+            if status in ("skip-live-session", "skip-live-login"):
                 continue
             return self._perform(num, email, trigger, left_snapshot)
 
@@ -2782,6 +2793,9 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        # Once per loop, not per tick: a settings key nothing reads would
+        # otherwise leave the loop running on a default with no trace of why.
+        log_unrecognized_keys(self.switcher.backup_dir)
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
