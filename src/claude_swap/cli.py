@@ -248,16 +248,14 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
             )
             return  # only reachable in tests
         if email is not None:
-            warning(
+            manager._warn(
                 f"Mapped account {email} no longer exists — "
                 "launching the default account."
             )
         else:
-            print(
-                dimmed(
-                    f"No account mapped for {os.getcwd()} — "
-                    "launching the default account."
-                )
+            manager._note(
+                f"No account mapped for {os.getcwd()} — "
+                "launching the default account."
             )
         manager.exec_default(tail)
     except ClaudeSwitchError as e:

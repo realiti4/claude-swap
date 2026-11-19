@@ -970,6 +970,18 @@ class TestClassifyUsageError:
         (line,) = _usage_entry_lines(UsageEntry(last_error="tls-cert"))
         assert "SSL_CERT_FILE" in line and "tls-cert" not in line
 
+    def test_organization_policy_403_shows_its_remedy(self):
+        """Same render path, for the kind `_classify_usage_error` reads from a
+        403 body: the line says renewing the plan, not the bare error code."""
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.usage_store import UsageEntry
+
+        (line,) = _usage_entry_lines(
+            UsageEntry(last_error="oauth_not_allowed_for_organization")
+        )
+        assert "renewing the plan" in line
+        assert "oauth_not_allowed_for_organization" not in line
+
     def test_bad_response(self):
         try:
             json.loads("not json")
@@ -1644,6 +1656,8 @@ class TestSetupTokenHeaderProbe:
         assert outcome.usage is None
         assert outcome.error == "setup-token"
         assert calls == []
+        # The kind renders through ERROR_NOTES, which names the remedy.
+        assert "usage.headerProbe" in oauth.ERROR_NOTES["setup-token"]
 
     def test_exhausted_account_reads_headers_off_the_429(self):
         values = dict(_UNIFIED_HEADERS)
