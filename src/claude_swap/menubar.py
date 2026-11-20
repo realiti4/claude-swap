@@ -31,6 +31,7 @@ from typing import ClassVar
 
 from claude_swap import launch_agent, oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.menubar_locale import translate, duration
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES, USAGE_RELOGIN_REQUIRED
@@ -102,6 +103,8 @@ class MenuBarSettings:
     so the CLI and the menu bar share one source of truth.
     """
 
+    language: str = "en"
+    account_cards: bool = False
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
@@ -304,6 +307,7 @@ def health_label(
     engine_running: bool,
     usage_age: float | None,
     refresh_interval: int,
+    language: str = "en",
 ) -> tuple[str, bool]:
     """The menu's first row: ``(label, attention)``.
 
@@ -328,6 +332,16 @@ def health_label(
         usage = f"usage stale, read {_age_text(usage_age)}"
     else:
         usage = f"usage read {_age_text(usage_age)}"
+    if language == "zh-Hans":
+        status = translate(language, status)
+        if usage_age is None:
+            usage = translate(language, usage)
+        else:
+            age = _age_text(usage_age)
+            age = (translate(language, age) if age == "just now" else
+                   translate(language, "{time} ago", time=duration(language, age.removesuffix(" ago"))))
+            message = "usage stale, read {age}" if usage_age > stale_after else "usage read {age}"
+            usage = translate(language, message, age=age)
     return f"{status} · {usage}", attention
 
 
@@ -428,6 +442,7 @@ def format_account_label(
     fetched_at: float | None = None,
     login_expires_at: float | None = None,
     quarantined: bool = False,
+    language: str = "en",
 ) -> str:
     """Build one account row's menu label.
 
@@ -440,6 +455,16 @@ def format_account_label(
     marker = "  (disabled)" if disabled else ""
     row = f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
     note = oauth.format_login_expiry(login_expires_at, quarantined, now)
+    if language == "zh-Hans":
+        marker = "  (已停用)" if disabled else ""
+        summary = usage_summary(usage, now, fetched_at)
+        for source, target in (("usage unavailable", "暂无用量"), ("(ahead)", "（用量偏快）"),
+                               ("rejected (!)", "请求被拒绝"), ("5h ", "5 小时 "), ("7d ", "本周 ")):
+            summary = summary.replace(source, target)
+        row = f"{num}  {label}{marker}  {summary}"
+        if note:
+            note = ("需要重新登录" if note == "re-login needed" else
+                    duration(language, note.removeprefix("re-login in ")) + "后需重新登录")
     return f"{row} · {note}" if note else row
 
 
@@ -882,6 +907,7 @@ def run(switcher) -> int:
                 engine_running=self._engine is not None,
                 usage_age=active_usage_age(self.snapshot),
                 refresh_interval=self.settings.refresh_interval,
+                language=self.settings.language,
             )
 
         def _refresh_health_row(self):
@@ -937,7 +963,7 @@ def run(switcher) -> int:
                 )
             except Exception as e:  # never let a bad start crash the menu bar
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
-                rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
+                rumps.notification("claude-swap", self._t("Auto-switch failed to start"), str(e))
                 self._engine_failure = str(e)
                 self._dirty = True  # the health row picks it up on the next tick
                 return
@@ -980,17 +1006,17 @@ def run(switcher) -> int:
                 events, self._engine_events = self._engine_events, []
             for ev in events:
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
-                    rumps.notification("claude-swap", "Auto-switched account", ev.human())
+                    rumps.notification("claude-swap", self._t("Auto-switched account"), ev.human())
                     self.refresh_async()  # reflect the switch promptly
                 elif ev.kind == "account-quarantined":
-                    rumps.notification("claude-swap", "Account quarantined", ev.human())
+                    rumps.notification("claude-swap", self._t("Account quarantined"), ev.human())
                 elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                    rumps.notification("claude-swap", self._t("All accounts exhausted"), ev.human())
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
                     # menu-bar user with a silently inert filter.
-                    rumps.notification("claude-swap", "Configuration warning", ev.human())
+                    rumps.notification("claude-swap", self._t("Configuration warning"), ev.human())
                 elif ev.kind == "error":
                     # A failed tick. The engine retries by itself, so dropping
                     # this hid a switch that could never succeed; say it once
@@ -999,7 +1025,7 @@ def run(switcher) -> int:
                         ev, self._engine_errors_surfaced, time.monotonic()
                     ):
                         self.switcher._logger.warning("auto-switch %s", ev.human())
-                        rumps.notification("claude-swap", "Auto-switch error", ev.human())
+                        rumps.notification("claude-swap", self._t("Auto-switch error"), ev.human())
                 elif ev.kind == "engine-stopped":
                     # The thread behind the hosted engine ended without us
                     # stopping it. Before this the reference stayed set: the
@@ -1015,7 +1041,7 @@ def run(switcher) -> int:
                         )
                         rumps.notification(
                             "claude-swap",
-                            "Auto-switch stopped",
+                            self._t("Auto-switch stopped"),
                             f"{self._engine_failure}. Open the menu to restart it.",
                         )
                         self.rebuild_menu()
@@ -1029,6 +1055,19 @@ def run(switcher) -> int:
                 return 0
 
         # ---- menu construction -----------------------------------------------
+        def _t(self, message, **values):
+            return translate(self.settings.language, message, **values)
+
+        def _language_callback(self, code):
+            def select(_sender):
+                self.settings.language = code
+                self._save_and_rebuild()
+            return select
+
+        def on_toggle_cards(self, _sender):
+            self.settings.account_cards = not self.settings.account_cards
+            self._save_and_rebuild()
+
         def rebuild_menu(self):
             health, attention = self._health()
             self._health_attention = attention
@@ -1059,6 +1098,7 @@ def run(switcher) -> int:
                             _purge(_sub)
                 _purge(self.menu._menu)
             self.menu.clear()
+            policy = load_settings(self.switcher.backup_dir) if self.settings.account_cards else None
             account_items = []
             for (
                 num, email, is_active, display, _last_good, alias, disabled, fetched_at,
@@ -1068,6 +1108,7 @@ def run(switcher) -> int:
                     format_account_label(
                         num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
                         login_expires_at=login_expires_at, quarantined=quarantined,
+                        language=self.settings.language,
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -1075,9 +1116,13 @@ def run(switcher) -> int:
                 if isinstance(display, str) and display != menu_note(display):
                     # The row shows the state; the remedy is a hover away.
                     _set_tooltip(item, display)
+                if policy is not None:
+                    from claude_swap.menubar_cards import attach_card
+                    attach_card(item, self, num, email, is_active, display, alias, disabled,
+                                login_expires_at, quarantined, policy)
                 account_items.append(item)
             if not account_items:
-                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+                account_items.append(rumps.MenuItem(self._t("No managed accounts"), callback=None))
 
             health_item = rumps.MenuItem(
                 health, callback=self.on_restart_engine if attention else None
@@ -1091,33 +1136,33 @@ def run(switcher) -> int:
                 None,
                 *account_items,
                 None,
-                rumps.MenuItem("Rotate to next", callback=self._switch(None)),
-                rumps.MenuItem("Switch to best", callback=self._switch("best")),
-                rumps.MenuItem("Next available", callback=self._switch("next-available")),
+                rumps.MenuItem(self._t("Rotate to next"), callback=self._switch(None)),
+                rumps.MenuItem(self._t("Switch to best"), callback=self._switch("best")),
+                rumps.MenuItem(self._t("Switch to next (skip exhausted accounts)"), callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
                 self._disable_menu(rumps),
                 self._remove_menu(rumps),
-                rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
+                rumps.MenuItem(self._t("Refresh current credentials"), callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
                 self._settings_menu(rumps),
-                rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
-                rumps.MenuItem("Quit", callback=self.on_quit),
+                rumps.MenuItem(self._t("Refresh now"), callback=self.on_refresh_now),
+                rumps.MenuItem(self._t("Quit"), callback=self.on_quit),
             ]
 
         def _add_menu(self, rumps):
-            menu = rumps.MenuItem("Add account")
-            menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
+            menu = rumps.MenuItem(self._t("Add account"))
+            menu.add(rumps.MenuItem(self._t("From current login"), callback=self.on_add_login))
             if hasattr(self.switcher, "add_account_from_token"):
-                menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
+                menu.add(rumps.MenuItem(self._t("From setup-token…"), callback=self.on_add_token))
             return menu
 
         def _remove_menu(self, rumps):
-            menu = rumps.MenuItem("Remove account")
+            menu = rumps.MenuItem(self._t("Remove account"))
             accounts = self.snapshot["accounts"]
             if not accounts:
-                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+                menu.add(rumps.MenuItem(self._t("No managed accounts"), callback=None))
             for (
                 num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at,
                 _login_expires_at, _quarantined,
@@ -1127,10 +1172,10 @@ def run(switcher) -> int:
             return menu
 
         def _disable_menu(self, rumps):
-            menu = rumps.MenuItem("Disable / enable account")
+            menu = rumps.MenuItem(self._t("Disable / enable account"))
             accounts = self.snapshot["accounts"]
             if not accounts:
-                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+                menu.add(rumps.MenuItem(self._t("No managed accounts"), callback=None))
             for (
                 num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at,
                 _login_expires_at, _quarantined,
@@ -1146,7 +1191,7 @@ def run(switcher) -> int:
             return menu
 
         def _history_menu(self, rumps):
-            menu = rumps.MenuItem("Switch history")
+            menu = rumps.MenuItem(self._t("Switch history"))
             try:
                 text = log_path.read_text(encoding="utf-8")
             except OSError:
@@ -1156,20 +1201,29 @@ def run(switcher) -> int:
                 for line in entries:
                     menu.add(rumps.MenuItem(line, callback=None))
             else:
-                menu.add(rumps.MenuItem("No switches logged yet", callback=None))
+                menu.add(rumps.MenuItem(self._t("No switches logged yet"), callback=None))
             menu.add(None)
-            menu.add(rumps.MenuItem("Open full log…", callback=self.on_open_log))
+            menu.add(rumps.MenuItem(self._t("Open full log…"), callback=self.on_open_log))
             return menu
 
         def _settings_menu(self, rumps):
-            menu = rumps.MenuItem("Settings")
-            name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
+            menu = rumps.MenuItem(self._t("Settings"))
+            language_menu = rumps.MenuItem(self._t("Language"))
+            for code, name in (("en", "English"), ("zh-Hans", "简体中文")):
+                choice = rumps.MenuItem(name, callback=self._language_callback(code))
+                choice.state = int(self.settings.language == code)
+                language_menu.add(choice)
+            menu.add(language_menu)
+            cards = rumps.MenuItem(self._t("Account cards"), callback=self.on_toggle_cards)
+            cards.state = int(self.settings.account_cards)
+            menu.add(cards)
+            name_item = rumps.MenuItem(self._t("Show account name in menu bar"), callback=self.on_toggle_name)
             name_item.state = 1 if self.settings.show_account_name else 0
             menu.add(name_item)
 
-            title_pct = rumps.MenuItem("Title percentage")
-            tp_labels = {"off": "None", "5h": "Session (5h)",
-                         "7d": "Weekly (7d)", "both": "Both (5h · 7d)"}
+            title_pct = rumps.MenuItem(self._t("Title percentage"))
+            tp_labels = {"off": self._t("None"), "5h": self._t("Session (5h)"),
+                         "7d": self._t("Weekly (7d)"), "both": self._t("Both (5h · 7d)")}
             for mode in TITLE_PCT_CHOICES:
                 ch = rumps.MenuItem(tp_labels[mode], callback=self._make_title_pct(mode))
                 ch.state = 1 if self.settings.title_pct == mode else 0
@@ -1177,24 +1231,24 @@ def run(switcher) -> int:
             menu.add(title_pct)
 
             scoped_item = rumps.MenuItem(
-                "Show model limits in title", callback=self.on_toggle_scoped
+                self._t("Show model limits in title"), callback=self.on_toggle_scoped
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
 
-            interval = rumps.MenuItem("Refresh interval")
-            labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
+            interval = rumps.MenuItem(self._t("Refresh interval"))
+            labels = {30: self._t("30 seconds"), 60: self._t("60 seconds"), 300: self._t("5 minutes")}
             for secs in REFRESH_CHOICES:
                 choice = rumps.MenuItem(labels[secs], callback=self._make_interval(secs))
                 choice.state = 1 if self.settings.refresh_interval == secs else 0
                 interval.add(choice)
             menu.add(interval)
 
-            auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
+            auto_item = rumps.MenuItem(self._t("Auto-switch accounts"), callback=self.on_toggle_autoswitch)
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
 
-            threshold_menu = rumps.MenuItem("Auto-switch threshold")
+            threshold_menu = rumps.MenuItem(self._t("Auto-switch threshold"))
             current = self._threshold()
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
@@ -1206,7 +1260,7 @@ def run(switcher) -> int:
             # Checked = the plist sits in ~/Library/LaunchAgents, where launchd
             # scans at login. The state is read from disk on every rebuild so a
             # change made from the CLI shows up here too.
-            login_item = rumps.MenuItem("Start at login", callback=self.on_toggle_login)
+            login_item = rumps.MenuItem(self._t("Start at login"), callback=self.on_toggle_login)
             login_item.state = 1 if launch_agent.start_at_login_enabled() else 0
             menu.add(login_item)
 
@@ -1229,8 +1283,8 @@ def run(switcher) -> int:
         def _notify_switched(self):
             rumps.notification(
                 "claude-swap",
-                "Account switched",
-                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
+                self._t("Account switched"),
+                self._t("Switch takes effect within ~30s — restart Claude Code to apply immediately."),
             )
 
         def _make_switch_to(self, num):
@@ -1250,10 +1304,10 @@ def run(switcher) -> int:
         def _make_remove(self, num):
             def cb(_sender):
                 if rumps.alert(
-                    title="Remove account",
-                    message=f"Remove account {num}?",
-                    ok="Remove",
-                    cancel="Cancel",
+                    title=self._t("Remove account"),
+                    message=self._t("Remove account {num}?", num=num),
+                    ok=self._t("Remove"),
+                    cancel=self._t("Cancel"),
                 ) == 1:  # 1 == OK
                     if self._guard(lambda: self.switcher.remove_account(str(num), assume_yes=True)):
                         self.refresh_async()
@@ -1280,17 +1334,17 @@ def run(switcher) -> int:
             import AppKit
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             email_win = rumps.Window(
-                title="Add account from setup-token",
-                message="Email for this token:",
-                ok="Next", cancel="Cancel", dimensions=(320, 24),
+                title=self._t("Add account from setup-token"),
+                message=self._t("Email for this token:"),
+                ok=self._t("Next"), cancel=self._t("Cancel"), dimensions=(320, 24),
             )
             email_resp = email_win.run()
             if email_resp.clicked != 1 or not email_resp.text.strip():
                 return
             token_win = rumps.Window(
-                title="Add account from setup-token",
-                message="Setup token (sk-ant-oat01-…):",
-                ok="Add", cancel="Cancel", dimensions=(320, 24),
+                title=self._t("Add account from setup-token"),
+                message=self._t("Setup token (sk-ant-oat01-…):"),
+                ok=self._t("Add"), cancel=self._t("Cancel"), dimensions=(320, 24),
             )
             token_resp = token_win.run()
             if token_resp.clicked != 1 or not token_resp.text.strip():
@@ -1309,7 +1363,7 @@ def run(switcher) -> int:
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:
                 rumps.alert(title="claude-swap",
-                            message="No active Claude Code login detected. Log in first.")
+                            message=self._t("No active Claude Code login detected. Log in first."))
                 return
             try:
                 self.switcher.add_account(slot=None)
