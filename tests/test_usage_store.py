@@ -2967,3 +2967,60 @@ class TestSuspectDrop:
         store.record({"1": FetchRecord(usage=new)}, IDENT)
         assert store.entries(IDENT)["1"].decision_value() == new
         assert not self._stamp(store)
+
+    @pytest.mark.parametrize(
+        "prior_seven, header_7d, seven",
+        [(100.0, "0.04", 4.0), (30.0, None, 10.0)],
+        ids=["a header reading lowered 7d first", "7d falls in the same reading"],
+    )
+    def test_a_scoped_drop_beside_a_lower_seven_day_is_taken(
+        self, store, clock, prior_seven, header_7d, seven
+    ):
+        # A real early reset drops 7d and the scoped window together; the
+        # header path (no scoped window) may already have lowered the 7d baseline.
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, prior_seven, 99.0))}, IDENT)
+        if header_7d:
+            store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: header_7d})
+        clock.advance(80.0)
+        new = self._reading(clock, 3.0, seven, 4.0)
+        store.record({"1": FetchRecord(usage=new)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == new
+        assert not self._stamp(store)
+
+    @pytest.mark.parametrize("header_first", [False, True], ids=["plain", "after a header drop"])
+    def test_a_lone_scoped_drop_is_held_once(self, store, clock, header_first):
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 10.0, 99.0))}, IDENT)
+        if header_first:  # the next success clears the header-drop flag
+            store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: "0.04"})
+            clock.advance(80.0)
+            store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 4.0, 99.0))}, IDENT)
+        seven = 4.0 if header_first else 10.0
+        clock.advance(80.0)
+        glitch = self._reading(clock, 0.0, seven, 4.0)
+        store.record({"1": FetchRecord(usage=glitch)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value()["scoped"][0]["pct"] == 99.0
+        assert self._stamp(store) is True
+        clock.advance(80.0)
+        store.record({"1": FetchRecord(usage=glitch)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == glitch
+        assert not self._stamp(store)
+
+    def test_a_held_seven_day_keeps_the_scoped_drop_held_after_a_header_drop(
+        self, store, clock
+    ):
+        prior = self._reading(clock, 0.0, 100.0, 99.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        store.record_header_reading(
+            "1",
+            IDENT,
+            {
+                usage_store.USAGE_HEADER_7D_PCT: "0.4",
+                usage_store.USAGE_HEADER_7D_RESET: str(clock.now + 86_400.0),
+            },
+        )
+        clock.advance(80.0)
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 0.0, 0.0))}, IDENT)
+        held = store.entries(IDENT)["1"].decision_value()
+        assert held["seven_day"]["pct"] == pytest.approx(40.0)
+        assert held["scoped"] == prior["scoped"]
+        assert self._stamp(store) is True

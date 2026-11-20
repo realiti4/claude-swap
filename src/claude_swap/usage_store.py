@@ -659,8 +659,13 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
 SUSPECT_DROP_PCT = 25.0
 
 
+def _seven_pct(reading: dict) -> float | None:
+    window = reading.get("seven_day")
+    return _num_or_none(window.get("pct")) if isinstance(window, dict) else None
+
+
 def _hold_suspect_drops(
-    prior: object, new: object, now: float
+    prior: object, new: object, now: float, header_drop: bool = False
 ) -> tuple[object, list[tuple]]:
     """``new`` with each window that contradicts ``prior`` replaced by its prior
     entry, and the ``(label, prior_entry, new_entry)`` replaced.
@@ -669,6 +674,8 @@ def _hold_suspect_drops(
     reset still ahead cannot be a reset, so it is held once as a bad answer
     (one numeric 0% from the endpoint read as an idle account for two minutes,
     2026-10-22); once the reset has passed it is a genuine one and never held.
+    A scoped drop beside a 7d that fell unheld, or that a header reading lowered
+    first (``header_drop``, a mixed-vintage baseline), is a real reset: not held.
     """
     if not isinstance(prior, dict) or not isinstance(new, dict):
         return new, []
@@ -696,6 +703,10 @@ def _hold_suspect_drops(
     for key in ("five_hour", "seven_day"):
         if (cur := check(key, prior.get(key), new.get(key))) is not None:
             out[key] = cur
+    old7, new7 = _seven_pct(prior), _seven_pct(new)
+    seven_fell = old7 is not None and new7 is not None and new7 < old7
+    if (header_drop or seven_fell) and not any(h[0] == "seven_day" for h in held):
+        return out, held
     old_scoped, new_scoped = prior.get("scoped"), new.get("scoped")
     old_scoped = old_scoped if isinstance(old_scoped, list) else []
     new_scoped = new_scoped if isinstance(new_scoped, list) else []
@@ -1516,9 +1527,13 @@ class UsageStore:
                 # so a vendor's early reset never reads full for days.
                 if not row.get("suspectDrop"):
                     usage, held = _hold_suspect_drops(
-                        row.get("lastGood"), rec.usage, now
+                        row.get("lastGood"),
+                        rec.usage,
+                        now,
+                        bool(row.get("headerSevenDayDrop")),
                     )
                 row["suspectDrop"] = bool(held)
+                row.pop("headerSevenDayDrop", None)
                 if held:
                     _logger.info(
                         "Account %s: this reading contradicts the prior one "
@@ -1859,6 +1874,8 @@ class UsageStore:
             else:
                 last_good.pop("five_hour", None)
             if seven_pct is not None:
+                if (old7 := _seven_pct(last_good)) is not None and seven_pct < old7:
+                    row["headerSevenDayDrop"] = True  # read by `record`
                 seven_entry: dict = {"pct": seven_pct}
                 if seven_reset is not None:
                     seven_entry["resets_at"] = seven_reset
