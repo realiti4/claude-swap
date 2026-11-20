@@ -2969,23 +2969,44 @@ class TestSuspectDrop:
         assert not self._stamp(store)
 
     @pytest.mark.parametrize(
-        "prior_seven, header_7d, seven",
-        [(100.0, "0.04", 4.0), (30.0, None, 10.0)],
-        ids=["a header reading lowered 7d first", "7d falls in the same reading"],
+        "prior_seven, header_7d, seven, omit, held",
+        [
+            (100.0, "0.04", 4.0, False, False),
+            (30.0, None, 10.0, False, False),
+            (29.0, "0.29", 29.0, False, True),
+            (30.0, "0.295", 29.5, False, True),
+            (30.0, None, 29.5, False, True),
+            (100.0, "0.04", 4.0, True, True),
+            (30.0, None, 10.0, True, True),
+        ],
+        ids=[
+            "a header reading lowered 7d first",
+            "7d falls in the same reading",
+            "header float noise below the stored 7d",
+            "header sub-point jitter",
+            "7d sub-point fall in the same reading",
+            "scoped omitted after a header drop",
+            "scoped omitted beside a 7d that fell",
+        ],
     )
-    def test_a_scoped_drop_beside_a_lower_seven_day_is_taken(
-        self, store, clock, prior_seven, header_7d, seven
+    def test_a_scoped_drop_is_taken_only_beside_a_corroborating_7d(
+        self, store, clock, prior_seven, header_7d, seven, omit, held
     ):
-        # A real early reset drops 7d and the scoped window together; the
-        # header path (no scoped window) may already have lowered the 7d baseline.
-        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, prior_seven, 99.0))}, IDENT)
+        # A real early reset drops 7d (past the floor) and the scoped window
+        # together; the header path (no scoped window) may already have lowered
+        # the 7d baseline. A scoped window the reading omits is never a reset.
+        prior = self._reading(clock, 0.0, prior_seven, 99.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
         if header_7d:
             store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: header_7d})
         clock.advance(80.0)
         new = self._reading(clock, 3.0, seven, 4.0)
+        if omit:
+            del new["scoped"]
         store.record({"1": FetchRecord(usage=new)}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() == new
-        assert not self._stamp(store)
+        expected = {**new, "scoped": prior["scoped"]} if held else new
+        assert store.entries(IDENT)["1"].decision_value() == expected
+        assert bool(self._stamp(store)) is held
 
     @pytest.mark.parametrize("header_first", [False, True], ids=["plain", "after a header drop"])
     def test_a_lone_scoped_drop_is_held_once(self, store, clock, header_first):
@@ -3023,40 +3044,6 @@ class TestSuspectDrop:
         held = store.entries(IDENT)["1"].decision_value()
         assert held["seven_day"]["pct"] == pytest.approx(40.0)
         assert held["scoped"] == prior["scoped"]
-        assert self._stamp(store) is True
-
-    @pytest.mark.parametrize(
-        "prior_seven, header_7d, seven, omit",
-        [
-            (29.0, "0.29", 29.0, False),
-            (30.0, "0.295", 29.5, False),
-            (30.0, None, 29.5, False),
-            (100.0, "0.04", 4.0, True),
-            (30.0, None, 10.0, True),
-        ],
-        ids=[
-            "header float noise below the stored 7d",
-            "header sub-point jitter",
-            "7d sub-point fall in the same reading",
-            "scoped omitted after a header drop",
-            "scoped omitted beside a 7d that fell",
-        ],
-    )
-    def test_a_scoped_drop_nothing_corroborates_is_held(
-        self, store, clock, prior_seven, header_7d, seven, omit
-    ):
-        # A 7d that moved less than the floor, or a scoped window the reading
-        # omits, is no corroborated reset: the prior Fable entry is kept.
-        prior = self._reading(clock, 0.0, prior_seven, 99.0)
-        store.record({"1": FetchRecord(usage=prior)}, IDENT)
-        if header_7d:
-            store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: header_7d})
-        clock.advance(80.0)
-        new = self._reading(clock, 0.0, seven, 4.0)
-        if omit:
-            del new["scoped"]
-        store.record({"1": FetchRecord(usage=new)}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value()["scoped"] == prior["scoped"]
         assert self._stamp(store) is True
 
     def test_an_adopted_reading_clears_the_header_drop_flag(self, store, clock):

@@ -657,8 +657,7 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
 # A success whose window reads this many points below the prior reading while
 # that window's own reset is still ahead contradicts it (`record`).
 SUSPECT_DROP_PCT = 25.0
-# A seven_day fall counts as a reset's corroboration only at this many points:
-# a header's unrounded fraction and 30s of ordinary movement fall below it.
+# A 7d fall under this many points is header rounding or jitter, not a reset.
 SEVEN_FALL_PCT = 1.0
 
 
