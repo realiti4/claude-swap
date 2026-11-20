@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 
 import pytest
 
@@ -43,9 +44,11 @@ from tests.test_tui import (
 # (tests/test_login_expiry.py) only joins a row while its login is due, so
 # these fixtures, which carry no expiry, render without it.
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h 25% · 7d 10%"
+GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h(⟳1h59m):25% · 7d(⟳2d23h):10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h 25% · 7d 10%"
+GOLDEN_MINI_DISABLED = (
+    " 3  user3@example.com  [personal]  (disabled)   5h(⟳1h59m):25% · 7d(⟳2d23h):10%"
+)
 
 NOW = 1000.0
 
@@ -65,7 +68,9 @@ def card(acc) -> str:
 
 
 def mini(acc) -> str:
-    return mini_account_text(acc, NOW).plain
+    # The mini row carries each window's reset countdown, and ``make_entry``
+    # stamps the resets off the real clock, so the golden is read on it too.
+    return mini_account_text(acc, time.time()).plain
 
 
 class TestThresholdBadge:
@@ -198,7 +203,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
             assert "(line" not in self._row(plain, "user3@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
@@ -219,4 +224,4 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "5h  50% used (line 60%)" in self._row(plain, "user2@example.com")
+            assert "50% (line 60%)" in self._row(plain, "user2@example.com")

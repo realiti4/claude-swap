@@ -42,6 +42,17 @@ async def _workers_done(pilot) -> None:
         await app.workers.wait_for_complete(pending)
 
 
+async def _laid_out(pilot, query):
+    """The first widget matching ``query`` once it has a width. One pause is not
+    a layout: a slow runner (Windows CI) reads the widget at 0x0."""
+    for _ in range(100):
+        await pilot.pause(0.05)
+        widget = next(iter(pilot.app.screen.query(query)), None)
+        if widget is not None and widget.size.width:
+            return widget
+    pytest.fail(f"{query!r} was never laid out")
+
+
 # ---------------------------------------------------------------------------
 # The rule: oauth.login_time_left / format_login_expiry
 # ---------------------------------------------------------------------------
@@ -184,7 +195,7 @@ class TestCliList:
     def test_quarantined_block_says_it_once(self):
         now = time.time()
         lines = _usage_entry_lines(UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED), now - 60)
-        assert lines[0].startswith("re-login needed")
+        assert lines[0].startswith("re-login may be needed")
         assert len(lines) == 1
 
     def test_age_note_stays_on_the_last_usage_row(self):
@@ -219,7 +230,10 @@ class TestCardAndMiniRow:
         header = widgets.account_card_text(acc, 100, now=now).plain.splitlines()[0]
         assert header.endswith("· Max 20x   re-login in 5h 7m")
         mini = widgets.mini_account_text(acc, now).plain
-        assert mini == " 2  dev (a@example.com)  [personal]  · Max 20x   5h 25% · 7d 10% · re-login in 5h 7m"
+        assert mini == (
+            " 2  dev (a@example.com)  [personal]  · Max 20x"
+            "   5h(⟳1h59m):25% · 7d(⟳2d23h):10% · re-login in 5h 7m"
+        )
 
     def test_quarantined_card_says_it_once(self):
         now = time.time()
@@ -228,7 +242,7 @@ class TestCardAndMiniRow:
         )
         lines = widgets.account_card_text(acc, 100, now=now).plain.splitlines()
         assert "re-login" not in lines[0]
-        assert lines[1].lstrip().startswith("⚠ re-login needed")
+        assert lines[1].lstrip().startswith("⚠ re-login may be needed")
         mini = widgets.mini_account_text(acc, now).plain
         assert mini.count("re-login") == 1
 
@@ -244,10 +258,15 @@ class TestCardAndMiniRow:
 
 
 def _seven(expires_at: float | None) -> list[AccountSnapshot]:
-    """Seven `developerN@example.com` slots, the active one on a plan."""
+    """Seven `developerN@x.io` slots, the active one aliased and on a plan.
+
+    The minis' usage chips carry their reset countdowns, so the addresses are
+    short enough that the short note fits an 88-column mini and the full one
+    does not, while a bare mini still fits at 80.
+    """
     accounts = [
         _replace_login(
-            make_account(n, active=n == 1, email=f"developer{n}@example.com", alias="work" if n in (1, 2) else ""),
+            make_account(n, active=n == 1, email=f"developer{n}@x.io", alias="work" if n == 1 else ""),
             expires_at,
         )
         for n in range(1, 8)
@@ -257,12 +276,14 @@ def _seven(expires_at: float | None) -> list[AccountSnapshot]:
 
 
 def _mixed(expires_at: float | None) -> list[AccountSnapshot]:
-    """One long address and five short ones under a long organisation tag."""
+    """One long address and five short ones under a long organisation tag,
+    every bare mini still within an 80-column dashboard (the chips carry
+    their reset countdowns)."""
     accounts = [
         make_account(1, active=True, email="developer1@example.com"),
-        make_account(2, email="developer-with-long-name2@example.com"),
+        make_account(2, email="long-address-name2@x.io"),
     ] + [
-        dataclasses.replace(make_account(n, email=f"a{n}@example.com"), org_name="Example Engineering Team")
+        dataclasses.replace(make_account(n, email=f"a{n}@x.io"), org_name="Example Engineering Team")
         for n in range(3, 8)
     ]
     return [_replace_login(acc, expires_at) for acc in accounts]
@@ -279,8 +300,7 @@ async def _dashboard(tmp_path, accounts, size):
     app = make_app(FakeSwitcher(accounts, tmp_path))
     async with app.run_test(size=size) as pilot:
         await _workers_done(pilot)
-        await pilot.pause()
-        panel = app.screen.query_one(AccountsPanel)
+        panel = await _laid_out(pilot, AccountsPanel)
         menu = app.screen.query_one("#menu", ListView)
         shown = sum(1 for item in menu.query(MenuItem) if menu.region.contains_region(item.region))
         return panel.render().plain.splitlines(), panel.size, shown
@@ -305,7 +325,7 @@ class TestDashboardFit:
         assert size.height == len(lines)
         minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
         assert len(minis) == 6
-        assert all(line.endswith("5h 25% · 7d 10% · re-login in 5d") for line in minis)
+        assert all(line.endswith("7d(⟳2d23h):10% · re-login in 5d") for line in minis)
 
     @pytest.mark.asyncio
     async def test_due_note_goes_before_usage_does(self, tmp_path):
@@ -332,16 +352,13 @@ class TestDashboardFit:
 
 
 async def _candidates(tmp_path, accounts, size):
-    from textual.widgets import Static
-
     from claude_swap.tui.autoview import AutoScreen
 
     app = make_app(FakeSwitcher(accounts, tmp_path))
     async with app.run_test(size=size) as pilot:
         await _workers_done(pilot)
         await app.push_screen(AutoScreen())
-        await pilot.pause()
-        box = app.screen.query_one("#candidates", Static)
+        box = await _laid_out(pilot, "#candidates")
         return box.render().plain, box.size.width
 
 
@@ -356,21 +373,22 @@ class TestNextBest:
         ]
         plain, _width = await _candidates(tmp_path, accounts, (100, 40))
         assert "re-login" not in plain
-        assert "   2  a@example.com  5h " in plain  # the name is not padded
+        assert "   2  a@example.com  5h(" in plain  # the name is not padded
 
     @pytest.mark.asyncio
     async def test_due_note_ends_the_row_and_steps_down_when_narrow(self, tmp_path, fake_engine):
-        # 40-column addresses at 80 columns: the full note overflows the
-        # 76-column row, the short one fits, and the usage figure stays.
+        # 20-column addresses at 80 columns (the chips carry their reset
+        # countdowns): the full note overflows the 76-column row, the short
+        # one fits, and the usage figure stays.
         expires = time.time() + DUE
         accounts = [make_account(1, active=True, email="active@example.com")] + [
-            _replace_login(make_account(n, email=f"{'x' * 27}{n}@example.com"), expires) for n in (2, 3)
+            _replace_login(make_account(n, email=f"{'x' * 7}{n}@example.com"), expires) for n in (2, 3)
         ]
         plain, width = await _candidates(tmp_path, accounts, (80, 24))
         rows = [line for line in plain.splitlines() if "re-login" in line]
         assert len(rows) == 2
         assert all(cell_len(row) <= width for row in rows)
-        assert all(row.endswith("% used  re-login in 5d") for row in rows)
+        assert all(row.endswith("7d(⟳2d23h):10%  re-login in 5d") for row in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +411,7 @@ async def test_switch_screen_card_header_keeps_the_note_within_the_width(tmp_pat
         async with app.run_test(size=size) as pilot:
             await _workers_done(pilot)
             await app.push_screen(SwitchScreen())
-            await pilot.pause()
-            card = app.screen.query(AccountCard).first()
+            card = await _laid_out(pilot, AccountCard)
             header = card.render().plain.splitlines()[0]
             assert cell_len(header) <= card.size.width
             assert header.endswith(expect)

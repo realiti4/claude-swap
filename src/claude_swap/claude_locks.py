@@ -51,6 +51,9 @@ CREDENTIALS_STALENESS_S = 60.0
 # The config lock (~/.claude.json.lock) keeps the older proper-lockfile
 # defaults: stale after 10s, touched every 5s.
 CONFIG_STALENESS_S = 10.0
+# The storage-write lock (``<config-home>/.storage-write.lock``, 2.1.326) is
+# stale after 15s.
+STORAGE_WRITE_STALENESS_S = 15.0
 # We touch a little faster than CC's 5s for margin.
 TOUCH_INTERVAL_S = 3.0
 # Claude Code holds the credentials lock for one token-endpoint round trip
@@ -85,6 +88,13 @@ def oauth_refresh_lock_dir() -> Path:
     """Claude Code's primary OAuth refresh lock
     (``<config-home>/.oauth_refresh.lock``, 2.1.218+)."""
     return get_claude_config_home() / ".oauth_refresh.lock"
+
+
+def storage_write_lock_dir() -> Path:
+    """Lock directory of Claude Code's credential-store write (2.1.326): its
+    ``/login`` takes this one alone, and its refresh takes it INSIDE the
+    refresh pair, so a writer that holds both takes it last."""
+    return get_claude_config_home() / ".storage-write.lock"
 
 
 def config_lock_dir() -> Path:
@@ -276,4 +286,15 @@ def claude_credentials_lock(*, timeout: float | None = None):
 def claude_config_lock(*, timeout: float | None = None):
     """Hold Claude Code's global-config write lock (``~/.claude.json.lock``)."""
     with proper_lockfile(config_lock_dir(), timeout=timeout):
+        yield
+
+
+@contextmanager
+def claude_storage_write_lock(*, timeout: float | None = None):
+    """Hold Claude Code's credential-store write lock (``.storage-write.lock``)."""
+    with proper_lockfile(
+        storage_write_lock_dir(),
+        timeout=timeout,
+        staleness=STORAGE_WRITE_STALENESS_S,
+    ):
         yield
