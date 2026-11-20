@@ -5,7 +5,7 @@ import weakref
 import AppKit as A
 from objc import super
 
-from claude_swap.menubar_locale import duration
+from claude_swap.menubar_locale import duration, weekly_reset_time
 
 
 def color(r, g, b, a=1):
@@ -126,7 +126,16 @@ class AccountUsageCard(A.NSView):
             reset = _live_countdown(window, now) if valid else None
             text = (tr("Resets in {time}", time=duration(d["language"], reset))
                     if reset else tr("No reset time") if valid else tr("No data"))
-            label(text, x, y + 29, col, 10, A.NSColor.secondaryLabelColor())
+            if i == 1 and reset:
+                clock = weekly_reset_time(d["language"], window.get("resets_at"))
+                combined = text + " " + clock
+                width = A.NSString.stringWithString_(combined).sizeWithAttributes_(
+                    {A.NSFontAttributeName: A.NSFont.systemFontOfSize_(10)}).width
+                if width <= col:
+                    text = combined
+                else:
+                    label(clock, x, y + 43, col, 10, secondary)
+            label(text, x, y + 29, col, 10, secondary)
 
     def mouseUp_(self, event):
         if not A.NSPointInRect(self.convertPoint_fromView_(event.locationInWindow(), None), self.bounds()):
@@ -149,7 +158,7 @@ def attach_card(item, owner, num, email, active, usage, alias, disabled,
         expiry = (tr("Sign in again") if time_left == expiry else
                   tr("Sign in again in {time}", time=duration(owner.settings.language, time_left)))
     count = len(usage.get('scoped') or []) if isinstance(usage, dict) else 0
-    height = max(81, 33 + count * 35)
+    height = max(94, 33 + count * 35)
     view = AccountUsageCard.alloc().initWithFrame_(((0, 0), (354, height)))
     view.setAutoresizingMask_(A.NSViewWidthSizable)
     view.owner = weakref.ref(owner)

@@ -85,3 +85,23 @@ def duration(language, value):
     if language == "zh-Hans":
         return value.translate(str.maketrans({"d": "天", "h": "小时", "m": "分"}))
     return value
+
+
+def weekly_reset_time(language, value):
+    """Format an offset-aware reset instant in the computer's local timezone."""
+    from datetime import datetime
+
+    if not isinstance(value, str):
+        return ""
+    try:
+        instant = datetime.fromisoformat(value)
+        if instant.tzinfo is None:
+            return ""
+        local = instant.astimezone()
+    except (ValueError, OverflowError, OSError):
+        return ""
+    if language == "zh-Hans":
+        day = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[local.weekday()]
+        return f"（{day} {local:%H:%M}）"
+    day = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[local.weekday()]
+    return f"({day} {local:%H:%M})"
