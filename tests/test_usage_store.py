@@ -3024,3 +3024,48 @@ class TestSuspectDrop:
         assert held["seven_day"]["pct"] == pytest.approx(40.0)
         assert held["scoped"] == prior["scoped"]
         assert self._stamp(store) is True
+
+    @pytest.mark.parametrize(
+        "prior_seven, header_7d, seven, omit",
+        [
+            (29.0, "0.29", 29.0, False),
+            (30.0, "0.295", 29.5, False),
+            (30.0, None, 29.5, False),
+            (100.0, "0.04", 4.0, True),
+            (30.0, None, 10.0, True),
+        ],
+        ids=[
+            "header float noise below the stored 7d",
+            "header sub-point jitter",
+            "7d sub-point fall in the same reading",
+            "scoped omitted after a header drop",
+            "scoped omitted beside a 7d that fell",
+        ],
+    )
+    def test_a_scoped_drop_nothing_corroborates_is_held(
+        self, store, clock, prior_seven, header_7d, seven, omit
+    ):
+        # A 7d that moved less than the floor, or a scoped window the reading
+        # omits, is no corroborated reset: the prior Fable entry is kept.
+        prior = self._reading(clock, 0.0, prior_seven, 99.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        if header_7d:
+            store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: header_7d})
+        clock.advance(80.0)
+        new = self._reading(clock, 0.0, seven, 4.0)
+        if omit:
+            del new["scoped"]
+        store.record({"1": FetchRecord(usage=new)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value()["scoped"] == prior["scoped"]
+        assert self._stamp(store) is True
+
+    def test_an_adopted_reading_clears_the_header_drop_flag(self, store, clock):
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 100.0, 99.0))}, IDENT)
+        store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: "0.04"})
+        clock.advance(10.0)
+        adopted = self._reading(clock, 0.0, 4.0, 99.0)
+        assert store.adopt({"1": (adopted, 0.0)}, IDENT) == {"1"}
+        clock.advance(80.0)
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 4.0, 4.0))}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value()["scoped"] == adopted["scoped"]
+        assert self._stamp(store) is True

@@ -657,6 +657,9 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
 # A success whose window reads this many points below the prior reading while
 # that window's own reset is still ahead contradicts it (`record`).
 SUSPECT_DROP_PCT = 25.0
+# A seven_day fall counts as a reset's corroboration only at this many points:
+# a header's unrounded fraction and 30s of ordinary movement fall below it.
+SEVEN_FALL_PCT = 1.0
 
 
 def _seven_pct(reading: dict) -> float | None:
@@ -675,13 +678,14 @@ def _hold_suspect_drops(
     (one numeric 0% from the endpoint read as an idle account for two minutes,
     2026-10-22); once the reset has passed it is a genuine one and never held.
     A scoped drop beside a 7d that fell unheld, or that a header reading lowered
-    first (``header_drop``, a mixed-vintage baseline), is a real reset: not held.
+    first (``header_drop``, a mixed-vintage baseline), is a real reset: not held,
+    but only for a scoped window the reading carries (an omitted one is held).
     """
     if not isinstance(prior, dict) or not isinstance(new, dict):
         return new, []
     held: list[tuple] = []
 
-    def check(label: object, old: object, cur: object) -> object:
+    def check(label: object, old: object, cur: object, corroborated: bool = False) -> object:
         if not isinstance(old, dict):
             return cur
         was = old.get("pct")
@@ -689,7 +693,8 @@ def _hold_suspect_drops(
         ts = parse_reset_ts(old.get("resets_at"))
         # A window the reading omits or leaves non-numeric counts as 0%.
         if (
-            isinstance(was, (int, float))
+            not (corroborated and isinstance(now_pct, (int, float)))
+            and isinstance(was, (int, float))
             and ts is not None
             and now < ts
             and was - (now_pct if isinstance(now_pct, (int, float)) else 0.0)
@@ -704,15 +709,18 @@ def _hold_suspect_drops(
         if (cur := check(key, prior.get(key), new.get(key))) is not None:
             out[key] = cur
     old7, new7 = _seven_pct(prior), _seven_pct(new)
-    seven_fell = old7 is not None and new7 is not None and new7 < old7
-    if (header_drop or seven_fell) and not any(h[0] == "seven_day" for h in held):
-        return out, held
+    seven_fell = (
+        old7 is not None and new7 is not None and old7 - new7 >= SEVEN_FALL_PCT
+    )
+    exempt = (header_drop or seven_fell) and not any(h[0] == "seven_day" for h in held)
     old_scoped, new_scoped = prior.get("scoped"), new.get("scoped")
     old_scoped = old_scoped if isinstance(old_scoped, list) else []
     new_scoped = new_scoped if isinstance(new_scoped, list) else []
     by_name = {s.get("name"): s for s in old_scoped if isinstance(s, dict)}
     kept = [
-        check(s.get("name"), by_name.get(s.get("name")), s) if isinstance(s, dict) else s
+        check(s.get("name"), by_name.get(s.get("name")), s, exempt)
+        if isinstance(s, dict)
+        else s
         for s in new_scoped
     ]
     seen = {s.get("name") for s in new_scoped if isinstance(s, dict)}
@@ -1874,7 +1882,8 @@ class UsageStore:
             else:
                 last_good.pop("five_hour", None)
             if seven_pct is not None:
-                if (old7 := _seven_pct(last_good)) is not None and seven_pct < old7:
+                old7 = _seven_pct(last_good)
+                if old7 is not None and old7 - seven_pct >= SEVEN_FALL_PCT:
                     row["headerSevenDayDrop"] = True  # read by `record`
                 seven_entry: dict = {"pct": seven_pct}
                 if seven_reset is not None:
@@ -1945,6 +1954,7 @@ class UsageStore:
             stored = _num_or_none(row.get("fetchedAt"))
             if stored is None or fetched_at > stored:
                 row["lastGood"] = usage
+                row.pop("headerSevenDayDrop", None)  # the baseline is replaced whole
                 row["fetchedAt"] = fetched_at
                 stored = fetched_at
                 adopted.add(num)
