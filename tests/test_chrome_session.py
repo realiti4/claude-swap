@@ -310,6 +310,11 @@ def test_adopted_needs_more_than_the_injected_account_uuid():
     assert not cs._adopted(_state(email="b@x"), target)
     assert not cs._adopted(_state(accountUuid="other"), target)
     assert not cs._adopted(None, target)
+    # A stored session without an account uuid needs the fetched profile email.
+    legacy = _session(email="a@x")
+    assert not cs._adopted(_state(email=""), legacy)
+    assert cs._adopted(_state(email="a@x"), legacy)
+    assert not cs._adopted(_state(email="a@x"), _session())
 
 
 def test_inject_reports_failure_when_the_extension_rejects_the_token(monkeypatch):

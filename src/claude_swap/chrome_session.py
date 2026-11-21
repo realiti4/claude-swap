@@ -541,7 +541,12 @@ def _adopted(data: dict | None, session: ChromeSession) -> bool:
         return False
     if not (data.get("accessToken") and data.get("refreshToken")):
         return False
-    if session.account_uuid and data.get("accountUuid") != session.account_uuid:
+    if session.account_uuid:
+        if data.get("accountUuid") != session.account_uuid:
+            return False
+    elif not (session.email and data.get("email")):
+        # Nothing the injection wrote identifies the account: only a profile
+        # fetched with the token can.
         return False
     if session.email and data.get("email") and data["email"].lower() != session.email.lower():
         return False
