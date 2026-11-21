@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import socket
 import ssl
 import sys
 import urllib.error
@@ -46,6 +47,11 @@ USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 USAGE_PROBE_SCOPED_MODELS = {"claude-fable-5-1": "7d_oi"}
 
 _logger = logging.getLogger("claude-swap")
+
+# Refresh failures that happen before any byte of the request is written: the
+# name did not resolve, the connection was refused, or the TLS handshake
+# rejected the certificate.
+_NEVER_SENT = (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -350,10 +356,63 @@ def try_refresh_oauth_credentials(
             # keeps its own kind and lands no strike.
             if err in ("invalid_grant", "invalid_client"):
                 return RefreshOutcome(None, err)
+        if e.code >= 500:
+            # Not a verdict on the grant either: a gateway can report an error
+            # for a request the origin already acted on.
+            _warn_grant_fate_unknown(credentials, f"HTTP {e.code}")
+        return RefreshOutcome(None, "transient")
+    except urllib.error.URLError as e:
+        # urllib wraps every failure before the reply is read in URLError:
+        # name lookup, connect, TLS and writing the request. A failure while
+        # reading the reply arrives unwrapped, below.
+        reason = e.reason
+        what = reason if isinstance(reason, str) else type(reason).__name__
+        if isinstance(reason, (str, *_NEVER_SENT)):
+            # Nothing reached the server, so no grant can have been spent.
+            # The ordinary offline case; it stays quiet.
+            _logger.debug("OAuth refresh not sent: %s", what)
+        else:
+            # A timeout or a reset here can be the connect or the write, and
+            # the exception does not say which. INFO, because the default log
+            # keeps it and it is not a reason for alarm.
+            _logger.info(
+                "OAuth refresh for %s failed while connecting or sending "
+                "(%s); whether the request reached the server is unknown.",
+                credential_fingerprint(credentials)[:19],
+                what,
+            )
         return RefreshOutcome(None, "transient")
     except Exception as e:
-        _logger.debug("OAuth refresh failed: %r", e)
+        # The request went out and no usable reply came back: a timeout or
+        # reset while waiting, or a reply that could not be read. The type
+        # name only: a decode error's repr holds the reply bytes.
+        _logger.debug("OAuth refresh failed: %s", type(e).__name__)
+        _warn_grant_fate_unknown(credentials, type(e).__name__)
         return RefreshOutcome(None, "transient")
+
+
+def _warn_grant_fate_unknown(credentials: str, what: str) -> None:
+    """Log a refresh that went out and came back without a verdict on the grant.
+
+    The outcome stays ``transient``: a retry is the only move either way. But
+    a timeout, a reset or a server error is not proof that nothing was spent,
+    and if the server did rotate the grant, the next refresh of these same
+    bytes gets invalid_grant. WARNING is a level the default log keeps, so
+    that later strike can be traced back to this exchange.
+
+    This module is not told which account it serves, so the line carries the
+    head of the credential fingerprint ("sha256:" and 12 hex digits): the
+    value the usage store writes as ``struckFingerprint``. ``what`` is a
+    status or an exception type name, never a repr: a decode error's repr is
+    the reply body, and a reply body can hold tokens.
+    """
+    _logger.warning(
+        "OAuth refresh for %s got no usable reply (%s). The refresh token "
+        "on disk may now be spent; if the next refresh fails with "
+        "invalid_grant, re-run `cswap --add-account` after logging in.",
+        credential_fingerprint(credentials)[:19],
+        what,
+    )
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:
