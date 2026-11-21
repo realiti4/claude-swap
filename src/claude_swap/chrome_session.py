@@ -476,13 +476,20 @@ def read_identity_cdp(port: int) -> dict:
 # dropped so it cannot be attributed to the injected token. ``diskRefreshToken``
 # matters most — the extension revokes a displaced disk token the next time it
 # stores one, which would kill the outgoing account's stored session.
-_INJECT_CLEAR_SESSION = ["swAnalyticsProfileCache", "tokenOrgUuid", "lastAuthFailureReason",
-                         "startupReauthState"]
-_INJECT_CLEAR_LOCAL = ["diskRefreshToken", "lastAuthFailureReason", "startupReauthState"]
-# Signing out locally (``detach``): the tokens and everything derived from them.
-_DETACH_CLEAR_SESSION = ["accessToken", "refreshToken", "tokenExpiry", "tokenHandOffAt",
-                         *_INJECT_CLEAR_SESSION]
-_DETACH_CLEAR_LOCAL = [*_INJECT_CLEAR_LOCAL]
+# Key names are the extension's storage enum (v1.0.107); removing a key from an
+# area that does not hold it is a no-op, so both areas get the same list.
+_ACCOUNT_STATE_KEYS = [
+    "swAnalyticsProfileCache", "tokenOrgUuid", "diskRefreshToken", "lastAuthFailureReason",
+    "startupReauthState", "oauthState", "codeVerifier", "oauthOrgSwitch", "orgTelemetry",
+    "orgGateOff", "lastHybridPairing", "pairingOrgMismatch", "lastActiveOrgHint",
+]
+_INJECT_CLEAR_SESSION = _INJECT_CLEAR_LOCAL = _ACCOUNT_STATE_KEYS
+# Signing out locally (``detach``): what the extension's own sign-out clears
+# about the account (tokens, identity, org state), minus the revoke. User
+# preferences, permissions and tab groups are left alone.
+_DETACH_KEYS = ["accessToken", "refreshToken", "tokenExpiry", "tokenHandOffAt", "signInState",
+                "accountUuid", "tokenOrg", "tokenScope", *_ACCOUNT_STATE_KEYS]
+_DETACH_CLEAR_SESSION = _DETACH_CLEAR_LOCAL = _DETACH_KEYS
 
 
 def _inject_js(session: ChromeSession) -> str:
@@ -523,18 +530,20 @@ def _restart_sw(port: int, sw_id: str | None) -> str | None:
 
 
 def _adopted(data: dict | None, session: ChromeSession) -> bool:
-    """Whether the extension is authenticated as ``session``'s account.
+    """Whether the extension holds ``session``'s account and has not failed on it.
 
-    ``accountUuid`` alone proves nothing (the injection wrote it); a fetched
-    profile email, a refresh token still in place and no recorded auth failure do.
+    A failed adoption leaves a ``lastAuthFailureReason`` and drops the refresh
+    token, so both are required to be clean. The profile email is checked only
+    when present: the extension re-fetches the profile on its own schedule
+    (browser start-up, auth changes), not necessarily on a SW restart.
     """
     if not data or data.get("authFailure"):
         return False
-    if not (data.get("accessToken") and data.get("refreshToken") and data.get("email")):
+    if not (data.get("accessToken") and data.get("refreshToken")):
         return False
     if session.account_uuid and data.get("accountUuid") != session.account_uuid:
         return False
-    if session.email and data["email"].lower() != session.email.lower():
+    if session.email and data.get("email") and data["email"].lower() != session.email.lower():
         return False
     return True
 
@@ -563,14 +572,14 @@ def inject_tokens_cdp(port: int, session: ChromeSession, *, settle: float = 10.0
     # 2) Terminate the SW (NOT runtime.reload → keeps storage.session), then
     # 3) wake it with a background claude.ai tab so it restarts + reconnects.
     wake_id = _restart_sw(port, sw_id)
-    # Poll until the SW has re-fetched the profile with the injected token (the
-    # profile cache was dropped, so an email only comes back if the token works)
-    # or has recorded an auth failure.
+    # Poll for the whole settle window unless the outcome is already certain:
+    # an auth failure (the token was rejected) or a re-fetched profile email
+    # (only the injected token can fetch it, since the cache was dropped).
     data: dict | None = None
     deadline = time.monotonic() + settle
     while True:
         data = _read_state_cdp(port)
-        if _adopted(data, session) or (data and data.get("authFailure")):
+        if data and (data.get("authFailure") or (_adopted(data, session) and data.get("email"))):
             break
         if time.monotonic() >= deadline:
             break
@@ -599,8 +608,13 @@ def detach_extension_cdp(port: int) -> bool:
     wake_id = _restart_sw(port, t.get("id"))
     if wake_id:
         _close_target(port, wake_id)
-    data = _read_state_cdp(port)
-    return bool(data) and not data.get("refreshToken")
+    # The restarted SW must come back up signed out (no tokens re-appearing).
+    for _ in range(5):
+        data = _read_state_cdp(port)
+        if data is not None:
+            return not (data.get("accessToken") or data.get("refreshToken"))
+        time.sleep(1)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1080,6 +1094,10 @@ class ChromeSync:
                 return True
             # Keep the outgoing account's stored tokens fresh before we overwrite.
             self._snapshot_current()
+            # The snapshot may have just stored newer tokens for this very
+            # account (e.g. the extension was on it but not yet confirmed);
+            # never act on the copy read before it.
+            session = self._vault.get(account_num) or session
             # Refresh before injecting when the window is closing or the access
             # token is already dead, so adoption never starts from a dead token.
             if _is_stale(session) or _access_expired(session):

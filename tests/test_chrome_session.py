@@ -300,8 +300,11 @@ def test_inject_leaves_token_org_alone_when_never_captured():
 def test_adopted_needs_more_than_the_injected_account_uuid():
     target = _session(account_uuid="acc", email="A@x")
     assert cs._adopted(_state(email="a@x"), target)
-    # accountUuid matches only because the injection wrote it; no profile yet.
-    assert not cs._adopted(_state(email=""), target)
+    # No profile re-fetch yet is not a failure: the extension does that on its
+    # own schedule.
+    assert cs._adopted(_state(email=""), target)
+    # The failure a dead token leaves behind (bitworks-io's v1.0.100 run).
+    assert not cs._adopted(_state(email="", refreshToken="", authFailure="session_expired"), target)
     assert not cs._adopted(_state(authFailure="session_expired"), target)
     assert not cs._adopted(_state(refreshToken=""), target)
     assert not cs._adopted(_state(email="b@x"), target)
@@ -425,3 +428,44 @@ def test_sync_is_a_no_op_when_already_on_the_account(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: pytest.fail("injected"))
     cs.ChromeVault(tmp_path).put("1", _session(account_uuid="acc", email="a@x"))
     assert sync.sync_to_account("1") is True
+
+
+def test_detach_clears_identity_but_keeps_preferences():
+    calls = _js_calls(cs._DETACH_JS)
+    removed = {k for _, op, keys in calls if op == "remove" for k in keys}
+    assert {"accessToken", "refreshToken", "accountUuid", "tokenOrg", "diskRefreshToken"} <= removed
+    assert not removed & {"permissionStorage", "permissionConsentByAccount", "anonymousId"}
+
+
+def test_detach_reports_tokens_that_came_back(monkeypatch):
+    monkeypatch.setattr(cs, "_sw_target", lambda *a, **k: {"id": "sw"})
+    monkeypatch.setattr(cs, "_eval_in_sw", lambda *a, **k: "ok")
+    monkeypatch.setattr(cs, "_restart_sw", lambda *a, **k: None)
+    monkeypatch.setattr(cs.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(cs, "_read_state_cdp", lambda *a, **k: _state())
+    assert cs.detach_extension_cdp(1) is False
+    monkeypatch.setattr(cs, "_read_state_cdp",
+                        lambda *a, **k: _state(accessToken="", refreshToken=""))
+    assert cs.detach_extension_cdp(1) is True
+
+
+def test_sync_uses_the_tokens_the_snapshot_just_stored(tmp_path, monkeypatch):
+    # The extension is on account 2 already but has no profile email cached and
+    # an old copy of 2 sits in the vault: the snapshot's fresh copy must win.
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    monkeypatch.setattr(cs, "automation_chrome_running", lambda *a, **k: True)
+    monkeypatch.setattr(cs, "_read_state_cdp", lambda *a, **k: _state(accountUuid="other"))
+    vault = cs.ChromeVault(tmp_path)
+    expired = int(time.time() * 1000) - 1000
+    vault.put("2", _session(access_token="old", refresh_token="rt-old", account_uuid="acc",
+                            token_expiry=expired))
+    live = _session(access_token="live", refresh_token="rt-live", account_uuid="acc",
+                    token_expiry=int(time.time() * 1000) + 3_600_000)
+    captures = iter([live, live])
+    monkeypatch.setattr(cs, "capture_tokens_cdp", lambda *a, **k: next(captures))
+    monkeypatch.setattr(cs, "refresh_session_detailed", lambda *a, **k: pytest.fail("refreshed"))
+    injected = []
+    monkeypatch.setattr(cs, "inject_tokens_cdp", lambda port, s, **k: injected.append(s) or True)
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    assert sync.sync_to_account("2") is True
+    assert [s.refresh_token for s in injected] == ["rt-live"]
