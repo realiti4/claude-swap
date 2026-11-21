@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import launch_agent, oauth, pace
+from claude_swap import codex_usage, launch_agent, oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.printer import warning
@@ -105,6 +105,7 @@ class MenuBarSettings:
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
+    title_codex: bool = False  # append Codex usage (if Codex has logged any) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -443,6 +444,32 @@ def format_account_label(
     return f"{row} · {note}" if note else row
 
 
+def format_codex_label(codex: codex_usage.CodexUsage, now: float | None = None) -> str:
+    """The Codex row's menu label: ``Codex · Plus  5h 1% (4h 59m) · 7d 0%``."""
+    plan = f" · {codex.plan_label}" if codex.plan_label else ""
+    return f"Codex{plan}  {usage_summary(codex.usage(now), now)}"
+
+
+def codex_tooltip(codex: codex_usage.CodexUsage) -> str:
+    """Hover text of the Codex row: where the figures come from and how old they are."""
+    return (
+        f"Read from Codex's session log, as of {codex.read_clock()}. "
+        "Codex writes it after each turn, so it changes when you use Codex on this Mac."
+    )
+
+
+def codex_row(codex: codex_usage.CodexUsage) -> tuple[str, str] | None:
+    """The Codex row's ``(label, tooltip)``, or None if it cannot be built.
+
+    Codex is an extra: whatever goes wrong with it leaves the accounts alone.
+    """
+    try:
+        return format_codex_label(codex), codex_tooltip(codex)
+    except Exception:
+        logging.getLogger("claude-swap").debug("could not build the Codex row", exc_info=True)
+        return None
+
+
 def _local_part(email: str, limit: int = 12) -> str:
     """Email text before '@', truncated with a trailing '*' marker."""
     local = email.split("@", 1)[0]
@@ -459,11 +486,14 @@ def format_title(
     alias: str | None = None,
     *,
     attention: bool = False,
+    codex: codex_usage.CodexUsage | None = None,
 ) -> str:
     """Build the menu-bar title from the active account and settings.
 
     ``attention`` prefixes a warning sign: auto-switch is enabled but not
-    running, which the closed menu would otherwise never show.
+    running, which the closed menu would otherwise never show. ``codex``, when
+    ``title_codex`` is on, adds ``Codex 1% · 0%`` after the Claude figures,
+    choosing windows by ``title_pct`` the same way.
     """
     icon = f"⚠ {ICON}" if attention else ICON
     if active_email is None:
@@ -492,6 +522,15 @@ def format_title(
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
+    if settings.title_codex and codex is not None:
+        try:
+            usage = codex.usage(now)
+            keys = {"5h": ("five_hour",), "7d": ("seven_day",), "both": ("five_hour", "seven_day")}
+            pcts = [p for k in keys.get(settings.title_pct, ()) if (p := _window_pct(usage, k)) is not None]
+            if pcts:
+                segments.append("Codex " + " · ".join(f"{p:.0f}%" for p in pcts))
+        except Exception:
+            logging.getLogger("claude-swap").debug("could not add Codex to the title", exc_info=True)
     if not segments:
         return icon
     return f"{icon} " + " · ".join(segments)
@@ -784,6 +823,7 @@ def run(switcher) -> int:
             # rate-limit edge. Reused across refreshes to hold its pacing state.
             self._snapshot_source = SnapshotSource(switcher)
             self.snapshot = dict(EMPTY_SNAPSHOT)
+            self.codex: codex_usage.CodexUsage | None = None  # latest Codex reading, if any
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
@@ -839,6 +879,7 @@ def run(switcher) -> int:
                     return
                 self._log_usage(snap)
                 self.snapshot = snap
+                self.codex = codex_usage.read()  # never raises; None hides the Codex row
                 self._snapshot_at = time.time()
                 self._dirty = True  # picked up by on_sync_tick on the main thread
                 if store_only:
@@ -1030,6 +1071,7 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
+            codex = self.codex  # the worker thread rebinds it: read once, use this copy
             health, attention = self._health()
             self._health_attention = attention
             self.title = format_title(
@@ -1038,6 +1080,7 @@ def run(switcher) -> int:
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
                 attention=attention,
+                codex=codex,
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -1086,10 +1129,19 @@ def run(switcher) -> int:
                 _set_tooltip(health_item, self._engine_failure)
             self._health_item = health_item
 
+            codex_items = []
+            row = codex_row(codex) if codex is not None else None
+            if row is not None:
+                # Not clickable: Codex is not an account to switch to.
+                codex_item = rumps.MenuItem(row[0], callback=None)
+                _set_tooltip(codex_item, row[1])
+                codex_items = [None, codex_item]
+
             self.menu = [
                 health_item,
                 None,
                 *account_items,
+                *codex_items,
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._switch(None)),
                 rumps.MenuItem("Switch to best", callback=self._switch("best")),
@@ -1101,7 +1153,7 @@ def run(switcher) -> int:
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
-                self._settings_menu(rumps),
+                self._settings_menu(rumps, codex is not None),
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
@@ -1161,7 +1213,7 @@ def run(switcher) -> int:
             menu.add(rumps.MenuItem("Open full log…", callback=self.on_open_log))
             return menu
 
-        def _settings_menu(self, rumps):
+        def _settings_menu(self, rumps, has_codex):
             menu = rumps.MenuItem("Settings")
             name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
             name_item.state = 1 if self.settings.show_account_name else 0
@@ -1181,6 +1233,15 @@ def run(switcher) -> int:
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
+
+            if has_codex or self.settings.title_codex:
+                # Only offered where Codex has logged usage, so it stays out of
+                # the way of everyone else.
+                codex_item = rumps.MenuItem(
+                    "Show Codex usage in menu bar", callback=self.on_toggle_codex
+                )
+                codex_item.state = 1 if self.settings.title_codex else 0
+                menu.add(codex_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -1344,6 +1405,10 @@ def run(switcher) -> int:
 
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
+            self._save_and_rebuild()
+
+        def on_toggle_codex(self, _sender):
+            self.settings.title_codex = not self.settings.title_codex
             self._save_and_rebuild()
 
         def _make_title_pct(self, mode):

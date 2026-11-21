@@ -25,6 +25,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `session.py`: `SessionManager`, behind `cswap run`. `mappings.py` maps a directory to an account.
 - `usage_store.py`: `UsageStore`, the per-account usage table. `poll_policy.py` holds every polling number. `snapshot_source.py` is the read path for dashboards.
 - `oauth.py`: the token, usage and profile endpoints, the header probe, and the formatting of reset times. `subscription.py` reads the plan label; `pace.py` computes the weekly pace marker.
+- `codex_usage.py`: reads Codex CLI's rate-limit windows from its session logs for display; it holds no account logic and touches no credential.
 - `transfer.py`: export and import. `settings.py`: `settings.json`. `migrations.py`: one-time data migrations. `update_check.py`: the PyPI version check.
 
 **Storage and platform.** Leaf modules that the core calls.

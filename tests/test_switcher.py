@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from claude_swap import macos_keychain
+from claude_swap import codex_usage, macos_keychain
 from claude_swap import oauth
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
@@ -1907,6 +1907,83 @@ class TestListAccountsUsage:
 
         output = capsys.readouterr().out
         assert "no credentials" in output
+
+    def _list_output(self, sample_sequence_data, capsys, *, json_output=False):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=json_output)
+        return payload, capsys.readouterr().out
+
+    def test_list_shows_a_codex_block_after_the_accounts(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys, tmp_path: Path, monkeypatch,
+    ):
+        """A Codex reading in Codex's session log shows under the accounts, shaped like one."""
+        day = tmp_path / "codex" / "sessions" / "2026" / "11" / "21"
+        day.mkdir(parents=True)
+        reset = time.time()
+        (day / "rollout-a.jsonl").write_text(json.dumps({
+            "timestamp": "2026-11-21T14:29:57.608Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "rate_limits": {
+                "limit_id": "codex", "plan_type": "plus",
+                "primary": {"used_percent": 1.0, "window_minutes": 300, "resets_at": reset + 3 * 3600 + 90},
+                "secondary": {"used_percent": 0.0, "window_minutes": 10080, "resets_at": reset + 6 * 86400 + 90},
+            }},
+        }) + "\n", encoding="utf-8")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+
+        _, out = self._list_output(sample_sequence_data, capsys)
+
+        lines = out.splitlines()
+        (header,) = [i for i, line in enumerate(lines) if line.startswith("  Codex")]
+        assert lines[header].startswith("  Codex · Plus (as of ")
+        assert lines[header - 1] == ""  # set off from the accounts above
+        assert lines[header + 1].startswith("     ├ 5h:   1%   resets ")
+        assert lines[header + 1].endswith(" in 3h 1m")
+        assert lines[header + 2].startswith("     └ 7d:   0%   resets ")
+        assert "ahead of pace" not in out
+        assert header > max(i for i, line in enumerate(lines) if line.startswith("  2: "))
+
+    def test_list_has_no_codex_block_without_a_reading(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys,
+    ):
+        _, out = self._list_output(sample_sequence_data, capsys)
+        assert "Codex" not in out
+
+    def test_list_still_shows_the_accounts_when_the_codex_part_fails(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys,
+    ):
+        reading = codex_usage.CodexUsage("plus", {"five_hour": (1.0, None)}, time.time())
+        with patch("claude_swap.codex_usage.read", return_value=reading), \
+             patch("claude_swap.switcher._codex_lines", side_effect=RuntimeError("boom")):
+            _, out = self._list_output(sample_sequence_data, capsys)
+        assert "  1: account1@example.com" in out
+        assert "  2: account2@example.com" in out
+        assert "Codex" not in out
+
+    def test_list_still_shows_the_accounts_when_reading_codex_fails(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys,
+    ):
+        with patch("claude_swap.codex_usage.read", side_effect=RuntimeError("boom")):
+            _, out = self._list_output(sample_sequence_data, capsys)
+        assert "  2: account2@example.com" in out
+        assert "Codex" not in out
+
+    def test_list_json_is_untouched_by_codex(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys,
+    ):
+        """`--json` is a contract: Codex is neither read for it nor added to it."""
+        with patch("claude_swap.codex_usage.read") as read:
+            payload, out = self._list_output(sample_sequence_data, capsys, json_output=True)
+        read.assert_not_called()
+        assert "codex" not in json.dumps(payload).lower()
+        assert out == ""
 
     def test_list_never_writes_live_while_claude_code_running(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
