@@ -18,7 +18,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot, org_tag_shown
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -70,18 +70,22 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
-        # The auto-switch threshold, drawn as a tick on the status strip's
-        # bars everywhere. Missing/invalid settings fall back to the default.
+        # The auto-switch lines, drawn as ticks on the status strip's bars
+        # everywhere: the threshold on the 5h row, the weekly line (when
+        # set) on the 7d and per-model rows. Missing/invalid settings fall
+        # back to the default.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            loaded = load_settings(switcher.backup_dir)
+            self.threshold_pct: float | None = loaded.threshold
+            self.weekly_threshold_pct: float | None = loaded.weekly_threshold
         except Exception:
             self.threshold_pct = None
+            self.weekly_threshold_pct = None
         try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+            ui = load_ui_settings(switcher.backup_dir)
+            self._theme_name, self.org_tag = ui.theme, ui.org_tag
         except Exception:
-            self._theme_name = "auto"
+            self._theme_name, self.org_tag = "auto", "auto"
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -154,6 +158,8 @@ class CswapApp(App):
     ) -> None:
         snap = self.source.take(full=full, store_only=store_only)
         self.call_from_thread(self._apply_snapshot, generation, lane, snap)
+        if self._store_only:
+            self.source.refresh_plans()
 
     def _apply_snapshot(
         self, generation: int, lane: str, snap: AccountsSnapshot
@@ -403,6 +409,11 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    def tag_shown(self, acc: AccountSnapshot) -> bool:
+        """Whether ``ui.orgTag`` draws ``acc``'s org tag in any TUI account view."""
+        accounts = self.snapshot.accounts if self.snapshot else ()
+        return org_tag_shown(self.org_tag, acc.email, [a.email for a in accounts])
 
     # -- theme --------------------------------------------------------------
 

@@ -20,6 +20,7 @@ from claude_swap.paths import (
     get_backup_root,
     get_claude_config_home,
     get_credentials_path,
+    get_default_global_config_path,
     get_global_config_path,
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
@@ -82,6 +83,38 @@ class TestGetGlobalConfigPath:
         assert get_global_config_path() == legacy
 
 
+@pytest.mark.parametrize(
+    "resolver", [get_global_config_path, get_default_global_config_path]
+)
+@pytest.mark.parametrize(
+    "legacy_kind, global_present, expect_legacy",
+    [
+        ("absent", False, False),
+        ("empty", True, False),
+        ("empty", False, True),
+        ("empty_readonly", False, False),
+        ("nonempty", True, True),
+        ("directory", False, False),
+    ],
+)
+def test_legacy_config_rule_matches_claude_code_2_1_299(
+    isolated_home: Path, resolver, legacy_kind, global_present, expect_legacy
+):
+    """An empty .config.json only wins while it is writable and .claude.json is absent."""
+    legacy = isolated_home / ".claude" / ".config.json"
+    legacy.parent.mkdir()
+    if legacy_kind == "directory":
+        legacy.mkdir()
+    elif legacy_kind != "absent":
+        legacy.write_text("{}" if legacy_kind == "nonempty" else "")
+        if legacy_kind == "empty_readonly":
+            legacy.chmod(0o444)
+    global_cfg = isolated_home / ".claude.json"
+    if global_present:
+        global_cfg.write_text("{}")
+    assert resolver() == (legacy if expect_legacy else global_cfg)
+
+
 class TestGetCredentialsPath:
     def test_default_inside_dot_claude(self, isolated_home: Path):
         assert get_credentials_path() == isolated_home / ".claude" / ".credentials.json"
@@ -90,6 +123,23 @@ class TestGetCredentialsPath:
         custom = tmp_path / "ccd"
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
         assert get_credentials_path() == custom / ".credentials.json"
+
+    def test_follows_a_defined_secure_storage_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Claude Code 2.1.322 reads the file from the secure-storage directory,
+        which the override names ahead of ``CLAUDE_CONFIG_DIR``."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "ccd"))
+        secure = tmp_path / "secure"
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+        assert get_credentials_path() == secure / ".credentials.json"
+
+    def test_an_empty_secure_storage_override_selects_the_default_home(
+        self, isolated_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "ccd"))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+        assert get_credentials_path() == isolated_home / ".claude" / ".credentials.json"
 
 
 class TestGetBackupRoot:

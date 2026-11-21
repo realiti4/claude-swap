@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import stat
+import os
 import sys
 from pathlib import Path
 
@@ -15,14 +17,24 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    RunSettings,
     UiSettings,
+    UnrecognizedKey,
+    UpdateSettings,
+    UsageSettings,
     effective_settings,
+    explicit_share_history,
+    load_run_settings,
     load_settings,
     load_ui_settings,
+    load_update_settings,
+    load_usage_settings,
+    log_unrecognized_keys,
     merged_with_cli,
     save_settings,
     set_setting,
     settings_path,
+    unrecognized_keys,
     unset_setting,
 )
 
@@ -30,6 +42,7 @@ from claude_swap.settings import (
 def _args(**kwargs) -> argparse.Namespace:
     defaults = {
         "threshold": None,
+        "weekly_threshold": None,
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
@@ -81,6 +94,24 @@ class TestLoadSettings:
         loaded = load_settings(tmp_path)
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
+
+    def test_quoted_false_does_not_enable_api_key_accounts(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": "false"}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is False
+
+    def test_quoted_bool_words_are_read_by_their_word(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": "TRUE"}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is True
+
+    def test_unparseable_bool_falls_back_to_the_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": "maybe"}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is False
 
     def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
@@ -151,6 +182,132 @@ class TestUiSettings:
         with pytest.raises(ConfigError, match="dark, light"):
             set_setting(tmp_path, "ui.theme", "purple")
 
+    def test_org_tag_defaults_auto_round_trips_and_ignores_bad_values(
+        self, tmp_path: Path
+    ):
+        assert load_ui_settings(tmp_path).org_tag == "auto"
+        assert set_setting(tmp_path, "ui.orgTag", "off") == "off"
+        assert load_ui_settings(tmp_path).org_tag == "off"
+        with pytest.raises(ConfigError, match="auto, on, off"):
+            set_setting(tmp_path, "ui.orgTag", "sometimes")
+        raw = {"ui": {"orgTag": "no", "theme": "light"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(theme="light")
+        raw = {"ui": {"orgTag": "on", "theme": "purple"}}
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert load_ui_settings(tmp_path) == UiSettings(org_tag="on")
+
+
+class TestRunSettings:
+    def test_missing_file_defaults_to_shared_history(self, tmp_path: Path):
+        assert load_run_settings(tmp_path) == RunSettings(share_history=True)
+
+    def test_reads_share_history(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": False}}))
+        assert load_run_settings(tmp_path).share_history is False
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        # "no" is truthy as a string and falsy in intent: neither reading is
+        # taken, the default is.
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "no"}}))
+        assert load_run_settings(tmp_path).share_history is True
+
+    def test_explicit_value_is_none_until_the_user_sets_one(self, tmp_path: Path):
+        """The loader answers "what applies"; this one, "who decided"."""
+        assert explicit_share_history(tmp_path) is None
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "no"}}))
+        assert explicit_share_history(tmp_path) is None  # not a choice either
+
+    @pytest.mark.parametrize("chosen", [True, False])
+    def test_explicit_value_is_the_one_in_the_file(self, tmp_path: Path, chosen):
+        # True included: equal to the default, and still the user's own.
+        set_setting(tmp_path, "run.shareHistory", str(chosen).lower())
+        assert explicit_share_history(tmp_path) is chosen
+        assert load_run_settings(tmp_path).share_history is chosen
+
+    def test_unset_goes_back_to_the_default(self, tmp_path: Path):
+        set_setting(tmp_path, "run.shareHistory", "false")
+        assert unset_setting(tmp_path, "run.shareHistory") is True
+        assert explicit_share_history(tmp_path) is None
+        assert load_run_settings(tmp_path).share_history is True
+
+    def test_set_share_history(self, tmp_path: Path):
+        assert set_setting(tmp_path, "run.shareHistory", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "run": {"shareHistory": True}}
+
+
+class TestUpdateSettings:
+    def test_missing_file_checks(self, tmp_path: Path):
+        assert load_update_settings(tmp_path) == UpdateSettings(check=True)
+
+    def test_reads_false(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"updates": {"check": False}}))
+        assert load_update_settings(tmp_path).check is False
+
+    def test_non_boolean_falls_back_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"updates": {"check": "false"}}))
+        assert load_update_settings(tmp_path).check is True
+
+    def test_set_and_unset_updates_check(self, tmp_path: Path):
+        assert set_setting(tmp_path, "updates.check", "false") is False
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "updates": {"check": False}}
+        assert load_update_settings(tmp_path).check is False
+        assert unset_setting(tmp_path, "updates.check") is True
+        assert "updates" not in json.loads(settings_path(tmp_path).read_text())
+
+
+class TestUsageSettings:
+    def test_missing_file_leaves_header_probe_off(self, tmp_path: Path):
+        # Opt-in: each probe is a real inference request on the subscription.
+        assert load_usage_settings(tmp_path) == UsageSettings(header_probe=False)
+
+    def test_reads_true(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": True}})
+        )
+        assert load_usage_settings(tmp_path).header_probe is True
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        # A string "true" is not True: never bool(str).
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": "true"}})
+        )
+        assert load_usage_settings(tmp_path).header_probe is False
+
+    def test_set_and_unset_header_probe(self, tmp_path: Path):
+        assert set_setting(tmp_path, "usage.headerProbe", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "usage": {"headerProbe": True}}
+        assert load_usage_settings(tmp_path).header_probe is True
+        assert unset_setting(tmp_path, "usage.headerProbe") is True
+        assert load_usage_settings(tmp_path).header_probe is False
+
+    def test_fable_probe_is_an_opt_in_of_its_own(self, tmp_path: Path):
+        # Agreeing to a Haiku token is not agreeing to spend Fable quota.
+        assert set_setting(tmp_path, "usage.headerProbe", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, fable_probe=False
+        )
+        assert set_setting(tmp_path, "usage.fableProbe", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, fable_probe=True
+        )
+        assert unset_setting(tmp_path, "usage.fableProbe") is True
+        assert load_usage_settings(tmp_path).fable_probe is False
+
+    def test_a_non_bool_key_does_not_take_the_other_one_down(
+        self, tmp_path: Path, caplog
+    ):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": True, "fableProbe": "yes"}})
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            loaded = load_usage_settings(tmp_path)
+        assert loaded == UsageSettings(header_probe=True, fable_probe=False)
+        assert "usage.fableProbe must be true or false" in caplog.text
+
 
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
@@ -163,9 +320,24 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["run"] == {
+            f.name for f in RunSettings.__dataclass_fields__.values()
+        }
+        assert by_section["updates"] == {
+            f.name for f in UpdateSettings.__dataclass_fields__.values()
+        }
+        assert by_section["usage"] == {
+            f.name for f in UsageSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "run": RunSettings(),
+            "updates": UpdateSettings(),
+            "usage": UsageSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 
@@ -251,6 +423,153 @@ class TestEffectiveSettings:
         assert by_key["autoswitch.intervalSeconds"] is False
 
 
+def _settings_warnings(caplog) -> list[str]:
+    """The settings.json lines in the captured log, and no one else's."""
+    return [
+        message
+        for message in (r.getMessage() for r in caplog.records)
+        if message.startswith("settings.json:")
+    ]
+
+
+class TestUnrecognizedKeys:
+    """A key nothing reads stays in the file and changes nothing;
+    `unrecognized_keys` is what names it."""
+
+    def test_typoed_keys_are_named_with_the_key_they_resemble(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 98.0, "hysteresisPCT": 5, "cooldownSecond": 600,
+            },
+        }))
+        assert unrecognized_keys(tmp_path) == [
+            UnrecognizedKey("autoswitch.hysteresisPCT", "autoswitch.hysteresisPct"),
+            UnrecognizedKey("autoswitch.cooldownSecond", "autoswitch.cooldownSeconds"),
+        ]
+        # The file is still read as before: the correct key applies and the
+        # mistyped ones leave their settings at the default.
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold == 98.0
+        assert loaded.hysteresis_pct == AutoSwitchSettings().hysteresis_pct
+        assert loaded.cooldown_seconds == AutoSwitchSettings().cooldown_seconds
+
+    def test_mistyped_section_is_named(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoSwitch": {"threshold": 70}})
+        )
+        assert unrecognized_keys(tmp_path) == [
+            UnrecognizedKey("autoSwitch", "autoswitch")
+        ]
+        assert load_settings(tmp_path) == AutoSwitchSettings()
+
+    def test_unrelated_key_gets_no_suggestion(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "futureSection": {"x": 1},
+            "autoswitch": {"graceSeconds": 30},
+            "ui": {"font": "mono"},
+        }))
+        assert unrecognized_keys(tmp_path) == [
+            UnrecognizedKey("futureSection"),
+            UnrecognizedKey("autoswitch.graceSeconds"),
+            UnrecognizedKey("ui.font"),
+        ]
+
+    @pytest.mark.parametrize(
+        "written, meant",
+        [
+            ("Strategy", "strategy"),
+            ("treshold", "threshold"),
+            ("models", "model"),
+            ("weekly_threshold", "weeklyThreshold"),
+            # A shortened name, as the `cswap auto` flags spell these two.
+            ("interval", "intervalSeconds"),
+            ("cooldown", "cooldownSeconds"),
+            ("hysteresis", "hysteresisPct"),
+            # Shares a word with a real key, or is too short to mean one.
+            ("graceSeconds", None),
+            ("holdSeconds", None),
+            ("maxThreshold", None),
+            ("order", None),
+            ("th", None),
+        ],
+    )
+    def test_suggestion_only_for_a_near_miss(self, tmp_path: Path, written, meant):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {written: 1}})
+        )
+        (item,) = unrecognized_keys(tmp_path)
+        assert item.dotted == f"autoswitch.{written}"
+        assert item.suggestion == (f"autoswitch.{meant}" if meant else None)
+
+    def test_setting_written_flat_at_the_top_level_is_told_where_it_belongs(
+        self, tmp_path: Path
+    ):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch.threshold": 80}))
+        (item,) = unrecognized_keys(tmp_path)
+        assert item == UnrecognizedKey("autoswitch.threshold", "autoswitch.threshold")
+        assert item.describe() == (
+            "'autoswitch.threshold' is not a key this version reads, so it has "
+            "no effect; it belongs inside 'autoswitch' as 'threshold'"
+        )
+        assert load_settings(tmp_path) == AutoSwitchSettings()
+
+    def test_key_is_quoted_so_stray_whitespace_shows(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"threshold ": 80, "a\nb": 1}})
+        )
+        spaced, broken = (item.describe() for item in unrecognized_keys(tmp_path))
+        assert spaced.startswith("'autoswitch.threshold ' is not a key")
+        assert spaced.endswith("did you mean autoswitch.threshold?")
+        assert "\n" not in broken
+
+    def test_every_registered_key_is_recognized(self, tmp_path: Path):
+        raw: dict = {"schemaVersion": 1}
+        for spec in SETTING_SPECS.values():
+            raw.setdefault(spec.section, {})[spec.json_key] = spec.default
+        settings_path(tmp_path).write_text(json.dumps(raw))
+        assert unrecognized_keys(tmp_path) == []
+
+    @pytest.mark.parametrize("content", [None, "{not json", "[1, 2]", "{}"])
+    def test_missing_corrupt_or_empty_file_reports_nothing(
+        self, tmp_path: Path, content
+    ):
+        if content is not None:
+            settings_path(tmp_path).write_text(content)
+        assert unrecognized_keys(tmp_path) == []
+
+    def test_section_that_is_not_an_object_is_not_searched(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": "best"}))
+        assert unrecognized_keys(tmp_path) == []
+
+    def test_log_names_each_ignored_key(self, tmp_path: Path, caplog):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {"hysteresisPCT": 5, "futureKnob": True},
+        }))
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            log_unrecognized_keys(tmp_path)
+        assert _settings_warnings(caplog) == [
+            "settings.json: 'autoswitch.hysteresisPCT' is not a key this version "
+            "reads, so it has no effect; did you mean autoswitch.hysteresisPct?",
+            "settings.json: 'autoswitch.futureKnob' is not a key this version "
+            "reads, so it has no effect",
+        ]
+
+    def test_loading_does_not_log_ignored_keys(self, tmp_path: Path, caplog):
+        """The loaders run on every command; only a starting loop logs."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"hysteresisPCT": 5}, "ui": {"them": "dark"}})
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_settings(tmp_path)
+            load_ui_settings(tmp_path)
+            load_run_settings(tmp_path)
+            load_update_settings(tmp_path)
+            load_usage_settings(tmp_path)
+            effective_settings(tmp_path)
+        assert _settings_warnings(caplog) == []
+
+
 class TestMergedWithCli:
     def test_no_flags_returns_settings_unchanged(self):
         base = AutoSwitchSettings(threshold=80.0)
@@ -303,6 +622,10 @@ class TestAtomicWriteThroughSymlink:
         assert link.is_symlink(), "the dotfiles link must survive the write"
         assert json.loads(tracked.read_text()) == {"written": "through"}
 
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
     def test_dangling_link_writes_where_it_points(self, tmp_path):
         target = tmp_path / "gone" / "settings.json"
         link = tmp_path / "settings.json"
@@ -324,7 +647,6 @@ class TestAtomicWriteThroughSymlink:
         another mount — the write fails outright. Assert the placement
         directly; staging two filesystems in a unit test is not portable."""
         import tempfile
-        from claude_swap import settings as S
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
@@ -332,7 +654,7 @@ class TestAtomicWriteThroughSymlink:
         seen = []
         real_mkstemp = tempfile.mkstemp
         monkeypatch.setattr(
-            S.tempfile, "mkstemp",
+            tempfile, "mkstemp",
             lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
         )
 
@@ -355,3 +677,80 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestWeeklyThreshold:
+    """`weekly_threshold`: optional, same bounds as `threshold`, forgiving on
+    load and loud on `set` — the registry's first optional float."""
+
+    def test_defaults_to_none(self, tmp_path: Path):
+        assert AutoSwitchSettings().weekly_threshold is None
+        assert load_settings(tmp_path).weekly_threshold is None
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [("97", 97.0), ("970", 99.9), ("10", 50.0), ('"banana"', None), ("null", None)],
+    )
+    def test_load_clamps_numbers_and_drops_garbage(self, tmp_path: Path, raw, expected):
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"weeklyThreshold": %s}}' % raw
+        )
+        assert load_settings(tmp_path).weekly_threshold == expected
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_non_finite_numbers_fall_back_to_defaults(self, tmp_path: Path, literal):
+        # json.loads accepts these literals and min/max pass NaN through, so
+        # the clamp must treat non-finite as garbage for both lines — a NaN
+        # line would never be crossed.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s, "weeklyThreshold": %s}}'
+            % (literal, literal)
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold == AutoSwitchSettings().threshold
+        assert loaded.weekly_threshold is None
+
+    def test_an_integer_too_large_for_a_float_still_clamps(self, tmp_path: Path):
+        # Python ints are unbounded; isfinite() on one past float range raises
+        # OverflowError. The clamp must keep answering 99.9 for both lines.
+        huge = "1" + "0" * 400
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s, "weeklyThreshold": %s}}' % (huge, huge)
+        )
+        loaded = load_settings(tmp_path)
+        assert (loaded.threshold, loaded.weekly_threshold) == (99.9, 99.9)
+
+    def test_set_validates_loudly_and_unset_clears(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between 50 and 99.9"):
+            set_setting(tmp_path, "autoswitch.weeklyThreshold", "970")
+        with pytest.raises(ConfigError, match="expects a number.*config unset"):
+            set_setting(tmp_path, "autoswitch.weeklyThreshold", "banana")
+        assert not settings_path(tmp_path).exists()
+        assert set_setting(tmp_path, "autoswitch.weeklyThreshold", "97") == 97.0
+        assert load_settings(tmp_path).weekly_threshold == 97.0
+        assert unset_setting(tmp_path, "autoswitch.weeklyThreshold") is True
+        assert load_settings(tmp_path).weekly_threshold is None
+
+    def test_a_weekly_line_below_the_5h_line_is_accepted(self, tmp_path: Path):
+        # "Keep a weekly reserve" is a legitimate policy; no cross-field rule.
+        set_setting(tmp_path, "autoswitch.threshold", "90")
+        assert set_setting(tmp_path, "autoswitch.weeklyThreshold", "80") == 80.0
+        loaded = load_settings(tmp_path)
+        assert (loaded.threshold, loaded.weekly_threshold) == (90.0, 80.0)
+
+    def test_cli_override_and_anchor(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(weekly_threshold=95.0), _args(weekly_threshold=97.0)
+        )
+        assert merged.weekly_threshold == 97.0
+        # --threshold alone leaves a configured weekly line in force (the
+        # #355 anchor bug class: both lines come from the one settings object).
+        merged = merged_with_cli(
+            AutoSwitchSettings(threshold=90.0, weekly_threshold=97.0),
+            _args(threshold=85.0),
+        )
+        assert (merged.threshold, merged.weekly_threshold) == (85.0, 97.0)
+
+    def test_cli_value_is_clamped(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
+        assert merged.weekly_threshold == 99.9
