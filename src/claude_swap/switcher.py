@@ -6391,6 +6391,15 @@ class ClaudeAccountSwitcher:
                                     ),
                                 },
                             )
+                            # Closes the start line (the stash logs nothing).
+                            self._logger.info(
+                                "Refresh for account %s stashed its "
+                                "successor (%s).",
+                                account_num,
+                                _fingerprint_head(
+                                    oauth.credential_fingerprint(working)
+                                ),
+                            )
                         except Exception:
                             self._logger.warning(
                                 "Backup and active-store writes failed after "

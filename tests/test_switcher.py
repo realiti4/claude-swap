@@ -2655,6 +2655,44 @@ class TestActiveAccountRefresh:
             "Refresh for account 1 " + ending.format(new=new),
         ]
 
+    def test_a_stashed_successor_closes_the_active_refresh_in_the_log(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog,
+    ):
+        """Both store writes fail (backup raises, live write refused) and only
+        the stash holds the successor: the POST still gets its closing line,
+        so a start with no end keeps meaning a spent grant with nothing to
+        show."""
+        import logging
+
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=Exception("backup write failed"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert len(switcher.list_unclaimed_credentials()) == 1
+        old = oauth.credential_fingerprint(self._EXPIRED)[:19]
+        new = oauth.credential_fingerprint(self._REFRESHED)[:19]
+        assert [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Refresh ")
+        ] == [
+            f"Refresh starting for account 1 ({old}).",
+            f"Refresh for account 1 stashed its successor ({new}).",
+        ]
+
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
