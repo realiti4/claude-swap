@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import socket
 import ssl
 import sys
 import urllib.error
@@ -20,13 +21,6 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-# How long a refresh POST waits for its reply unless the caller passes a
-# tighter budget. The grant is single-use, so a request that reached the server
-# cannot be taken back: giving up on a slow reply discards the only copy of the
-# successor while the server retires the token we still hold, and the slot then
-# needs a fresh /login. Waiting is the cheap side of that trade. 30 s is what
-# Claude Code gives the same request (`timeout:30000` in 2.1.290).
-OAUTH_REFRESH_TIMEOUT_S = 30.0
 
 # What ``claude setup-token`` grants (and what ``cswap add-token`` stores).
 # Such a token can run inference but cannot read the usage endpoint.
@@ -53,6 +47,11 @@ USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 USAGE_PROBE_SCOPED_MODELS = {"claude-fable-5-1": "7d_oi"}
 
 _logger = logging.getLogger("claude-swap")
+
+# Refresh failures that happen before any byte of the request is written: the
+# name did not resolve, the connection was refused, or the TLS handshake
+# rejected the certificate.
+_NEVER_SENT = (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -257,16 +256,13 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = OAUTH_REFRESH_TIMEOUT_S
+    credentials: str, timeout_s: float = 10.0
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
-    contenders' acquire timeout (see ``_fetch_active_usage``). The consume
-    gate is the deliberate exception: it keeps the default under its own
-    lock, and a contender that gives up first defers (see
-    ``ClaudeAccountSwitcher.consume_backup_grant``).
+    contenders' acquire timeout (see ``_fetch_active_usage``).
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -345,16 +341,31 @@ def try_refresh_oauth_credentials(
             _warn_grant_fate_unknown(credentials, f"HTTP {e.code}")
         return RefreshOutcome(None, "transient")
     except urllib.error.URLError as e:
-        # The request did not go out whole: urllib wraps resolve, connect, TLS
-        # and send failures in URLError and leaves a failure while reading the
-        # reply unwrapped. No grant was spent, so this is the ordinary
-        # offline case and stays quiet.
-        _logger.debug("OAuth refresh not sent: %r", e)
+        # urllib wraps every failure before the reply is read in URLError:
+        # name lookup, connect, TLS and writing the request. A failure while
+        # reading the reply arrives unwrapped, below.
+        reason = e.reason
+        what = reason if isinstance(reason, str) else type(reason).__name__
+        if isinstance(reason, (str, *_NEVER_SENT)):
+            # Nothing reached the server, so no grant can have been spent.
+            # The ordinary offline case; it stays quiet.
+            _logger.debug("OAuth refresh not sent: %s", what)
+        else:
+            # A timeout or a reset here can be the connect or the write, and
+            # the exception does not say which. INFO, because the default log
+            # keeps it and it is not a reason for alarm.
+            _logger.info(
+                "OAuth refresh for %s failed while connecting or sending "
+                "(%s); whether the request reached the server is unknown.",
+                credential_fingerprint(credentials)[:19],
+                what,
+            )
         return RefreshOutcome(None, "transient")
     except Exception as e:
         # The request went out and no usable reply came back: a timeout or
-        # reset while waiting, or a reply that could not be read.
-        _logger.debug("OAuth refresh failed: %r", e)
+        # reset while waiting, or a reply that could not be read. The type
+        # name only: a decode error's repr holds the reply bytes.
+        _logger.debug("OAuth refresh failed: %s", type(e).__name__)
         _warn_grant_fate_unknown(credentials, type(e).__name__)
         return RefreshOutcome(None, "transient")
 
