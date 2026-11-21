@@ -1155,7 +1155,7 @@ class TestPollPlan:
 
 
 class TestDueCandidate:
-    """Candidate selection shared by the auto engine and the TUI watch view."""
+    """The auto engine's one-alternate-per-tick candidate pick."""
 
     NOW = 1_000_000.0
 
@@ -1237,6 +1237,32 @@ class TestDueCandidate:
         # due_candidate has no current scoped-model selection: repair keys on
         # the impossible deadline shape rather than stale policy semantics.
         assert due_candidate(["2"], entries, self.NOW) == "2"
+
+    def test_attempted_but_unmeasured_slot_yields_to_an_older_due_row(self):
+        """A fetch-path sentinel (a live session's expired or refused
+        credential) records no measurement, plan or backoff. Keyed on
+        fetchedAt alone it stayed the stalest due row every tick and the
+        other alternates were never polled; the pick keys on the attempt
+        stamp reserve() writes, so a no-op pick rotates to the back."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 400, last_attempt_at=self.NOW - 400),
+            "3": UsageEntry(last_attempt_at=self.NOW - 60),  # picked last tick, no data
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "2"
+        # ...and comes back around once nothing was touched more recently,
+        # so a rotated credential is noticed on the next idle tick.
+        entries["2"] = UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 30)
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
+
+    def test_adopted_reading_counts_as_a_touch(self):
+        """``UsageStore.adopt`` moves fetchedAt without an attempt: the later
+        of the two stamps is the touch, so a freshly adopted row is not the
+        least recent."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 900),
+            "3": UsageEntry(fetched_at=self.NOW - 600, last_attempt_at=self.NOW - 600),
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
 
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
@@ -1765,6 +1791,79 @@ class TestAdopt:
         store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
         store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=60.0)
         assert store.entries(IDENT)["1"].held_until == clock.now + 60.0
+
+    @staticmethod
+    def _rejected_reading(
+        clock, deadline_in: float, retry_after_s: float | None = 3600.0
+    ) -> dict:
+        """A setup-token header-probe reading refused for quota (see
+        ``oauth.request_usage_via_probe``), its ``resets_at`` stamp
+        ``deadline_in`` seconds from this clock's now. With a Retry-After
+        that stamp is the server's deadline; without one it is the quota
+        reset copied from the unified headers."""
+        from datetime import datetime, timezone
+
+        resets_at = datetime.fromtimestamp(
+            clock.now + deadline_in, tz=timezone.utc
+        ).isoformat()
+        return {
+            **USAGE,
+            "rejected": {"retry_after_s": retry_after_s, "resets_at": resets_at},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+
+    def test_rejection_deadline_carries_over_as_backoff(self, store, clock):
+        """A refused probe's deadline binds every machine: an adopted
+        reading's absolute ``resets_at`` becomes this store's backoff, so no
+        collector probes before it ends. The Retry-After (3600s) was
+        relative to the other machine's fetch, so it is not re-added."""
+        reading = self._rejected_reading(clock, 1800.0)
+        assert store.adopt({"1": (reading, 1800.0)}, IDENT) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert entry.backoff_until == pytest.approx(clock.now + 1800.0)
+        assert entry.last_error is None and entry.consecutive_failures == 0
+        clock.advance(SERVE_TTL_S + 1)  # stale: every mode would fetch now
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        clock.advance(1800.0)
+        assert set(store.reserve(["1"], IDENT, respect_plans=False)) == {"1"}
+
+    def test_rejection_without_retry_after_installs_no_backoff(self, store, clock):
+        """No Retry-After means ``resets_at`` is the quota reset, not a
+        deadline: like the local path (``record``), adoption leaves the row
+        on bounded polling so an early quota grant is still observed."""
+        reading = self._rejected_reading(clock, 1800.0, retry_after_s=None)
+        assert store.adopt({"1": (reading, 0.0)}, IDENT) == {"1"}
+        assert store.entries(IDENT)["1"].backoff_until is None
+        # The same reading recorded locally installs none either.
+        store.record({"2": FetchRecord(usage=reading)}, IDENT)
+        assert store.entries(IDENT)["2"].backoff_until is None
+
+    def test_past_or_unadopted_rejection_leaves_backoff_alone(self, store, clock):
+        # A deadline already behind us is no reason to wait.
+        store.adopt({"1": (self._rejected_reading(clock, -10.0), 0.0)}, IDENT)
+        assert store.entries(IDENT)["1"].backoff_until is None
+        # A reading older than this machine's own is not adopted, deadline
+        # included.
+        store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(10)
+        assert store.adopt({"2": (self._rejected_reading(clock, 1800.0), 30.0)}, IDENT) == set()
+        assert store.entries(IDENT)["2"].backoff_until is None
+
+    def test_rejection_deadline_never_shortens_and_is_capped(self, store, clock):
+        # This machine's own 429 already parks the row past the deadline.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=4000.0)}, IDENT
+        )
+        parked = store.entries(IDENT)["1"].backoff_until
+        assert parked > clock.now + 1800.0
+        store.adopt({"1": (self._rejected_reading(clock, 1800.0), 0.0)}, IDENT)
+        assert store.entries(IDENT)["1"].backoff_until == parked
+        # An absurd deadline is bounded like a 429's ask.
+        store.adopt({"2": (self._rejected_reading(clock, 10 * 86400.0), 0.0)}, IDENT)
+        assert store.entries(IDENT)["2"].backoff_until == pytest.approx(
+            clock.now + usage_store.RETRY_AFTER_FLOOR_CAP_S
+        )
 
     def _usage_resetting_in(self, clock, five_hour_s, scoped_s=None):
         from datetime import datetime, timezone

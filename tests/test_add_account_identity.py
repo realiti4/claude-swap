@@ -22,7 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.exceptions import ConfigError, ValidationError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError, ValidationError
 
 CREDS = json.dumps({"claudeAiOauth": {
     "accessToken": "sk-ant-oat01-THEIRS", "refreshToken": "rt-theirs",
@@ -718,3 +718,69 @@ def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
         "_get_current_identity_triple returned, or a sibling change that "
         "overwrites one of the unpacked names silently poisons it"
     )
+
+
+WIPED = json.dumps({"claudeAiOauth": {
+    "accessToken": "", "refreshToken": "", "expiresAt": 0}})
+
+
+def test_add_refuses_a_wiped_credential(temp_home: Path, mock_claude_config: Path):
+    """Both tokens emptied (Claude Code after invalid_grant) is unusable, not unverifiable."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+
+    with patch.object(s, "_read_capture_credentials", return_value=WIPED), \
+         patch("claude_swap.oauth.fetch_oauth_profile") as fetch:
+        with pytest.raises(ConfigError, match="Nothing was changed"):
+            s.add_account(slot=7, assume_yes=True)
+
+    fetch.assert_not_called()
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
+def test_CONTROL_refresh_token_without_access_token_still_registers(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """A surviving refresh token can revive the slot, so the guard stays advisory."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    creds = json.dumps({"claudeAiOauth": {
+        "accessToken": "", "refreshToken": "rt-live", "expiresAt": 0}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=creds):
+        s.add_account(slot=7, assume_yes=True)
+
+    assert "7" in s._get_sequence_data().get("accounts", {})
+
+
+def test_extract_oauth_data_is_none_for_json_that_is_not_an_object():
+    from claude_swap import oauth
+    assert oauth.extract_oauth_data("[]") is None
+    assert oauth.extract_oauth_data('"x"') is None
+def test_a_config_torn_mid_rewrite_in_that_window_is_refused_not_a_crash(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The same window, with the config unreadable rather than changed.
+
+    The second read is not guaranteed to produce a config at all: Claude Code
+    rewrites `.claude.json` constantly, and the ownership probe's network
+    round-trip makes the gap between the two reads seconds wide. `_read_json`
+    answers None for a file caught mid-rewrite, and the `.get` on the next
+    line then died with a raw AttributeError -- which `cli.py` does not catch,
+    so `cswap --json add` printed a traceback and no envelope at all, leaving
+    a scripted or menu-bar caller with unparseable output.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    cfg = s._get_claude_config_path()
+
+    def tears_during_lookup(token):
+        # Claude Code is part-way through replacing the file.
+        cfg.write_text('{"oauthAccount": {"emailAddr', encoding="utf-8")
+        return {"uuid": "u-ax", "email": "ax@example.com",
+                "organizationUuid": ""}
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               side_effect=tears_during_lookup):
+        with pytest.raises(ClaudeSwitchError):
+            s.add_account(slot=7, assume_yes=True)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
