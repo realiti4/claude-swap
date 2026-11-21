@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,7 @@ import pytest
 from claude_swap import __version__
 from claude_swap import cli
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.printer import warning
 from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -1416,6 +1418,87 @@ class TestRunCommand:
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
 
+    def test_whatever_the_launch_prints_goes_to_stderr(self, capsys):
+        """Stdout is claude's. A notice from anywhere on the way to the
+        launch, however it is printed, must not land in it."""
+
+        class PrintingSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(self, identifier, claude_args, **kwargs):
+                print("a bootstrap notice")
+                warning("a bootstrap warning")
+
+        with patch("claude_swap.session.SessionManager", PrintingSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=self.backup_dir)), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "run", "2"]):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "a bootstrap notice" in captured.err
+        assert "a bootstrap warning" in captured.err
+
+    @pytest.mark.parametrize(
+        "unbuffered", [False, True], ids=["buffered", "unbuffered"]
+    )
+    def test_real_handoff_leaves_stdout_to_claude(self, tmp_path, unbuffered):
+        """Through the real handoff, a piped stdout carries claude's output
+        and nothing else, and the launch notice still arrives, on stderr.
+
+        Unbuffered is the case that puts a stdout notice in front of claude's
+        output; buffered is the one where a POSIX exec drops it.
+        """
+        fake_claude = tmp_path / "claude.py"
+        fake_claude.write_text(
+            'import json, sys\nprint(json.dumps({"args": sys.argv[1:]}))\n'
+        )
+        # An unmapped directory launches the default login, which reads no
+        # credential on the way, so the stub needs nothing account-shaped.
+        script = textwrap.dedent("""\
+            import sys
+            from pathlib import Path
+            from types import SimpleNamespace
+            from unittest.mock import patch
+
+            from claude_swap import cli
+
+            switcher = SimpleNamespace(
+                backup_dir=Path.cwd(),
+                _logger=None,
+                slot_for_directory=lambda cwd: (None, None),
+                _is_running_in_container=lambda: True,
+            )
+            argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
+            # Python stands in for claude; the handoff itself is the real one.
+            with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \\
+                 patch("claude_swap.session.shutil.which", return_value=sys.executable), \\
+                 patch.object(sys, "argv", argv):
+                cli.main()
+        """)
+        env = _subprocess_env(NO_COLOR="1", PYTHONIOENCODING="utf-8")
+        env.pop("PYTHONUNBUFFERED", None)
+        if unbuffered:
+            env["PYTHONUNBUFFERED"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(fake_claude)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert [json.loads(line) for line in result.stdout.splitlines()] == [
+            {"args": ["--output-format", "stream-json"]}
+        ]
+        assert "No account mapped" in result.stderr
+
 
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
@@ -1932,6 +2015,28 @@ class TestMapCommand:
         assert "Directory mappings" in out
         assert "work@co.com" in out
         assert "2:" in out  # slot number resolved
+        assert "[personal]" not in out  # sole holder of its email: ``auto`` hides the tag
+
+    @pytest.mark.parametrize("mode, tagged", [("auto", True), ("off", False)])
+    def test_map_list_org_tag_follows_ui_org_tag(self, temp_home, capsys, mode, tagged):
+        from claude_swap.mappings import MappingStore
+        from claude_swap.settings import settings_path
+        switcher = self._seeded_switcher_env(temp_home)
+        data = switcher._get_sequence_data()
+        data["accounts"]["3"] = {
+            **data["accounts"]["2"], "organizationUuid": "org-3", "organizationName": "orgB",
+        }
+        data["sequence"] = [2, 3]
+        switcher._write_json(switcher.sequence_file, data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+        target = temp_home / "proj"
+        target.mkdir()
+        MappingStore(switcher.backup_dir).set(target, "work@co.com", "")
+
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._map_command([])
+
+        assert ("[personal]" in capsys.readouterr().out) is tagged
 
     def test_map_list_flags_removed_account(self, temp_home, capsys):
         from claude_swap.mappings import MappingStore
@@ -2233,7 +2338,9 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
         assert ("exec_default", []) in calls
-        assert "No account mapped" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "No account mapped" in captured.err
 
     def test_removed_account_falls_back_with_warning(self, tmp_path, monkeypatch, capsys):
         from claude_swap.mappings import MappingStore
@@ -2252,7 +2359,9 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
         assert ("exec_default", []) in calls
-        assert "no longer exists" in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no longer exists" in captured.err
 
     def test_explicit_account_still_runs(self, tmp_path, monkeypatch):
         """An explicit account argument bypasses mapping resolution."""
@@ -2488,3 +2597,51 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+class TestPersonAtTerminal:
+    """The main dispatch tells the switcher whether a person can answer a system
+    prompt; only then may the Keychain migration wait for the permission window."""
+
+    @staticmethod
+    def _run(argv: list[str], *, tty: bool) -> bool:
+        """Run ``cswap <argv>`` with stdin and stderr as terminals or not, and
+        return the ``interactive`` value the switcher was built with."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch.object(sys.stdin, "isatty", return_value=tty), \
+             patch.object(sys.stderr, "isatty", return_value=tty), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = {}
+            cli.main()
+        return switcher_cls.call_args.kwargs["interactive"]
+
+    def test_human_command_in_a_terminal(self):
+        assert self._run(["--list"], tty=True) is True
+
+    def test_json_in_a_terminal_is_not_a_person(self):
+        assert self._run(["--list", "--json"], tty=True) is False
+
+    def test_no_terminal_is_not_a_person(self):
+        assert self._run(["--list"], tty=False) is False
+
+    def test_either_stream_redirected_is_not_a_person(self):
+        args = cli.argparse.Namespace(json=False, menubar=False)
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(sys.stderr, "isatty", return_value=False):
+            assert cli._person_at_terminal(args) is False
+        with patch.object(sys.stdin, "isatty", return_value=False), \
+             patch.object(sys.stderr, "isatty", return_value=True):
+            assert cli._person_at_terminal(args) is False
+
+    def test_menubar_is_not_a_person(self):
+        args = cli.argparse.Namespace(json=False, menubar=True)
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(sys.stderr, "isatty", return_value=True):
+            assert cli._person_at_terminal(args) is False
+
+    def test_closed_stream_is_not_a_person(self):
+        args = cli.argparse.Namespace(json=False, menubar=False)
+        with patch.object(sys.stdin, "isatty", side_effect=ValueError("closed")):
+            assert cli._person_at_terminal(args) is False

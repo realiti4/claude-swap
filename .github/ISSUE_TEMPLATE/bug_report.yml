@@ -49,5 +49,5 @@ body:
     id: logs
     attributes:
       label: Command output or logs
-      description: Paste the failing command's output — `cswap list` for account-state issues, `cswap auto` log lines for auto-switch issues. Formatted automatically, no backticks needed. Please redact emails/account identifiers, and never paste access/refresh tokens, API keys, setup tokens, or credential-file/Keychain contents.
+      description: Paste the failing command's output — `cswap list` for account-state issues, `cswap auto` log lines for auto-switch issues. Re-running the command with `--debug` adds detail. Formatted automatically, no backticks needed. Please redact emails/account identifiers, and never paste access/refresh tokens, API keys, setup tokens, or credential-file/Keychain contents.
       render: shell
