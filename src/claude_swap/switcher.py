@@ -6391,15 +6391,6 @@ class ClaudeAccountSwitcher:
                                     ),
                                 },
                             )
-                            # Closes the start line (the stash logs nothing).
-                            self._logger.info(
-                                "Refresh for account %s stashed its "
-                                "successor (%s).",
-                                account_num,
-                                _fingerprint_head(
-                                    oauth.credential_fingerprint(working)
-                                ),
-                            )
                         except Exception:
                             self._logger.warning(
                                 "Backup and active-store writes failed after "
@@ -6407,6 +6398,17 @@ class ClaudeAccountSwitcher:
                                 "rotated credential was NOT persisted "
                                 "anywhere — re-login may be required.",
                                 account_num,
+                            )
+                        else:
+                            # Closes the start line: neither store was
+                            # written, so the saved line below cannot fire.
+                            self._logger.info(
+                                "Refresh for account %s stashed its "
+                                "successor (%s).",
+                                account_num,
+                                _fingerprint_head(
+                                    oauth.credential_fingerprint(working)
+                                ),
                             )
                     if posted and (backup_ok or live_ok):
                         # A failed write of either store has its own warning
