@@ -10,6 +10,7 @@ and every later refresh for that slot answers `invalid_grant` — the state the
 TUI renders as "re-login needed" for an account nobody did anything wrong to.
 """
 import json
+import logging
 import pytest
 
 from claude_swap import oauth
@@ -87,3 +88,51 @@ def test_CONTROL_a_backup_write_that_succeeds_is_not_retried(gate, monkeypatch):
     monkeypatch.setattr(gate, "_write_credentials", lambda c: None)
     gate._fetch_active_usage("1", "a@example.com", SPENT)
     assert len(calls) == 1, f"wrote the backup {len(calls)} times on a clean path"
+
+
+def _refresh_lines(caplog):
+    return [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("Refresh ")
+    ]
+
+
+@pytest.mark.parametrize(
+    "backup_fails, saved",
+    [
+        # The retry lands the successor in the slot while the live write
+        # failed: the only place the order of the retry and the log line shows.
+        (1, True),
+        # Neither store took it: nothing was saved, so no line claims it.
+        (2, False),
+    ],
+)
+def test_a_retry_that_saves_the_successor_closes_the_start_line(
+    gate, monkeypatch, caplog, backup_fails, saved
+):
+    """Every POST is bracketed in the log. The retry sits ahead of the line
+    that says the successor was saved, so a persist the retry completes is not
+    left as a start line with nothing after it."""
+    calls = []
+    real = gate._write_account_credentials
+
+    def flaky(num, email, creds, **_kw):
+        calls.append(creds)
+        if len(calls) <= backup_fails:
+            raise OSError("transient")
+        return real(num, email, creds)
+
+    def live_refused(_creds):
+        raise OSError("live store refused")
+
+    monkeypatch.setattr(gate, "_write_account_credentials", flaky)
+    monkeypatch.setattr(gate, "_write_credentials", live_refused)
+    with caplog.at_level(logging.INFO, logger="claude-swap"):
+        gate._fetch_active_usage("1", "a@example.com", SPENT)
+
+    old = oauth.credential_fingerprint(SPENT)[:19]
+    new = oauth.credential_fingerprint(ROTATED)[:19]
+    expected = [f"Refresh starting for account 1 ({old})."]
+    if saved:
+        expected.append(f"Refresh for account 1 saved its successor ({new}).")
+    assert _refresh_lines(caplog) == expected
