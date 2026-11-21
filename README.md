@@ -286,6 +286,8 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 Auto-switching is off until you turn it on, with *Settings → Auto-switch accounts* or `cswap menubar --auto-switch`. It runs the same engine as [`cswap auto`](#automatic-switching) with the same `autoswitch.*` settings, so the menu bar and CLI stay in sync, and the menu's first row shows whether it is running, off, or stopped (click to restart) and when usage was last refreshed.
 
+If you also use the Codex CLI, its 5h / 7d usage shows under the accounts (and in `cswap list`), read from Codex's session logs; see [Codex usage](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md#codex-usage).
+
 ```bash
 cswap menubar --service-status      # running? pid? starts at login? auto-switch on?
 cswap menubar --auto-switch         # turn auto-switch on (--no-auto-switch: off)

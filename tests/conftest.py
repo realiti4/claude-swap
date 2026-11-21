@@ -493,6 +493,9 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    # Codex's session logs are read for the usage display; with CODEX_HOME
+    # exported, tests would read the developer's real ones instead of $HOME's.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     # The menu bar's wrapper .app lives in /Applications, outside $HOME, and
     # launch_agent.uninstall() deletes it: on a developer's Mac the real one
     # may be the very app drawing the menu bar while the suite runs.

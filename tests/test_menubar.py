@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import menubar, oauth
+from claude_swap import codex_usage, menubar, oauth
 from claude_swap.autoswitch import ErrorEvent
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.menubar import ENGINE_ERROR_REPEAT_S, should_surface_engine_error
@@ -88,6 +88,15 @@ def test_settings_round_trip(tmp_path: Path):
     original.save(path)
     loaded = menubar.MenuBarSettings.load(path)
     assert loaded == original
+
+
+def test_settings_title_codex_is_off_by_default_and_round_trips(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    assert menubar.MenuBarSettings.load(path).title_codex is False
+    menubar.MenuBarSettings(title_codex=True).save(path)
+    assert menubar.MenuBarSettings.load(path).title_codex is True
+    path.write_text(json.dumps({"title_codex": "yes"}), encoding="utf-8")
+    assert menubar.MenuBarSettings.load(path).title_codex is False  # wrong type: default kept
 
 
 def test_settings_save_is_atomic(tmp_path: Path, monkeypatch):
@@ -451,6 +460,97 @@ def test_format_title_and_summary_with_a_null_five_hour_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     assert menubar.format_title("loc@x.com", usage, s) == "⇄ 25%"
     assert menubar.usage_summary(usage) == "7d 25%"
+
+
+# --- Codex usage ---------------------------------------------------------------
+
+_CODEX_NOW = 1_000_000.0
+
+
+def _codex(five=(1.0, 3 * 3600 + 90), week=(0.0, 6 * 86400 + 90), plan="plus"):
+    """A Codex reading; each window is ``(pct, seconds until its reset)`` or None."""
+    windows = {}
+    for key, window in (("five_hour", five), ("seven_day", week)):
+        if window is not None:
+            windows[key] = (window[0], _CODEX_NOW + window[1])
+    return codex_usage.CodexUsage(plan, windows, _CODEX_NOW - 60)
+
+
+def _codex_title(codex, title_pct="both", **kw):
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct=title_pct, title_codex=True)
+    return menubar.format_title("loc@x.com", _USAGE, s, _CODEX_NOW, codex=codex, **kw)
+
+
+def test_format_title_codex_follows_title_pct():
+    assert _codex_title(_codex(), "both") == "⇄ 42% · 18% · Codex 1% · 0%"
+    assert _codex_title(_codex(), "5h") == "⇄ 42% · Codex 1%"
+    assert _codex_title(_codex(), "7d") == "⇄ 18% · Codex 0%"
+    assert _codex_title(_codex(), "off") == "⇄"
+
+
+def test_format_title_codex_is_off_by_default_and_without_a_reading():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    assert not s.title_codex
+    assert menubar.format_title("loc@x.com", _USAGE, s, _CODEX_NOW, codex=_codex()) == "⇄ 42% · 18%"
+    on = menubar.MenuBarSettings(show_account_name=False, title_pct="both", title_codex=True)
+    assert menubar.format_title("loc@x.com", _USAGE, on, _CODEX_NOW, codex=None) == "⇄ 42% · 18%"
+
+
+def test_format_title_codex_with_only_one_window_and_after_scoped():
+    assert _codex_title(_codex(week=None), "both") == "⇄ 42% · 18% · Codex 1%"
+    assert _codex_title(_codex(five=None), "both") == "⇄ 42% · 18% · Codex 0%"
+    s = menubar.MenuBarSettings(
+        show_account_name=False, title_pct="5h", title_scoped=True, title_codex=True
+    )
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    title = menubar.format_title("loc@x.com", usage, s, _CODEX_NOW, codex=_codex())
+    assert title == "⇄ 42% · Fable 55% · Codex 1%"
+
+
+def test_format_title_codex_shows_a_passed_reset_as_zero():
+    assert _codex_title(_codex(five=(80.0, -1), week=(90.0, -1)), "both") == "⇄ 42% · 18% · Codex 0% · 0%"
+
+
+def test_format_codex_label():
+    label = menubar.format_codex_label(_codex(), _CODEX_NOW)
+    assert label == "Codex · Plus  5h 1% (3h 1m) · 7d 0% (6d 0h)"
+    assert menubar.format_codex_label(_codex(plan=None), _CODEX_NOW).startswith("Codex  5h 1%")
+    # A passed reset reads as 0 % with no countdown.
+    assert menubar.format_codex_label(_codex(five=(80.0, -1)), _CODEX_NOW) == "Codex · Plus  5h 0% · 7d 0% (6d 0h)"
+
+
+class _BrokenCodex:
+    """A reading that blows up wherever the menu bar touches it."""
+
+    plan_label = "Plus"
+
+    def usage(self, now=None):
+        raise RuntimeError("boom")
+
+    def read_clock(self):
+        raise RuntimeError("boom")
+
+
+def test_format_title_drops_a_codex_part_that_fails_and_keeps_the_rest():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both", title_codex=True)
+    title = menubar.format_title("loc@x.com", _USAGE, s, _CODEX_NOW, codex=_BrokenCodex())
+    assert title == "⇄ loc · 42% · 18%"
+
+
+def test_codex_row_is_the_label_and_the_tooltip():
+    label, tip = menubar.codex_row(_codex())
+    assert label.startswith("Codex · Plus  5h ")
+    assert tip == menubar.codex_tooltip(_codex())
+
+
+def test_codex_row_is_none_when_the_reading_cannot_be_formatted():
+    assert menubar.codex_row(_BrokenCodex()) is None
+
+
+def test_codex_tooltip_dates_the_reading_and_says_when_it_changes():
+    tip = menubar.codex_tooltip(_codex())
+    assert f"as of {_codex().read_clock()}" in tip
+    assert "after each turn" in tip
 
 
 # --- reset-time helpers --------------------------------------------------------
