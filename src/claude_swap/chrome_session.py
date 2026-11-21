@@ -420,6 +420,9 @@ def _read_state_cdp(port: int) -> dict | None:
 
 def _session_from_state(data: dict) -> ChromeSession:
     org = _token_org_fields(data.get("tokenOrg"))
+    profile_org = (data.get("orgUuid") or "").lower()
+    if org and profile_org and org["token_org_uuid"] != profile_org:
+        org = {}  # left over from another account; the profile is authoritative
     return ChromeSession(
         access_token=data.get("accessToken", ""),
         refresh_token=data.get("refreshToken", ""),
@@ -494,8 +497,14 @@ _DETACH_CLEAR_SESSION = _DETACH_CLEAR_LOCAL = _DETACH_KEYS
 
 def _inject_js(session: ChromeSession) -> str:
     local = {"accountUuid": session.account_uuid}
+    # A tokenOrg we never captured is removed rather than left on the previous
+    # account's org. Absent reads as a non-hybrid org in v1.0.107
+    # (``refusesClearText`` treats a missing tokenOrg like ``hybrid: false``).
+    clear_local = list(_INJECT_CLEAR_LOCAL)
     if session.token_org_uuid and session.token_org_hybrid is not None:
         local["tokenOrg"] = {"uuid": session.token_org_uuid, "hybrid": session.token_org_hybrid}
+    else:
+        clear_local.append("tokenOrg")
     if session.token_scope:
         local["tokenScope"] = session.token_scope
     return (
@@ -505,7 +514,7 @@ def _inject_js(session: ChromeSession) -> str:
         f"refreshToken: {json.dumps(session.refresh_token)},"
         f"tokenExpiry: {json.dumps(session.token_expiry)}}});"
         f"await chrome.storage.session.remove({json.dumps(_INJECT_CLEAR_SESSION)});"
-        f"await chrome.storage.local.remove({json.dumps(_INJECT_CLEAR_LOCAL)});"
+        f"await chrome.storage.local.remove({json.dumps(clear_local)});"
         f"await chrome.storage.local.set({json.dumps(local)});"
         "return 'ok';})()"
     )

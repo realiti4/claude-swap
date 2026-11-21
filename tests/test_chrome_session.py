@@ -291,10 +291,21 @@ def test_inject_writes_token_org_and_clears_the_previous_accounts_state():
                          "tokenScope": "user:profile"}
 
 
-def test_inject_leaves_token_org_alone_when_never_captured():
+def test_inject_removes_a_token_org_it_never_captured():
+    # Left in place it would keep naming the previous account's org.
     calls = _js_calls(cs._inject_js(_session(account_uuid="acc")))
     local_set = next(a for area, op, a in calls if area == "local" and op == "set")
+    local_removed = next(a for area, op, a in calls if area == "local" and op == "remove")
     assert local_set == {"accountUuid": "acc"}
+    assert "tokenOrg" in local_removed
+
+
+def test_capture_drops_a_token_org_that_disagrees_with_the_profile(monkeypatch):
+    monkeypatch.setattr(cs, "_read_state_cdp", lambda *a, **k: _state(
+        orgUuid="org-b", tokenOrg={"uuid": "org-a", "hybrid": False}))
+    got = cs.capture_tokens_cdp(1)
+    assert got.org_uuid == "org-b"
+    assert (got.token_org_uuid, got.token_org_hybrid) == ("", None)
 
 
 def test_adopted_needs_more_than_the_injected_account_uuid():
@@ -303,7 +314,7 @@ def test_adopted_needs_more_than_the_injected_account_uuid():
     # No profile re-fetch yet is not a failure: the extension does that on its
     # own schedule.
     assert cs._adopted(_state(email=""), target)
-    # The failure a dead token leaves behind (bitworks-io's v1.0.100 run).
+    # The failure a dead token leaves behind.
     assert not cs._adopted(_state(email="", refreshToken="", authFailure="session_expired"), target)
     assert not cs._adopted(_state(authFailure="session_expired"), target)
     assert not cs._adopted(_state(refreshToken=""), target)
