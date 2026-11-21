@@ -6631,13 +6631,10 @@ class ClaudeAccountSwitcher:
                         live_ok = False
                         self._logger.warning(
                             "Active-store write failed after a %s for "
-                            "account %s%s.",
+                            "account %s.",
                             "backup restore" if restore_source is not None
                             else "consumed refresh",
                             account_num,
-                            "" if backup_ok
-                            else "; the rotated credential was NOT persisted "
-                                 "anywhere — re-login may be required",
                         )
                     if not backup_ok:
                         # A REFRESH TOKEN IS ONE-TIME-USE, so the bytes still
@@ -6660,23 +6657,40 @@ class ClaudeAccountSwitcher:
                             )
                             backup_ok = True
                         except Exception:
-                            self._logger.error(
-                                "Account-%s kept a SPENT refresh token: the "
-                                "rotated credential reached the active store "
-                                "but not the slot backup, twice. This slot "
-                                "reads \"re-login may be needed\" once it is "
-                                "no longer active; a re-login repairs it.",
-                                account_num,
-                            )
+                            if live_ok:
+                                self._logger.error(
+                                    "Account-%s kept a SPENT refresh token: "
+                                    "the rotated credential reached the "
+                                    "active store but not the slot backup, "
+                                    "twice. This slot reads \"re-login may "
+                                    "be needed\" once it is no longer "
+                                    "active; a re-login repairs it.",
+                                    account_num,
+                                )
+                            else:
+                                self._logger.error(
+                                    "Account-%s kept a SPENT refresh token: "
+                                    "neither the slot backup (twice) nor the "
+                                    "active store took the rotated "
+                                    "credential; stashing it for the next "
+                                    "pass.",
+                                    account_num,
+                                )
                     if backup_ok or live_ok:
                         pending = None
                     elif pending is not None:
                         # Both writes are spent — including the retry above
                         # — and the successor exists nowhere durable. Stash
                         # it rather than let it die with this pass.
-                        self._stash_pending_refresh(
+                        if not self._stash_pending_refresh(
                             account_num, pending, consumed_fp
-                        )
+                        ):
+                            self._logger.warning(
+                                "Account %s's rotated credential was NOT "
+                                "persisted anywhere (slot backup, active "
+                                "store, stash); re-login may be required.",
+                                account_num,
+                            )
                         pending = None
                     if posted and (backup_ok or live_ok):
                         # A failed write of either store has its own warning
@@ -6756,8 +6770,10 @@ class ClaudeAccountSwitcher:
 
     def _stash_pending_refresh(
         self, account_num: str, creds: str, consumed_fp: str
-    ) -> None:
+    ) -> bool:
         """Park a POSTed-but-unpersisted `_fetch_active_usage` successor.
+        Returns whether the stash reached disk; that success closes the POST
+        in the log, as the "saved" line does.
 
         Same mechanism `_consume_backup_grant_locked` uses for its own
         never-discard-a-consumed-generation promise: the next
@@ -6795,6 +6811,7 @@ class ClaudeAccountSwitcher:
                 "only. Fix the storage failure, then re-login and `cswap "
                 "add` if the slot strikes.", account_num, exc_info=True,
             )
+            return False
         except BaseException:
             self._logger.error(
                 "Account %s's active-refresh successor could not be "
@@ -6803,6 +6820,11 @@ class ClaudeAccountSwitcher:
                 "slot strikes.", account_num, exc_info=True,
             )
             raise
+        self._logger.info(
+            "Refresh for account %s stashed its successor (%s).",
+            account_num, _fingerprint_head(oauth.credential_fingerprint(creds)),
+        )
+        return True
 
     def _resync_rotated_backup(
         self, account_num: str, email: str, org_uuid: str, creds: str,

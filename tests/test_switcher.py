@@ -2681,6 +2681,67 @@ class TestActiveAccountRefresh:
             "Refresh for account 1 " + ending.format(new=new),
         ]
 
+    @pytest.mark.parametrize(
+        "backup_writes, stash_fails, close",
+        [
+            pytest.param(
+                [OSError("disk"), None], False,
+                "saved its successor ({new}).", id="retry-saves",
+            ),
+            pytest.param(
+                OSError("disk"), False,
+                "stashed its successor ({new}).", id="stash-saves",
+            ),
+            pytest.param(OSError("disk"), True, None, id="nothing-saves"),
+        ],
+    )
+    def test_a_failed_live_write_closes_the_post_by_what_holds_the_successor(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog, backup_writes, stash_fails, close,
+    ):
+        """The live write and the first backup write fail. The POST then
+        closes once, by where its successor ended up, and "NOT persisted
+        anywhere" is said only when nothing holds it."""
+        import logging
+
+        switcher = self._switcher(sample_sequence_data)
+        stash = patch.object(
+            switcher._store, "_write_unclaimed_credential",
+            side_effect=OSError("disk") if stash_fails else None,
+            wraps=switcher._store._write_unclaimed_credential,
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials", side_effect=OSError("disk")), \
+             patch.object(
+                 switcher, "_write_account_credentials", side_effect=backup_writes
+             ), \
+             stash as stash_write, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._REFRESHED, None)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        old = oauth.credential_fingerprint(self._EXPIRED)[:19]
+        new = oauth.credential_fingerprint(self._REFRESHED)[:19]
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Refresh ")
+        ]
+        assert lines == [f"Refresh starting for account 1 ({old})."] + (
+            [f"Refresh for account 1 {close.format(new=new)}"] if close else []
+        )
+        assert stash_write.called == (close is None or "stashed" in close)
+        assert ("NOT persisted anywhere" in caplog.text) == (close is None)
+        assert not any(
+            "reached the active store" in r.getMessage()
+            for r in caplog.records if r.levelno >= logging.ERROR
+        )
+
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
