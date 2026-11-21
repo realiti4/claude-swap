@@ -332,12 +332,15 @@ The wizard installs the extension into the dedicated profile (one click from the
 ```bash
 cswap chrome open              # open/focus the dedicated Claude Browser
 cswap chrome capture <n>       # store account <n>'s tokens (connect it there first)
+cswap chrome detach            # sign the extension out without revoking, to connect the next account
 cswap chrome refresh <n>       # keep account <n>'s stored tokens alive (no browser)
 cswap chrome create-profile    # (re)create the dedicated profile  (--rebuild to reset)
 cswap chrome enable | disable  # turn the feature on/off
 ```
 
 Once set up, `cswap switch <n>` (CLI or menu bar) flips the dedicated browser to account `<n>` too — the extension reconnects on its own, no side-panel reopen needed. A stored account's refresh token lasts about 28.5 days untouched; switching to it within that window is seamless (the extension self-refreshes an expired token), and `cswap chrome refresh <n>` (or any switch) rolls the window forward so it never lapses. Off until you turn it on (`chrome.enabled` in `settings.json`); when disabled, switching is CLI-only and behaves exactly as before.
+
+Never use the extension's own sign-out to move between accounts: it revokes the refresh token server-side, which kills that account's stored session (`cswap chrome doctor` then marks it revoked). Run `cswap chrome detach` before connecting the next account instead. `cswap chrome capture <n>` only stores the extension's account under slot `<n>` when its email and org match that slot (`--force` overrides).
 
 #### Making a *running* session follow a switch (bridge relay)
 
