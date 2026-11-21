@@ -535,6 +535,130 @@ class TestTryRefreshOAuthCredentials:
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.error == "transient"
 
+    def test_no_reply_is_logged_with_the_generation(self, caplog):
+        """A refresh that got no reply may still have been consumed server-side,
+        so it must leave a trace the default log level keeps."""
+        import logging
+
+        creds = self._make_credentials()
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(creds)
+
+        assert outcome.error == "transient"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        # "sha256:" and 12 hex digits, as the store's struckFingerprint begins.
+        assert oauth.credential_fingerprint(creds)[:19] in warnings[0].getMessage()
+        assert "TimeoutError" in warnings[0].getMessage()
+
+    def test_server_error_reply_is_logged_as_no_reply(self, caplog):
+        """A 5xx is no verdict on the grant: a gateway can report an error for
+        a request the origin already acted on."""
+        import logging
+
+        for code in (502, 503, 504):
+            caplog.clear()
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=self._http_error(code, b"upstream error"),
+            ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(
+                    self._make_credentials()
+                )
+            assert outcome.error == "transient"
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert f"HTTP {code}" in warnings[0].getMessage()
+
+    def test_unreadable_reply_keeps_its_bytes_out_of_the_log(self, caplog):
+        """A decode error's repr is the reply body, and a reply body can hold
+        tokens: every line names the exception type and nothing more."""
+        import logging
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'\xff{"refresh_token": "leak-me"}'
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ), caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error == "transient"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "UnicodeDecodeError" in warnings[0].getMessage()
+        # The debug line too: with --debug it reaches the console and the file.
+        assert caplog.records
+        assert not [r for r in caplog.records if "leak-me" in r.getMessage()]
+
+    def test_a_request_that_never_left_is_not_logged(self, caplog):
+        """A failed name lookup, a refused connection or a rejected
+        certificate happens before any byte is written: no grant can have been
+        spent, and an offline machine must not fill the log."""
+        import logging
+        import socket
+
+        for cause in (
+            socket.gaierror(11001, "getaddrinfo failed"),
+            ConnectionRefusedError(10061, "refused"),
+            ssl.SSLCertVerificationError("self-signed certificate"),
+            "no host given",
+        ):
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=urllib.error.URLError(cause),
+            ), caplog.at_level(logging.INFO, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(
+                    self._make_credentials()
+                )
+            assert outcome.error == "transient"
+        assert not caplog.records
+
+    def test_a_failure_while_connecting_or_sending_leaves_delivery_open(
+        self, caplog
+    ):
+        """urllib reports a failed connect and a failed write the same way, so
+        a timeout or a reset there says what was seen and no more. INFO: the
+        default log keeps it, and it is not the no-reply warning."""
+        import logging
+
+        creds = self._make_credentials()
+        for cause in (TimeoutError("timed out"), ConnectionResetError(54, "reset")):
+            caplog.clear()
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=urllib.error.URLError(cause),
+            ), caplog.at_level(logging.INFO, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(creds)
+            assert outcome.error == "transient"
+            [record] = caplog.records
+            assert record.levelno == logging.INFO
+            message = record.getMessage()
+            assert oauth.credential_fingerprint(creds)[:19] in message
+            assert type(cause).__name__ in message
+            assert "unknown" in message
+            assert "spent" not in message
+
+    def test_answered_refresh_is_not_logged_as_no_reply(self, caplog):
+        """A 4xx is the server's answer to the request, whatever it says."""
+        import logging
+
+        for err in (
+            self._http_error(400, b'{"error": "invalid_grant"}'),
+            self._http_error(400, b'{"error": "temporarily_unavailable"}'),
+            self._http_error(429, b"slow down"),
+        ):
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen", side_effect=err
+            ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+                oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
     def test_missing_refresh_token_is_permanent(self):
         creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
         outcome = oauth.try_refresh_oauth_credentials(creds)
@@ -2251,6 +2375,26 @@ class TestConsumeBusyIsDeterministic:
                 refresh_via=lambda *_: oauth.RefreshOutcome(None, "consume-busy"),
             )
         assert out.error == "consume-busy", out.error
+        usage.assert_not_called()
+
+    def test_a_grant_left_to_the_live_login_does_not_spend_a_doomed_request(self):
+        """The gate declines a grant the live login holds. The token in hand
+        is still expired, and the retry after its 401 would be declined the
+        same way."""
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(None, "live-login"),
+            )
+        assert out.error == "live-login", out.error
+        assert out.struck_fp is None
         usage.assert_not_called()
 
     def test_every_deterministic_kind_has_a_note(self):
