@@ -490,6 +490,13 @@ def _label_token_status(source: str, credentials: str) -> str | None:
     return f"{source}: {status}"
 
 
+def _fingerprint_head(fingerprint: str | None) -> str:
+    """The part of a credential fingerprint that goes in a log line: "sha256:"
+    and 12 hex digits, as ``oauth``'s refresh lines print it and as a row's
+    ``struckFingerprint`` begins."""
+    return (fingerprint or "")[:19]
+
+
 def _same_directory(left: Path, right: Path) -> bool:
     """Whether two paths name the same directory, symlinks and ``..`` included.
 
@@ -3305,11 +3312,23 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
+        # Every POST is bracketed in the log: this line, then one line for how
+        # it ended (saved, stashed, or no successor). A start with no line
+        # after it means the process stopped in between, which is the one
+        # case where the grant may be spent with nothing to show for it.
+        self._logger.info(
+            "Refresh starting for account %s (%s).",
+            account_num, _fingerprint_head(consumed_fp),
+        )
         result = oauth.try_refresh_oauth_credentials(
             refresh_input, slot=account_num,
             **({} if timeout_s is None else {"timeout_s": timeout_s}),
         )
         if result.error is not None or not result.credentials:
+            self._logger.info(
+                "Refresh for account %s ended without a successor (%s).",
+                account_num, result.error or "empty reply",
+            )
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
             # caller's snapshot, and failures are the only outcomes that
@@ -3426,6 +3445,13 @@ class ClaudeAccountSwitcher:
                     else:
                         self._write_account_credentials(
                             account_num, email, result.credentials
+                        )
+                        self._logger.info(
+                            "Refresh for account %s saved its successor (%s).",
+                            account_num,
+                            _fingerprint_head(
+                                oauth.credential_fingerprint(result.credentials)
+                            ),
                         )
                         # Durably persisted — the placeholder is redundant.
                         _retire_early_entry()
@@ -6199,6 +6225,7 @@ class ClaudeAccountSwitcher:
                     # backup lineage) mean an actor is mutating the store
                     # right now — defer rather than fight it.
                     restore_source = None
+                    posted = False
                     # A prior pass may have already POSTed the backup's
                     # refresh token and failed to persist the successor
                     # anywhere durable (the both-fail arm below stashes it
@@ -6432,9 +6459,24 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
+                        # Bracketed in the log like the gate's POST (see
+                        # ``_consume_backup_grant_locked``).
+                        self._logger.info(
+                            "Refresh starting for account %s (%s).",
+                            account_num,
+                            _fingerprint_head(
+                                oauth.credential_fingerprint(refresh_input)
+                            ),
+                        )
                         result = oauth.try_refresh_oauth_credentials(
                             refresh_input, timeout_s=6.0, slot=account_num
                         )
+                        if result.error is not None or not result.credentials:
+                            self._logger.info(
+                                "Refresh for account %s ended without a "
+                                "successor (%s).",
+                                account_num, result.error or "empty reply",
+                            )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
                         ) or (
@@ -6501,6 +6543,7 @@ class ClaudeAccountSwitcher:
                             refresh_input
                         )
                         pending = working
+                        posted = True
                         # Our own POST produced this lineage — self-attributed,
                         # no oracle needed. The verdict is what lets the next
                         # expiry consume it if the backup write below fails.
@@ -6635,6 +6678,16 @@ class ClaudeAccountSwitcher:
                             account_num, pending, consumed_fp
                         )
                         pending = None
+                    if posted and (backup_ok or live_ok):
+                        # A failed write of either store has its own warning
+                        # above; this line says the successor exists on disk.
+                        self._logger.info(
+                            "Refresh for account %s saved its successor (%s).",
+                            account_num,
+                            _fingerprint_head(
+                                oauth.credential_fingerprint(working)
+                            ),
+                        )
                     if not live_ok:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
