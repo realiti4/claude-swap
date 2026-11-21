@@ -4412,7 +4412,7 @@ class ClaudeAccountSwitcher:
         # connected to this same account, capture its OAuth tokens too. The org
         # guard ensures a browser connected to a different account isn't stored
         # here; otherwise this no-ops and the user runs `cswap chrome capture N`.
-        self._chrome.capture_for_account(account_num, organization_uuid)
+        self._chrome.capture_for_account(account_num, organization_uuid, current_email)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:

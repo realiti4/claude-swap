@@ -1457,6 +1457,7 @@ Examples:
   cswap chrome doctor           # what's set up + per-account coverage
   cswap chrome open             # open/focus the dedicated Claude Browser
   cswap chrome capture 3        # store account 3's tokens (connect it there first)
+  cswap chrome detach           # sign the extension out without revoking (connect the next account)
   cswap chrome refresh 3        # keep account 3's stored tokens alive (no browser)
   cswap chrome bridge install   # relay so a running session follows a switch (LOCAL_BRIDGE=1)
   cswap chrome create-profile   # (re)create the dedicated Chrome profile
@@ -1466,7 +1467,7 @@ Examples:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     sub = parser.add_subparsers(
         dest="action",
-        metavar="{setup,doctor,open,capture,refresh,bridge,create-profile,enable,disable}",
+        metavar="{setup,doctor,open,capture,detach,refresh,bridge,create-profile,enable,disable}",
     )
     sub.add_parser("setup", help="Guided one-time setup")
     sub.add_parser("doctor", help="Report setup state and per-account coverage")
@@ -1488,6 +1489,14 @@ Examples:
     )
     p_cap = sub.add_parser("capture", help="Store the account the extension is connected to")
     p_cap.add_argument("account", metavar="N", help="Account number to store the current tokens for")
+    p_cap.add_argument(
+        "--force", action="store_true",
+        help="Store even if the extension is on a different account than slot N",
+    )
+    sub.add_parser(
+        "detach",
+        help="Sign the extension out without revoking its tokens (to connect another account)",
+    )
     p_ref = sub.add_parser("refresh", help="Offline-refresh a stored account's tokens (keep-alive)")
     p_ref.add_argument("account", metavar="N", help="Account number to refresh")
     p_cp = sub.add_parser("create-profile", help="(Re)create the dedicated Chrome profile")
@@ -1590,17 +1599,33 @@ Examples:
             print(f"{accent('Claude Browser')} open")
         return
     if action == "capture":
-        if sync.capture_from_browser(args.account):
+        slots = {num: (email, org) for num, email, org in chrome_onboard._accounts(switcher)}
+        if args.account not in slots and not args.force:
+            error(f"No managed account {args.account} (see `cswap list`)")
+            sys.exit(1)
+        email, org = ("", "") if args.force else slots[args.account]
+        reason = sync.capture_checked(args.account, org, email)
+        if not reason:
             print(f"{accent('Captured')} account {args.account} from the extension's current pairing")
             return
-        error(f"Capture failed — open the Claude Browser and connect account {args.account} first")
+        error(f"Capture failed: {reason}")
+        if not args.force:
+            print(dimmed(f"Connect account {args.account} in the Claude Browser first "
+                         f"(`cswap chrome detach` signs the current one out without revoking it)."))
+        sys.exit(1)
+    if action == "detach":
+        if sync.detach():
+            print(f"{accent('Detached')} the extension (its account's tokens stay valid and stored). "
+                  "Connect the next account in the Claude Browser.")
+            return
+        error("Detach failed — is the Claude Browser running with the extension installed?")
         sys.exit(1)
     if action == "refresh":
-        if sync.refresh_account(args.account):
+        reason = sync.refresh_account(args.account)
+        if not reason:
             print(f"{accent('Refreshed')} stored tokens for account {args.account}")
             return
-        error(f"Refresh failed for account {args.account} — no stored tokens, or the refresh "
-              f"token expired (re-capture: cswap chrome capture {args.account})")
+        error(f"Refresh failed for account {args.account}: {reason}")
         sys.exit(1)
 
 

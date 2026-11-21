@@ -91,12 +91,20 @@ def print_doctor(switcher) -> None:
     if not accounts:
         print(f"    {dimmed('no managed accounts yet — run `cswap add`')}")
     for num, email, _org in accounts:
-        has = vault.get(num) is not None
-        hint = "" if has else muted(f"  → connect + `cswap chrome capture {num}`")
+        stored = vault.get(num)
+        has = stored is not None and not stored.refresh_dead
+        if stored is None:
+            hint = muted(f"  → connect + `cswap chrome capture {num}`")
+        elif stored.refresh_dead:
+            hint = muted(f"  → revoked; connect + `cswap chrome capture {num}`")
+        else:
+            hint = ""
         print(f"    {_mark(has)} {num} {email or '(unknown)'}{hint}")
 
     print(dimmed("\n  Note: connect the Claude Browser extension to Claude Code (and"))
     print(dimmed("  disconnect your everyday Chrome) so browser automation uses this profile."))
+    print(dimmed("  Never sign the extension out to change accounts: that revokes the stored"))
+    print(dimmed("  session. Use `cswap chrome detach`, or let `cswap switch` move it."))
 
 
 # --------------------------------------------------------------------------- #
@@ -179,20 +187,29 @@ def run_setup(switcher) -> int:
 
     # Step 4 — capture each account's browser session.
     print("[4/4] Capture each account's browser session")
+    print(dimmed("      Do not use the extension's own sign-out between accounts: it revokes"))
+    print(dimmed("      the session just captured. cswap signs it out for you instead."))
     accounts = _accounts(switcher)
     if not accounts:
         print(dimmed("      No managed accounts yet — add them with `cswap add`, then"))
         print(dimmed("      `cswap chrome capture <n>` for each."))
     sync = cs.ChromeSync(settings, root)
-    for num, email, _org in accounts:
+    for i, (num, email, org) in enumerate(accounts):
         print(f"      Account {num} ({email or 'unknown'}):")
         print(dimmed("        connect the extension to this account in the Claude Browser"))
         _pause("        then")
-        if sync.capture_from_browser(num):
+        reason = sync.capture_checked(num, org, email)
+        if not reason:
             print(f"        {accent(_OK)} captured")
         else:
-            print(f"        {yellowed('!')} not captured (was it logged in?) "
+            print(f"        {yellowed('!')} not captured: {reason} "
                   f"— retry: cswap chrome capture {num}")
+        if i < len(accounts) - 1:
+            if sync.detach():
+                print(dimmed("        extension signed out (tokens kept) for the next account"))
+            else:
+                print(f"        {yellowed('!')} could not sign the extension out; run "
+                      "`cswap chrome detach` before connecting the next account")
 
     print(accent("\nDone.") + f" Verify anytime with {accent('cswap chrome doctor')}.")
     print(dimmed(f"Settings: {settings_path(root)}"))
