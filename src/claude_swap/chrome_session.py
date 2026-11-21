@@ -15,7 +15,14 @@ flow and stores the resulting tokens in ``chrome.storage.session`` (in-memory):
   refresh** (each refresh mints a fresh 28.5 day window).
 - ``tokenExpiry``  (ms) — when the access token expires.
 
-``chrome.storage.local`` holds ``accountUuid``. The service worker (SW) reads
+``chrome.storage.local`` holds ``accountUuid`` and, on newer builds (v1.0.100+),
+``tokenOrg`` (``{uuid, hybrid}``, read by the extension's identity/policy code),
+``tokenScope`` and sometimes a ``diskRefreshToken`` copy. When the extension
+stores a new token it **revokes** a displaced ``diskRefreshToken`` and signing
+out revokes every refresh token it holds, so an injection must not leave another
+account's token behind and users must never sign the extension out to move
+between accounts (``cswap chrome detach`` clears it locally instead). The
+service worker (SW) reads
 ``storage.session`` **once at startup** into JS runtime memory and connects the
 bridge from there; it re-reads only when it restarts.
 
@@ -83,6 +90,10 @@ OAUTH_REQUESTED_EXPIRES_IN = 31536000  # what the extension asks for; server cap
 # refresh-token window closes and it would need a browser re-login.
 KEEPALIVE_REFRESH_DAYS = 20
 
+# Refresh before injecting when the stored access token expires within this
+# window, so the extension never adopts an already-dead access token.
+ACCESS_EXPIRY_MARGIN_MS = 5 * 60 * 1000
+
 
 def is_supported() -> bool:
     """Chrome extension sync is implemented for macOS only (for now)."""
@@ -108,6 +119,10 @@ class ChromeSession:
     org_uuid: str = ""
     email: str = ""
     captured_at: int = 0        # ms epoch; last capture/refresh (refresh-token age)
+    token_org_uuid: str = ""    # extension's ``tokenOrg.uuid`` (storage.local)
+    token_org_hybrid: bool | None = None  # ``tokenOrg.hybrid``; None = not captured
+    token_scope: str = ""       # extension's ``tokenScope`` (storage.local)
+    refresh_dead: bool = False  # the token endpoint rejected the refresh token
 
     def is_usable(self) -> bool:
         # A refresh token is the durable credential; without it a stored session
@@ -123,6 +138,10 @@ class ChromeSession:
             "orgUuid": self.org_uuid,
             "email": self.email,
             "capturedAt": self.captured_at,
+            **({"tokenOrg": {"uuid": self.token_org_uuid, "hybrid": self.token_org_hybrid}}
+               if self.token_org_uuid and self.token_org_hybrid is not None else {}),
+            **({"tokenScope": self.token_scope} if self.token_scope else {}),
+            **({"refreshDead": True} if self.refresh_dead else {}),
         }
 
     @classmethod
@@ -135,7 +154,17 @@ class ChromeSession:
             org_uuid=data.get("orgUuid", ""),
             email=data.get("email", ""),
             captured_at=int(data.get("capturedAt", 0) or 0),
+            **_token_org_fields(data.get("tokenOrg")),
+            token_scope=data.get("tokenScope", "") or "",
+            refresh_dead=bool(data.get("refreshDead", False)),
         )
+
+
+def _token_org_fields(raw) -> dict:
+    """``tokenOrg`` as stored by the extension → ChromeSession fields."""
+    if isinstance(raw, dict) and isinstance(raw.get("uuid"), str) and raw["uuid"]:
+        return {"token_org_uuid": raw["uuid"].lower(), "token_org_hybrid": raw.get("hybrid") is True}
+    return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -359,7 +388,9 @@ _CAPTURE_JS = r"""
 (async () => {
   const s = await chrome.storage.session.get(
     ['accessToken', 'refreshToken', 'tokenExpiry', 'swAnalyticsProfileCache']);
-  const l = await chrome.storage.local.get(['accountUuid']);
+  const l = await chrome.storage.local.get(
+    ['accountUuid', 'tokenOrg', 'tokenScope', 'lastAuthFailureReason']);
+  const f = await chrome.storage.session.get(['lastAuthFailureReason']);
   const prof = (s.swAnalyticsProfileCache || {}).profile || {};
   return JSON.stringify({
     accessToken: s.accessToken || '',
@@ -368,17 +399,15 @@ _CAPTURE_JS = r"""
     accountUuid: l.accountUuid || '',
     email: (prof.account || {}).email || '',
     orgUuid: (prof.organization || {}).uuid || '',
+    tokenOrg: l.tokenOrg || null,
+    tokenScope: l.tokenScope || '',
+    authFailure: l.lastAuthFailureReason || f.lastAuthFailureReason || '',
   });
 })()
 """
 
 
-def capture_tokens_cdp(port: int) -> ChromeSession | None:
-    """Capture the extension's *current* OAuth tokens from the SW via CDP.
-
-    Requires the automation Chrome running with the extension connected. Returns
-    None if the SW is unreachable or no tokens are present (not logged in).
-    """
+def _read_state_cdp(port: int) -> dict | None:
     raw = _eval_in_sw(port, _CAPTURE_JS)
     if not raw:
         return None
@@ -386,15 +415,37 @@ def capture_tokens_cdp(port: int) -> ChromeSession | None:
         data = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return None
-    session = ChromeSession(
+    return data if isinstance(data, dict) else None
+
+
+def _session_from_state(data: dict) -> ChromeSession:
+    org = _token_org_fields(data.get("tokenOrg"))
+    return ChromeSession(
         access_token=data.get("accessToken", ""),
         refresh_token=data.get("refreshToken", ""),
         token_expiry=int(data.get("tokenExpiry", 0) or 0),
         account_uuid=data.get("accountUuid", ""),
-        org_uuid=data.get("orgUuid", ""),
+        # The profile cache is the authoritative org; ``tokenOrg`` covers the
+        # window before the extension has re-fetched the profile.
+        org_uuid=data.get("orgUuid", "") or org.get("token_org_uuid", ""),
         email=data.get("email", ""),
         captured_at=int(time.time() * 1000),
+        token_scope=data.get("tokenScope", "") or "",
+        **org,
     )
+
+
+def capture_tokens_cdp(port: int) -> ChromeSession | None:
+    """Capture the extension's *current* OAuth tokens from the SW via CDP.
+
+    Requires the automation Chrome running with the extension connected. Returns
+    None if the SW is unreachable, no tokens are present (not logged in), or the
+    extension has recorded an auth failure for the tokens it holds.
+    """
+    data = _read_state_cdp(port)
+    if not data or data.get("authFailure"):
+        return None
+    session = _session_from_state(data)
     return session if session.is_usable() else None
 
 
@@ -421,18 +472,71 @@ def read_identity_cdp(port: int) -> dict:
 # --------------------------------------------------------------------------- #
 # Injection + SW restart (adopt a stored account into the running extension)
 # --------------------------------------------------------------------------- #
+# State tied to whichever account the extension held before an injection:
+# dropped so it cannot be attributed to the injected token. ``diskRefreshToken``
+# matters most — the extension revokes a displaced disk token the next time it
+# stores one, which would kill the outgoing account's stored session.
+_INJECT_CLEAR_SESSION = ["swAnalyticsProfileCache", "tokenOrgUuid", "lastAuthFailureReason",
+                         "startupReauthState"]
+_INJECT_CLEAR_LOCAL = ["diskRefreshToken", "lastAuthFailureReason", "startupReauthState"]
+# Signing out locally (``detach``): the tokens and everything derived from them.
+_DETACH_CLEAR_SESSION = ["accessToken", "refreshToken", "tokenExpiry", "tokenHandOffAt",
+                         *_INJECT_CLEAR_SESSION]
+_DETACH_CLEAR_LOCAL = [*_INJECT_CLEAR_LOCAL]
+
+
 def _inject_js(session: ChromeSession) -> str:
+    local = {"accountUuid": session.account_uuid}
+    if session.token_org_uuid and session.token_org_hybrid is not None:
+        local["tokenOrg"] = {"uuid": session.token_org_uuid, "hybrid": session.token_org_hybrid}
+    if session.token_scope:
+        local["tokenScope"] = session.token_scope
     return (
         "(async () => {"
         "await chrome.storage.session.set({"
         f"accessToken: {json.dumps(session.access_token)},"
         f"refreshToken: {json.dumps(session.refresh_token)},"
         f"tokenExpiry: {json.dumps(session.token_expiry)}}});"
-        f"await chrome.storage.local.set({{accountUuid: {json.dumps(session.account_uuid)}}});"
-        # Drop the cached profile so the SW re-fetches identity for the new token.
-        "await chrome.storage.session.remove('swAnalyticsProfileCache');"
+        f"await chrome.storage.session.remove({json.dumps(_INJECT_CLEAR_SESSION)});"
+        f"await chrome.storage.local.remove({json.dumps(_INJECT_CLEAR_LOCAL)});"
+        f"await chrome.storage.local.set({json.dumps(local)});"
         "return 'ok';})()"
     )
+
+
+_DETACH_JS = (
+    "(async () => {"
+    f"await chrome.storage.session.remove({json.dumps(_DETACH_CLEAR_SESSION)});"
+    f"await chrome.storage.local.remove({json.dumps(_DETACH_CLEAR_LOCAL)});"
+    "return 'ok';})()"
+)
+
+
+def _restart_sw(port: int, sw_id: str | None) -> str | None:
+    """Terminate the SW (keeps storage.session) and wake it with a background
+    claude.ai tab. Returns the wake tab's id (caller closes it)."""
+    _close_target(port, sw_id)
+    time.sleep(2)
+    wake_id = _create_target(port, CLAUDE_URL, background=True)
+    _wait_for_sw(port)
+    return wake_id
+
+
+def _adopted(data: dict | None, session: ChromeSession) -> bool:
+    """Whether the extension is authenticated as ``session``'s account.
+
+    ``accountUuid`` alone proves nothing (the injection wrote it); a fetched
+    profile email, a refresh token still in place and no recorded auth failure do.
+    """
+    if not data or data.get("authFailure"):
+        return False
+    if not (data.get("accessToken") and data.get("refreshToken") and data.get("email")):
+        return False
+    if session.account_uuid and data.get("accountUuid") != session.account_uuid:
+        return False
+    if session.email and data["email"].lower() != session.email.lower():
+        return False
+    return True
 
 
 def inject_tokens_cdp(port: int, session: ChromeSession, *, settle: float = 10.0) -> bool:
@@ -456,43 +560,77 @@ def inject_tokens_cdp(port: int, session: ChromeSession, *, settle: float = 10.0
     if _eval_in_sw(port, _inject_js(session)) != "ok":
         _logger.warning("chrome-sync: failed to write tokens into the extension")
         return False
-    # 2) Terminate the SW (NOT runtime.reload → keeps storage.session).
-    _close_target(port, sw_id)
-    time.sleep(2)
-    # 3) Wake it with a background claude.ai tab so it restarts + reconnects.
-    wake_id = _create_target(port, CLAUDE_URL, background=True)
-    _wait_for_sw(port)
-    time.sleep(settle)
-    ident = read_identity_cdp(port)
+    # 2) Terminate the SW (NOT runtime.reload → keeps storage.session), then
+    # 3) wake it with a background claude.ai tab so it restarts + reconnects.
+    wake_id = _restart_sw(port, sw_id)
+    # Poll until the SW has re-fetched the profile with the injected token (the
+    # profile cache was dropped, so an email only comes back if the token works)
+    # or has recorded an auth failure.
+    data: dict | None = None
+    deadline = time.monotonic() + settle
+    while True:
+        data = _read_state_cdp(port)
+        if _adopted(data, session) or (data and data.get("authFailure")):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     if wake_id:
         _close_target(port, wake_id)
-    # Adopted if the SW is back with the injected account's identity. Match by
-    # uuid when we have it (email may lag a beat behind the profile fetch).
-    ok = bool(ident) and (
-        (session.account_uuid and ident.get("accountUuid") == session.account_uuid)
-        or (session.email and ident.get("email") == session.email)
-        or bool(ident.get("email"))
-    )
+    ok = _adopted(data, session)
     if not ok:
-        _logger.warning("chrome-sync: extension did not adopt the injected account (got %s)",
-                        ident.get("email") or ident.get("accountUuid") or "nothing")
+        got = (data or {}).get("authFailure") or (data or {}).get("email") or "nothing"
+        _logger.warning("chrome-sync: extension did not adopt the injected account (got %s)", got)
     return ok
+
+
+def detach_extension_cdp(port: int) -> bool:
+    """Sign the extension out locally, without revoking its tokens.
+
+    The extension's own sign-out revokes every refresh token it holds, which
+    kills the stored copy of that account. Clearing its storage and restarting
+    the SW leaves it signed out while the tokens stay valid server-side.
+    """
+    t = _sw_target(port)
+    if not t:
+        return False
+    if _eval_in_sw(port, _DETACH_JS) != "ok":
+        return False
+    wake_id = _restart_sw(port, t.get("id"))
+    if wake_id:
+        _close_target(port, wake_id)
+    data = _read_state_cdp(port)
+    return bool(data) and not data.get("refreshToken")
 
 
 # --------------------------------------------------------------------------- #
 # Offline token refresh (keep-alive; no browser needed)
 # --------------------------------------------------------------------------- #
+REFRESH_OK = "ok"
+REFRESH_REJECTED = "rejected"   # the token endpoint refused the refresh token
+REFRESH_FAILED = "failed"       # network / unexpected response; may succeed later
+
+
 def refresh_session(session: ChromeSession, *, timeout: float = 30.0) -> ChromeSession | None:
+    """:func:`refresh_session_detailed` without the outcome."""
+    return refresh_session_detailed(session, timeout=timeout)[0]
+
+
+def refresh_session_detailed(
+    session: ChromeSession, *, timeout: float = 30.0
+) -> tuple[ChromeSession | None, str]:
     """Refresh a stored session's tokens offline via the OAuth token endpoint.
 
     Rotates the refresh token (the old one is invalidated server-side) and
     returns an updated ChromeSession with a fresh ~28.5 day window. Uses the
     system ``curl`` (as the old cookie path used ``openssl``) so no CA-bundle /
-    third-party HTTP dependency is needed. Returns None on any failure
-    (network, ``invalid_grant`` when the refresh token has itself expired).
+    third-party HTTP dependency is needed. Returns ``(session, REFRESH_OK)``,
+    or ``(None, REFRESH_REJECTED)`` when the endpoint answers ``invalid_grant``
+    (revoked or expired refresh token: only a re-capture helps), or
+    ``(None, REFRESH_FAILED)`` for anything that may succeed on a retry.
     """
     if not session.refresh_token:
-        return None
+        return None, REFRESH_REJECTED
     try:
         proc = subprocess.run(
             [
@@ -508,12 +646,14 @@ def refresh_session(session: ChromeSession, *, timeout: float = 30.0) -> ChromeS
         data = json.loads(proc.stdout or "{}")
     except Exception as e:  # noqa: BLE001
         _logger.warning("chrome-sync: token refresh call failed: %s", e)
-        return None
+        return None, REFRESH_FAILED
     if not data.get("access_token"):
         err = (data.get("error") or {})
         _logger.info("chrome-sync: token refresh rejected: %s",
                      err.get("message") if isinstance(err, dict) else err or "no access_token")
-        return None
+        # invalid_grant = the refresh token was revoked (e.g. the extension
+        # signed out) or expired; nothing but a re-capture brings it back.
+        return None, (REFRESH_REJECTED if "invalid_grant" in (proc.stdout or "") else REFRESH_FAILED)
     now = int(time.time() * 1000)
     account = data.get("account") or {}
     org = data.get("organization") or {}
@@ -526,7 +666,8 @@ def refresh_session(session: ChromeSession, *, timeout: float = 30.0) -> ChromeS
         org_uuid=org.get("uuid") or session.org_uuid,
         email=account.get("email_address") or session.email,
         captured_at=now,
-    )
+        refresh_dead=False,
+    ), REFRESH_OK
 
 
 def _is_stale(session: ChromeSession, days: int = KEEPALIVE_REFRESH_DAYS) -> bool:
@@ -535,6 +676,11 @@ def _is_stale(session: ChromeSession, days: int = KEEPALIVE_REFRESH_DAYS) -> boo
         return False
     age_days = (time.time() * 1000 - session.captured_at) / (1000 * 86400)
     return age_days >= days
+
+
+def _access_expired(session: ChromeSession, margin_ms: int = ACCESS_EXPIRY_MARGIN_MS) -> bool:
+    """Whether the stored access token is expired (or about to be)."""
+    return bool(session.token_expiry) and session.token_expiry <= time.time() * 1000 + margin_ms
 
 
 # --------------------------------------------------------------------------- #
@@ -802,119 +948,166 @@ class ChromeSync:
         except Exception as e:  # noqa: BLE001
             _logger.info("chrome-sync: could not snapshot current account: %s", e)
 
-    def capture_for_account(self, account_num: str, expected_org_uuid: str = "") -> bool:
-        """Capture the extension's current account into the vault, with org guard.
+    def capture_checked(
+        self, account_num: str, expected_org_uuid: str = "", expected_email: str = ""
+    ) -> str:
+        """Capture the extension's current account into ``account_num``'s slot.
 
-        Called from add_account. Because the tokens live in the extension's
-        in-memory storage, this reads them from the running automation Chrome via
-        CDP (there is no offline path). ``expected_org_uuid`` is the account's
-        Claude Code ``organizationUuid``; when given, the captured session's org
-        must match it, so we never store a browser login for a different account
-        than the one Claude Code is adding.
+        Returns "" on success, else a one-line reason. ``expected_org_uuid`` /
+        ``expected_email`` are the slot's Claude Code identity; when given, the
+        extension must be connected to that same account, so a capture can never
+        file one account's browser session under another account's slot. (A Team
+        org holds several members, so the email is checked as well as the org.)
         """
         if not self.active:
-            return False
+            return "Chrome sync is disabled"
         if not automation_chrome_running(self._s.debug_port):
-            _logger.info("chrome-sync: automation Chrome not running; connect this account in "
-                         "`cswap chrome open` then run `cswap chrome capture %s`", account_num)
-            return False
+            return "the Claude Browser is not running (open it with `cswap chrome open`)"
         try:
             session = capture_tokens_cdp(self._s.debug_port)
-            if session is None:
-                _logger.info("chrome-sync: no extension login to capture for account %s", account_num)
-                return False
-            if expected_org_uuid and session.org_uuid and session.org_uuid != expected_org_uuid:
-                _logger.warning(
-                    "chrome-sync: the extension is connected to org %s, which does not match "
-                    "the account being added (org %s); skipping capture. Connect this account "
-                    "in the automation Chrome, then `cswap chrome capture %s`.",
-                    session.org_uuid, expected_org_uuid, account_num,
-                )
-                return False
-            self._vault.put(account_num, session)
-            _logger.info("chrome-sync: captured extension tokens for account %s (%s)",
-                         account_num, session.email or session.account_uuid)
-            return True
         except Exception as e:  # noqa: BLE001
             _logger.warning("chrome-sync: capture failed for account %s: %s", account_num, e)
-            return False
+            return f"capture failed: {e}"
+        if session is None:
+            return "the extension is not signed in (or its last sign-in failed)"
+        if expected_email and session.email.lower() != expected_email.lower():
+            return (f"the extension is connected to {session.email or 'an account not loaded yet'}, "
+                    f"not {expected_email}")
+        if expected_org_uuid and session.org_uuid != expected_org_uuid:
+            return (f"the extension is connected to org {session.org_uuid or '(not loaded yet)'}, "
+                    f"not this account's org {expected_org_uuid}")
+        self._vault.put(account_num, session)
+        _logger.info("chrome-sync: captured extension tokens for account %s (%s)",
+                     account_num, session.email or session.account_uuid)
+        return ""
 
-    # Kept for the "log into the account directly in the dedicated browser" flow;
-    # identical to capture_for_account without the org guard.
+    def capture_for_account(
+        self, account_num: str, expected_org_uuid: str = "", expected_email: str = ""
+    ) -> bool:
+        """Best-effort capture with the identity guard (called from add_account).
+
+        Because the tokens live in the extension's in-memory storage, this reads
+        them from the running automation Chrome via CDP (no offline path).
+        """
+        reason = self.capture_checked(account_num, expected_org_uuid, expected_email)
+        if reason:
+            _logger.info("chrome-sync: not capturing account %s: %s; connect it in the Claude "
+                         "Browser, then `cswap chrome capture %s`", account_num, reason, account_num)
+        return not reason
+
+    # Unguarded capture, for `cswap chrome capture N --force` only.
     def capture_from_browser(self, account_num: str) -> bool:
-        if not self.active:
-            return False
-        if not automation_chrome_running(self._s.debug_port):
-            _logger.info("chrome-sync: automation Chrome not running; open it and connect first")
+        return not self.capture_checked(account_num)
+
+    def detach(self) -> bool:
+        """Sign the extension out locally (no revoke), after storing its account.
+
+        The outgoing account is snapshotted first, so its stored tokens are the
+        ones it held at detach time.
+        """
+        if not self.active or not automation_chrome_running(self._s.debug_port):
             return False
         try:
-            session = capture_tokens_cdp(self._s.debug_port)
-            if session is None:
-                _logger.info("chrome-sync: no extension login in the automation Chrome to capture")
-                return False
-            self._vault.put(account_num, session)
-            _logger.info("chrome-sync: captured account %s from browser (%s)",
-                         account_num, session.email or session.account_uuid)
-            return True
+            self._snapshot_current()
+            return detach_extension_cdp(self._s.debug_port)
         except Exception as e:  # noqa: BLE001
-            _logger.warning("chrome-sync: capture-from-browser failed for %s: %s", account_num, e)
+            _logger.warning("chrome-sync: detach failed: %s", e)
             return False
 
-    def refresh_account(self, account_num: str) -> bool:
-        """Offline-refresh a stored account's tokens (keep-alive). No browser."""
+    def _live_account_uuid(self) -> str:
+        """The account the running extension holds tokens for, or ""."""
+        if not automation_chrome_running(self._s.debug_port):
+            return ""
+        data = _read_state_cdp(self._s.debug_port) or {}
+        return data.get("accountUuid", "") if data.get("refreshToken") else ""
+
+    def _refresh_stored(self, account_num: str, session: ChromeSession) -> ChromeSession | None:
+        refreshed, outcome = refresh_session_detailed(session)
+        if refreshed is not None:
+            self._vault.put(account_num, refreshed)
+            return refreshed
+        if outcome == REFRESH_REJECTED and not session.refresh_dead:
+            self._vault.put(account_num, replace(session, refresh_dead=True))
+        return None
+
+    def refresh_account(self, account_num: str) -> str:
+        """Offline-refresh a stored account's tokens (keep-alive). No browser.
+
+        Returns "" on success, else a one-line reason. Refuses the account the
+        extension is on right now: rotating its refresh token would invalidate
+        the one the extension holds in memory.
+        """
         if not self.active:
-            return False
+            return "Chrome sync is disabled"
         session = self._vault.get(account_num)
         if session is None:
-            return False
-        refreshed = refresh_session(session)
-        if refreshed is None:
-            _logger.warning("chrome-sync: could not refresh account %s (refresh token expired?)",
-                            account_num)
-            return False
-        self._vault.put(account_num, refreshed)
+            return "no stored browser session for this account"
+        if session.account_uuid and self._live_account_uuid() == session.account_uuid:
+            return ("the Claude Browser is on this account right now; it keeps its own "
+                    "tokens fresh")
+        if self._refresh_stored(account_num, session) is None:
+            stored = self._vault.get(account_num)
+            if stored is not None and stored.refresh_dead:
+                return (f"the refresh token was revoked or expired; connect the account in the "
+                        f"Claude Browser and run `cswap chrome capture {account_num}`")
+            return "the token endpoint could not be reached; try again later"
         _logger.info("chrome-sync: refreshed stored tokens for account %s", account_num)
-        return True
+        return ""
 
     def sync_to_account(self, account_num: str) -> bool:
-        """Inject the account's stored tokens into the extension and reconnect it."""
+        """Inject the account's stored tokens into the extension and reconnect it.
+
+        True only once the extension is authenticated as that account; the
+        vault then holds the tokens the extension settled on.
+        """
         if not self.active:
             return False
         session = self._vault.get(account_num)
         if session is None:
             _logger.info("chrome-sync: no stored session for account %s; skipping", account_num)
             return False
+        if session.refresh_dead:
+            _logger.warning("chrome-sync: account %s's browser session was revoked; re-capture "
+                            "it with `cswap chrome capture %s`", account_num, account_num)
+            return False
         try:
             if not self._ensure_up():
                 return False
+            port = self._s.debug_port
+            if _adopted(_read_state_cdp(port), session):
+                # Already there: keep the stored copy current, inject nothing.
+                self._snapshot_current()
+                return True
             # Keep the outgoing account's stored tokens fresh before we overwrite.
             self._snapshot_current()
-            # Keep-alive: refresh a long-parked token before injecting, so its
-            # (possibly expired) refresh token doesn't fail adoption.
-            if _is_stale(session):
-                refreshed = refresh_session(session)
-                if refreshed:
-                    session = refreshed
-                    self._vault.put(account_num, session)
-            ok = inject_tokens_cdp(self._s.debug_port, session)
+            # Refresh before injecting when the window is closing or the access
+            # token is already dead, so adoption never starts from a dead token.
+            if _is_stale(session) or _access_expired(session):
+                session = self._refresh_stored(account_num, session) or session
+            ok = inject_tokens_cdp(port, session)
             if not ok:
-                # The injected tokens may be stale beyond the extension's own
-                # refresh; try an offline refresh, then re-inject once.
-                refreshed = refresh_session(session)
+                # The extension may have failed on tokens past its own refresh;
+                # refresh offline and re-inject once.
+                refreshed = self._refresh_stored(account_num, session)
                 if refreshed:
-                    self._vault.put(account_num, refreshed)
-                    ok = inject_tokens_cdp(self._s.debug_port, refreshed)
-            if ok:
-                # Store whatever the extension settled on (it may have rotated the
-                # token when it reconnected), keyed to this account.
-                settled = capture_tokens_cdp(self._s.debug_port)
-                if settled and settled.account_uuid == (session.account_uuid or settled.account_uuid):
-                    self._vault.put(account_num, settled)
-                _logger.info("chrome-sync: switched browser to account %s", account_num)
-            else:
+                    ok = inject_tokens_cdp(port, refreshed)
+            settled = capture_tokens_cdp(port) if ok else None
+            if settled is None or (session.account_uuid
+                                   and settled.account_uuid != session.account_uuid):
                 _logger.warning("chrome-sync: could not switch browser to account %s "
                                 "(re-login may be needed)", account_num)
-            return ok
+                return False
+            # Store what the extension settled on: it may have rotated the
+            # refresh token while adopting, which invalidates the stored one.
+            self._vault.put(account_num, replace(
+                settled,
+                token_org_uuid=settled.token_org_uuid or session.token_org_uuid,
+                token_org_hybrid=(settled.token_org_hybrid if settled.token_org_hybrid is not None
+                                  else session.token_org_hybrid),
+                token_scope=settled.token_scope or session.token_scope,
+            ))
+            _logger.info("chrome-sync: switched browser to account %s", account_num)
+            return True
         except Exception as e:  # noqa: BLE001
             _logger.warning("chrome-sync: sync failed for account %s: %s", account_num, e)
             return False
