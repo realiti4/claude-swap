@@ -267,6 +267,14 @@ def test_format_account_label_disabled_marker():
     assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_format_account_label_chrome_marker():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, chrome_bound=True)
+    assert label == "2  loc@papaya.asia  (chrome)  5h 42% · 7d 18% · $ 30%"
+    # both markers can co-exist (disabled first, then chrome)
+    both = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True, chrome_bound=True)
+    assert both == "2  loc@papaya.asia  (disabled)  (chrome)  5h 42% · 7d 18% · $ 30%"
+
+
 def test_format_account_label_login_due():
     now = 1_000_000.0
     label = menubar.format_account_label(
