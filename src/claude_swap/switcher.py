@@ -275,6 +275,10 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "live-login": (
+        "the live login is this account's, so Claude Code renews it — "
+        "switch to this account to realign"
+    ),
     "oauth_not_allowed_for_organization": (
         "this account's organization does not allow OAuth sign-in (a lapsed "
         "plan or an org policy), so its usage cannot be read — renewing the "
@@ -417,6 +421,13 @@ def _label_token_status(source: str, credentials: str) -> str | None:
     return f"{source}: {status}"
 
 
+def _fingerprint_head(fingerprint: str | None) -> str:
+    """The part of a credential fingerprint that goes in a log line: "sha256:"
+    and 12 hex digits, as ``oauth``'s refresh lines print it and as a row's
+    ``struckFingerprint`` begins."""
+    return (fingerprint or "")[:19]
+
+
 def _same_directory(left: Path, right: Path) -> bool:
     """Whether two paths name the same directory, symlinks and ``..`` included.
 
@@ -462,10 +473,14 @@ _ADOPT_LOCK_WAIT_S = 0.5
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, interactive: bool = False):
         self.home = Path.home()
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
+        # A person is running this command at a terminal and can answer a system
+        # prompt. Only the macOS Keychain migration reads it, to wait for the
+        # permission window instead of timing out under it.
+        self.interactive = interactive
 
         # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
         # before any logger or directory setup writes to the new location.
@@ -2605,7 +2620,9 @@ class ClaudeAccountSwitcher:
 
         The body below is the sequence: adopt a stashed successor and re-read
         under the slot lock, POST outside it, then CAS on the refresh-token
-        fingerprint and either persist or stash. A consumed generation is
+        fingerprint and either persist or stash. A grant the live login also
+        holds is not POSTed (``live-login``): its successor would reach the
+        backup only. A consumed generation is
         never discarded — a stash is adopted by the next pass — and the gate
         never raises after the grant is consumed, since callers run in the
         never-raises collect pass.
@@ -2847,8 +2864,49 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
+        live_holds = self._live_login_holds(refresh_input)
+        if live_holds is None:
+            # Whether the live login holds this grant cannot be told. Same
+            # rule as an unreadable backup above: defer, nothing consumed.
+            self._logger.info(
+                "Live credential unreadable; deferring account %s's backup "
+                "refresh to the next pass.", account_num,
+            )
+            return oauth.RefreshOutcome(None, "transient")
+        if live_holds:
+            # A grant the live login also holds is Claude Code's to renew.
+            # This gate saves the successor to the slot's backup only, so
+            # POSTing it leaves the live store on a spent refresh token, which
+            # the token endpoint rejects on re-presentation (see
+            # ``_fetch_active_usage``). A slot arrives here as inactive with
+            # the live login's grant when ``~/.claude.json`` names another
+            # account than the one the live credential belongs to, or when a
+            # switch activated it after this pass decided it was inactive.
+            #
+            # Its own kind, not ``transient``: a caller that carries on with
+            # the stored credential after a failed refresh (``cswap run``
+            # seeding a profile) would hand a second Claude Code the same
+            # grant.
+            self._logger.info(
+                "Account %s's stored login is the live login; leaving its "
+                "renewal to Claude Code.", account_num,
+            )
+            return oauth.RefreshOutcome(None, "live-login", None, consumed_fp)
+
+        # Every POST is bracketed in the log: this line, then one line for how
+        # it ended (saved, stashed, or no successor). A start with no line
+        # after it means the process stopped in between, which is the one
+        # case where the grant may be spent with nothing to show for it.
+        self._logger.info(
+            "Refresh starting for account %s (%s).",
+            account_num, _fingerprint_head(consumed_fp),
+        )
         result = oauth.try_refresh_oauth_credentials(refresh_input)
         if result.error is not None or not result.credentials:
+            self._logger.info(
+                "Refresh for account %s ended without a successor (%s).",
+                account_num, result.error or "empty reply",
+            )
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
             # caller's snapshot, and failures are the only outcomes that
@@ -2927,6 +2985,13 @@ class ClaudeAccountSwitcher:
                         self._write_account_credentials(
                             account_num, email, result.credentials
                         )
+                        self._logger.info(
+                            "Refresh for account %s saved its successor (%s).",
+                            account_num,
+                            _fingerprint_head(
+                                oauth.credential_fingerprint(result.credentials)
+                            ),
+                        )
             except LockError:
                 # The grant IS consumed — the successor must survive even
                 # though the persist lock is unavailable. The token works;
@@ -2998,6 +3063,29 @@ class ClaudeAccountSwitcher:
         return oauth.RefreshOutcome(
             outcome_creds, None, result.token_account, consumed_fp
         )
+
+    def _live_login_holds(self, credentials: str) -> bool | None:
+        """Whether the live store holds the refresh token in ``credentials``.
+
+        True on an exact match. False when ``credentials`` carry no refresh
+        token, or the live store was read and holds another credential or
+        none. None when the live store could not be read for certain: a read
+        error, an unreadable Keychain, or a Keychain failure that a fallback
+        file covered, whose bytes may be an older generation than the one
+        Claude Code holds. Never raises.
+        """
+        if not (oauth.extract_oauth_data(credentials) or {}).get("refreshToken"):
+            return False
+        try:
+            live = self._read_active_credentials()
+        except Exception:
+            self._logger.debug("live credential read failed", exc_info=True)
+            return None
+        if live.value is None or live.keychain_unavailable or live.degraded:
+            return None
+        return bool(live.value) and oauth.credential_fingerprint(
+            live.value
+        ) == oauth.credential_fingerprint(credentials)
 
     def _retire_stash_entry(self, entry_id: str, account_num: str) -> None:
         """Drop one stash entry as housekeeping. Never fatal.
@@ -5431,6 +5519,7 @@ class ClaudeAccountSwitcher:
                     # backup lineage) mean an actor is mutating the store
                     # right now — defer rather than fight it.
                     restore_source = None
+                    posted = False
                     if live_oauth is not None and (
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
@@ -5525,9 +5614,24 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
+                        # Bracketed in the log like the gate's POST (see
+                        # ``_consume_backup_grant_locked``).
+                        self._logger.info(
+                            "Refresh starting for account %s (%s).",
+                            account_num,
+                            _fingerprint_head(
+                                oauth.credential_fingerprint(refresh_input)
+                            ),
+                        )
                         result = oauth.try_refresh_oauth_credentials(
                             refresh_input, timeout_s=6.0
                         )
+                        if result.error is not None or not result.credentials:
+                            self._logger.info(
+                                "Refresh for account %s ended without a "
+                                "successor (%s).",
+                                account_num, result.error or "empty reply",
+                            )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
                         ) or (
@@ -5590,6 +5694,7 @@ class ClaudeAccountSwitcher:
                             # Transient (network) failure: backoff via store.
                             return FetchRecord(error="refresh-failed")
                         working = result.credentials
+                        posted = True
                         # Our own POST produced this lineage — self-attributed,
                         # no oracle needed. The verdict is what lets the next
                         # expiry consume it if the backup write below fails.
@@ -5678,6 +5783,16 @@ class ClaudeAccountSwitcher:
                                 "no longer active; a re-login repairs it.",
                                 account_num,
                             )
+                    if posted and (backup_ok or live_ok):
+                        # A failed write of either store has its own warning
+                        # above; this line says the successor exists on disk.
+                        self._logger.info(
+                            "Refresh for account %s saved its successor (%s).",
+                            account_num,
+                            _fingerprint_head(
+                                oauth.credential_fingerprint(working)
+                            ),
+                        )
                     if not live_ok:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.

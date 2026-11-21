@@ -41,6 +41,11 @@ if TYPE_CHECKING:
 STATE_FILENAME = ".migrations.json"
 STATE_VERSION = 1
 
+# How long a legacy read waits for a person to answer the Keychain permission
+# window: time to type the login password and click. See
+# ``migrate_macos_keyring_to_security``.
+_PROMPT_WAIT = 60.0
+
 
 # ---------------------------------------------------------------------------
 # State file
@@ -105,6 +110,19 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     an item does not consult the ACL, so the cleanup never prompts. A failed
     delete leaves a harmless orphan behind (logged; ``purge`` sweeps it up).
 
+    The prompt asks for the login password, and under the wrapper's default
+    bound the read's ``security`` process is usually killed before a person has
+    answered: the window closes with it on macOS 15.7.7 (issue #589) and stays
+    open with no reader left on 27.2.1 (measured). When a person is running the
+    command (``switcher.interactive``) and an attribute-only lookup finds the
+    legacy item, the read is announced on stderr and waits ``_PROMPT_WAIT``
+    instead. The lookup only chooses the bound: an item it does
+    not find is still read, under the default bound, and that read decides
+    whether the item is absent. A prompt left unanswered ends the attempt, so an
+    unattended terminal waits once per run, not once per account; accounts
+    already moved stay moved and the rest retry on the next run. Every other
+    caller keeps the default bound on every read.
+
     Returns ``True`` (completed) on macOS once every account is accounted for
     (including the benign "already migrated / nothing to do" cases); ``False``
     (skip) on non-macOS or when there's no readable sequence yet. Raises
@@ -153,10 +171,44 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     # account-None-{email} maps to a slot only when its email is unique.
     email_counts = Counter(info.get("email", "") for info in accounts.values())
 
-    def _read_old(username: str) -> str:
-        """Read a legacy ``KEYRING_SERVICE`` item: ``""`` if absent, else its value.
-        Raises on a genuine read failure (e.g. locked Keychain)."""
-        return macos_keychain.get_password(KEYRING_SERVICE, username) or ""
+    announced = False
+    unanswered = False  # a prompt went unanswered: stop reading for this run
+    timed_out = False
+
+    def _read_old(username: str) -> str | None:
+        """Read a legacy ``KEYRING_SERVICE`` item: its value, ``""`` if absent,
+        ``None`` if the read failed (logged). A failed read (e.g. a locked
+        Keychain) is a real failure, never "nothing to migrate"."""
+        nonlocal announced, unanswered, timed_out
+        prompted = switcher.interactive and macos_keychain.item_exists(
+            KEYRING_SERVICE, username
+        )
+        try:
+            if prompted:
+                if not announced:
+                    announced = True
+                    print(
+                        "claude-swap: moving saved logins from an older version. "
+                        "macOS may ask for your login password for each one: "
+                        'enter it and choose "Always Allow" (waiting up to '
+                        f"{_PROMPT_WAIT:.0f} s)",
+                        file=sys.stderr,
+                    )
+                value = macos_keychain.get_password(
+                    KEYRING_SERVICE, username, timeout=_PROMPT_WAIT
+                )
+            else:
+                value = macos_keychain.get_password(KEYRING_SERVICE, username)
+        except Exception as e:  # noqa: BLE001
+            switcher._logger.warning(
+                f"macos_keyring_to_security: read of {username} failed: {e}"
+            )
+            if isinstance(e, macos_keychain.KeychainTimeout):
+                timed_out = True
+                if prompted:
+                    unanswered = True
+            return None
+        return value or ""
 
     def _delete_old(username: str) -> None:
         """Best-effort removal of a legacy ``KEYRING_SERVICE`` item. Never raises:
@@ -175,28 +227,24 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     failed = 0
 
     for account_num, info in pending.items():
+        if unanswered:
+            failed += 1  # not attempted; the next run retries it
+            continue
+
         email = info.get("email", "")
         canonical = f"account-{account_num}-{email}"
         none_user = f"account-None-{email}"
 
         # --- pick a source (canonical wins) -------------------------------
-        try:
-            creds = _read_old(canonical)
-        except Exception as e:  # noqa: BLE001
-            switcher._logger.warning(
-                f"macos_keyring_to_security: read of {canonical} failed: {e}"
-            )
+        creds = _read_old(canonical)
+        if creds is None:
             failed += 1
             continue
 
         source_username = canonical
         if not creds and str(account_num) != "None" and email_counts[email] == 1:
-            try:
-                creds = _read_old(none_user)
-            except Exception as e:  # noqa: BLE001
-                switcher._logger.warning(
-                    f"macos_keyring_to_security: read of {none_user} failed: {e}"
-                )
+            creds = _read_old(none_user)
+            if creds is None:
                 failed += 1
                 continue
             if creds:
@@ -253,9 +301,15 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
         )
 
     if failed:
+        hint = (
+            ". If macOS showed a Keychain permission window, run `cswap list` in a "
+            'terminal and approve it (login password, then "Always Allow")'
+            if timed_out
+            else ""
+        )
         raise MigrationIncomplete(
             f"{failed} account(s) could not be migrated to the security service; "
-            "will retry on next run"
+            f"will retry on next run{hint}"
         )
     return True
 
