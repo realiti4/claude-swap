@@ -592,14 +592,14 @@ class TestValidation:
 
     def test_credentials_garbage_string_rejected(self, temp_home: Path):
         # A non-key string credential is interpreted as an API-key account and
-        # rejected because it isn't a valid sk-ant-api… key.
+        # rejected because it isn't a bare sk-ant-… key.
         s = _linux_switcher(temp_home)
         env = self._make_envelope()
         env["accounts"][0]["credentials"] = "a string"
         f = temp_home / "c.cswap"
         f.write_text(json.dumps(env))
 
-        with pytest.raises(TransferError, match="must be a raw sk-ant-api"):
+        with pytest.raises(TransferError, match="must be a raw sk-ant-"):
             import_accounts(s, str(f))
 
     def test_credentials_non_object_non_string_rejected(self, temp_home: Path):
@@ -640,6 +640,28 @@ class TestValidation:
         s = _linux_switcher(temp_home)
         with pytest.raises(TransferError, match="not found"):
             import_accounts(s, str(temp_home / "nope.cswap"))
+
+    def test_still_encrypted_file_rejected(self, temp_home: Path):
+        """`cswap export - | gpg -c > backup.gpg` is documented, so importing
+        the result without decrypting it first is the obvious slip. The
+        undecrypted bytes must surface as a TransferError carrying the decrypt
+        hint, not as a bare UnicodeDecodeError."""
+        s = _linux_switcher(temp_home)
+        blob = temp_home / "backup.cswap.gpg"
+        # Head of a real `gpg -c` payload: the OpenPGP packet tag plus the
+        # symmetric-key-encrypted session-key packet, invalid UTF-8 at byte 0.
+        blob.write_bytes(b"\x8c\x0d\x04\x09\x03\x02\xff\xd8\xab\x12\x00\xff\xfe")
+
+        with pytest.raises(TransferError, match="decrypt"):
+            import_accounts(s, str(blob))
+
+    def test_directory_source_rejected(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        src = temp_home / "backups"
+        src.mkdir()
+
+        with pytest.raises(TransferError, match="not a directory"):
+            import_accounts(s, str(src))
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +711,19 @@ class TestPipeMode:
 
         seq = s._get_sequence_data()
         assert seq["accounts"]["1"]["email"] == "alice@example.com"
+
+    def test_import_from_stdin_rejects_binary(self, temp_home: Path):
+        """`cat backup.gpg | cswap import -` is the pipe-mode form of the same
+        slip: a strict-UTF-8 stdin raises while reading, before any JSON is
+        parsed, so the guard has to sit on the read itself."""
+        s = _linux_switcher(temp_home)
+        stdin = io.TextIOWrapper(
+            io.BytesIO(b"\x8c\x0d\x04\x09\x03\x02\xff\xd8\xab\x12\x00\xff\xfe"),
+            encoding="utf-8",
+        )
+        with patch.object(sys, "stdin", stdin):
+            with pytest.raises(TransferError, match="decrypt"):
+                import_accounts(s, "-")
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +775,25 @@ class TestFilePermissions:
 
         mode = os.stat(out).st_mode & 0o777
         assert mode == 0o600
+
+    def test_export_onto_a_symlink_replaces_the_link_not_its_target(
+        self, temp_home: Path
+    ):
+        """The destination is user-typed and may sit in a shared directory:
+        a planted link must not redirect the export (refresh tokens) onto
+        another file. The link is replaced; its old target is untouched."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        decoy = temp_home / "decoy.txt"
+        decoy.write_text("decoy", encoding="utf-8")
+        out = temp_home / "x.cswap"
+        out.symlink_to(decoy)
+
+        export_accounts(s, str(out))
+
+        assert not out.is_symlink()
+        assert '"accounts"' in out.read_text(encoding="utf-8")
+        assert decoy.read_text(encoding="utf-8") == "decoy"
 
     def test_export_temp_file_never_created_world_readable(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -2022,3 +2076,200 @@ class TestForceOverwriteNarratesTheStrikeClear:
         assert "same credential generation" in err
         assert "invalid_grant" not in err
         assert "refresh-token generation" not in err
+
+
+# ---------------------------------------------------------------------------
+# import-usage
+# ---------------------------------------------------------------------------
+
+def _live_creds(tag: str) -> dict:
+    """A backup whose token is valid (far-future expiry), so it goes straight
+    to the usage request (patched), never through a refresh. Distinct per
+    account: two slots holding one credential read as a duplicate login."""
+    return {"claudeAiOauth": {
+        "accessToken": f"tok-{tag}",
+        "refreshToken": f"rtok-{tag}",
+        "expiresAt": 4_102_444_800_000,
+    }}
+
+
+def _usage_row(email: str, org_uuid: str = "", pct: float = 42.0, age_s: float = 30.0) -> dict:
+    """An account row as another machine's ``cswap list --json`` prints it.
+
+    Slot 9 on purpose: rows are matched by identity, never by the producer's
+    slot number."""
+    import time
+
+    from claude_swap.json_output import account_row
+
+    return account_row(
+        9, email, "", org_uuid, False,
+        {"five_hour": {"pct": pct, "resets_at": "2099-01-01T00:00:00+00:00"}},
+        usage_fetched_at=time.time() - age_s,
+        usage_age_s=age_s,
+    )
+
+
+def _usage_document(*rows: dict) -> str:
+    return json.dumps(
+        {"schemaVersion": 1, "activeAccountNumber": None, "accounts": list(rows)}
+    )
+
+
+class TestImportUsage:
+    def _import(self, switcher, home: Path, document: str, hold_s: float | None = None):
+        from claude_swap.transfer import import_usage
+
+        path = home / "usage.json"
+        path.write_text(document, encoding="utf-8")
+        import_usage(switcher, str(path), hold_s=hold_s)
+
+    def test_rows_are_matched_by_identity(self, temp_home: Path, capsys):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a")
+        _seed_account(s, 2, "bob@example.com")
+        unavailable = {
+            "email": "alice@example.com", "organizationUuid": "org-a",
+            "usageStatus": "unavailable", "usage": None,
+        }
+        self._import(s, temp_home, _usage_document(
+            _usage_row("bob@example.com", pct=42.0),
+            _usage_row("stranger@example.com"),
+            unavailable,
+        ))
+
+        entries = s._usage_store.entries({
+            "1": ("alice@example.com", "org-a"), "2": ("bob@example.com", ""),
+        })
+        assert entries["2"].last_good["five_hour"]["pct"] == 42.0
+        assert entries["2"].age_s == pytest.approx(30.0, abs=5)
+        assert entries["1"].last_good is None
+        err = capsys.readouterr().err
+        assert "Adopted usage for bob@example.com → slot 2" in err
+        assert "Done: 1 adopted, 0 kept, 2 skipped" in err
+
+    def test_a_window_without_a_figure_is_adopted(self, temp_home: Path, capsys):
+        # ``list --json`` prints ``"pct": null`` for a window reported without a
+        # utilization figure; the document must still import, the window kept.
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        self._import(
+            s, temp_home, _usage_document(_usage_row("bob@example.com", pct=None)),
+        )
+
+        entry = s._usage_store.entries({"2": ("bob@example.com", "")})["2"]
+        assert entry.last_good["five_hour"]["pct"] is None
+        assert entry.last_good["five_hour"]["resets_at"] == "2099-01-01T00:00:00+00:00"
+        assert "Adopted usage for bob@example.com → slot 2" in capsys.readouterr().err
+
+    def test_a_held_account_is_not_fetched(self, temp_home: Path):
+        """Through the real collector: after a hand-over with a hold,
+        ``list --json`` serves the adopted reading and sends no request for
+        that account, while an account nobody handed over is fetched as
+        usual."""
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        _seed_account(s, 2, "bob@example.com", creds=_live_creds("bob"))
+        self._import(
+            s, temp_home,
+            _usage_document(_usage_row("bob@example.com", pct=42.0, age_s=400.0)),
+            hold_s=600.0,
+        )
+
+        fetched: list[str] = []
+
+        def fake_fetch(num, email, creds, **kwargs):
+            fetched.append(email)
+            return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=fake_fetch):
+            payload = s.list_accounts(json_output=True)
+
+        assert fetched == ["alice@example.com"], payload
+        bob = next(a for a in payload["accounts"] if a["email"] == "bob@example.com")
+        # 400s is past STALE_OK_S: the hold is what keeps it decision-grade.
+        assert bob["usageStatus"] == "ok"
+        assert bob["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_a_zero_hold_hands_the_account_back(self, temp_home: Path, capsys):
+        """``--hold 0`` lifts the hold an earlier hand-over set, so the next
+        collector fetches the account itself instead of waiting it out."""
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        document = _usage_document(_usage_row("alice@example.com", age_s=400.0))
+        self._import(s, temp_home, document, hold_s=600.0)
+        self._import(s, temp_home, document, hold_s=0.0)
+        assert "holds lifted" in capsys.readouterr().err
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1.0}}),
+        ) as fetch:
+            s.list_accounts(json_output=True)
+        fetch.assert_called_once()
+
+    def test_a_held_active_account_shows_its_reading_not_token_expired(
+        self, temp_home: Path
+    ):
+        """An expired active token reads token_expired until the fetch path
+        refreshes it. A held slot is not waiting on that fetch — the reading
+        it was handed is current — so the row shows the reading."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alice@example.com", "accountUuid": "acct-1"}}
+        ))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok", "refreshToken": "rtok", "expiresAt": 1000}}
+        ))
+        self._import(
+            s, temp_home, _usage_document(_usage_row("alice@example.com", pct=42.0)),
+            hold_s=600.0,
+        )
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            payload = s.list_accounts(json_output=True)
+
+        fetch.assert_not_called()
+        (row,) = payload["accounts"]
+        assert row["active"] is True
+        assert row["usageStatus"] == "ok"
+        assert row["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_reads_stdin(self, temp_home: Path, monkeypatch):
+        from claude_swap.transfer import import_usage
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        monkeypatch.setattr(
+            sys, "stdin", io.StringIO(_usage_document(_usage_row("alice@example.com")))
+        )
+        import_usage(s, "-")
+        entry = s._usage_store.entries({"1": ("alice@example.com", "")})["1"]
+        assert entry.last_good is not None
+
+    @pytest.mark.parametrize("document,message", [
+        ('{"schemaVersion": 2, "accounts": []}', "unsupported usage document schemaVersion"),
+        ('{"schemaVersion": 1}', "no accounts list"),
+        ("[]", "must be a JSON object"),
+    ])
+    def test_malformed_document_is_refused(self, temp_home: Path, document, message):
+        s = _linux_switcher(temp_home)
+        with pytest.raises(TransferError, match=message):
+            self._import(s, temp_home, document)
+
+    def test_a_bad_row_writes_nothing(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        _seed_account(s, 2, "bob@example.com")
+        bad = _usage_row("bob@example.com")
+        bad["usageAgeSeconds"] = -5
+        with pytest.raises(TransferError, match="usageAgeSeconds for bob@example.com"):
+            self._import(
+                s, temp_home, _usage_document(_usage_row("alice@example.com"), bad)
+            )
+        assert not s._usage_store.path.exists()

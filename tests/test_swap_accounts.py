@@ -1,17 +1,24 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
+import errno
+import json
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from claude_swap import macos_keychain
+from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialError,
+    SessionError,
     ValidationError,
 )
+from claude_swap.models import Platform
+from claude_swap.session import keychain_service_name
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -269,25 +276,128 @@ class TestSwapAccounts:
     def test_write_json_publishes_only_after_chmod(
         self, temp_home: Path, sample_sequence_data: dict
     ):
-        """chmod runs on the temp file, making the rename the final commit —
-        a chmod failure must abort *without* publishing, otherwise callers
-        would roll files back around already-committed metadata."""
+        """The mode goes on the temp's descriptor, making the rename the final
+        commit — a mode failure must abort *without* publishing, otherwise
+        callers would roll files back around already-committed metadata."""
         if sys.platform == "win32":
-            pytest.skip("_write_json skips chmod on Windows (no POSIX file modes)")
+            pytest.skip("_write_json skips the mode call on Windows (no POSIX file modes)")
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
         before = switcher.sequence_file.read_text(encoding="utf-8")
 
-        def failing_chmod(path, mode):
-            raise OSError("chmod denied (injected)")
+        def failing_fchmod(fd, mode):
+            raise OSError("fchmod denied (injected)")
 
         # Scoped context: see H-1 comment above.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("claude_swap.switcher.os.chmod", failing_chmod)
+            mp.setattr("claude_swap.fsutil.os.fchmod", failing_fchmod)
             with pytest.raises(OSError):
                 switcher._write_json(switcher.sequence_file, {"x": 1})
 
         assert switcher.sequence_file.read_text(encoding="utf-8") == before
+
+    def test_write_json_replaces_target_when_rename_cannot_overwrite(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """On Windows os.rename refuses an existing target and shutil.move
+        falls back to copying into it in place, so readers can see a
+        truncated file. The write must replace the target file instead."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        before_ino = switcher.sequence_file.stat().st_ino
+
+        def windows_rename(src, dst, *args, **kwargs):
+            raise FileExistsError(f"cannot rename onto existing {dst}")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("claude_swap.switcher.os.rename", windows_rename)
+            switcher._write_json(switcher.sequence_file, {"x": 1})
+
+        assert json.loads(switcher.sequence_file.read_text(encoding="utf-8")) == {"x": 1}
+        assert switcher.sequence_file.stat().st_ino != before_ino
+        assert not list(switcher.sequence_file.parent.glob("*.tmp"))
+
+    def test_write_json_temp_file_is_private_from_creation(
+        self, temp_home: Path
+    ):
+        """The temp file holds the whole payload (``~/.claude.json`` can carry
+        ``primaryApiKey`` and MCP env secrets), so it has to be 0600 when it
+        is created. With the mode call neutralised, the published file carries
+        the mode the temp file was created with: a write-then-chmod writer
+        shows up here as 0644 under the usual 022 umask."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX file modes")
+        switcher = ClaudeAccountSwitcher()
+        target = temp_home / ".claude.json"
+
+        old_umask = os.umask(0o022)
+        try:
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
+                switcher._write_json(target, {"primaryApiKey": "sk-test"})
+        finally:
+            os.umask(old_umask)
+
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert not list(temp_home.glob(".claude.*.tmp"))
+
+    def test_write_json_keeps_a_symlinked_config(self, temp_home: Path):
+        """A dotfiles-managed ~/.claude.json is a symlink. The publish must
+        land on its target and leave the link in place, as Claude Code's own
+        writer does; renaming onto the link would detach it silently (#192)."""
+        dotfiles = temp_home / "dotfiles"
+        dotfiles.mkdir()
+        tracked = dotfiles / "claude.json"
+        tracked.write_text("{}", encoding="utf-8")
+        link = temp_home / ".claude.json"
+        link.unlink(missing_ok=True)
+        link.symlink_to(tracked)
+
+        ClaudeAccountSwitcher()._write_json(
+            link, {"oauthAccount": {"emailAddress": "a@example.com"}}
+        )
+
+        assert link.is_symlink()
+        written = json.loads(tracked.read_text(encoding="utf-8"))
+        assert written["oauthAccount"]["emailAddress"] == "a@example.com"
+        assert not list(dotfiles.glob("*.tmp"))
+        assert not list(temp_home.glob("*.tmp"))
+
+    def test_write_json_failed_publish_strands_nothing(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A rename the destination refuses (a bind-mounted ~/.claude.json
+        answers EBUSY) must leave the target as it was and no temp beside it:
+        the temp holds the whole payload, credentials included."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        def refuse(src, dst, **kwargs):
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        monkeypatch.setattr("claude_swap.fsutil.replace_with_retry", refuse)
+        with pytest.raises(OSError):
+            switcher._write_json(switcher.sequence_file, {"x": 1})
+
+        assert switcher.sequence_file.read_text(encoding="utf-8") == before
+        assert not list(switcher.sequence_file.parent.glob("*.tmp"))
+
+    def test_write_json_refuses_nan(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """``json.dumps`` would emit ``NaN``, which Claude Code's JSON.parse
+        rejects — in ~/.claude.json that is a corrupted config. Refused at
+        write time, file untouched, no temp."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        with pytest.raises(ConfigError, match="invalid JSON"):
+            switcher._write_json(switcher.sequence_file, {"x": float("nan")})
+
+        assert switcher.sequence_file.read_text(encoding="utf-8") == before
+        assert not list(switcher.sequence_file.parent.glob("*.tmp"))
 
     def test_swap_same_email_one_sided_clears_destination(
         self, temp_home: Path, sample_sequence_data_with_org: dict
@@ -450,6 +560,15 @@ class TestSwapUnreadableSourceIsNotAbsent:
     ``_read_account_credentials_ex``, aborting BEFORE anything moves.
     """
 
+    @pytest.fixture(autouse=True)
+    def _file_mode(self, monkeypatch):
+        """Force the FILE store: these cases read the file backend, and on
+        macOS a usable Keychain takes the write instead -- no file to `chmod`,
+        and the retained generation lands where `_prev_backup_path` cannot
+        see it. Class-wide and autouse, so membership alone grants it.
+        """
+        monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
+
     def _write(self, switcher, data):
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, data)
@@ -458,10 +577,23 @@ class TestSwapUnreadableSourceIsNotAbsent:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
+    # THE MACOS ARM MAKES THE SHAPE REACHABLE ON THE UBUNTU JOB, which is
+    # where it adds anything -- and the class fixture that forces the file
+    # store is what makes it so. `_use_keychain` keys on the SWITCHER's
+    # platform, not on the real OS, so this arm turns it True on Ubuntu too;
+    # the `[None]` arm is already file-mode there and the fixture is inert,
+    # but on this arm -- and on the whole macOS job -- the fixture is what
+    # keeps the store on file so there is an `.enc` to chmod. Windows skips
+    # this case entirely (the `skipif` above), and on macOS
+    # `Platform.detect()` already answers MACOS, so the arm duplicates
+    # `[None]` there.
+    @pytest.mark.parametrize("as_platform", [None, Platform.MACOS])
     def test_unreadable_enc_aborts_the_swap_before_anything_changes(
-        self, temp_home: Path, sample_sequence_data: dict
+        self, temp_home: Path, sample_sequence_data: dict, as_platform
     ):
         switcher = ClaudeAccountSwitcher()
+        if as_platform is not None:
+            switcher.platform = as_platform
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials("1", "account1@example.com", "rt-1")
         switcher._write_account_credentials("2", "account2@example.com", "rt-2")
@@ -516,3 +648,228 @@ class TestSwapUnreadableSourceIsNotAbsent:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["email"] == "account2@example.com"
         assert data["accounts"]["2"]["email"] == "account1@example.com"
+
+
+def test_staging_interrupted_mid_write_leaves_no_files(
+    temp_home: Path, monkeypatch
+):
+    """A Ctrl-C while a staging copy is being written must remove what this
+    call created: a leftover holds plaintext credentials and wedges the next
+    same-email swap behind a "may be the only surviving copy" refusal. The
+    interrupt lands inside ``os.fdopen``, before a file object owns the
+    descriptor, so the production handler must close it as well (on Windows
+    an open file cannot be unlinked) -- the injection deliberately does not."""
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    real_fdopen = os.fdopen
+    real_close = os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def fdopen_then_interrupt(fd, *args, **kwargs):
+        opened.append(fd)
+        if len(opened) == 2:  # first copy written in full, second just created
+            raise KeyboardInterrupt
+        return real_fdopen(fd, *args, **kwargs)
+
+    def spying_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr("claude_swap.switcher.os.fdopen", fdopen_then_interrupt)
+    monkeypatch.setattr("claude_swap.switcher.os.close", spying_close)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._stage_overlap_material(
+            {"1": ("creds-one", "config-one"), "2": ("creds-two", "")}
+        )
+
+    assert len(opened) == 2
+    assert opened[1] in closed, "the descriptor fdopen never took over leaked"
+    assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+
+
+def test_staging_interrupted_after_fdopen_leaves_no_files(
+    temp_home: Path, monkeypatch
+):
+    """The same interruption landing inside the write, once the file object
+    owns the descriptor: the with block must have closed it before the
+    discard runs (on Windows an open file cannot be unlinked)."""
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    real_fdopen = os.fdopen
+    owned: list = []
+
+    class InterruptingWriter:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+            return False
+
+        def write(self, text):
+            raise KeyboardInterrupt
+
+    def fdopen_interrupting_the_second(fd, *args, **kwargs):
+        fh = real_fdopen(fd, *args, **kwargs)
+        owned.append(fh)
+        return InterruptingWriter(fh) if len(owned) == 2 else fh
+
+    monkeypatch.setattr("claude_swap.switcher.os.fdopen", fdopen_interrupting_the_second)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._stage_overlap_material(
+            {"1": ("creds-one", "config-one"), "2": ("creds-two", "")}
+        )
+
+    assert len(owned) == 2
+    assert all(fh.closed for fh in owned)
+    assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+class TestSwapSessionProfileKeychain:
+    """A swapped session profile must not strand its keychain entry.
+
+    On macOS the profile's credential lives in a keychain item whose service
+    name is the hash of the profile DIR PATH
+    (``session.keychain_service_name``), so ``os.replace`` on the dir leaves
+    the item behind at the old name. Nothing in cswap ever names that service
+    again -- ``purge`` enumerates the profile dirs that still exist -- so an
+    entry missed here is permanent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def as_macos(self, monkeypatch):
+        """Take the keychain arm of the session helpers on any host."""
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.MACOS)
+        )
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def test_swap_deletes_both_old_paths_session_keychain_entries(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        account = macos_keychain.keychain_account_name()
+        services = {}
+        slots = (("1", "account1@example.com"), ("2", "account2@example.com"))
+        for num, email in slots:
+            old_dir = switcher._session_dir(num, email)
+            old_dir.mkdir(parents=True)
+            (old_dir / ".credentials.json").write_text("plaintext-seed")
+            services[num] = keychain_service_name(old_dir)
+            # The rotated generation claude wrote back into the profile: the
+            # newest tokens this account ever had, and what is left exposed.
+            macos_keychain.set_password(services[num], account, f"rotated-{num}")
+
+        switcher.swap_accounts("1", "2")
+
+        assert switcher._session_dir("2", "account1@example.com").exists()
+        assert switcher._session_dir("1", "account2@example.com").exists()
+        assert macos_keychain.get_password(services["1"], account) is None
+        assert macos_keychain.get_password(services["2"], account) is None
+
+
+def _creds(token: str, expires_at: int) -> str:
+    return json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": f"rt-{token}",
+                "expiresAt": expires_at,
+            }
+        }
+    )
+
+
+class TestSwapAdoptsSessionCredentials:
+    """``swap`` relocates both BACKUPS; each profile's rotated credential must
+    get into its backup first.
+
+    Same reasoning as the move counterpart: the profile's Keychain item cannot
+    follow the relocation (its service name hashes the old path) and is
+    deleted with the old slot key, so an unadopted rotation is lost and the
+    destination is seeded from a consumed generation.
+    """
+
+    SLOTS = (("1", "account1@example.com"), ("2", "account2@example.com"))
+
+    def _switcher(self, sample_sequence_data: dict) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def _seed(
+        self,
+        switcher: ClaudeAccountSwitcher,
+        num: str,
+        email: str,
+        backup: str,
+        profile: str,
+        identity: str | None = None,
+    ) -> Path:
+        # The pure store write; see the move counterpart for why.
+        switcher._store._write_account_credentials(num, email, backup)
+        session_dir = switcher._session_dir(num, email)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(profile)
+        if identity is None:
+            identity = json.dumps(
+                {"oauthAccount": {"emailAddress": email, "organizationUuid": ""}}
+            )
+        (session_dir / ".claude.json").write_text(identity)
+        return session_dir
+
+    def test_swap_carries_both_profiles_newer_generations(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        for num, email in self.SLOTS:
+            self._seed(
+                switcher, num, email,
+                backup=_creds(f"stored-{num}", 1),
+                profile=_creds(f"fresh-{num}", 9999999999999),
+            )
+
+        switcher.swap_accounts("1", "2")
+
+        assert switcher.read_account_credentials(
+            "2", "account1@example.com"
+        ) == _creds("fresh-1", 9999999999999)
+        assert switcher.read_account_credentials(
+            "1", "account2@example.com"
+        ) == _creds("fresh-2", 9999999999999)
+
+    def test_swap_refuses_when_an_ahead_profile_cannot_be_adopted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """One profile ahead with an unreadable identity: the swap refuses
+        before anything moves, and the records and backups stay put."""
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(
+            switcher, "1", "account1@example.com",
+            backup=_creds("stored-1", 1),
+            profile=_creds("fresh-1", 9999999999999),
+            identity="not json{{{",
+        )
+        self._seed(
+            switcher, "2", "account2@example.com",
+            backup=_creds("stored-2", 1),
+            profile=_creds("fresh-2", 9999999999999),
+        )
+
+        with pytest.raises(SessionError, match="could not be adopted"):
+            switcher.swap_accounts("1", "2")
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["email"] == "account1@example.com"
+        assert data["accounts"]["2"]["email"] == "account2@example.com"
+        assert switcher.read_account_credentials(
+            "1", "account1@example.com"
+        ) == _creds("stored-1", 1)
+        assert switcher._session_dir("1", "account1@example.com").exists()

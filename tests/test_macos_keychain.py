@@ -56,6 +56,25 @@ def test_get_password_raises_on_other_nonzero():
             macos_keychain.get_password("svc", "acct")
 
 
+def test_get_password_bounds_the_read_with_the_default_timeout():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout="the-secret\n")
+        macos_keychain.get_password("svc", "acct")
+        assert run.call_args.kwargs["timeout"] == macos_keychain._TIMEOUT
+
+
+def test_get_password_timeout_argument_replaces_the_default():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout="the-secret\n")
+        macos_keychain.get_password("svc", "acct", timeout=60.0)
+        assert run.call_args.kwargs["timeout"] == 60.0
+
+    expired = subprocess.TimeoutExpired(cmd="security", timeout=60)
+    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=expired):
+        with pytest.raises(macos_keychain.KeychainTimeout, match="after 60.0s"):
+            macos_keychain.get_password("svc", "acct", timeout=60.0)
+
+
 # ---------------------------------------------------------------------------
 # item_exists
 # ---------------------------------------------------------------------------
@@ -176,8 +195,11 @@ def test_calls_pass_timeout_to_subprocess():
 def test_timeout_becomes_keychain_error(fn, args):
     timeout = subprocess.TimeoutExpired(cmd="security", timeout=5)
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):
-        with pytest.raises(macos_keychain.KeychainError):
+        # KeychainTimeout is a KeychainError, so the file-fallback handlers that
+        # catch KEYCHAIN_ERRORS keep treating a timeout as "Keychain unusable".
+        with pytest.raises(macos_keychain.KeychainTimeout) as raised:
             getattr(macos_keychain, fn)(*args)
+    assert isinstance(raised.value, macos_keychain.KeychainError)
 
 
 def test_item_exists_stays_false_on_timeout_and_missing_binary():

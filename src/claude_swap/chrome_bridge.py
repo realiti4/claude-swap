@@ -51,7 +51,8 @@ import threading
 import time
 from pathlib import Path
 
-from claude_swap.chrome_session import ChromeVault, is_supported
+from claude_swap.chrome_session import is_supported
+from claude_swap.credentials import looks_like_api_key
 
 _logger = logging.getLogger("claude-swap")
 
@@ -131,19 +132,44 @@ def _tls_context() -> ssl.SSLContext:
 
 
 def _active_account(backup_root: Path) -> dict | None:
-    """The current cswap account's tokens+uuid, or None if unavailable."""
+    """The current account's Claude Code identity + live OAuth token, or None.
+
+    Everything comes from Claude Code itself: the account (uuid/email) from
+    ``~/.claude.json`` ``oauthAccount`` and the access token from the live
+    credential Claude Code keeps refreshed. The bridge only accepts a token whose
+    scopes allow ``client_type: claude-code`` (the extension's ChromeVault token
+    is rejected with ``scope_not_allowed``), so the relay does not use the vault.
+    """
     try:
         data = json.loads((Path(backup_root) / "sequence.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        data = {}
     num = data.get("activeAccountNumber")
-    if num is None:
+    try:
+        account = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount") or {}
+    except (OSError, json.JSONDecodeError):
         return None
-    session = ChromeVault(backup_root).get(str(num))
-    if session is None:
+    uuid, email = account.get("accountUuid"), account.get("emailAddress")
+    if not uuid:
         return None
-    return {"num": str(num), "token": session.access_token,
-            "uuid": session.account_uuid, "email": session.email}
+    token = _live_claude_code_token()
+    if not token:
+        return None
+    return {"num": str(num) if num is not None else "?", "token": token, "uuid": uuid, "email": email}
+
+
+def _live_claude_code_token() -> str | None:
+    """Claude Code's live OAuth access token (Keychain / credentials file)."""
+    try:
+        from .switcher import ClaudeAccountSwitcher
+
+        raw = ClaudeAccountSwitcher()._read_credentials()
+        if not raw or looks_like_api_key(raw):
+            return None
+        return json.loads(raw).get("claudeAiOauth", {}).get("accessToken") or None
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("chrome-bridge: cannot read Claude Code token: %s", e)
+        return None
 
 
 def _open_upstream(uuid: str, token: str, ctx: ssl.SSLContext) -> socket.socket | None:
@@ -197,9 +223,27 @@ def _relay_connection(down: socket.socket, backup_root: Path, ctx: ssl.SSLContex
         return
     head = req.decode("latin1", "replace")
     key = ""
+    origin = None
+    host = ""
     for line in head.split("\r\n"):
-        if line.lower().startswith("sec-websocket-key:"):
+        lower = line.lower()
+        if lower.startswith("sec-websocket-key:"):
             key = line.split(":", 1)[1].strip()
+        elif lower.startswith("origin:"):
+            origin = line.split(":", 1)[1].strip()
+        elif lower.startswith("host:"):
+            host = line.split(":", 1)[1].strip()
+    # Only native Claude Code clients may use the relay: browsers always send an
+    # Origin on WebSocket handshakes (blocks cross-site WebSocket hijacking), and
+    # a non-loopback Host means DNS rebinding.
+    if origin is not None or host.rsplit(":", 1)[0] not in ("127.0.0.1", "localhost", "[::1]"):
+        _logger.warning("chrome-bridge: rejected handshake (origin=%r, host=%r)", origin, host)
+        try:
+            down.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+        except OSError:
+            pass
+        down.close()
+        return
     accept = base64.b64encode(hashlib.sha1((key + _WS_MAGIC).encode()).digest()).decode()
     down.sendall((
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"

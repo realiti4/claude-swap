@@ -1,5 +1,6 @@
 """Tests for `cswap move` (ClaudeAccountSwitcher.move_account)."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -7,13 +8,16 @@ from pathlib import Path
 import pytest
 
 from claude_swap import macos_keychain
+from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialError,
+    SessionError,
     ValidationError,
 )
 from claude_swap.models import Platform
+from claude_swap.session import keychain_service_name
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -497,6 +501,15 @@ class TestMoveUnreadableSourceIsNotAbsent:
     same file already tests for the destination side).
     """
 
+    @pytest.fixture(autouse=True)
+    def _file_mode(self, monkeypatch):
+        """Force the FILE store: these cases read the file backend, and on
+        macOS a usable Keychain takes the write instead -- no file to `chmod`,
+        and the retained generation lands where `_prev_backup_path` cannot
+        see it. Class-wide and autouse, so membership alone grants it.
+        """
+        monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
+
     def _write(self, switcher, data):
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, data)
@@ -505,10 +518,23 @@ class TestMoveUnreadableSourceIsNotAbsent:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
+    # THE MACOS ARM MAKES THE SHAPE REACHABLE ON THE UBUNTU JOB, which is
+    # where it adds anything -- and the class fixture that forces the file
+    # store is what makes it so. `_use_keychain` keys on the SWITCHER's
+    # platform, not on the real OS, so this arm turns it True on Ubuntu too;
+    # the `[None]` arm is already file-mode there and the fixture is inert,
+    # but on this arm -- and on the whole macOS job -- the fixture is what
+    # keeps the store on file so there is an `.enc` to chmod. Windows skips
+    # this case entirely (the `skipif` above), and on macOS
+    # `Platform.detect()` already answers MACOS, so the arm duplicates
+    # `[None]` there.
+    @pytest.mark.parametrize("as_platform", [None, Platform.MACOS])
     def test_unreadable_enc_aborts_the_move_before_anything_changes(
-        self, temp_home: Path, sample_sequence_data: dict
+        self, temp_home: Path, sample_sequence_data: dict, as_platform
     ):
         switcher = ClaudeAccountSwitcher()
+        if as_platform is not None:
+            switcher.platform = as_platform
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials("2", "account2@example.com", "live-rt")
         switcher._write_account_credentials("1", "account1@example.com", "rt-1")
@@ -553,3 +579,155 @@ class TestMoveUnreadableSourceIsNotAbsent:
         assert (num_src, num_target, swapped) == ("2", "5", False)
         data = switcher._get_sequence_data()
         assert data["accounts"]["5"]["email"] == "account2@example.com"
+
+
+class TestMoveSessionProfileKeychain:
+    """A relocated session profile must not strand its keychain entry.
+
+    On macOS the profile's credential lives in a keychain item whose service
+    name is the hash of the profile DIR PATH
+    (``session.keychain_service_name``), so ``os.replace`` on the dir leaves
+    the item behind at the old name. Nothing in cswap ever names that service
+    again -- ``purge`` enumerates the profile dirs that still exist -- so an
+    entry missed here is permanent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def as_macos(self, monkeypatch):
+        """Take the keychain arm of the session helpers on any host."""
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.MACOS)
+        )
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def test_move_deletes_the_old_paths_session_keychain_entry(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        email = "account2@example.com"
+        old_dir = switcher._session_dir("2", email)
+        old_dir.mkdir(parents=True)
+        (old_dir / ".credentials.json").write_text("plaintext-seed")
+        old_service = keychain_service_name(old_dir)
+        account = macos_keychain.keychain_account_name()
+        # The rotated generation claude wrote back into the profile: the
+        # newest tokens this account ever had, and what is left exposed.
+        macos_keychain.set_password(old_service, account, "rotated-generation")
+
+        switcher.move_account("2", "5")
+
+        assert not old_dir.exists()
+        assert switcher._session_dir("5", email).exists()
+        assert macos_keychain.get_password(old_service, account) is None
+
+
+_STORED = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "stored-access",
+            "refreshToken": "stored-refresh",
+            "expiresAt": 1,
+        }
+    }
+)
+_ROTATED = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "fresh-access",
+            "refreshToken": "rotated-refresh",
+            "expiresAt": 9999999999999,
+        }
+    }
+)
+
+
+class TestMoveAdoptsSessionCredential:
+    """``move`` relocates the BACKUP; a profile's rotated credential must get
+    into that backup first.
+
+    Claude rotates the token family inside the session profile and nothing
+    syncs it back, so after a session that refreshed, the backup is a consumed
+    generation. The profile's Keychain item cannot follow the relocation (its
+    service name hashes the old path) and is deleted with the old slot key, so
+    without adoption the destination profile is seeded from a grant whose
+    first refresh gets invalid_grant -- and the fresh generation is gone.
+    """
+
+    EMAIL = "account2@example.com"
+
+    def _switcher(self, sample_sequence_data: dict) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def _seed(
+        self,
+        switcher: ClaudeAccountSwitcher,
+        backup: str,
+        profile: str,
+        identity: str | None = None,
+    ) -> Path:
+        # The pure store write: the post-write hook invalidates the profile
+        # written next, which a real backup write must do but is not what this
+        # models (a session that rotated AFTER the backup was taken).
+        switcher._store._write_account_credentials("2", self.EMAIL, backup)
+        session_dir = switcher._session_dir("2", self.EMAIL)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(profile)
+        if identity is None:
+            identity = json.dumps(
+                {"oauthAccount": {"emailAddress": self.EMAIL, "organizationUuid": ""}}
+            )
+        (session_dir / ".claude.json").write_text(identity)
+        return session_dir
+
+    def test_move_carries_the_profiles_newer_generation(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, backup=_STORED, profile=_ROTATED)
+
+        switcher.move_account("2", "5")
+
+        assert switcher.read_account_credentials("5", self.EMAIL) == _ROTATED
+        assert switcher._session_dir("5", self.EMAIL).exists()
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["5"]["email"] == self.EMAIL
+
+    def test_move_keeps_a_backup_that_is_ahead_of_the_profile(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A re-login landed in the backup after the profile last ran: the
+        backup is the later generation and must not be downgraded."""
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, backup=_ROTATED, profile=_STORED)
+
+        switcher.move_account("2", "5")
+
+        assert switcher.read_account_credentials("5", self.EMAIL) == _ROTATED
+
+    def test_move_refuses_when_the_ahead_profile_cannot_be_adopted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Profile ahead but its identity unreadable: adoption cannot tell
+        whose credential that is, and the move must not carry the consumed
+        backup silently. Nothing moves."""
+        switcher = self._switcher(sample_sequence_data)
+        session_dir = self._seed(
+            switcher, backup=_STORED, profile=_ROTATED, identity="not json{{{"
+        )
+
+        with pytest.raises(SessionError, match="could not be adopted"):
+            switcher.move_account("2", "5")
+
+        data = switcher._get_sequence_data()
+        assert "5" not in data["accounts"]
+        assert data["accounts"]["2"]["email"] == self.EMAIL
+        assert switcher.read_account_credentials("2", self.EMAIL) == _STORED
+        assert session_dir.exists()
+        assert (session_dir / ".credentials.json").read_text() == _ROTATED

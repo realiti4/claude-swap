@@ -2,13 +2,31 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap import fsutil
+from claude_swap.fsutil import (
+    atomic_write_bytes,
+    atomic_write_text,
+    can_junction,
+    can_symlink,
+    is_link,
+    link_points_at,
+    make_dir_link,
+    make_file_link,
+    publish_target,
+    read_text_with_retry,
+    remove_link,
+    replace_with_retry,
+)
+
+# Captured at import, before conftest's autouse fixture stubs os.fsync per test.
+_REAL_FSYNC = os.fsync
 
 
 class TestReplaceWithRetry:
@@ -284,3 +302,487 @@ class TestStrictRosterReadBranches:
         p = tmp_path / "config.json"
         p.write_text("[1, 2, 3]")
         assert self._switcher(tmp_path)._read_json(p) is None
+
+
+class TestAtomicWrite:
+    """``atomic_write_text`` is how every published file lands: temp beside
+    the target, fsync, rename. The switch rollback restores ``~/.claude.json``
+    through it because ``Path.write_text`` truncates the live file before it
+    writes, and Claude Code, which watches that file, treats a torn read as a
+    corrupted config (#419)."""
+
+    def test_publishes_by_rename(self, tmp_path):
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+        before = target.stat().st_ino
+        atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "new"
+        assert list(tmp_path.iterdir()) == [target]
+        if sys.platform != "win32":
+            assert target.stat().st_ino != before  # published, not rewritten
+            assert target.stat().st_mode & 0o777 == 0o600
+
+    def test_failed_publish_leaves_destination_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+
+        def refuse(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr("claude_swap.fsutil.replace_with_retry", refuse)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_interrupted_write_leaves_no_temp(self, tmp_path, monkeypatch):
+        """A Ctrl-C is not an OSError; the temp must still go. Injected at
+        fsync, the one call in the sequence only this writer makes."""
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+
+        def interrupt(fd):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_temp_is_private_from_creation(self, tmp_path, monkeypatch):
+        """With the mode call neutralised the published mode is the one the
+        temp was created with: a write-then-chmod writer shows up as 0644."""
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
+        old_umask = os.umask(0o022)
+        try:
+            atomic_write_text(tmp_path / "secret.json", "{}")
+        finally:
+            os.umask(old_umask)
+        assert (tmp_path / "secret.json").stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_failing_mode_call_aborts_before_publishing(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "secret.json"
+        target.write_text("old")
+
+        def refuse(fd, mode):
+            raise PermissionError("fchmod denied (injected)")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", refuse)
+        with pytest.raises(PermissionError):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_fsync_unsupported_is_tolerated_other_errors_are_not(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "x.json"
+        target.write_text("old")
+
+        def unsupported(fd):
+            raise OSError(errno.EINVAL, "fsync not supported here")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", unsupported)
+        atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "new"
+
+        def broken(fd):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", broken)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "newer")
+        assert target.read_text(encoding="utf-8") == "new"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_suite_runs_with_fsync_stubbed(self):
+        """conftest stubs ``os.fsync``; the real one rejects a bad descriptor."""
+        os.fsync(-1)
+
+    def test_atomic_write_with_real_fsync(self, tmp_path, monkeypatch):
+        """The stub leaves no other test a real fsync: one on a closed fd
+        (EBADF) would pass the whole suite."""
+        with pytest.raises(ValueError):
+            _REAL_FSYNC(-1)  # the capture is the real function, not the stub
+        monkeypatch.setattr(os, "fsync", _REAL_FSYNC)
+        atomic_write_text(tmp_path / "x.json", "new")
+        assert (tmp_path / "x.json").read_text(encoding="utf-8") == "new"
+
+    def test_missing_parent_is_not_created(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            atomic_write_text(tmp_path / "missing" / "x.json", "{}")
+        assert not (tmp_path / "missing").exists()
+
+    def test_bytes_round_trip(self, tmp_path):
+        target = tmp_path / "blob.bin"
+        payload = bytes(range(256)) * 300
+        atomic_write_bytes(target, payload)
+        assert target.read_bytes() == payload
+        assert list(tmp_path.iterdir()) == [target]
+
+
+class TestAtomicWriteSymlinks:
+    """A rename never follows a link: renaming onto a symlinked path detaches
+    it silently (#192). The writer publishes onto the end of the chain, as
+    Claude Code's own config writer does for ``~/.claude.json``."""
+
+    def test_writes_through_a_link_and_keeps_it(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        live = tmp_path / "live"
+        live.mkdir()
+        tracked = repo / ".claude.json"
+        tracked.write_text("old")
+        link = live / ".claude.json"
+        link.symlink_to(tracked)
+
+        atomic_write_text(link, "new")
+
+        assert link.is_symlink(), "the dotfiles link must survive the write"
+        assert tracked.read_text(encoding="utf-8") == "new"
+        assert [p.name for p in repo.iterdir()] == [".claude.json"]
+        assert [p.name for p in live.iterdir()] == [".claude.json"]
+
+    def test_follows_a_relative_two_hop_chain(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        final = tmp_path / "real" / "final.json"
+        final.write_text("old")
+        # Native separator: Windows rejects a forward slash inside a reparse
+        # point (WinError 123 from realpath), which is the link, not the writer.
+        (tmp_path / "hop2").symlink_to(Path("real") / "final.json")
+        (tmp_path / "hop1").symlink_to("hop2")
+
+        atomic_write_text(tmp_path / "hop1", "new")
+
+        assert (tmp_path / "hop1").is_symlink()
+        assert (tmp_path / "hop2").is_symlink()
+        assert final.read_text(encoding="utf-8") == "new"
+        assert publish_target(tmp_path / "hop1") == final.resolve()
+
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
+    def test_dangling_link_writes_where_it_points(self, tmp_path):
+        (tmp_path / "gone").mkdir()
+        link = tmp_path / ".claude.json"
+        link.symlink_to(tmp_path / "gone" / "config.json")
+
+        atomic_write_text(link, "{}")
+
+        assert link.is_symlink()
+        assert (tmp_path / "gone" / "config.json").read_text(encoding="utf-8") == "{}"
+        assert [p.name for p in (tmp_path / "gone").iterdir()] == ["config.json"]
+
+    def test_follow_symlinks_false_replaces_the_link(self, tmp_path):
+        target = tmp_path / "elsewhere.json"
+        target.write_text("untouched")
+        link = tmp_path / "out.cswap"
+        link.symlink_to(target)
+
+        atomic_write_text(link, "export", follow_symlinks=False)
+
+        assert not link.is_symlink()
+        assert link.read_text(encoding="utf-8") == "export"
+        assert target.read_text(encoding="utf-8") == "untouched"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["elsewhere.json", "out.cswap"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink loop semantics")
+    def test_loop_raises_eloop_and_writes_nothing(self, tmp_path):
+        loop = tmp_path / "loop.json"
+        loop.symlink_to("loop.json")
+
+        with pytest.raises(OSError) as info:
+            atomic_write_text(loop, "{}")
+
+        assert info.value.errno == errno.ELOOP
+        assert loop.is_symlink()
+        assert [p.name for p in tmp_path.iterdir()] == ["loop.json"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink loop semantics")
+    def test_loop_hidden_behind_dotdot_is_still_refused(self, tmp_path):
+        """Non-strict realpath would collapse ``loop/..`` lexically and aim
+        the write at ``victim.json``, a file ``open`` cannot even reach."""
+        victim = tmp_path / "victim.json"
+        victim.write_bytes(b"victim")
+        (tmp_path / "loop").symlink_to("loop")
+        config = tmp_path / "config.json"
+        config.symlink_to("loop/../victim.json")
+
+        with pytest.raises(OSError) as info:
+            atomic_write_text(config, "{}")
+
+        assert info.value.errno == errno.ELOOP
+        assert victim.read_bytes() == b"victim"
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "config.json", "loop", "victim.json",
+        ]
+
+    def test_publish_target_of_a_plain_path_is_the_path(self, tmp_path):
+        p = tmp_path / "plain.json"
+        assert publish_target(p) == p
+        p.write_text("x")
+        assert publish_target(p) == p
+
+    def test_strict_fallback_refuses_a_dangling_link(self, tmp_path, monkeypatch):
+        """On a 3.12 release without ``ALLOW_MISSING`` the resolver runs
+        fully strict: a dangling link is refused rather than guessed, while
+        an existing target is still written through."""
+        monkeypatch.setattr("claude_swap.fsutil._RESOLVE_STRICT", True)
+        (tmp_path / "gone").mkdir()
+        dangling = tmp_path / "dangling.json"
+        dangling.symlink_to(tmp_path / "gone" / "config.json")
+
+        with pytest.raises(FileNotFoundError):
+            atomic_write_text(dangling, "{}")
+
+        assert dangling.is_symlink()
+        assert list((tmp_path / "gone").iterdir()) == []
+        assert not list(tmp_path.glob("*.tmp"))
+
+        tracked = tmp_path / "tracked.json"
+        tracked.write_text("old")
+        link = tmp_path / "link.json"
+        link.symlink_to(tracked)
+        atomic_write_text(link, "new")
+        assert link.is_symlink()
+        assert tracked.read_text(encoding="utf-8") == "new"
+
+
+class TestAtomicWriteTempName:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="MAX_PATH turns a 251-character name into a path-length question",
+    )
+    def test_a_destination_name_near_name_max_still_publishes(self, tmp_path):
+        """The temp carries a bounded slice of the destination name: a legal
+        251-character destination must not fail with ENAMETOOLONG at the temp
+        (mkstemp adds eight random characters and ``.tmp`` to the prefix)."""
+        target = tmp_path / ("x" * 245 + ".cswap")
+        target.write_text("old")
+
+        atomic_write_text(target, "new")
+
+        assert target.read_text(encoding="utf-8") == "new"
+        assert [p.name for p in tmp_path.iterdir()] == [target.name]
+
+
+# ---------------------------------------------------------------------------
+# links: symlinks and Windows junctions behind one vocabulary
+# ---------------------------------------------------------------------------
+
+
+def _host_can_symlink(where: Path) -> bool:
+    probe = where / ".symlink-probe"
+    try:
+        probe.symlink_to(where / "nonexistent")
+    except OSError:
+        return False
+    probe.unlink()
+    return True
+
+
+class TestIsLink:
+    def test_plain_entries_and_missing_paths_are_not_links(self, tmp_path):
+        (tmp_path / "d").mkdir()
+        (tmp_path / "f").write_text("x")
+        assert not is_link(tmp_path / "d")
+        assert not is_link(tmp_path / "f")
+        assert not is_link(tmp_path / "missing")
+
+    def test_a_directory_link_is_a_link_even_when_dangling(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        make_dir_link(target, link)
+        assert is_link(link)
+        target.rmdir()
+        assert is_link(link)  # dangling: exists() is False, is_link is not
+
+    def test_a_file_symlink_is_a_link(self, tmp_path):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        (tmp_path / "f").write_text("x")
+        make_file_link(tmp_path / "f", tmp_path / "l")
+        assert is_link(tmp_path / "l")
+        assert (tmp_path / "l").read_text() == "x"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_make_dir_link_is_a_junction_on_windows(self, tmp_path):
+        """The one directory link an ordinary Windows user may create: not a
+        symlink to the stdlib, but a link to cswap."""
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("precious")
+        link = tmp_path / "link"
+        make_dir_link(target, link)
+        assert link.is_junction()
+        assert not link.is_symlink()
+        assert is_link(link)
+        assert (link / "keep.txt").read_text() == "precious"
+        (link / "written.txt").write_text("through the junction")
+        assert (target / "written.txt").read_text() == "through the junction"
+
+
+class TestLinkPointsAt:
+    def test_a_directory_link_points_at_its_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        make_dir_link(target, tmp_path / "link")
+        assert link_points_at(tmp_path / "link", target)
+        assert not link_points_at(tmp_path / "link", tmp_path)
+
+    def test_not_a_link_points_nowhere(self, tmp_path):
+        (tmp_path / "f").write_text("x")
+        assert not link_points_at(tmp_path / "f", tmp_path / "f")
+        assert not link_points_at(tmp_path / "missing", tmp_path)
+
+    def test_the_stored_path_counts_not_where_it_leads(self, tmp_path):
+        """A link to an intermediate link is a different link than one to the
+        resolved target (the dotfiles case in session._sync_items)."""
+        real = tmp_path / "real"
+        real.mkdir()
+        hop = tmp_path / "hop"
+        make_dir_link(real, hop)
+        make_dir_link(hop, tmp_path / "link")
+        assert link_points_at(tmp_path / "link", hop)
+        assert not link_points_at(tmp_path / "link", real)
+
+    def test_ignores_the_windows_extended_length_prefix(self, monkeypatch):
+        prefix = "\\\\?\\"
+        monkeypatch.setattr(
+            fsutil.os, "readlink", lambda _p: prefix + "C:\\Users\\me\\.claude\\projects"
+        )
+        assert link_points_at(Path("link"), Path("C:\\Users\\me\\.claude\\projects"))
+
+    def test_unc_prefix_maps_back_to_the_share_path(self, monkeypatch):
+        monkeypatch.setattr(
+            fsutil.os, "readlink", lambda _p: "\\\\?\\UNC\\server\\share\\projects"
+        )
+        assert link_points_at(Path("link"), Path("\\\\server\\share\\projects"))
+
+    def test_other_target_does_not_match(self, monkeypatch):
+        monkeypatch.setattr(fsutil.os, "readlink", lambda _p: "/elsewhere")
+        assert not link_points_at(Path("link"), Path("/target"))
+
+
+class TestRemoveLink:
+    def test_removes_a_directory_link_and_keeps_its_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("precious")
+        link = tmp_path / "link"
+        make_dir_link(target, link)
+
+        remove_link(link)
+
+        assert not link.exists() and not is_link(link)
+        assert (target / "keep.txt").read_text() == "precious"
+
+    def test_removes_a_file_link_and_keeps_its_target(self, tmp_path):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        (tmp_path / "f").write_text("x")
+        make_file_link(tmp_path / "f", tmp_path / "l")
+
+        remove_link(tmp_path / "l")
+
+        assert not (tmp_path / "l").exists()
+        assert (tmp_path / "f").read_text() == "x"
+
+
+class TestLinkProbes:
+    @pytest.fixture(autouse=True)
+    def fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(fsutil, "_LINK_PROBES", {})
+
+    def test_off_windows_both_are_true_without_probing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "linux")
+        calls = []
+        monkeypatch.setattr(fsutil.os, "symlink", lambda *a, **k: calls.append(a))
+        assert can_symlink(tmp_path) is True
+        assert can_junction(tmp_path) is True
+        assert calls == []
+
+    def test_a_refused_symlink_reads_as_unavailable_and_leaves_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+
+        def refuse(*_a, **_k):
+            e = OSError(22, "A required privilege is not held by the client")
+            e.winerror = 1314
+            raise e
+
+        monkeypatch.setattr(fsutil.os, "symlink", refuse)
+        assert can_symlink(tmp_path) is False
+        assert list(tmp_path.iterdir()) == []
+
+    def test_symlink_probe_runs_once_per_directory(self, tmp_path, monkeypatch):
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        calls = []
+        real = os.symlink
+
+        def counting(*a, **k):
+            calls.append(a)
+            return real(*a, **k)
+
+        monkeypatch.setattr(fsutil.os, "symlink", counting)
+        other = tmp_path / "other"
+        other.mkdir()
+
+        assert can_symlink(tmp_path) is True
+        assert can_symlink(tmp_path) is True
+        assert can_symlink(other) is True
+
+        assert len(calls) == 2  # one per directory, not per call
+        assert list(tmp_path.iterdir()) == [other]
+        assert list(other.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_junction_probe_is_true_on_ntfs_and_leaves_nothing(self, tmp_path):
+        assert can_junction(tmp_path) is True
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_a_refused_junction_reads_as_unavailable(self, tmp_path, monkeypatch):
+        import _winapi
+
+        def refuse(*_a):
+            raise OSError(1, "The request is not supported")
+
+        monkeypatch.setattr(_winapi, "CreateJunction", refuse)
+        assert can_junction(tmp_path) is False
+        assert list(tmp_path.iterdir()) == []
+
+    def test_answers_are_kept_per_kind(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        here = os.path.normcase(str(tmp_path))
+        monkeypatch.setattr(
+            fsutil, "_LINK_PROBES", {(here, f"junction:{here}"): False}
+        )
+        if not _host_can_symlink(tmp_path):
+            pytest.skip("this host cannot create symlinks")
+        assert can_junction(tmp_path) is False  # the cached answer
+        assert can_symlink(tmp_path) is True  # probed on its own
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+    def test_junction_probe_is_per_target(self, tmp_path):
+        """The probe links to the target's parent, where the real link will
+        point, so a target Windows refuses is found out before anything moves."""
+        target = tmp_path / "claude-home"
+        target.mkdir()
+        assert can_junction(tmp_path, target) is True
+        assert list(tmp_path.iterdir()) == [target]
+        assert len(fsutil._LINK_PROBES) == 1
+        assert can_junction(tmp_path) is True  # a second key, its own probe
+        assert len(fsutil._LINK_PROBES) == 2
