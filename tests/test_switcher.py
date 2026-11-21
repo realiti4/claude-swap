@@ -4105,6 +4105,78 @@ class TestRecoveryNeverWritesAnotherSlotLive:
         assert entry["consumedFp"] == oauth.credential_fingerprint(self._EXPIRED)
         assert _read_safety_copy(switcher, entry_id) == self._REFRESHED
 
+    def _stash_exit_refresh_lines(
+        self, switcher, caplog, stash_error: Exception | None = None,
+    ):
+        """Run the backup-fails, live-refused collect exit and return the
+        log lines that bracket the POST (those starting with "Refresh ")."""
+        import logging
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=Exception("backup write failed"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._REFRESHED, None)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"), \
+             patch.object(
+                 switcher._store, "_write_unclaimed_credential",
+                 side_effect=stash_error,
+             ), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._fetch_active_usage(
+                "2", "account2@example.com", self._EXPIRED
+            )
+        return [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Refresh ")
+        ]
+
+    def test_a_stashed_successor_closes_the_start_line(
+        self, temp_home: Path, sample_sequence_data: dict, caplog,
+    ):
+        """The start line is promised an end line (saved, stashed or no
+        successor). The stash exit writes to neither store, so the saved
+        line does not fire: the stash must say how it ended itself."""
+        sample_sequence_data["accounts"]["2"]["email"] = "account2@example.com"
+        switcher = self._switcher(
+            temp_home, sample_sequence_data, "account2@example.com"
+        )
+
+        lines = self._stash_exit_refresh_lines(switcher, caplog)
+
+        old = oauth.credential_fingerprint(self._EXPIRED)[:19]
+        new = oauth.credential_fingerprint(self._REFRESHED)[:19]
+        assert lines == [
+            f"Refresh starting for account 2 ({old}).",
+            f"Refresh for account 2 stashed its successor ({new}).",
+        ]
+
+    def test_a_failed_stash_writes_no_stashed_line(
+        self, temp_home: Path, sample_sequence_data: dict, caplog,
+    ):
+        """Nothing was stashed, so no line may say it was: the warning that
+        the successor was not persisted anywhere is the ending."""
+        sample_sequence_data["accounts"]["2"]["email"] = "account2@example.com"
+        switcher = self._switcher(
+            temp_home, sample_sequence_data, "account2@example.com"
+        )
+
+        lines = self._stash_exit_refresh_lines(
+            switcher, caplog, stash_error=OSError("disk full"),
+        )
+
+        old = oauth.credential_fingerprint(self._EXPIRED)[:19]
+        assert lines == [f"Refresh starting for account 2 ({old})."]
+        assert any(
+            "NOT persisted anywhere" in r.getMessage() for r in caplog.records
+        )
+
     def test_CONTROL_a_successful_backup_write_needs_no_stash(
         self, temp_home: Path, sample_sequence_data: dict,
     ):

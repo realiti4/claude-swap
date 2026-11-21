@@ -5692,6 +5692,17 @@ class ClaudeAccountSwitcher:
                                 "anywhere — re-login may be required.",
                                 account_num,
                             )
+                        else:
+                            # Closes the start line: neither store was
+                            # written, so the saved line below cannot fire.
+                            self._logger.info(
+                                "Refresh for account %s stashed its "
+                                "successor (%s).",
+                                account_num,
+                                _fingerprint_head(
+                                    oauth.credential_fingerprint(working)
+                                ),
+                            )
                     if posted and (backup_ok or live_ok):
                         # A failed write of either store has its own warning
                         # above; this line says the successor exists on disk.
