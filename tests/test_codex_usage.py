@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap.codex_usage import Window, fetch_usage
+from claude_swap.codex_usage import Unauthorized, Window, fetch_usage, refresh_tokens
 
 URLOPEN = "claude_swap.codex_usage.urllib.request.urlopen"
 
@@ -81,8 +81,34 @@ def test_other_window_lengths(seconds, label):
         assert fetch_usage("tok", "a")[0].label == label
 
 
+def test_401_raises_unauthorized():
+    err = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b'{"code": "token_revoked"}'))
+    with patch(URLOPEN, side_effect=err), pytest.raises(Unauthorized):
+        fetch_usage("tok", "a")
+
+
+def test_refresh_posts_codex_request_and_returns_rotated_tokens():
+    body = {"id_token": "id2", "access_token": "at2", "refresh_token": "rt2", "extra": 1}
+    with patch(URLOPEN, return_value=_resp(json.dumps(body).encode())) as urlopen:
+        assert refresh_tokens("rt1") == {"id_token": "id2", "access_token": "at2", "refresh_token": "rt2"}
+    req = urlopen.call_args.args[0]
+    assert (req.full_url, req.get_method()) == ("https://auth.openai.com/oauth/token", "POST")
+    assert json.loads(req.data) == {"client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                                    "grant_type": "refresh_token", "refresh_token": "rt1",
+                                    "scope": "openid profile email"}
+
+
 @pytest.mark.parametrize("effect", [
     urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b"")),
+    urllib.error.URLError("down"),
+])
+def test_refresh_failure_returns_none(effect):
+    with patch(URLOPEN, side_effect=effect):
+        assert refresh_tokens("rt1") is None
+
+
+@pytest.mark.parametrize("effect", [
+    urllib.error.HTTPError("u", 500, "Server Error", {}, io.BytesIO(b"")),
     urllib.error.URLError("down"),
     TimeoutError(),
 ])

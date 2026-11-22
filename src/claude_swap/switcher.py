@@ -93,7 +93,11 @@ from claude_swap.paths import (
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
 )
-from claude_swap.process_detection import get_running_instances, list_sessions
+from claude_swap.process_detection import (
+    get_running_instances,
+    list_codex_processes,
+    list_sessions,
+)
 from claude_swap import poll_policy
 from claude_swap.settings import (
     UsageSettings,
@@ -6398,7 +6402,7 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         tag_mode = load_ui_settings(self.backup_dir).org_tag
         emails = [info[1] for info in accounts_info]
-        print(bolded("Accounts:"))
+        print(bolded("Claude accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
             tag = self._tag_suffix(tag_mode, emails, email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
@@ -6432,6 +6436,15 @@ class ClaudeAccountSwitcher:
             for msg in lockstep_warnings:
                 warning(msg)
 
+        try:
+            from claude_swap import codex_accounts
+
+            codex_lines = codex_accounts.list_lines()
+            if codex_lines:
+                print("\n" + "\n".join(codex_lines))
+        except Exception:
+            self._logger.debug("Failed to list Codex accounts", exc_info=True)
+
         # Running instances
         try:
             from claude_swap.session import session_dir_for
@@ -6448,22 +6461,33 @@ class ClaudeAccountSwitcher:
             for num, email, _, _, _, _, alias in accounts_info:
                 profile = session_dir_for(self.backup_dir, str(num), email)
                 tagged += [(s, f"{num}: {alias or email}") for s in list_sessions(profile)]
+            # ponytail: every codex process is assumed to use the default
+            # CODEX_HOME, so all run as the live Codex login.
+            codex = list_codex_processes()
+            if codex:
+                try:
+                    codex_account = codex_accounts.active_account() or "unmanaged login"
+                except Exception:
+                    codex_account = "unknown Codex login"
 
-            if tagged or ide_instances:
+            if tagged or ide_instances or codex:
                 # Group by (label, folder, account) to avoid repetitive lines
                 groups: dict[tuple[str, str, str], dict[str, int]] = {}
                 for session, account in tagged:
-                    label = entrypoint_label(session.entrypoint)
+                    label = f"Claude {entrypoint_label(session.entrypoint)}"
                     cwd = abbreviate_path(session.cwd)
                     key = (label, cwd, account)
                     counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
                     counts["sessions"] += 1
                 for ide in ide_instances:
-                    name = ide_short_name(ide.ide_name)
+                    name = f"Claude {ide_short_name(ide.ide_name)}"
                     for folder in ide.workspace_folders:
                         key = (name, abbreviate_path(folder), default_account)
                         counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
                         counts["ide"] += 1
+                for proc in codex:
+                    key = (proc.label, abbreviate_path(proc.cwd), codex_account)
+                    groups.setdefault(key, {"sessions": 0, "ide": 0})["sessions"] += 1
 
                 print()
                 print(bolded("Running instances:"))

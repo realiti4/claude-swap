@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import codex_usage, oauth, paths
@@ -164,6 +165,14 @@ def remove(target: str) -> tuple[str, str]:
     return num, acc.get("email", "")
 
 
+def active_account() -> str | None:
+    """``"num: email"`` of the live Codex login, or None when it is not stored."""
+    index = _load_index()
+    live = _read_auth(auth_path())
+    num = _slot_of(index, *identity(live[1])) if live else None
+    return f"{num}: {index[num].get('email') or index[num].get('account_id')}" if num else None
+
+
 def _usage_lines(windows: list[codex_usage.Window]) -> list[str]:
     """Rows in the shape of the Claude list's usage rows (switcher._usage_entry_lines)."""
     if not windows:
@@ -178,6 +187,47 @@ def _usage_lines(windows: list[codex_usage.Window]) -> list[str]:
         row = f"{label + ':':<{width}} {body}"
         out.append(f"{dimmed('└' if j == len(windows) - 1 else '├')} {muted(row)}")
     return out
+
+
+def _refresh_slot(num: str) -> dict | None:
+    """Refresh a stored (not live) slot's tokens and save them: the new tokens, or None.
+
+    Under Codex's ``auth.lock``, as :func:`switch` takes it, and never for the
+    live login: its refresh token belongs to the running Codex, and rotating
+    it here would sign that Codex out.
+    """
+    with FileLock(auth_path().parent / "auth.lock"):
+        live = _read_auth(auth_path())
+        if live and _slot_of(_load_index(), *identity(live[1])) == num:
+            return None
+        stored = _read_auth(_slot_file(num))
+        tokens = (stored[1].get("tokens") or {}) if stored else {}
+        fresh = codex_usage.refresh_tokens(tokens.get("refresh_token") or "") if tokens else None
+        if not fresh:
+            return None
+        auth = stored[1]
+        auth["tokens"] = {**tokens, **fresh}
+        auth["last_refresh"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        atomic_write_text(_slot_file(num), json.dumps(auth, indent=2))
+        return auth["tokens"]
+
+
+def _account_usage_lines(num: str, tokens: dict, active: bool, index: dict) -> list[str]:
+    """Usage rows for one slot; a 401 on a stored slot gets one token refresh."""
+    if not tokens.get("access_token"):
+        return _usage_lines([])
+    try:
+        return _usage_lines(codex_usage.fetch_usage(tokens["access_token"], tokens.get("account_id")))
+    except codex_usage.Unauthorized:
+        pass
+    fresh = None if active else _refresh_slot(num)
+    if fresh:
+        try:
+            return _usage_lines(codex_usage.fetch_usage(fresh["access_token"], fresh.get("account_id")))
+        except codex_usage.Unauthorized:
+            pass
+    who = index[num].get("email") or "this account"
+    return [dimmed(f"login revoked: `codex login` as {who}, then `cswap codex add`")]
 
 
 def list_lines() -> list[str]:
@@ -196,12 +246,7 @@ def list_lines() -> list[str]:
         auth = live if active else _read_auth(_slot_file(num))
         tokens = (auth[1] if auth else {}).get("tokens") or {}
         # ponytail: one blocking fetch per account; thread them if long lists get slow.
-        windows = (
-            codex_usage.fetch_usage(tokens["access_token"], tokens.get("account_id"))
-            if tokens.get("access_token")
-            else []
-        )
-        lines += [f"     {line}" for line in _usage_lines(windows)]
+        lines += [f"     {line}" for line in _account_usage_lines(num, tokens, active, index)]
         if i < len(nums) - 1:
             lines.append("")
     return lines

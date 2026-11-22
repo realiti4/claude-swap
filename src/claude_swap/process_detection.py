@@ -362,6 +362,54 @@ def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
     return instances
 
 
+@dataclass
+class CodexProcess:
+    """A running ``codex`` process, from ``ps`` and ``lsof``."""
+
+    pid: int
+    label: str  # "Codex CLI", "Codex exec", "Codex app"
+    cwd: str
+
+
+def list_codex_processes() -> list[CodexProcess]:
+    """Running ``codex`` processes; [] on Windows or any failure.
+
+    ponytail: argv is split on spaces, so a codex binary under a path with a
+    space is missed; read ``comm`` per pid if that ever matters.
+    """
+    if sys.platform == "win32":
+        return []
+    try:
+        ps = spawn.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=5)
+        procs: dict[int, str] = {}
+        for line in ps.stdout.splitlines():
+            pid, _, args = line.strip().partition(" ")
+            argv = args.split()
+            if not argv or os.path.basename(argv[0]) != "codex":
+                continue
+            if "ChatGPT.app" in argv[0] or "app-server" in argv or "exec-server" in argv:
+                procs[int(pid)] = "Codex app"
+            else:
+                procs[int(pid)] = "Codex exec" if "exec" in argv else "Codex CLI"
+        if not procs:
+            return []
+        lsof = spawn.run(
+            ["lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(map(str, procs))],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    # lsof exits non-zero when any pid has gone; its output still holds the rest.
+    cwds: dict[int, str] = {}
+    pid = None
+    for line in lsof.stdout.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            cwds[pid] = line[1:]
+    return [CodexProcess(pid, label, cwds.get(pid, "?")) for pid, label in procs.items()]
+
+
 def get_running_instances(
     claude_dir: Path | None = None,
 ) -> tuple[list[ClaudeSession], list[IdeInstance]]:

@@ -2015,12 +2015,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 show_token_status=args.token_status,
                 json_output=args.json,
             )
-            if not args.json:
-                from claude_swap import codex_accounts
-
-                codex_lines = codex_accounts.list_lines()
-                if codex_lines:
-                    print("\n" + "\n".join(codex_lines))
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
 

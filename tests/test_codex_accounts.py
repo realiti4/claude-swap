@@ -160,15 +160,60 @@ def test_email_from_jwt():
     assert codex_accounts.identity({"tokens": {"id_token": "not-a-jwt"}}) == ("", "")
 
 
-def test_cli_codex_and_list_print_openai_section(codex_home, usage_calls, capsys):
+def test_cli_codex_prints_openai_section(codex_home, usage_calls, capsys):
+    # `cswap list` prints it from ClaudeAccountSwitcher.list_accounts (test_switcher).
     _login(codex_home, "a@example.com", "acct-a")
     with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
          patch("os.geteuid", return_value=1000, create=True), \
          patch("claude_swap.update_check.check_for_update", return_value=None):
-        for argv in (["cswap", "codex", "add"], ["cswap", "codex"], ["cswap", "list"]):
+        for argv in (["cswap", "codex", "add"], ["cswap", "codex"]):
             with patch.object(sys, "argv", argv):
                 cli.main()
     out = _plain(capsys.readouterr().out)
     assert "Added Codex account 1: a@example.com" in out
-    assert out.count("OpenAI accounts:") == 2
-    assert out.count("  1: a@example.com (active)") == 2
+    assert out.count("OpenAI accounts:") == 1
+    assert out.count("  1: a@example.com (active)") == 1
+
+
+def _revoked_until_refreshed(monkeypatch):
+    """fetch_usage 401s on any token but "at-new"; refresh_tokens returns "at-new"."""
+
+    def fetch(access_token, account_id, timeout=10):
+        if access_token != "at-new":
+            raise codex_usage.Unauthorized
+        return [codex_usage.Window("weekly", 7.0, None)]
+
+    monkeypatch.setattr(codex_usage, "fetch_usage", fetch)
+
+
+
+def test_list_refreshes_a_rejected_stored_slot_and_saves_rotated_tokens(codex_home, monkeypatch):
+    _revoked_until_refreshed(monkeypatch)
+    calls = []
+    monkeypatch.setattr(codex_usage, "refresh_tokens",
+                        lambda rt, timeout=10: calls.append(rt) or {"access_token": "at-new", "refresh_token": "r2"})
+    _login(codex_home, "a@example.com", "acct-a", refresh="ra")
+    codex_accounts.add()
+    live_b = _login(codex_home, "b@example.com", "acct-b", refresh="rb")
+    codex_accounts.add()
+
+    lines = [_plain(line) for line in codex_accounts.list_lines()]
+    assert lines[1:3] == ["  1: a@example.com", "     └ weekly:   7%"]
+    assert calls == ["ra"]  # slot 1 only: the live login (2) is never refreshed
+    saved = json.loads(_slot("1").read_text())["tokens"]
+    assert (saved["access_token"], saved["refresh_token"], saved["account_id"]) == ("at-new", "r2", "acct-a")
+    assert (codex_home / "auth.json").read_text() == live_b
+    assert lines[-1] == "     login revoked: `codex login` as b@example.com, then `cswap codex add`"
+
+
+def test_list_says_login_revoked_when_refresh_fails(codex_home, monkeypatch):
+    _revoked_until_refreshed(monkeypatch)
+    monkeypatch.setattr(codex_usage, "refresh_tokens", lambda rt, timeout=10: None)
+    _login(codex_home, "a@example.com", "acct-a")
+    codex_accounts.add()
+    before = _slot("1").read_text()
+    (codex_home / "auth.json").unlink()  # nothing live: slot 1 is stored-only
+
+    lines = [_plain(line) for line in codex_accounts.list_lines()]
+    assert lines[2] == "     login revoked: `codex login` as a@example.com, then `cswap codex add`"
+    assert _slot("1").read_text() == before

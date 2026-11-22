@@ -10,13 +10,21 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Codex's own token refresh (codex-rs login/src/auth/manager.rs).
+REFRESH_URL = "https://auth.openai.com/oauth/token"
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 _logger = logging.getLogger("claude-swap")
+
+
+class Unauthorized(Exception):
+    """The usage endpoint rejected the access token (HTTP 401)."""
 
 
 class Window(NamedTuple):
@@ -33,7 +41,10 @@ def _label(seconds: int) -> str:
 
 
 def fetch_usage(access_token: str, account_id: str | None, timeout: float = 10) -> list[Window]:
-    """Rate-limit windows for a ChatGPT login; [] when unknown. Never raises.
+    """Rate-limit windows for a ChatGPT login; [] when unknown.
+
+    Raises only :class:`Unauthorized`, on a 401: the token is expired or
+    revoked, which a refresh may fix and a retry never will.
 
     The window's length, not its slot, names it: a plan with only a weekly
     limit reports it as ``primary_window`` with ``secondary_window: null``.
@@ -65,6 +76,40 @@ def fetch_usage(access_token: str, account_id: str | None, timeout: float = 10) 
                 reset.isoformat() if reset else None,
             ))
         return windows
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise Unauthorized from None
+        _logger.debug("Codex usage fetch failed: HTTP %s", e.code)
+        return []
     except Exception as e:
         _logger.debug("Codex usage fetch failed: %r", e)
         return []
+
+
+def refresh_tokens(refresh_token: str, timeout: float = 10) -> dict | None:
+    """New ``{id_token, access_token, refresh_token}`` from a refresh token; None on failure.
+
+    The refresh token rotates: the caller must save what this returns, or the
+    login is lost. Never raises.
+    """
+    body = json.dumps({
+        "client_id": CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": "openid profile email",
+    }).encode()
+    req = urllib.request.Request(
+        REFRESH_URL, data=body, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "codex_cli_rs/0.167.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        fresh = {k: data[k] for k in ("id_token", "access_token", "refresh_token") if data.get(k)}
+        return fresh if "access_token" in fresh else None
+    except urllib.error.HTTPError as e:
+        _logger.debug("Codex token refresh failed: HTTP %s", e.code)
+        return None
+    except Exception as e:
+        _logger.debug("Codex token refresh failed: %r", e)
+        return None
