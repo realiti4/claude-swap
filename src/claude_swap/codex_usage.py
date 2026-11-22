@@ -66,7 +66,7 @@ _log = logging.getLogger("claude-swap")
 # Only the newest week of day directories is looked at: a session resumed after
 # longer than that holds figures already past their weekly reset.
 _MAX_DAY_DIRS = 7
-_MAX_FILES = 20
+_MAX_FILES = 200  # runs refused at the usage limit write small logs with no reading; look past a long run of them
 _MAX_READINGS = 3
 _CHUNK = 256 * 1024
 _SCAN_CAP = 4 * 1024 * 1024
