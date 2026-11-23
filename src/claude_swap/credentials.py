@@ -257,8 +257,10 @@ def _credential_object(credentials: str | None) -> dict | None:
 # re-enrolled on every login) or unknown — stays with the target slot: a
 # stale restore of an unlisted shared field merely re-prompts for auth,
 # while carrying a live account-bound field across a switch would present
-# one account's credential under another. keychainOverflow: Claude Code
-# 2.1.331+ pointer to a machine-level Keychain item.
+# one account's credential under another. keychainOverflow (Claude Code
+# 2.1.331+) points at a machine-level Keychain item cswap never swaps, so the
+# live pointer is safe to carry: Claude Code restores account sections only if
+# its hash matches the item's own login or members; others get the shared ones.
 SHARED_CREDENTIAL_KEYS = frozenset({
     "mcpOAuth",
     "mcpOAuthClientConfig",
