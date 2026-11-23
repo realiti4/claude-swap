@@ -3396,6 +3396,92 @@ class TestConsumeFirstStrategy:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
 
+    def test_returns_once_the_active_rolls_over_past_the_account_it_left(
+        self, temp_home
+    ):
+        """The no-return bar must not outlive the reason for leaving.
+
+        consume-first left 1 because 2's weekly window reset sooner. When 2's
+        window rolls over, its reset moves a week out and 1 resets soonest
+        again, while 1 itself is unchanged. Held by the bar, 1's remaining
+        weekly quota expires unused at its reset.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(0, 9, _R_LATER),
+            "2": _usage7(0, 20, _R_SOON),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(h.settings.cooldown_seconds + 60.0)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(0, 9, _R_LATER),       # exactly as it was left
+            "2": _usage7(4, 1, _R_LATEST),      # rolled over, a week out
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_burn_alone_does_not_return_to_the_account_it_left(self, temp_home):
+        """Without a rollover the reset ordering that caused the move stands,
+        so the active burning down is no reason to go back."""
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(0, 9, _R_LATER),
+            "2": _usage7(0, 20, _R_SOON),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(h.settings.cooldown_seconds + 60.0)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(0, 9, _R_LATER),
+            "2": _usage7(60, 70, _R_SOON),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_reset_ordering_releases_only_a_consume_first_departure(self):
+        """A move made for headroom was not about reset ordering, so a
+        sooner reset on the account it left is no evidence that it
+        recovered."""
+        from claude_swap.autoswitch import AutoSwitchEngine, _binding_recovery_ts
+        from claude_swap.settings import AutoSwitchSettings
+
+        class Fake(AutoSwitchEngine):
+            def __init__(self):
+                self._models = ()
+
+        e = Fake()
+        settings = AutoSwitchSettings(strategy="consume-first")
+        now = 1_000_000.0
+        usage = {"1": _usage7(0, 9, _R_LATER), "2": _usage7(4, 1, _R_LATEST)}
+        headroom = {"1": 91.0, "2": 96.0}
+        # Account 1 exactly as it was left: no leg but reset ordering applies.
+        left_recovery = _binding_recovery_ts(usage["1"], (), now)
+
+        def state(trigger: str) -> dict:
+            return {
+                "lastSwitchFrom": 1,
+                "lastSwitchTo": "2",
+                "leftHeadroom": 91.0,
+                "leftRecoveryAt": left_recovery,
+                "leftTrigger": trigger,
+            }
+
+        assert e._left_account_recovered(
+            state("consume-first"), usage, headroom, 96.0, settings, now, "2"
+        ) is True
+        assert e._left_account_recovered(
+            state("proactive"), usage, headroom, 96.0, settings, now, "2"
+        ) is False
+
 
 class TestWeeklyFirstStrategy:
     """`best`'s departure line, landing gates, hysteresis and escapes, with
@@ -4587,6 +4673,12 @@ class TestAllAboveHeadroomDoesNotFlap:
             "2": _usage7(50, 50, self._days_out(h, 10)),   # 50 pts, resets SOONER
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
+        # Account 2's reset moving from 10 to 400 days out below inverts the
+        # reset ordering, which releases a consume-first departure on its own
+        # (`test_returns_once_the_active_rolls_over_past_the_account_it_left`).
+        # Recorded as proactive, the release is left to the dominance leg this
+        # test pins.
+        h.engine._mutate_state(lambda s: s.update(leftTrigger="proactive"))
         h.clock.advance(301.0)
 
         outcomes = []

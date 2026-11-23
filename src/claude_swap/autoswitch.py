@@ -2044,6 +2044,21 @@ class AutoSwitchEngine:
             and h >= min(left_headroom + SPENT_HEADROOM_PCT, 100.0)
         ):
             return True
+        if left_trigger == "consume-first":
+            # consume-first left this account because the active's weekly
+            # window reset sooner. When the active's window rolls over, the
+            # account left behind resets soonest again while nothing about it
+            # changed, and holding the bar until its own reset wastes exactly
+            # the quota consume-first exists to spend. A weekly reset moves
+            # only on a rollover, so burn cannot fake this leg.
+            peer_reset = _seven_day_reset_ts(usage.get(barred), now)
+            active_reset = _seven_day_reset_ts(usage.get(current), now)
+            if (
+                peer_reset is not None
+                and active_reset is not None
+                and peer_reset < active_reset - RECOVERY_HYSTERESIS_S
+            ):
+                return True
         # `None` is the JSON-safe spelling of "unknown or already past", which
         # `_binding_recovery_ts` returns as `inf`: an account nobody can
         # schedule around. Moving off it onto a real reset IS the improvement.
