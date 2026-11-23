@@ -257,13 +257,15 @@ def _credential_object(credentials: str | None) -> dict | None:
 # re-enrolled on every login) or unknown — stays with the target slot: a
 # stale restore of an unlisted shared field merely re-prompts for auth,
 # while carrying a live account-bound field across a switch would present
-# one account's credential under another.
+# one account's credential under another. keychainOverflow: Claude Code
+# 2.1.331+ pointer to a machine-level Keychain item.
 SHARED_CREDENTIAL_KEYS = frozenset({
     "mcpOAuth",
     "mcpOAuthClientConfig",
     "mcpXaaIdp",
     "mcpXaaIdpConfig",
     "pluginSecrets",
+    "keychainOverflow",
 })
 
 # Account-scoped siblings cswap knows about, named so the unrecognized-key

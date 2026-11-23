@@ -9403,6 +9403,30 @@ class TestSharedOAuthCredentialPreservation:
             "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         }
 
+    def test_live_keychain_overflow_pointer_wins_over_stale_target(
+        self, temp_home
+    ):
+        # The pointer opens a machine-level Keychain item cswap never swaps,
+        # so it is machine-shared like mcpOAuth.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "keychainOverflow": {"slot": "a", "key": "stale"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "keychainOverflow": {"slot": "b", "key": "current"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "keychainOverflow": {"slot": "b", "key": "current"},
+        }
+
     def test_account_bound_and_unknown_siblings_stay_target_owned(
         self, temp_home
     ):
