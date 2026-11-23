@@ -9407,15 +9407,25 @@ class TestSharedOAuthCredentialPreservation:
         self, temp_home
     ):
         # The pointer opens a machine-level Keychain item cswap never swaps,
-        # so it is machine-shared like mcpOAuth.
+        # so its slot and key follow the machine. Its login, organizationUuid
+        # and member would let Claude Code restore the live account's
+        # sections into the target's item, so they are dropped.
         switcher = ClaudeAccountSwitcher()
         target = json.dumps({
             "claudeAiOauth": {"accessToken": "target"},
-            "keychainOverflow": {"slot": "a", "key": "stale"},
+            "organizationUuid": "",
+            "keychainOverflow": {
+                "slot": "a", "key": "stale", "login": "target-hash",
+                "organizationUuid": "", "member": "target-member",
+            },
         })
         live = json.dumps({
             "claudeAiOauth": {"accessToken": "live"},
-            "keychainOverflow": {"slot": "b", "key": "current"},
+            "organizationUuid": "",
+            "keychainOverflow": {
+                "slot": "b", "key": "current", "login": "live-hash",
+                "organizationUuid": "", "member": "live-member",
+            },
         })
 
         composed = json.loads(
@@ -9424,8 +9434,25 @@ class TestSharedOAuthCredentialPreservation:
 
         assert composed == {
             "claudeAiOauth": {"accessToken": "target"},
+            "organizationUuid": "",
             "keychainOverflow": {"slot": "b", "key": "current"},
         }
+
+    def test_non_dict_keychain_overflow_pointer_is_carried_as_is(
+        self, temp_home
+    ):
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({"claudeAiOauth": {"accessToken": "target"}})
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "keychainOverflow": "opaque",
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed["keychainOverflow"] == "opaque"
 
     def test_account_bound_and_unknown_siblings_stay_target_owned(
         self, temp_home

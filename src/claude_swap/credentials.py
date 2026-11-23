@@ -258,9 +258,9 @@ def _credential_object(credentials: str | None) -> dict | None:
 # stale restore of an unlisted shared field merely re-prompts for auth,
 # while carrying a live account-bound field across a switch would present
 # one account's credential under another. keychainOverflow (Claude Code
-# 2.1.331+) points at a machine-level Keychain item cswap never swaps, so the
-# live pointer is safe to carry: Claude Code restores account sections only if
-# its hash matches the item's own login or members; others get the shared ones.
+# 2.1.331+) points at a machine-level Keychain item cswap never swaps. Only its
+# slot and key are carried: its login and member hashes would let Claude Code
+# restore one account's sections into another's item.
 SHARED_CREDENTIAL_KEYS = frozenset({
     "mcpOAuth",
     "mcpOAuthClientConfig",
@@ -304,7 +304,13 @@ def shared_credential_fields(credentials: str | None) -> dict | None:
                 "(a newer Claude Code?), treating them as slot-owned: %s",
                 sorted(unrecognized),
             )
-    return {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
+    shared = {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
+    pointer = shared.get("keychainOverflow")
+    if isinstance(pointer, dict):
+        shared["keychainOverflow"] = {
+            k: v for k, v in pointer.items() if k in ("slot", "key")
+        }
+    return shared
 
 
 def merge_shared_credential_fields(
