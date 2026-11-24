@@ -713,3 +713,27 @@ def test_first_capture_into_a_slot_also_files_its_web_login(tmp_path, monkeypatc
     assert sync.capture_checked("1", "org-a", "a@x") == ""
     assert sync.web_stored("1")
 
+
+def test_switch_to_an_account_without_a_web_login_signs_the_web_out(tmp_path, monkeypatch):
+    sync = _sync_env(tmp_path, monkeypatch, live_state=_state(accountUuid="other"),
+                     settled=_session(account_uuid="acc-3"))
+    cs.ChromeVault(tmp_path).put("2", _session(account_uuid="acc-2"))
+    cs.ChromeVault(tmp_path).put("3", _session(account_uuid="acc-3"))
+    monkeypatch.setattr(cs, "capture_web_login_cdp",
+                        lambda *a, **k: ("acc-2", "b@x", [{"name": "sessionKey", "value": "s2"}]))
+    applied = []
+    monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda port, c: applied.append(c))
+    monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: True)
+    assert sync.sync_to_account("3") is True
+    assert applied == [[]]                                   # signed out, not left on 2
+    assert cs.WebVault(tmp_path).get_web("2") is not None    # 2's login was stored first
+
+
+def test_a_web_login_that_could_not_be_stored_is_left_in_place(tmp_path, monkeypatch):
+    sync = _sync_env(tmp_path, monkeypatch, live_state=_state(accountUuid="other"),
+                     settled=_session(account_uuid="acc-3"))
+    cs.ChromeVault(tmp_path).put("3", _session(account_uuid="acc-3"))
+    monkeypatch.setattr(cs, "capture_web_login_cdp", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda *a, **k: pytest.fail("cleared"))
+    monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: True)
+    assert sync.sync_to_account("3") is True

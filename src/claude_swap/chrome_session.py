@@ -678,7 +678,8 @@ WEB_BOUND_COOKIES = frozenset({"__Host-sessionBinding", "__Host-sessionBindingGr
 _WEB_IDENTITY_JS = r"""
 (async () => {
   try {
-    const r = await fetch('https://claude.ai/api/account', {credentials: 'include'});
+    const r = await fetch('https://claude.ai/api/account',
+                          {credentials: 'include', signal: AbortSignal.timeout(4000)});
     if (!r.ok) return JSON.stringify({status: r.status});
     const j = await r.json();
     return JSON.stringify({status: r.status, uuid: j.uuid || '', email: j.email_address || ''});
@@ -694,14 +695,17 @@ def read_web_identity_cdp(port: int) -> dict | None:
     cookies (``<all_urls>`` host permission). None when signed out or
     unreachable.
     """
-    raw = _eval_in_sw(port, _WEB_IDENTITY_JS)
-    try:
-        data = json.loads(raw) if raw else None
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict) or data.get("status") != 200 or not data.get("uuid"):
-        return None
-    return {"uuid": data["uuid"], "email": data.get("email", "")}
+    for _ in range(2):  # one retry when claude.ai does not answer
+        raw = _eval_in_sw(port, _WEB_IDENTITY_JS, timeout=6.0)
+        try:
+            data = json.loads(raw) if raw else None
+        except (TypeError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict) and data.get("status") == 200 and data.get("uuid"):
+            return {"uuid": data["uuid"], "email": data.get("email", "")}
+        if isinstance(data, dict) and data.get("status"):
+            return None  # answered: not signed in
+    return None
 
 
 def _browser_call(port: int, method: str, params: dict | None = None) -> dict:
@@ -1107,6 +1111,7 @@ class ChromeSync:
         self._s = settings
         self._vault = ChromeVault(backup_root)
         self._web = WebVault(backup_root)
+        self._web_clearable = False  # set by _snapshot_web, read by _apply_web
         self._backup_root = Path(backup_root)
         # Background mode (the menu bar): a switch hands the browser sync to a
         # worker thread instead of waiting the seconds an injection takes.
@@ -1211,6 +1216,7 @@ class ChromeSync:
         an account with no stored tokens yet, by its email among ``slots``
         (only when exactly one slot has it). Returns that slot.
         """
+        self._web_clearable = False
         try:
             got = capture_web_login_cdp(self._s.debug_port)
             if not got:
@@ -1224,21 +1230,29 @@ class ChromeSync:
                     num = None  # the slot's tokens belong to another account uuid
             if num:
                 self._web.put_web(num, uuid, email, cookies)
+                self._web_clearable = True
             return num
         except Exception as e:  # noqa: BLE001
             _logger.info("chrome-sync: could not snapshot the claude.ai login: %s", e)
             return None
 
     def _apply_web(self, account_num: str) -> None:
-        """Put ``account_num``'s claude.ai login in the browser, if stored."""
+        """Put ``account_num``'s claude.ai login in the browser.
+
+        With none stored, the web is signed out locally rather than left on
+        another account, which the extension rejects; only when the login
+        being replaced was just stored, so none is lost.
+        """
         entry = self._web.get_web(account_num)
+        clearable, self._web_clearable = self._web_clearable, False
         if entry is None:
             _logger.info("chrome-sync: no claude.ai login stored for account %s; sign in to "
                          "claude.ai as it in the Claude Browser, then `cswap chrome capture`",
                          account_num)
-            return
+            if not clearable:
+                return
         try:
-            apply_web_cookies_cdp(self._s.debug_port, entry["cookies"])
+            apply_web_cookies_cdp(self._s.debug_port, entry["cookies"] if entry else [])
         except Exception as e:  # noqa: BLE001
             _logger.warning("chrome-sync: could not switch the claude.ai login: %s", e)
 
