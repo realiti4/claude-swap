@@ -1229,6 +1229,9 @@ class ChromeSync:
             return "Chrome sync is disabled"
         if not automation_chrome_running(self._s.debug_port):
             return "the Claude Browser is not running (open it with `cswap chrome open`)"
+        # The web login is filed by its own account uuid, so it is stored
+        # whichever account the extension is on.
+        self._snapshot_web()
         try:
             session = capture_tokens_cdp(self._s.debug_port)
         except Exception as e:  # noqa: BLE001
@@ -1245,14 +1248,18 @@ class ChromeSync:
         self._vault.put(account_num, session)
         _logger.info("chrome-sync: captured extension tokens for account %s (%s)",
                      account_num, session.email or session.account_uuid)
-        web_slot = self._snapshot_web()
-        if web_slot != account_num:
-            _logger.info("chrome-sync: claude.ai is not signed in as account %s; its web login "
-                         "was not stored", account_num)
         return ""
 
     def web_stored(self, account_num: str) -> bool:
         return self._web.get_web(account_num) is not None
+
+    def web_stored_at(self, account_num: str) -> int:
+        """When ``account_num``'s web login was last stored (ms), 0 if never."""
+        entry = self._web.get_web(account_num)
+        return int(entry.get("capturedAt", 0)) if entry else 0
+
+    def has_session(self, account_num: str) -> bool:
+        return self._vault.get(account_num) is not None
 
     def capture_for_account(
         self, account_num: str, expected_org_uuid: str = "", expected_email: str = ""
@@ -1271,6 +1278,22 @@ class ChromeSync:
     # Unguarded capture, for `cswap chrome capture N --force` only.
     def capture_from_browser(self, account_num: str) -> bool:
         return not self.capture_checked(account_num)
+
+    def detach_web(self) -> bool:
+        """Sign the claude.ai web login out locally, after storing it.
+
+        For signing in to claude.ai as another account: its own sign-out
+        would end the stored login server-side.
+        """
+        if not self.active or not automation_chrome_running(self._s.debug_port):
+            return False
+        try:
+            self._snapshot_web()
+            apply_web_cookies_cdp(self._s.debug_port, [])
+            return read_web_identity_cdp(self._s.debug_port) is None
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("chrome-sync: web detach failed: %s", e)
+            return False
 
     def detach(self) -> bool:
         """Sign the extension out locally (no revoke), after storing its account.

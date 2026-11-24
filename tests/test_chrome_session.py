@@ -634,3 +634,17 @@ def test_sync_leaves_the_web_alone_when_it_is_already_on_the_target(tmp_path, mo
     monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda *a, **k: pytest.fail("web replaced"))
     monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: True)
     assert sync.sync_to_account("2") is True
+
+
+def test_capture_stores_the_web_login_even_when_the_extension_is_elsewhere(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    monkeypatch.setattr(cs, "automation_chrome_running", lambda *a, **k: True)
+    cs.ChromeVault(tmp_path).put("1", _session(account_uuid="acc-1", email="a@x"))
+    monkeypatch.setattr(cs, "capture_tokens_cdp",
+                        lambda *a, **k: _session(account_uuid="acc-2", email="b@x", org_uuid="o"))
+    monkeypatch.setattr(cs, "capture_web_cookies_cdp",
+                        lambda *a, **k: ("acc-1", [{"name": "sessionKey", "value": "s1"}]))
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    assert "b@x" in sync.capture_checked("1", "o", "a@x")       # extension: wrong account
+    assert sync.web_stored("1")                                  # web login: stored anyway
+    assert cs.ChromeVault(tmp_path).get("1").account_uuid == "acc-1"  # tokens untouched

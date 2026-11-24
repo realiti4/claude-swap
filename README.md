@@ -342,7 +342,7 @@ Once set up, `cswap switch <n>` (CLI or menu bar) flips the dedicated browser to
 
 Never use the extension's own sign-out to move between accounts: it revokes the refresh token server-side, which kills that account's stored session (`cswap chrome doctor` then marks it revoked). Run `cswap chrome detach` before connecting the next account instead. `cswap chrome capture <n>` only stores the extension's account under slot `<n>` when its email and org match that slot (`--force` overrides).
 
-The dedicated browser's claude.ai web login follows the switch too: the extension re-authorizes through it and stops on a login to another account. `cswap chrome capture <n>` stores it when claude.ai is signed in as account `<n>`.
+The dedicated browser's claude.ai web login follows the switch too: the extension re-authorizes through it and stops on a login to another account. `cswap chrome capture <n>` stores it when claude.ai is signed in as account `<n>`; to sign in there as another account, run `cswap chrome detach --web-only` first rather than claude.ai's own log-out, which ends the stored login.
 
 #### Making a *running* session follow a switch (bridge relay)
 

@@ -1493,9 +1493,13 @@ Examples:
         "--force", action="store_true",
         help="Store even if the extension is on a different account than slot N",
     )
-    sub.add_parser(
+    p_det = sub.add_parser(
         "detach",
         help="Sign the extension out without revoking its tokens (to connect another account)",
+    )
+    p_det.add_argument(
+        "--web-only", action="store_true",
+        help="Only sign the claude.ai web login out (to sign in there as another account)",
     )
     p_ref = sub.add_parser("refresh", help="Offline-refresh a stored account's tokens (keep-alive)")
     p_ref.add_argument("account", metavar="N", help="Account number to refresh")
@@ -1604,17 +1608,32 @@ Examples:
             error(f"No managed account {args.account} (see `cswap list`)")
             sys.exit(1)
         email, org = ("", "") if args.force else slots[args.account]
+        web_before = sync.web_stored_at(args.account)
         reason = sync.capture_checked(args.account, org, email)
+        web_now = sync.web_stored_at(args.account) != web_before
+        if web_now:
+            print(f"{accent('Stored')} the claude.ai web login for account {args.account}")
         if not reason:
             print(f"{accent('Captured')} account {args.account} from the extension's current pairing")
             if not sync.web_stored(args.account):
                 print(dimmed(f"claude.ai web login not stored: sign in to claude.ai as account "
                              f"{args.account} in the Claude Browser, then run this again."))
             return
+        if web_now and sync.has_session(args.account):
+            # Only the web login was missing; the extension's tokens are stored.
+            print(dimmed(f"Extension not captured ({reason}); its stored tokens are kept."))
+            return
         error(f"Capture failed: {reason}")
         if not args.force:
             print(dimmed(f"Connect account {args.account} in the Claude Browser first "
                          f"(`cswap chrome detach` signs the current one out without revoking it)."))
+        sys.exit(1)
+    if action == "detach" and args.web_only:
+        if sync.detach_web():
+            print(f"{accent('Signed out')} claude.ai in the Claude Browser (its login is stored, "
+                  "not ended). Sign in there as the next account, then `cswap chrome capture N`.")
+            return
+        error("Web detach failed — is the Claude Browser running?")
         sys.exit(1)
     if action == "detach":
         if sync.detach():
