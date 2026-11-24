@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import balance, oauth, poll_policy
+from claude_swap import balance, oauth, poll_policy, tokens
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
@@ -1422,6 +1422,11 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
+        # A balance move costs the prompt cache, so widen the margin while a
+        # large conversation is open (balance.margin_factor).
+        self._margin_factor = 1.0
+        if trigger == "balance":
+            self._update_balance_margin_factor(settings)
         decided_now = self.clock()
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
@@ -1585,6 +1590,26 @@ class AutoSwitchEngine:
             )
             return TickOutcome.BLOCKED
 
+        # A balance move is optional, so do not make it while Claude Code is
+        # in the middle of a reply. Switching then would send the rest of
+        # that turn's requests from an account with a cold prompt cache. The
+        # transcripts' last write time shows whether a reply is streaming.
+        # Escapes and forced moves never wait.
+        if trigger == "balance" and ordered and settings.balance_idle_seconds > 0:
+            ledger = self._token_ledger()
+            ledger.refresh()
+            quiet = ledger.seconds_since_write()
+            if quiet is not None and quiet < settings.balance_idle_seconds:
+                self._emit(NoSwitchEvent(
+                    reason="busy",
+                    detail=(
+                        f"a reply is being written ({quiet:.0f}s since last log "
+                        f"write); balance move to #{ordered[0]} waits for "
+                        f"{settings.balance_idle_seconds:.0f}s quiet"
+                    ),
+                ))
+                return TickOutcome.NO_ACTION
+
         # -- freshen + switch ----------------------------------------------
         # The departure snapshot of the account we are leaving, taken from the
         # SAME `usage`/`headroom` the ranking just decided on — for
@@ -1679,7 +1704,16 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    # -- Claude Code session logs (tokens.py) -------------------------------
+
+    def _token_ledger(self) -> tokens.Ledger:
+        """The shared transcript reader for this cswap data directory."""
+        return tokens.ledger_for(self.switcher.backup_dir)
+
     # -- balance strategy (balance.py) ---------------------------------------
+
+    # Multiplier on `balance_margin` for this tick; see balance.margin_factor.
+    _margin_factor: float = 1.0
 
     def _balance_scores(
         self, nums, usage, settings: AutoSwitchSettings, now: float
@@ -1694,6 +1728,21 @@ class AutoSwitchEngine:
             if rate is not None:
                 scores[num] = rate.score
         return scores
+
+    def _update_balance_margin_factor(self, settings: AutoSwitchSettings) -> None:
+        """Set ``self._margin_factor`` for this tick from how big the open conversations are.
+
+        A move empties the prompt cache, so while a large conversation is
+        open, a candidate must beat the active account by a wider margin to
+        be worth that cost (balance.margin_factor).
+        """
+        self._margin_factor = 1.0
+        if settings.balance_big_context <= 0:
+            return
+        ledger = self._token_ledger()
+        ledger.refresh()
+        peak = ledger.recent_peak_context(balance.BIG_CONTEXT_LOOKBACK_S)
+        self._margin_factor = balance.margin_factor(peak, settings.balance_big_context)
 
     def _balance_detail(
         self, current, candidates, usage, settings, now, thresholds
@@ -1710,8 +1759,13 @@ class AutoSwitchEngine:
             over_note = f" (over {binding.label} line)" if binding is not None and binding.over else ""
             parts.append(f"#{num} {balance.fmt(scores.get(num))}{over_note}")
 
-        margin = pct_label(settings.balance_margin)
-        return "scores " + ", ".join(parts) + f"; need +{margin}% to move"
+        margin = settings.balance_margin * self._margin_factor
+        widened = (
+            f" (x{self._margin_factor:g}: large context in use)"
+            if self._margin_factor > 1
+            else ""
+        )
+        return "scores " + ", ".join(parts) + f"; need +{pct_label(margin)}% to move{widened}"
 
     def _no_return_account(
         self,
@@ -2286,8 +2340,8 @@ class AutoSwitchEngine:
         # (balance.py) instead of headroom. It applies to two triggers:
         #   * "balance": the active account is below its lines and the engine
         #     is only looking for a better-paced account. A candidate must
-        #     beat the active account's score by balance_margin percent,
-        #     otherwise staying put is cheaper.
+        #     beat the active account's score by balance_margin percent (times
+        #     the large-context factor), otherwise staying put is cheaper.
         #   * "proactive": the active account crossed a line and must be left.
         #     The highest-scoring healthy account wins, with no margin.
         # The escapes (at-limit, failover) and the case where every account
@@ -2306,7 +2360,9 @@ class AutoSwitchEngine:
             # The score a candidate must reach on a "balance" nudge. None when
             # the active account has no score, and then no nudge is made.
             need = (
-                balance.required_score(active_score, settings.balance_margin)
+                balance.required_score(
+                    active_score, settings.balance_margin, self._margin_factor
+                )
                 if active_score is not None
                 else None
             )

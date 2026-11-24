@@ -25,7 +25,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
-from claude_swap import balance, oauth
+from claude_swap import balance, oauth, tokens
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
@@ -334,7 +334,7 @@ class AutoScreen(Screen):
         if settings is not None and settings.strategy == "balance":
             return self._balance_text(
                 snap, active_number, settings, models, palette
-            )
+            ) + self._tokens_text(snap, active_number, settings, palette)
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
         candidates = [
@@ -401,7 +401,9 @@ class AutoScreen(Screen):
     #
     # With strategy "balance", the candidate list above is replaced by a
     # panel that shows every account's balance score: the same numbers the
-    # engine ranks on, computed by the same functions (balance.py).
+    # engine ranks on, computed by the same functions (balance.py). Under it
+    # are token counts from this computer's Claude
+    # Code logs (tokens.py).
 
     def _balance_text(self, snap, active_number, settings, models, palette) -> Text:
         """Every account with its balance score, highest first.
@@ -472,8 +474,72 @@ class AutoScreen(Screen):
             style=palette.muted,
         )
         if active_score is not None:
-            need = balance.required_score(active_score, settings.balance_margin)
+            ledger = tokens.ledger_for(self.app.switcher.backup_dir)
+            factor = balance.margin_factor(
+                ledger.recent_peak_context(balance.BIG_CONTEXT_LOOKBACK_S),
+                settings.balance_big_context,
+            )
+            need = balance.required_score(active_score, settings.balance_margin, factor)
             text.append(f"  moves at >= {balance.fmt(need)}", style=palette.muted)
+            if factor > 1:
+                text.append(f" (x{factor:g} margin: large context)", style=palette.muted)
         for _sort_key, _slot, row in sorted(rows):
             text.append(row)
+        return text
+
+    def _tokens_text(self, snap, active_number, settings, palette) -> Text:
+        """Token counts from this computer's Claude Code logs, under the balance panel.
+
+        Three parts:
+
+        * totals per account for the last hour and since local midnight;
+        * the last three prompts in the past three hours (time, account,
+          model, API calls, tokens sent and received, peak context);
+        * a note when a reply is being written right now, since balance
+          moves wait for it (``autoswitch.balanceIdleSeconds``).
+        """
+        ledger = tokens.ledger_for(self.app.switcher.backup_dir)
+        ledger.refresh_async()
+        now = time.time()
+        text = Text()
+
+        text.append("\n\nTokens (this computer)  sent    recv  prompts", style=palette.muted)
+        # Local midnight today: struct_time's date fields, with the time set
+        # to 00:00:00 and DST left for mktime to work out (-1).
+        midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+        for label, since in (("last hour", now - 3600), ("today", midnight)):
+            totals = ledger.totals(since, active_number)
+            if not totals:
+                text.append(f"\n {label:<10} none", style=palette.muted)
+                continue
+            for i, (slot, row) in enumerate(sorted(totals.items())):
+                period = label if i == 0 else ""  # label only the first row
+                text.append(
+                    f"\n {period:<10} #{slot:<3} {tokens.human(row['sent']):>8} "
+                    f"{tokens.human(row['received']):>7} {row['prompts']:>6}",
+                    style=palette.foreground,
+                )
+
+        last_prompts = ledger.prompts(now - 3 * 3600, active_number)[-3:]
+        if last_prompts:
+            text.append("\nLast prompts", style=palette.muted)
+            for p in reversed(last_prompts):  # newest first
+                when = time.strftime("%H:%M", time.localtime(p.ts))
+                models = ",".join(tokens.short_model(m) for m in p.models)
+                text.append(
+                    f"\n {when} #{p.account or '?'} {models:<9} "
+                    f"{p.calls:>3} calls  sent {tokens.human(p.sent):>7}  "
+                    f"recv {tokens.human(p.received):>6}  "
+                    f"ctx {tokens.human(p.peak_context)}",
+                    style=palette.foreground,
+                )
+
+        quiet_for = ledger.seconds_since_write(now)
+        reply_in_progress = (
+            quiet_for is not None
+            and settings.balance_idle_seconds > 0
+            and quiet_for < settings.balance_idle_seconds
+        )
+        if reply_in_progress:
+            text.append("\n reply in progress: balance moves wait", style=palette.muted)
         return text

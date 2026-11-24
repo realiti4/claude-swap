@@ -1489,7 +1489,7 @@ class TestAutoScreen:
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
-    async def test_balance_strategy_shows_scores(self, tmp_path, fake_engine):
+    async def test_balance_strategy_shows_scores_and_tokens(self, tmp_path, fake_engine):
         from dataclasses import replace as dc_replace
 
         fake = FakeSwitcher(
@@ -1504,6 +1504,7 @@ class TestAutoScreen:
             text = screen._candidates_text(snap, active_number=snap.active_number).plain
             assert "Balance (score" in text
             assert "score" in text and "w1" in text
+            assert "Tokens (this computer)" in text
 
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

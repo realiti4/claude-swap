@@ -20,6 +20,8 @@ Which way the two settings push: a higher weight makes an account score higher, 
 
 Below the lines, auto-switch moves only when another account's score beats the active one's by `autoswitch.balanceMargin` percent (default 25). Otherwise it reports `balanced` with every score. When the active account crosses a line, it moves to the highest-scoring account under its lines, with no margin. The at-limit and failover escapes, and the case where every account is over its lines, rank exactly as `best` does. The cooldown is the minimum time spent on an account between balance moves.
 
+A move starts the new account on a cold prompt cache, so two gates read Claude Code's local session logs (counts only, never text). A balance move waits until no transcript has been written for `autoswitch.balanceIdleSeconds` (default 90; 0 turns it off), so a reply in progress is not split. While an open conversation is at least `autoswitch.balanceBigContext` tokens (default 400000; 0 turns it off), the margin is doubled. `cswap tokens` shows the same counts per account and per prompt.
+
 ## A separate line for the weekly windows
 
 Set with `--weekly-threshold 97`, or `cswap config set autoswitch.weeklyThreshold 97`.

@@ -169,11 +169,19 @@ def test_requests_are_credited_to_the_account_active_at_the_time(env):
     assert set(ledger.totals(0)) == {"1", "2"}
 
 
+def test_peak_context(env):
+    backup, config, project = env
+    now = time.time()
+    _write(project / "a.jsonl", [_user(now - 30), _reply(now - 29, "m1", inp=500, model="claude-fable-5-2")])
+    _write(project / "b.jsonl", [_user(now - 20), _reply(now - 19, "m2", inp=100)])
+    ledger = _ledger(backup, config)
+    assert ledger.recent_peak_context(600) == 500
+
 
 def test_missing_projects_dir_is_harmless(tmp_path):
     ledger = tokens.Ledger(tmp_path, config_dir=tmp_path / "nothing")
     ledger.refresh(force=True)
-    assert ledger.prompts() == []
+    assert ledger.prompts() == [] and ledger.seconds_since_write() is None
 
 
 @pytest.mark.parametrize("n, text", [(812, "812"), (45_200, "45.2k"), (1_234_567, "1.2M")])

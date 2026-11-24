@@ -110,9 +110,15 @@ class TestSpareRate:
         assert balance.spare_rate(usage, (), 1.0, self.NOW) is None
 
 
-class TestMarginAndDisplay:
+class TestMargin:
+    def test_factor(self):
+        assert balance.margin_factor(500_000, 400_000) == balance.BIG_CONTEXT_MARGIN_FACTOR
+        assert balance.margin_factor(100_000, 400_000) == 1.0
+        assert balance.margin_factor(10**9, 0) == 1.0  # 0 turns it off
+
     def test_required_score(self):
-        assert balance.required_score(40.0, 25.0) == pytest.approx(50.0)
+        assert balance.required_score(40.0, 25.0, 1.0) == pytest.approx(50.0)
+        assert balance.required_score(40.0, 25.0, 2.0) == pytest.approx(60.0)
 
     def test_fmt(self):
         assert balance.fmt(None) == "-"
@@ -124,6 +130,10 @@ class TestMarginAndDisplay:
 
 def _harness(temp_home, **settings):
     settings.setdefault("strategy", "balance")
+    # No transcripts exist in temp_home; keep the token-based gates out of
+    # the way so these tests are only about ranking.
+    settings.setdefault("balance_idle_seconds", 0)
+    settings.setdefault("balance_big_context", 0)
     h = EngineHarness(temp_home, **settings)
     for number in (1, 2, 3):
         h.seed(number, f"account{number}@example.com")
@@ -191,3 +201,72 @@ def test_plan_weight_override_changes_the_pick(temp_home):
     })
     assert outcome is TickOutcome.SWITCHED
     assert _targets(h) == [3]
+
+
+# -- cache-aware gates (balanceIdleSeconds, balanceBigContext) ----------------
+
+
+def _transcript(now, context_tokens):
+    """Write one Claude Code transcript with a single request of this size."""
+    import json
+    from datetime import datetime, timezone
+
+    from claude_swap.paths import get_claude_config_home
+
+    def iso(ts):
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    project = get_claude_config_home() / "projects" / "p"
+    project.mkdir(parents=True, exist_ok=True)
+    records = [
+        {"type": "user", "timestamp": iso(now - 5), "cwd": "/x/p",
+         "message": {"content": "hi"}},
+        {"type": "assistant", "timestamp": iso(now - 4), "message": {
+            "id": "m1", "model": "claude-opus-5-5",
+            "usage": {"input_tokens": context_tokens, "output_tokens": 1}}},
+    ]
+    (project / "s.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+    )
+
+
+def test_balance_move_waits_while_a_reply_is_being_written(temp_home):
+    import time
+
+    h = _harness(temp_home, balance_idle_seconds=90)
+    _transcript(time.time(), 1000)  # written just now
+    outcome = h.tick_with_usage({
+        "1": _weekly(h, 60, 100),
+        "2": _weekly(h, 10, 100),
+        "3": _weekly(h, 50, 100),
+    })
+    assert outcome is TickOutcome.NO_ACTION
+    assert not _targets(h)
+    assert h.events[-1].reason == "busy"
+
+
+def _margin_usage(h):
+    # 2 beats 1 by 30%: enough for a 25% margin, not for a doubled 50%.
+    return {
+        "1": _weekly(h, 50, 100),   # 0.0050
+        "2": _weekly(h, 35, 100),   # 0.0065
+        "3": _weekly(h, 60, 100),
+    }
+
+
+def test_old_large_context_keeps_the_normal_margin(temp_home):
+    import time
+
+    h = _harness(temp_home, balance_margin=25, balance_big_context=400_000)
+    _transcript(time.time() - 3600, 500_000)  # an hour old: outside the look-back
+    assert h.tick_with_usage(_margin_usage(h)) is TickOutcome.SWITCHED
+
+
+def test_recent_large_context_doubles_the_margin(temp_home):
+    import time
+
+    h = _harness(temp_home, balance_margin=25, balance_big_context=400_000)
+    _transcript(time.time() - 120, 500_000)  # large, two minutes ago
+    outcome = h.tick_with_usage(_margin_usage(h))
+    assert outcome is TickOutcome.NO_ACTION
+    assert "need +50% to move (x2: large context in use)" in h.events[-1].detail

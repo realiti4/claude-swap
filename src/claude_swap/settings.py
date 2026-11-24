@@ -87,6 +87,14 @@ class AutoSwitchSettings:
     # Per-slot plan weight overrides, "slot=weight,..." (e.g. "1=5,2=1").
     # None means use the weight of each account's plan.
     balance_weights: str | None = None
+    # Hold a balance move until Claude Code's transcripts have been quiet this
+    # many seconds, so a reply is not split across two accounts' prompt
+    # caches. 0 turns the wait off.
+    balance_idle_seconds: float = 90.0
+    # While an open conversation is at least this many tokens, multiply the
+    # margin by balance.BIG_CONTEXT_MARGIN_FACTOR. A move re-sends the whole
+    # context uncached, so a big context makes moving costlier. 0 turns it off.
+    balance_big_context: float = 400000.0
 
 
 @dataclass(frozen=True)
@@ -227,6 +235,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "balanceWeights", "balance_weights", "string",
             help="balance strategy: plan weight overrides by slot, e.g. 1=5,2=1",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceIdleSeconds", "balance_idle_seconds", "float", 0.0, 3600.0,
+            help="balance: hold a move until Claude Code logs are quiet this long (0=off)",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceBigContext", "balance_big_context", "float", 0.0, 10000000.0,
+            help="balance: double the margin while a session context is this many tokens (0=off)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
