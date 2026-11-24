@@ -9403,56 +9403,52 @@ class TestSharedOAuthCredentialPreservation:
             "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         }
 
-    def test_live_keychain_overflow_pointer_wins_over_stale_target(
-        self, temp_home
-    ):
-        # The pointer opens a machine-level Keychain item cswap never swaps,
-        # so its slot and key follow the machine. Its login, organizationUuid
-        # and member would let Claude Code restore the live account's
-        # sections into the target's item, so they are dropped.
-        switcher = ClaudeAccountSwitcher()
-        target = json.dumps({
-            "claudeAiOauth": {"accessToken": "target"},
-            "organizationUuid": "",
-            "keychainOverflow": {
-                "slot": "a", "key": "stale", "login": "target-hash",
-                "organizationUuid": "", "member": "target-member",
-            },
-        })
-        live = json.dumps({
-            "claudeAiOauth": {"accessToken": "live"},
-            "organizationUuid": "",
-            "keychainOverflow": {
-                "slot": "b", "key": "current", "login": "live-hash",
-                "organizationUuid": "", "member": "live-member",
-            },
-        })
+    @staticmethod
+    def _cred(token, pointer=None):
+        data = {"claudeAiOauth": {"accessToken": token}}
+        if pointer is not None:
+            data["keychainOverflow"] = pointer
+        return json.dumps(data)
 
-        composed = json.loads(
-            switcher._prepare_credentials_for_activation(target, live)
-        )
-
-        assert composed == {
-            "claudeAiOauth": {"accessToken": "target"},
-            "organizationUuid": "",
-            "keychainOverflow": {"slot": "b", "key": "current"},
-        }
-
-    def test_non_dict_keychain_overflow_pointer_is_carried_as_is(
-        self, temp_home
+    @pytest.mark.parametrize("target_pointer", [{"slot": "a", "key": "stale"}, None])
+    def test_shared_only_keychain_overflow_pointer_follows_the_switch(
+        self, temp_home, target_pointer
     ):
         switcher = ClaudeAccountSwitcher()
-        target = json.dumps({"claudeAiOauth": {"accessToken": "target"}})
-        live = json.dumps({
-            "claudeAiOauth": {"accessToken": "live"},
-            "keychainOverflow": "opaque",
-        })
+        live_pointer = {"slot": "b", "key": "current"}
 
-        composed = json.loads(
-            switcher._prepare_credentials_for_activation(target, live)
+        composed = json.loads(switcher._prepare_credentials_for_activation(
+            self._cred("target", target_pointer), self._cred("live", live_pointer)
+        ))
+
+        assert composed["keychainOverflow"] == live_pointer
+
+    @pytest.mark.parametrize(
+        "a_pointer, b_pointer",
+        [
+            pytest.param({"slot": "a", "key": "k", "login": "h"}, None, id="b-has-none"),
+            pytest.param(
+                {"slot": "a", "key": "k", "login": "h"},
+                {"slot": "b", "key": "k", "member": "m"},
+                id="b-mixed",
+            ),
+            pytest.param(None, {"slot": "b", "key": "k", "member": "m"}, id="a-has-none"),
+            pytest.param("opaque", None, id="a-non-dict"),
+        ],
+    )
+    def test_mixed_keychain_overflow_pointer_returns_as_stored_after_a_b_a(
+        self, temp_home, a_pointer, b_pointer
+    ):
+        switcher = ClaudeAccountSwitcher()
+        a_saved = self._cred("a", a_pointer)
+
+        on_b = switcher._prepare_credentials_for_activation(
+            self._cred("b", b_pointer), a_saved
         )
+        back_on_a = switcher._prepare_credentials_for_activation(a_saved, on_b)
 
-        assert composed["keychainOverflow"] == "opaque"
+        assert json.loads(back_on_a) == json.loads(a_saved)
+        assert json.loads(on_b).get("keychainOverflow") == b_pointer
 
     def test_account_bound_and_unknown_siblings_stay_target_owned(
         self, temp_home

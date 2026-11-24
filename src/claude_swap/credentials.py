@@ -258,9 +258,9 @@ def _credential_object(credentials: str | None) -> dict | None:
 # stale restore of an unlisted shared field merely re-prompts for auth,
 # while carrying a live account-bound field across a switch would present
 # one account's credential under another. keychainOverflow (Claude Code
-# 2.1.331+) points at a machine-level Keychain item cswap never swaps. Only its
-# slot and key are carried: its login and member hashes would let Claude Code
-# restore one account's sections into another's item.
+# 2.1.331+) points at a machine-level Keychain item cswap never swaps. It
+# follows the machine only while it holds nothing but slot and key; otherwise
+# the target slot's own pointer is kept as stored.
 SHARED_CREDENTIAL_KEYS = frozenset({
     "mcpOAuth",
     "mcpOAuthClientConfig",
@@ -304,13 +304,7 @@ def shared_credential_fields(credentials: str | None) -> dict | None:
                 "(a newer Claude Code?), treating them as slot-owned: %s",
                 sorted(unrecognized),
             )
-    shared = {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
-    pointer = shared.get("keychainOverflow")
-    if isinstance(pointer, dict):
-        shared["keychainOverflow"] = {
-            k: v for k, v in pointer.items() if k in ("slot", "key")
-        }
-    return shared
+    return {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
 
 
 def merge_shared_credential_fields(
@@ -321,7 +315,10 @@ def merge_shared_credential_fields(
     The allowlisted keys are wholly live-owned, presence and absence alike:
     the target's copies are discarded and ``shared_fields`` supplies the
     current generation, so a shared key the machine no longer holds is not
-    resurrected from the slot's snapshot. All other target fields pass
+    resurrected from the slot's snapshot. The exception is a
+    ``keychainOverflow`` pointer on either side that carries more than
+    ``slot`` and ``key`` (or is not a dict): the target's own pointer, or
+    none, is kept as stored. All other target fields pass
     through untouched. Returns ``target_credentials`` unchanged when it is
     not a JSON credential object carrying a Claude login (managed API keys
     and opaque legacy shapes stay activatable verbatim).
@@ -336,6 +333,17 @@ def merge_shared_credential_fields(
         if key not in SHARED_CREDENTIAL_KEYS
     }
     composed.update(shared_fields)
+    pointers = (
+        shared_fields.get("keychainOverflow", {}),
+        target.get("keychainOverflow", {}),
+    )
+    if any(
+        not isinstance(p, dict) or not p.keys() <= {"slot", "key"}
+        for p in pointers
+    ):
+        composed.pop("keychainOverflow", None)
+        if "keychainOverflow" in target:
+            composed["keychainOverflow"] = target["keychainOverflow"]
     return json.dumps(composed)
 
 
