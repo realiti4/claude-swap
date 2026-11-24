@@ -32,6 +32,7 @@ SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
 AUTOSWITCH_STRATEGIES = (
     "best", "weekly-first", "consume-first", "priority-consume-first",
+    "balance",  # plan-weighted load balancing; see balance.py
 )
 
 _logger = logging.getLogger("claude-swap")
@@ -77,6 +78,15 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+
+    # -- balance strategy (balance.py); only read when strategy == "balance" --
+    # How much better, in percent, another account's score must be before a
+    # below-line move is made. Keeps two nearly equal accounts from swapping
+    # back and forth.
+    balance_margin: float = 25.0
+    # Per-slot plan weight overrides, "slot=weight,..." (e.g. "1=5,2=1").
+    # None means use the weight of each account's plan.
+    balance_weights: str | None = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +219,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceMargin", "balance_margin", "float", 0.0, 500.0,
+            help="balance strategy: pct a target's score must beat the active's by",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceWeights", "balance_weights", "string",
+            help="balance strategy: plan weight overrides by slot, e.g. 1=5,2=1",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
