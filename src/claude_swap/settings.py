@@ -174,7 +174,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.dotted: spec
     for spec in (
         SettingSpec(
-            "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
+            "autoswitch", "threshold", "threshold", "float", 40.0, 99.9,
             help="Switch when the 5h window (or any window, if no weekly line) reaches this pct",
         ),
         SettingSpec(

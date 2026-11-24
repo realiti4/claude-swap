@@ -355,9 +355,15 @@ class TestSetUnsetSetting:
             set_setting(tmp_path, "autoswitch.unhealthyTicks", "3.5")
 
     def test_set_rejects_out_of_range_without_writing(self, tmp_path: Path):
-        with pytest.raises(ConfigError, match="between 50 and 99.9"):
+        with pytest.raises(ConfigError, match="between 40 and 99.9"):
             set_setting(tmp_path, "autoswitch.threshold", "200")
+        with pytest.raises(ConfigError, match="between 40 and 99.9"):
+            set_setting(tmp_path, "autoswitch.threshold", "39.9")
         assert not settings_path(tmp_path).exists()
+
+    def test_set_accepts_the_lower_bound(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.threshold", "40") == 40.0
+        assert load_settings(tmp_path).threshold == 40.0
 
     def test_set_rejects_unknown_key(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="unknown setting"):
