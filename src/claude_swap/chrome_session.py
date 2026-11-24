@@ -373,12 +373,32 @@ def _close_target(port: int, target_id: str) -> None:
         cdp.close()
 
 
+# Poll step for the waits around an SW restart. A CDP target listing is a
+# local HTTP call of a few milliseconds, so polling this often costs nothing.
+_POLL_S = 0.1
+
+
 def _wait_for_sw(port: int, timeout: float = 12.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _sw_target(port):
             return True
-        time.sleep(0.4)
+        time.sleep(_POLL_S)
+    return False
+
+
+def _wait_for_sw_gone(port: int, sw_id: str | None, timeout: float = 2.0) -> bool:
+    """Wait until the SW target ``sw_id`` has left the target list.
+
+    The wake tab must only be opened once the old SW is gone: a still-running
+    SW would serve it from memory instead of re-reading the injected storage.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        t = _sw_target(port)
+        if t is None or t.get("id") != sw_id:
+            return True
+        time.sleep(_POLL_S)
     return False
 
 
@@ -533,7 +553,7 @@ def _restart_sw(port: int, sw_id: str | None) -> str | None:
     """Terminate the SW (keeps storage.session) and wake it with a background
     claude.ai tab. Returns the wake tab's id (caller closes it)."""
     _close_target(port, sw_id)
-    time.sleep(2)
+    _wait_for_sw_gone(port, sw_id)  # on timeout, wake anyway; adoption is checked after
     wake_id = _create_target(port, CLAUDE_URL, background=True)
     _wait_for_sw(port)
     return wake_id
@@ -598,7 +618,7 @@ def inject_tokens_cdp(port: int, session: ChromeSession, *, settle: float = 10.0
             break
         if time.monotonic() >= deadline:
             break
-        time.sleep(1)
+        time.sleep(0.25)
     if wake_id:
         _close_target(port, wake_id)
     ok = _adopted(data, session)

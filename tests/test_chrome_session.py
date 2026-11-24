@@ -534,3 +534,16 @@ def test_follow_switch_is_a_no_op_when_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(sync, "sync_to_account", lambda n: pytest.fail("synced"))
     sync.follow_switch("2")
     assert sync.wait_idle(1)
+
+
+def test_wait_for_sw_gone_waits_for_the_old_worker_only(monkeypatch):
+    monkeypatch.setattr(cs.time, "sleep", lambda *_: None)
+    listings = iter([{"id": "old"}, {"id": "old"}, None])
+    monkeypatch.setattr(cs, "_sw_target", lambda *a, **k: next(listings))
+    assert cs._wait_for_sw_gone(1, "old") is True
+    # A new worker already up under another id also means the old one is gone.
+    monkeypatch.setattr(cs, "_sw_target", lambda *a, **k: {"id": "new"})
+    assert cs._wait_for_sw_gone(1, "old") is True
+    # Still the old one at the deadline.
+    monkeypatch.setattr(cs, "_sw_target", lambda *a, **k: {"id": "old"})
+    assert cs._wait_for_sw_gone(1, "old", timeout=0) is False
