@@ -25,7 +25,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
-from claude_swap import balance, oauth, tokens
+from claude_swap import balance, modelctl, oauth, tokens
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
@@ -401,8 +401,8 @@ class AutoScreen(Screen):
     #
     # With strategy "balance", the candidate list above is replaced by a
     # panel that shows every account's balance score: the same numbers the
-    # engine ranks on, computed by the same functions (balance.py). Under it
-    # are token counts from this computer's Claude
+    # engine ranks on, computed by the same functions (balance.py,
+    # modelctl.py). Under it are token counts from this computer's Claude
     # Code logs (tokens.py).
 
     def _balance_text(self, snap, active_number, settings, models, palette) -> Text:
@@ -414,11 +414,13 @@ class AutoScreen(Screen):
 
         ``●`` marks the active account and ``w5`` is the plan weight. The
         bracket shows the window that set the score (used %, hours to reset).
-        Rows also note an account over a line, and disabled accounts. The header
+        Rows also note an account over a line, per-model windows left out
+        because the model is not in use, and disabled accounts. The header
         shows the score a candidate needs to take over.
         """
         weight_overrides = balance.parse_weight_overrides(settings.balance_weights)
         now = time.time()
+        model_views, model_note = self._model_views(snap, settings, models)
 
         rows: list[tuple[float, str, Text]] = []  # (sort key, slot, rendered row)
         active_score: float | None = None
@@ -427,7 +429,9 @@ class AutoScreen(Screen):
             weight = weight_overrides.get(
                 acc.number, balance.weight_for_plan(acc.subscription_plan)
             )
-            usage_view = acc.usage.last_good
+            usage_view, ignored_windows = model_views.get(
+                acc.number, (acc.usage.last_good, [])
+            )
             rate = balance.spare_rate(usage_view, models, weight, now)
             score = rate.score if rate else None
             if is_active:
@@ -461,6 +465,10 @@ class AutoScreen(Screen):
                 row.append(
                     f"  over {binding.label} line", style=palette.severity(binding.pct)
                 )
+            if ignored_windows:
+                row.append(
+                    f"  ({', '.join(ignored_windows)} not in use)", style=palette.muted
+                )
             if not acc.switchable and not is_active:
                 row.append("  disabled", style=palette.muted)
 
@@ -485,7 +493,72 @@ class AutoScreen(Screen):
                 text.append(f" (x{factor:g} margin: large context)", style=palette.muted)
         for _sort_key, _slot, row in sorted(rows):
             text.append(row)
+        if model_note:
+            text.append(f"\nModel  {model_note}", style=palette.muted)
         return text
+
+    def _model_views(self, snap, settings, models):
+        """Apply the engine's model-control filter to each account for display.
+
+        Returns ``(views, note)``:
+
+        * ``views``: ``{slot: (filtered usage, ignored window names)}``, empty
+          when model control is off, in which case callers use the raw usage;
+        * ``note``: one line for the panel footer. It gives the configured
+          default model, what the next tick will change it to, and which
+          watched models are in use.
+
+        Uses :func:`modelctl.view_usage` and :func:`modelctl.models_in_use`,
+        the same calls the engine makes, so the screen cannot disagree with
+        what the engine will do.
+        """
+        if not settings.model_control or not models:
+            return {}, ""
+
+        ledger = tokens.ledger_for(self.app.switcher.backup_dir)
+        ledger.refresh_async()  # never block the UI thread on a scan
+        in_use = modelctl.models_in_use(
+            ledger, models, settings.model_grace_seconds, time.time()
+        )
+        _readable, configured = modelctl.read_model()
+        model_map = modelctl.parse_model_map(settings.model_map)
+
+        views = {}
+        active_view = None
+        for acc in snap.accounts:
+            account_line = (
+                acc.policy.threshold
+                if acc.policy.threshold is not None
+                else settings.threshold
+            )
+            view = modelctl.view_usage(
+                acc.usage.last_good,
+                acc.number,
+                models=models,
+                model_map=model_map,
+                configured=configured,
+                fallback=settings.fallback_model,
+                line=account_line,
+                weekly=settings.weekly_threshold,
+                recent=in_use,
+            )
+            views[acc.number] = (view.usage, view.ignored_windows)
+            if acc.number == snap.active_number:
+                active_view = view
+
+        configured_name = tokens.short_model(configured) if configured else "(not set)"
+        note = f"Claude default model: {configured_name}"
+        if active_view is not None:
+            if active_view.model_to_set and active_view.model_to_set != configured:
+                note += f" -> {tokens.short_model(active_view.model_to_set)} next tick"
+            if active_view.using_fallback:
+                note += " (fallback)"
+        busy = [name for name, used in in_use.items() if used]
+        if busy:
+            note += f" · in use: {', '.join(busy)}"
+        else:
+            note += f" · in use: no {'/'.join(m.lower() for m in models)}"
+        return views, note
 
     def _tokens_text(self, snap, active_number, settings, palette) -> Text:
         """Token counts from this computer's Claude Code logs, under the balance panel.

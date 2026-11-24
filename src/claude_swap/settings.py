@@ -96,6 +96,19 @@ class AutoSwitchSettings:
     # context uncached, so a big context makes moving costlier. 0 turns it off.
     balance_big_context: float = 400000.0
 
+    # -- model control (modelctl.py); off unless model_control is True --------
+    # Count a per-model window only while that model is in use, and set
+    # Claude Code's default model per account.
+    model_control: bool = False
+    # Default model per slot, "slot=model-id,..." (e.g.
+    # "1=claude-fable-5-2,2=claude-opus-5-5"). None leaves the model alone.
+    model_map: str | None = None
+    # Written instead of an account's usual model while that model's own
+    # window is over its line.
+    fallback_model: str | None = "claude-opus-5-5"
+    # A model Claude Code used within this many seconds still counts as in use.
+    model_grace_seconds: float = 600.0
+
 
 @dataclass(frozen=True)
 class UiSettings:
@@ -243,6 +256,22 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "balanceBigContext", "balance_big_context", "float", 0.0, 10000000.0,
             help="balance: double the margin while a session context is this many tokens (0=off)",
+        ),
+        SettingSpec(
+            "autoswitch", "modelControl", "model_control", "bool",
+            help="Manage Claude Code's default model and per-model windows",
+        ),
+        SettingSpec(
+            "autoswitch", "modelMap", "model_map", "string",
+            help="Default model per slot, e.g. 1=claude-fable-5-2,2=claude-opus-5-5",
+        ),
+        SettingSpec(
+            "autoswitch", "fallbackModel", "fallback_model", "string",
+            help="Model to use when the mapped model's window is over its line",
+        ),
+        SettingSpec(
+            "autoswitch", "modelGraceSeconds", "model_grace_seconds", "float", 0.0, 86400.0,
+            help="A model seen in the logs this recently still counts as in use",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

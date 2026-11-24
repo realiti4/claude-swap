@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import balance, oauth, poll_policy, tokens
+from claude_swap import balance, modelctl, oauth, poll_policy, tokens
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
@@ -378,6 +378,41 @@ class NoSwitchEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"no switch: {self.reason}" + (f" ({self.detail})" if self.detail else "")
+
+
+@dataclass(frozen=True)
+class ModelEvent(AutoSwitchEvent):
+    """Model control changed Claude Code's default model, or has a hint about it.
+
+    Emitted only with ``autoswitch.modelControl`` on, and only when the
+    message differs from the previous tick's. ``detail`` is human-readable
+    text, e.g. ``"Claude default model opus 5.5 -> fable 5.2 (new sessions)"``.
+    """
+
+    kind: ClassVar[str] = "model"
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {"detail": self.detail}
+
+    def human(self) -> str:
+        return f"model: {self.detail}"
+
+
+@dataclass
+class _ModelPlan:
+    """Model control's per-tick decisions, handed from the decision to the apply step.
+
+    Built by ``AutoSwitchEngine._model_view`` while ranking and read by
+    ``AutoSwitchEngine._apply_model`` once the tick has settled which account
+    is active.
+    """
+
+    configured: str | None        # `model` in Claude Code's settings.json now
+    readable: bool                # False: settings.json is damaged, do not write it
+    recent: dict[str, bool]       # window name (lower case) -> model used recently
+    model_to_set: dict[str, str] = field(default_factory=dict)  # slot -> model
+    on_fallback: set[str] = field(default_factory=set)  # slots using the fallback
 
 
 @dataclass(frozen=True)
@@ -923,6 +958,9 @@ class AutoSwitchEngine:
         try:
             outcome = self._tick_inner()
             self._persist_health_counters(self._health_account)
+            # After the tick, so the model follows whichever account ended
+            # up active (no-op unless autoswitch.modelControl is on).
+            self._apply_model()
             return outcome
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
@@ -1143,6 +1181,12 @@ class AutoSwitchEngine:
             threshold=thresholds[current],
             weekly_threshold=settings.weekly_threshold,
         )
+        # Model control may drop the per-model windows of models nobody is
+        # using (modelctl.py). Everything from here on decides on that
+        # filtered view. The model-name check below still needs every window
+        # the API reported, so it keeps the unfiltered reading.
+        raw_usage = usage
+        usage, headroom = self._model_view(usage, headroom, settings, thresholds)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1168,7 +1212,7 @@ class AutoSwitchEngine:
         )
 
         if not self._model_check_done:
-            self._check_model_names(quarantined, usage)
+            self._check_model_names(quarantined, raw_usage)
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -1458,6 +1502,9 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
+            # The refetched readings get the same model-control filter as
+            # the first pass, so both phases rank on the same view.
+            usage, headroom = self._model_view(usage, headroom, settings, thresholds)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
@@ -1709,6 +1756,168 @@ class AutoSwitchEngine:
     def _token_ledger(self) -> tokens.Ledger:
         """The shared transcript reader for this cswap data directory."""
         return tokens.ledger_for(self.switcher.backup_dir)
+
+    # -- model control (modelctl.py) -----------------------------------------
+    #
+    # Each tick runs in two halves. During the decision, `_model_view`
+    # filters out the per-model windows of models nobody is using, and
+    # records in `_model_plan` which model each account should run. After
+    # the tick, whether or not it switched, `_apply_model` writes the active
+    # account's model into Claude Code's settings.json. Writing happens only
+    # after the tick so that it always follows the account that ended up
+    # active.
+
+    # The decision half's output for the apply half, or None when model
+    # control is off.
+    _model_plan: _ModelPlan | None = None
+    # The last model message shown, so the same one is not repeated every tick.
+    _last_model_note: str = ""
+
+    def _model_view(self, usage, headroom, settings, thresholds):
+        """Apply model control to this tick's usage readings.
+
+        Returns ``(usage, headroom)``: each account's reading with the
+        windows of unused models removed (:func:`modelctl.view_usage`), and
+        headroom recomputed from that filtered reading. Also stores the
+        per-account model decisions in ``self._model_plan`` for
+        :meth:`_apply_model`.
+
+        When ``autoswitch.modelControl`` is off, or no per-model windows are
+        configured, returns its inputs unchanged.
+        """
+        self._model_plan = None
+        if not settings.model_control or not self._models:
+            return usage, headroom
+
+        ledger = self._token_ledger()
+        ledger.refresh()
+        recent = modelctl.models_in_use(
+            ledger, self._models, settings.model_grace_seconds, self.clock()
+        )
+        readable, configured = modelctl.read_model()
+        model_map = modelctl.parse_model_map(settings.model_map)
+
+        plan = _ModelPlan(configured=configured, readable=readable, recent=recent)
+        filtered_usage = {}
+        for num, reading in usage.items():
+            view = modelctl.view_usage(
+                reading,
+                num,
+                models=self._models,
+                model_map=model_map,
+                configured=configured,
+                fallback=settings.fallback_model,
+                line=thresholds[num],
+                weekly=settings.weekly_threshold,
+                recent=recent,
+            )
+            filtered_usage[num] = view.usage
+            if view.model_to_set:
+                plan.model_to_set[num] = view.model_to_set
+            if view.using_fallback:
+                plan.on_fallback.add(num)
+
+        self._model_plan = plan
+        return filtered_usage, _headroom_by_account(filtered_usage, self._models)
+
+    def _apply_model(self) -> None:
+        """Write the active account's model into Claude Code's settings.json.
+
+        Runs once at the end of every tick. Three outcomes:
+
+        * the active account has a model to set that differs from what is
+          configured: write it, remembering the previous value the first
+          time;
+        * nothing to set, and settings.json still holds the value cswap last
+          wrote: put back the value from before cswap changed it;
+        * otherwise leave the file alone. That includes when someone changed
+          the model by hand since cswap's last write.
+
+        Then, if the active account is on its fallback model while the usual
+        model is still in use, add a hint that open sessions need ``/model``.
+        The resulting message is emitted only when it differs from last tick.
+        """
+        plan = self._model_plan
+        if plan is None or not self.settings.model_control:
+            return
+        current = self.switcher.current_account_number()
+        if current is None:
+            return
+
+        note = self._sync_model_setting(plan, current)
+
+        if current in plan.on_fallback:
+            hint = self._open_sessions_hint(plan, current)
+            if hint:
+                note = f"{note}; {hint}" if note else hint
+
+        if note and note != self._last_model_note:
+            self._emit(ModelEvent(detail=note))
+        self._last_model_note = note
+
+    def _sync_model_setting(self, plan: _ModelPlan, current: str) -> str:
+        """Bring settings.json's ``model`` in line with ``plan`` for ``current``.
+
+        Returns a human-readable note of what happened, or ``""`` when nothing
+        needed doing.
+        """
+        backup_root = self.switcher.backup_dir
+        state = modelctl.load_state(backup_root)
+        configured = plan.configured
+        target = plan.model_to_set.get(current)
+
+        # Nothing to enforce, and the file still shows our last write: put
+        # back what was there before cswap touched it. If the value differs
+        # from our last write, someone changed it, and their choice stays.
+        restoring = (
+            target is None
+            and "applied" in state
+            and configured == state.get("applied")
+        )
+        if restoring:
+            target = state.get("saved")
+        elif target is None:
+            return ""
+
+        if target == configured:
+            return ""  # already right
+        if not plan.readable:
+            return "Claude settings.json unreadable; model not changed"
+
+        change = f"{configured or 'default'} -> {target or 'default'}"
+        if self.dry_run:
+            return f"[dry-run] would set Claude default model {change}"
+
+        try:
+            if "applied" not in state:
+                # The first change cswap makes: remember the original value.
+                state["saved"] = configured
+            modelctl.write_model(target)
+            if restoring:
+                state = {}  # back to the original: nothing left to undo
+            else:
+                state["applied"] = target
+            modelctl.save_state(backup_root, state)
+        except (OSError, ValueError) as e:
+            return f"could not set model: {e}"
+        return f"Claude default model {change} (new sessions)"
+
+    def _open_sessions_hint(self, plan: _ModelPlan, current: str) -> str:
+        """Tell the user how to keep using ``current`` in sessions that are already open.
+
+        The fallback only reaches new sessions. An open session still on the
+        blocked model would hit that model's limit, so name the ``/model``
+        command that moves it to the fallback. Returns ``""`` when no watched
+        model is in use and there is nothing to warn about.
+        """
+        busy = [name for name, in_use in plan.recent.items() if in_use]
+        if not busy:
+            return ""
+        fallback_name = tokens.short_model(self.settings.fallback_model).split()[0]
+        return (
+            f"#{current} is over its {', '.join(busy)} line but open sessions "
+            f"still use it: /model {fallback_name} in them to keep using #{current}"
+        )
 
     # -- balance strategy (balance.py) ---------------------------------------
 

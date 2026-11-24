@@ -498,6 +498,20 @@ class Ledger:
             return None
         return max(0.0, (now or time.time()) - self._newest_write_ts)
 
+    def model_last_seen(self, name: str) -> float | None:
+        """When was a model whose id contains ``name`` last used?
+
+        ``name`` is a per-model window name such as ``"Fable"``, which
+        matches ids like ``claude-fable-5-2``. Case is ignored.
+        """
+        needle = name.lower()
+        latest: float | None = None
+        for request in self._requests:
+            if needle in (request.model or "").lower():
+                if latest is None or request.ts > latest:
+                    latest = request.ts
+        return latest
+
     def recent_peak_context(self, within_s: float, now: float | None = None) -> int:
         """Largest current context among sessions active in the last ``within_s``.
 

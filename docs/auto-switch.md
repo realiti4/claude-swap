@@ -22,6 +22,19 @@ Below the lines, auto-switch moves only when another account's score beats the a
 
 A move starts the new account on a cold prompt cache, so two gates read Claude Code's local session logs (counts only, never text). A balance move waits until no transcript has been written for `autoswitch.balanceIdleSeconds` (default 90; 0 turns it off), so a reply in progress is not split. While an open conversation is at least `autoswitch.balanceBigContext` tokens (default 400000; 0 turns it off), the margin is doubled. `cswap tokens` shows the same counts per account and per prompt.
 
+## Model control
+
+Off by default; `cswap config set autoswitch.modelControl true` turns it on. It needs named models in `autoswitch.model`, because `all` names none.
+
+- **Per-model windows bind only while in use.** A window from `autoswitch.model` counts for an account only if Claude Code on this computer used that model within `autoswitch.modelGraceSeconds` (default 600), or it is the model cswap sets for that account. An account whose Fable quota is spent still counts its general weekly room while nobody is on Fable.
+- **Default model per account.** `autoswitch.modelMap` (e.g. `1=claude-fable-5-2,2=claude-opus-5-5`) is written to the `model` key of Claude Code's `settings.json` when that slot becomes active. While the mapped model's own window is over its line, `autoswitch.fallbackModel` (default `claude-opus-5-5`) is written instead. Only that key is changed. The previous value is put back once nothing needs setting, unless it was changed by hand in the meantime. A new value applies to sessions started after it, so for open sessions the engine prints the `/model` command to run.
+
+## Cooldown and hysteresis
+
+A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is already over its switch lines, it moves to the one with the most quota left before a limit (the lowest usage on its fullest window, whatever line that window carries) under `best`, `weekly-first` and `consume-first` alike, once that account has twice the current one's remaining quota or 3 points more than it, whichever is less. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset. `priority-consume-first` does neither: it holds rather than land on an account over its lines (see [Account priority tiers](#account-priority-tiers)).
+
+Under `consume-first` the margin (10 points by default, `autoswitch.hysteresisPct`) is instead the room a landing needs. A move made below the threshold only lands on an account with at least that many points left under every one of its lines, each window against its own line: the cooldown that move starts would otherwise hold it on an account that crosses its line minutes later. Setting the margin to 0 removes that bar. A move forced by the active account's line prefers targets with that room, under `weekly-first` too, and still takes the soonest reset when none has it. An at-limit or failover escape lands on an account below its lines before one over them under every strategy; under `consume-first` it keeps the soonest-reset order only among accounts with that room, and otherwise takes the one with the most quota left.
+
 ## A separate line for the weekly windows
 
 Set with `--weekly-threshold 97`, or `cswap config set autoswitch.weeklyThreshold 97`.

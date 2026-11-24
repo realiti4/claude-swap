@@ -169,12 +169,14 @@ def test_requests_are_credited_to_the_account_active_at_the_time(env):
     assert set(ledger.totals(0)) == {"1", "2"}
 
 
-def test_peak_context(env):
+def test_model_last_seen_and_peak_context(env):
     backup, config, project = env
     now = time.time()
     _write(project / "a.jsonl", [_user(now - 30), _reply(now - 29, "m1", inp=500, model="claude-fable-5-2")])
     _write(project / "b.jsonl", [_user(now - 20), _reply(now - 19, "m2", inp=100)])
     ledger = _ledger(backup, config)
+    assert ledger.model_last_seen("Fable") == pytest.approx(now - 29, abs=1)
+    assert ledger.model_last_seen("Haiku") is None
     assert ledger.recent_peak_context(600) == 500
 
 

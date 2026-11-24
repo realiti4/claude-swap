@@ -48,7 +48,7 @@ The two projections stay `--json`-only, since a linear projection is too rough t
 
 ## `cswap auto --json`
 
-`cswap auto --json` emits an event stream instead: one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}`) with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`. The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+`cswap auto --json` emits an event stream instead: one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}`) with kinds like `poll`, `switch`, `no-switch`, `model`, `account-quarantined`, `all-exhausted`, `error`. `model` (only with `autoswitch.modelControl` on) has a human-readable `detail` describing a default-model change or a `/model` hint. The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 ## `cswap tokens --json`
 
