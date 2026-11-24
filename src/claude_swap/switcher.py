@@ -8291,8 +8291,9 @@ class ClaudeAccountSwitcher:
             data["accounts"][target_account].get("organizationUuid", ""),
         )
         # Best-effort browser sync, after the lock releases (CDP/network is safe
-        # here). Never affects the already-committed OAuth switch above.
-        self._chrome.sync_to_account(target_account)
+        # here). Never affects the already-committed OAuth switch above; the
+        # menu bar runs it in the background (ChromeSync.follow_switch).
+        self._chrome.follow_switch(target_account)
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
     def _print_switch_followup(self) -> None:

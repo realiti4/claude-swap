@@ -743,6 +743,9 @@ def run(switcher) -> int:
     # key on. Returns only when staying in this interpreter (already bundled,
     # opted out, framework build, or the bundle could not be built).
     app_bundle.maybe_reexec(switcher.backup_dir)
+    # Switch callbacks run on the AppKit main thread: keep the seconds a
+    # browser sync takes off it, so the menu stays responsive.
+    switcher._chrome.background = True
     if not app_bundle.in_bundle():
         ensure_notification_identity()
     try:

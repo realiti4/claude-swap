@@ -69,6 +69,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -927,6 +928,50 @@ class ChromeSync:
         self._s = settings
         self._vault = ChromeVault(backup_root)
         self._backup_root = Path(backup_root)
+        # Background mode (the menu bar): a switch hands the browser sync to a
+        # worker thread instead of waiting the seconds an injection takes.
+        self.background = False
+        self._bg_lock = threading.Lock()
+        self._bg_target: str | None = None
+        self._bg_thread: threading.Thread | None = None
+
+    def follow_switch(self, account_num: str) -> None:
+        """Move the browser to ``account_num`` after a committed CLI switch.
+
+        Inline by default. In background mode it returns at once and a single
+        worker performs the sync; switches made while it runs collapse into
+        one sync to the latest target, so the browser ends on the account the
+        CLI ended on.
+        """
+        if not self.active:
+            return
+        if not self.background:
+            self.sync_to_account(account_num)
+            return
+        with self._bg_lock:
+            self._bg_target = account_num
+            if self._bg_thread is None or not self._bg_thread.is_alive():
+                self._bg_thread = threading.Thread(
+                    target=self._bg_worker, name="chrome-sync", daemon=True)
+                self._bg_thread.start()
+
+    def _bg_worker(self) -> None:
+        while True:
+            with self._bg_lock:
+                target, self._bg_target = self._bg_target, None
+                if target is None:
+                    self._bg_thread = None
+                    return
+            self.sync_to_account(target)  # swallows and logs its own failures
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until the background worker has nothing left to do."""
+        with self._bg_lock:
+            t = self._bg_thread
+        if t is not None:
+            t.join(timeout)
+        with self._bg_lock:
+            return self._bg_thread is None or not self._bg_thread.is_alive()
 
     @property
     def active(self) -> bool:

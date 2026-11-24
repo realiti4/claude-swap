@@ -485,3 +485,52 @@ def test_sync_uses_the_tokens_the_snapshot_just_stored(tmp_path, monkeypatch):
     sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
     assert sync.sync_to_account("2") is True
     assert [s.refresh_token for s in injected] == ["rt-live"]
+
+
+# --------------------------------------------------------------------------- #
+# follow_switch (the menu bar runs the browser sync off the main thread)
+# --------------------------------------------------------------------------- #
+def test_follow_switch_is_inline_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    seen = []
+    monkeypatch.setattr(sync, "sync_to_account", lambda n: seen.append(n) or True)
+    sync.follow_switch("2")
+    assert seen == ["2"]
+
+
+def test_follow_switch_in_background_returns_at_once_and_ends_on_the_latest(tmp_path, monkeypatch):
+    import threading as th
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    sync.background = True
+    release = th.Event()
+    started = th.Event()
+    seen = []
+
+    def slow_sync(n):
+        seen.append(n)
+        started.set()
+        release.wait(5)
+        return True
+
+    monkeypatch.setattr(sync, "sync_to_account", slow_sync)
+    t0 = time.monotonic()
+    sync.follow_switch("2")
+    assert started.wait(5)
+    # Two more switches while the first sync is still running.
+    sync.follow_switch("3")
+    sync.follow_switch("1")
+    assert time.monotonic() - t0 < 1
+    release.set()
+    assert sync.wait_idle(5)
+    assert seen == ["2", "1"]   # "3" was superseded before its turn
+
+
+def test_follow_switch_is_a_no_op_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=False), tmp_path)
+    sync.background = True
+    monkeypatch.setattr(sync, "sync_to_account", lambda n: pytest.fail("synced"))
+    sync.follow_switch("2")
+    assert sync.wait_idle(1)
