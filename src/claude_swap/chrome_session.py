@@ -709,14 +709,23 @@ def read_web_identity_cdp(port: int) -> dict | None:
 
 
 def _browser_call(port: int, method: str, params: dict | None = None) -> dict:
-    bws = _browser_ws(port)
-    if not bws:
-        raise RuntimeError("automation Chrome is not reachable")
-    cdp = _CDP(bws)
-    try:
-        return cdp.call(method, params or {})
-    finally:
-        cdp.close()
+    """One CDP call on the browser target, retried once: Chrome answers
+    ``Browser context management is not supported`` now and then while
+    another client or the extension's SW is attaching."""
+    for attempt in range(2):
+        bws = _browser_ws(port)
+        if not bws:
+            raise RuntimeError("automation Chrome is not reachable")
+        cdp = _CDP(bws)
+        try:
+            return cdp.call(method, params or {})
+        except RuntimeError:
+            if attempt:
+                raise
+            time.sleep(0.5)
+        finally:
+            cdp.close()
+    raise AssertionError("unreachable")
 
 
 def _claude_cookies(port: int) -> list[dict]:

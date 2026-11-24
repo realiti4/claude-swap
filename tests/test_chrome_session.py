@@ -737,3 +737,23 @@ def test_a_web_login_that_could_not_be_stored_is_left_in_place(tmp_path, monkeyp
     monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda *a, **k: pytest.fail("cleared"))
     monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: True)
     assert sync.sync_to_account("3") is True
+
+
+def test_browser_call_retries_a_transient_cdp_error(monkeypatch):
+    monkeypatch.undo()  # the autouse guard stubs _browser_call itself
+    monkeypatch.setattr(cs, "_browser_ws", lambda port: "ws://x")
+    monkeypatch.setattr(cs.time, "sleep", lambda s: None)
+    answers = iter([RuntimeError("Storage.getCookies: Browser context management is not supported."),
+                    {"cookies": []}])
+
+    class FakeCDP:
+        def __init__(self, url): pass
+        def call(self, method, params):
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        def close(self): pass
+
+    monkeypatch.setattr(cs, "_CDP", FakeCDP)
+    assert cs._browser_call(9333, "Storage.getCookies") == {"cookies": []}
