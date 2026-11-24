@@ -49,3 +49,7 @@ The two projections stay `--json`-only, since a linear projection is too rough t
 ## `cswap auto --json`
 
 `cswap auto --json` emits an event stream instead: one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}`) with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`. The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+
+## `cswap tokens --json`
+
+`{"schemaVersion": 1, "hours": …, "totals": {…}, "prompts": […]}`. `totals` maps an account number (`"?"` when unknown) to `sent`, `received`, `calls`, `prompts` and `cache_read`. Each entry of `prompts`, oldest first, has `ts` (Unix seconds), `account`, `project` (folder name only), `calls`, `sent`, `received`, `cacheRead`, `peakContext` and `models` (model id → calls). No prompt or reply text is included.
