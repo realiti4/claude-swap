@@ -95,11 +95,11 @@ def print_doctor(switcher) -> None:
         stored = vault.get(num)
         has = stored is not None and not stored.refresh_dead
         if stored is None:
-            hint = muted(f"  → connect + `cswap chrome capture {num}`")
+            hint = muted("  → connect + `cswap chrome capture`")
         elif stored.refresh_dead:
-            hint = muted(f"  → revoked; connect + `cswap chrome capture {num}`")
+            hint = muted("  → revoked; connect + `cswap chrome capture`")
         elif web.get_web(num) is None:
-            hint = muted(f"  → no claude.ai login: sign in there + `cswap chrome capture {num}`")
+            hint = muted("  → no claude.ai login: sign in there + `cswap chrome capture`")
         else:
             hint = ""
         print(f"    {_mark(has)} {num} {email or '(unknown)'}{hint}")
@@ -195,7 +195,7 @@ def run_setup(switcher) -> int:
     accounts = _accounts(switcher)
     if not accounts:
         print(dimmed("      No managed accounts yet — add them with `cswap add`, then"))
-        print(dimmed("      `cswap chrome capture <n>` for each."))
+        print(dimmed("      `cswap chrome capture` for each."))
     sync = cs.ChromeSync(settings, root)
     for i, (num, email, org) in enumerate(accounts):
         print(f"      Account {num} ({email or 'unknown'}):")

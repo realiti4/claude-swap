@@ -603,8 +603,8 @@ def test_snapshot_files_the_web_login_under_its_own_account(tmp_path, monkeypatc
     vault.put("1", _session(account_uuid="acc-1", email="a@x"))
     vault.put("2", _session(account_uuid="acc-2", email="b@x"))
     monkeypatch.setattr(cs, "capture_tokens_cdp", lambda *a, **k: None)
-    monkeypatch.setattr(cs, "capture_web_cookies_cdp",
-                        lambda *a, **k: ("acc-2", [{"name": "sessionKey", "value": "s2"}]))
+    monkeypatch.setattr(cs, "capture_web_login_cdp",
+                        lambda *a, **k: ("acc-2", "b@x", [{"name": "sessionKey", "value": "s2"}]))
     sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
     assert sync._snapshot_current() == "2"
     assert cs.WebVault(tmp_path).get_web("2")["cookies"][0]["value"] == "s2"
@@ -616,7 +616,7 @@ def test_sync_puts_the_target_web_login_in_before_injecting(tmp_path, monkeypatc
                      settled=_session(account_uuid="acc"))
     cs.ChromeVault(tmp_path).put("2", _session(account_uuid="acc"))
     cs.WebVault(tmp_path).put_web("2", "acc", "b@x", [{"name": "sessionKey", "value": "s2"}])
-    monkeypatch.setattr(cs, "capture_web_cookies_cdp", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "capture_web_login_cdp", lambda *a, **k: None)
     order = []
     monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda port, c: order.append(("web", c)))
     monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: order.append(("inject",)) or True)
@@ -629,8 +629,8 @@ def test_sync_leaves_the_web_alone_when_it_is_already_on_the_target(tmp_path, mo
     sync = _sync_env(tmp_path, monkeypatch, live_state=_state(accountUuid="other"),
                      settled=_session(account_uuid="acc"))
     cs.ChromeVault(tmp_path).put("2", _session(account_uuid="acc"))
-    monkeypatch.setattr(cs, "capture_web_cookies_cdp",
-                        lambda *a, **k: ("acc", [{"name": "sessionKey", "value": "s2"}]))
+    monkeypatch.setattr(cs, "capture_web_login_cdp",
+                        lambda *a, **k: ("acc", "", [{"name": "sessionKey", "value": "s2"}]))
     monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda *a, **k: pytest.fail("web replaced"))
     monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: True)
     assert sync.sync_to_account("2") is True
@@ -642,9 +642,74 @@ def test_capture_stores_the_web_login_even_when_the_extension_is_elsewhere(tmp_p
     cs.ChromeVault(tmp_path).put("1", _session(account_uuid="acc-1", email="a@x"))
     monkeypatch.setattr(cs, "capture_tokens_cdp",
                         lambda *a, **k: _session(account_uuid="acc-2", email="b@x", org_uuid="o"))
-    monkeypatch.setattr(cs, "capture_web_cookies_cdp",
-                        lambda *a, **k: ("acc-1", [{"name": "sessionKey", "value": "s1"}]))
+    monkeypatch.setattr(cs, "capture_web_login_cdp",
+                        lambda *a, **k: ("acc-1", "a@x", [{"name": "sessionKey", "value": "s1"}]))
     sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
     assert "b@x" in sync.capture_checked("1", "o", "a@x")       # extension: wrong account
     assert sync.web_stored("1")                                  # web login: stored anyway
     assert cs.ChromeVault(tmp_path).get("1").account_uuid == "acc-1"  # tokens untouched
+
+
+# --------------------------------------------------------------------------- #
+# capture without a slot number
+# --------------------------------------------------------------------------- #
+_SLOTS = [("1", "a@x", "org-a"), ("2", "b@x", "team"), ("3", "b@x", "org-b"), ("4", "c@x", "team")]
+
+
+def test_match_slot_uses_the_org_only_when_the_email_is_ambiguous():
+    assert cs.match_slot(_SLOTS, "A@X") == "1"
+    assert cs.match_slot(_SLOTS, "a@x", "unrelated") == "1"   # one slot: org not needed
+    assert cs.match_slot(_SLOTS, "b@x") is None               # two orgs, no org given
+    assert cs.match_slot(_SLOTS, "b@x", "TEAM") == "2"
+    assert cs.match_slot(_SLOTS, "z@x") is None
+    assert cs.match_slot(_SLOTS, "") is None
+
+
+def test_capture_auto_files_extension_and_web_by_their_own_accounts(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    monkeypatch.setattr(cs, "automation_chrome_running", lambda *a, **k: True)
+    monkeypatch.setattr(cs, "capture_tokens_cdp",
+                        lambda *a, **k: _session(account_uuid="acc-2", email="b@x", org_uuid="team"))
+    # claude.ai is signed in as an account with no stored tokens yet: filed by email.
+    monkeypatch.setattr(cs, "capture_web_login_cdp",
+                        lambda *a, **k: ("acc-4", "c@x", [{"name": "sessionKey", "value": "s4"}]))
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    got = sync.capture_auto(_SLOTS)
+    assert got == {"extension": "2", "web": "4", "reason": ""}
+    assert cs.ChromeVault(tmp_path).get("2").account_uuid == "acc-2"
+    assert cs.WebVault(tmp_path).get_web("4")["accountUuid"] == "acc-4"
+
+
+def test_capture_auto_refuses_an_unmanaged_or_ambiguous_extension_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    monkeypatch.setattr(cs, "automation_chrome_running", lambda *a, **k: True)
+    monkeypatch.setattr(cs, "capture_tokens_cdp",
+                        lambda *a, **k: _session(account_uuid="acc", email="b@x", org_uuid=""))
+    monkeypatch.setattr(cs, "capture_web_login_cdp", lambda *a, **k: None)
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    got = sync.capture_auto(_SLOTS)
+    assert got["extension"] is None and "cswap add" in got["reason"]
+    assert cs.ChromeVault(tmp_path).account_numbers() == set()
+
+
+def test_web_login_is_not_filed_under_a_slot_whose_tokens_are_another_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    cs.ChromeVault(tmp_path).put("1", _session(account_uuid="acc-1", email="a@x"))
+    monkeypatch.setattr(cs, "capture_web_login_cdp",
+                        lambda *a, **k: ("acc-other", "a@x", [{"name": "sessionKey", "value": "s"}]))
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    assert sync._snapshot_web(_SLOTS) is None
+    assert cs.WebVault(tmp_path).get_web("1") is None
+
+
+def test_first_capture_into_a_slot_also_files_its_web_login(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    monkeypatch.setattr(cs, "automation_chrome_running", lambda *a, **k: True)
+    monkeypatch.setattr(cs, "capture_tokens_cdp",
+                        lambda *a, **k: _session(account_uuid="acc-1", email="a@x", org_uuid="org-a"))
+    monkeypatch.setattr(cs, "capture_web_login_cdp",
+                        lambda *a, **k: ("acc-1", "a@x", [{"name": "sessionKey", "value": "s1"}]))
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    assert sync.capture_checked("1", "org-a", "a@x") == ""
+    assert sync.web_stored("1")
+

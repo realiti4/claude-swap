@@ -741,13 +741,35 @@ def _cookie_param(c: dict) -> dict:
 
 def capture_web_cookies_cdp(port: int) -> tuple[str, list[dict]] | None:
     """``(account uuid, identity cookies)`` of the browser's claude.ai login."""
+    got = capture_web_login_cdp(port)
+    return (got[0], got[2]) if got else None
+
+
+def capture_web_login_cdp(port: int) -> tuple[str, str, list[dict]] | None:
+    """``(account uuid, email, identity cookies)`` of the browser's claude.ai login."""
     ident = read_web_identity_cdp(port)
     if not ident:
         return None
     cookies = [_cookie_param(c) for c in _claude_cookies(port) if c["name"] in WEB_IDENTITY_COOKIES]
     if not any(c["name"] == "sessionKey" for c in cookies):
         return None
-    return ident["uuid"], cookies
+    return ident["uuid"], ident.get("email", ""), cookies
+
+
+def match_slot(slots, email: str, org_uuid: str = "") -> str | None:
+    """The one managed slot for ``email`` (and ``org_uuid`` when known).
+
+    ``slots`` is ``[(num, email, organizationUuid), ...]``. One email can hold
+    several slots (one per org), so the org narrows it; None unless exactly
+    one slot is left.
+    """
+    if not email:
+        return None
+    hits = [num for num, e, o in slots if (e or "").lower() == email.lower()]
+    if org_uuid and len(hits) > 1:
+        hits = [num for num, e, o in slots if (e or "").lower() == email.lower()
+                and (o or "").lower() == org_uuid.lower()]
+    return hits[0] if len(hits) == 1 else None
 
 
 def apply_web_cookies_cdp(port: int, cookies: list[dict]) -> None:
@@ -1181,21 +1203,27 @@ class ChromeSync:
             _logger.info("chrome-sync: could not snapshot current account: %s", e)
         return self._snapshot_web()
 
-    def _snapshot_web(self) -> str | None:
+    def _snapshot_web(self, slots=()) -> str | None:
         """Store the browser's claude.ai login under the slot it belongs to.
 
-        The slot is found by the login's own account uuid (``/api/account``),
-        never assumed to be the extension's account. Returns that slot.
+        The slot is found by the login's own account uuid (``/api/account``)
+        in the token vault, never assumed to be the extension's account; for
+        an account with no stored tokens yet, by its email among ``slots``
+        (only when exactly one slot has it). Returns that slot.
         """
         try:
-            got = capture_web_cookies_cdp(self._s.debug_port)
+            got = capture_web_login_cdp(self._s.debug_port)
             if not got:
                 return None
-            uuid, cookies = got
+            uuid, email, cookies = got
             num = self._vault.find_by_uuid(uuid)
+            if num is None:
+                num = match_slot(slots, email)
+                stored = self._vault.get(num) if num else None
+                if stored is not None and stored.account_uuid and stored.account_uuid != uuid:
+                    num = None  # the slot's tokens belong to another account uuid
             if num:
-                stored = self._vault.get(num)
-                self._web.put_web(num, uuid, stored.email if stored else "", cookies)
+                self._web.put_web(num, uuid, email, cookies)
             return num
         except Exception as e:  # noqa: BLE001
             _logger.info("chrome-sync: could not snapshot the claude.ai login: %s", e)
@@ -1206,8 +1234,8 @@ class ChromeSync:
         entry = self._web.get_web(account_num)
         if entry is None:
             _logger.info("chrome-sync: no claude.ai login stored for account %s; sign in to "
-                         "claude.ai as it in the Claude Browser, then `cswap chrome capture %s`",
-                         account_num, account_num)
+                         "claude.ai as it in the Claude Browser, then `cswap chrome capture`",
+                         account_num)
             return
         try:
             apply_web_cookies_cdp(self._s.debug_port, entry["cookies"])
@@ -1229,9 +1257,18 @@ class ChromeSync:
             return "Chrome sync is disabled"
         if not automation_chrome_running(self._s.debug_port):
             return "the Claude Browser is not running (open it with `cswap chrome open`)"
-        # The web login is filed by its own account uuid, so it is stored
-        # whichever account the extension is on.
-        self._snapshot_web()
+        try:
+            return self._capture_tokens_into(account_num, expected_org_uuid, expected_email)
+        finally:
+            # After the tokens, so a first capture's uuid can file the web
+            # login; it is filed by its own uuid, whichever account the
+            # extension is on.
+            self._snapshot_web(((account_num, expected_email, expected_org_uuid),)
+                               if expected_email else ())
+
+    def _capture_tokens_into(
+        self, account_num: str, expected_org_uuid: str, expected_email: str
+    ) -> str:
         try:
             session = capture_tokens_cdp(self._s.debug_port)
         except Exception as e:  # noqa: BLE001
@@ -1249,6 +1286,41 @@ class ChromeSync:
         _logger.info("chrome-sync: captured extension tokens for account %s (%s)",
                      account_num, session.email or session.account_uuid)
         return ""
+
+    def capture_auto(self, slots) -> dict:
+        """Capture whatever the browser holds into the slots it belongs to.
+
+        The extension's account goes to the slot with its email (and org);
+        the claude.ai login to the slot with its account uuid or email. They
+        need not be the same account. Returns ``{"extension": num | None,
+        "web": num | None, "reason": str}``; ``reason`` explains a missing
+        extension capture.
+        """
+        out: dict = {"extension": None, "web": None, "reason": ""}
+        if not self.active:
+            out["reason"] = "Chrome sync is disabled"
+            return out
+        if not automation_chrome_running(self._s.debug_port):
+            out["reason"] = "the Claude Browser is not running (open it with `cswap chrome open`)"
+            return out
+        try:
+            session = capture_tokens_cdp(self._s.debug_port)
+            if session is None:
+                out["reason"] = "the extension is not signed in (or its last sign-in failed)"
+            else:
+                num = match_slot(slots, session.email, session.org_uuid)
+                if num is None:
+                    out["reason"] = (f"no single managed account matches the extension's "
+                                     f"{session.email or 'account'} (add it with `cswap add`)")
+                else:
+                    self._vault.put(num, session)
+                    out["extension"] = num
+                    _logger.info("chrome-sync: captured extension tokens for account %s (%s)",
+                                 num, session.email or session.account_uuid)
+        except Exception as e:  # noqa: BLE001
+            out["reason"] = f"capture failed: {e}"
+        out["web"] = self._snapshot_web(slots)
+        return out
 
     def web_stored(self, account_num: str) -> bool:
         return self._web.get_web(account_num) is not None

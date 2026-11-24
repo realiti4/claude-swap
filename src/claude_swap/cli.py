@@ -1456,7 +1456,8 @@ Examples:
   cswap chrome setup            # guided one-time setup
   cswap chrome doctor           # what's set up + per-account coverage
   cswap chrome open             # open/focus the dedicated Claude Browser
-  cswap chrome capture 3        # store account 3's tokens (connect it there first)
+  cswap chrome capture          # store what the browser is signed in as, slot found automatically
+  cswap chrome capture 3        # store into slot 3 only (refused if it is another account)
   cswap chrome detach           # sign the extension out without revoking (connect the next account)
   cswap chrome refresh 3        # keep account 3's stored tokens alive (no browser)
   cswap chrome bridge install   # relay so a running session follows a switch (LOCAL_BRIDGE=1)
@@ -1487,8 +1488,11 @@ Examples:
         "--focus", action="store_true",
         help="Bring the browser window to the foreground (off by default)",
     )
-    p_cap = sub.add_parser("capture", help="Store the account the extension is connected to")
-    p_cap.add_argument("account", metavar="N", help="Account number to store the current tokens for")
+    p_cap = sub.add_parser(
+        "capture", help="Store the extension's account and the claude.ai login (slot found automatically)")
+    p_cap.add_argument(
+        "account", metavar="N", nargs="?", default=None,
+        help="Store into this slot only (default: the slot each login belongs to)")
     p_cap.add_argument(
         "--force", action="store_true",
         help="Store even if the extension is on a different account than slot N",
@@ -1602,6 +1606,22 @@ Examples:
                 cs.bring_automation_to_front(settings.debug_port)
             print(f"{accent('Claude Browser')} open")
         return
+    if action == "capture" and args.account is None:
+        if args.force:
+            error("--force needs a slot number: cswap chrome capture N --force")
+            sys.exit(1)
+        got = sync.capture_auto(chrome_onboard._accounts(switcher))
+        if got["extension"]:
+            print(f"{accent('Captured')} the extension's account into account {got['extension']}")
+        else:
+            print(dimmed(f"Extension not captured: {got['reason']}"))
+        if got["web"]:
+            print(f"{accent('Stored')} the claude.ai web login for account {got['web']}")
+        else:
+            print(dimmed("claude.ai web login not stored: not signed in, or not a managed account"))
+        if not (got["extension"] or got["web"]):
+            sys.exit(1)
+        return
     if action == "capture":
         slots = {num: (email, org) for num, email, org in chrome_onboard._accounts(switcher)}
         if args.account not in slots and not args.force:
@@ -1631,7 +1651,7 @@ Examples:
     if action == "detach" and args.web_only:
         if sync.detach_web():
             print(f"{accent('Signed out')} claude.ai in the Claude Browser (its login is stored, "
-                  "not ended). Sign in there as the next account, then `cswap chrome capture N`.")
+                  "not ended). Sign in there as the next account, then `cswap chrome capture`.")
             return
         error("Web detach failed — is the Claude Browser running?")
         sys.exit(1)
