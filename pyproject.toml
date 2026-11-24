@@ -28,6 +28,9 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# Firstchair runs Claude Code, Codex and Grok workers and can seat its Claude
+# workers on cswap accounts: `cswap firstchair ...` delegates to it.
+firstchair = ["firstchair>=0.1.0a3"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

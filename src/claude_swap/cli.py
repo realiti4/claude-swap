@@ -456,6 +456,31 @@ def _unclaimed_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+FIRSTCHAIR_INSTALL_HINT = (
+    "cswap firstchair needs the firstchair package. Install it into cswap's environment:\n"
+    "  uv tool install 'claude-swap[firstchair]'"
+)
+
+
+def _firstchair_command(argv: list[str]) -> None:
+    """Handle `cswap firstchair ...` by handing off to the Firstchair companion.
+
+    Firstchair (https://github.com/GrayManSam/firstchair) runs Claude Code,
+    Codex and Grok workers, for example a lead with workers in separate git
+    worktrees, or a second model reviewing the first one's plan. With
+    FIRSTCHAIR_CSWAP=1 it seats Claude workers on cswap accounts through
+    `cswap list --json` and `cswap run N --`. It ships as a separate package
+    behind the `firstchair` extra, so cswap carries no orchestration code;
+    this command only delegates to it.
+    """
+    try:
+        from firstchair.cli import main as firstchair_main
+    except ImportError:
+        printer.error(FIRSTCHAIR_INSTALL_HINT)
+        sys.exit(1)
+    sys.exit(firstchair_main(argv, prog=f"{_prog_name()} firstchair") or 0)
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -1478,6 +1503,9 @@ def main() -> None:
     if argv and argv[0] == "priority":
         _priority_command(argv[1:])
         return
+    if argv and argv[0] == "firstchair":
+        _firstchair_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1528,6 +1556,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s firstchair ...             run agent workers on cswap accounts (firstchair extra)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

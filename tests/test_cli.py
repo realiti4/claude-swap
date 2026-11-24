@@ -2645,3 +2645,31 @@ class TestPersonAtTerminal:
         args = cli.argparse.Namespace(json=False, menubar=False)
         with patch.object(sys.stdin, "isatty", side_effect=ValueError("closed")):
             assert cli._person_at_terminal(args) is False
+
+
+class TestFirstchairCommand:
+    """`cswap firstchair ...` only delegates to the optional firstchair package."""
+
+    def test_delegates_arguments_to_the_companion(self):
+        import types
+
+        calls = []
+        companion_cli = types.ModuleType("firstchair.cli")
+        companion_cli.main = lambda argv, prog: calls.append((argv, prog)) or 0
+        companion = types.ModuleType("firstchair")
+        companion.cli = companion_cli
+        with patch.dict(sys.modules, {"firstchair": companion,
+                                      "firstchair.cli": companion_cli}), \
+             patch.object(sys, "argv", ["cswap", "firstchair", "run", "--dry-run", "x"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        assert calls == [(["run", "--dry-run", "x"], "cswap firstchair")]
+
+    def test_without_the_extra_explains_how_to_install_it(self, capsys):
+        with patch.dict(sys.modules, {"firstchair": None, "firstchair.cli": None}), \
+             patch.object(sys, "argv", ["cswap", "firstchair", "run"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        assert "claude-swap[firstchair]" in capsys.readouterr().err
