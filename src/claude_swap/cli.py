@@ -1607,6 +1607,9 @@ Examples:
         reason = sync.capture_checked(args.account, org, email)
         if not reason:
             print(f"{accent('Captured')} account {args.account} from the extension's current pairing")
+            if not sync.web_stored(args.account):
+                print(dimmed(f"claude.ai web login not stored: sign in to claude.ai as account "
+                             f"{args.account} in the Claude Browser, then run this again."))
             return
         error(f"Capture failed: {reason}")
         if not args.force:

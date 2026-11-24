@@ -86,6 +86,7 @@ def print_doctor(switcher) -> None:
 
     # Per-account browser-session coverage.
     vault = cs.ChromeVault(root)
+    web = cs.WebVault(root)
     accounts = _accounts(switcher)
     print(accent("  browser sessions (per account):"))
     if not accounts:
@@ -97,6 +98,8 @@ def print_doctor(switcher) -> None:
             hint = muted(f"  → connect + `cswap chrome capture {num}`")
         elif stored.refresh_dead:
             hint = muted(f"  → revoked; connect + `cswap chrome capture {num}`")
+        elif web.get_web(num) is None:
+            hint = muted(f"  → no claude.ai login: sign in there + `cswap chrome capture {num}`")
         else:
             hint = ""
         print(f"    {_mark(has)} {num} {email or '(unknown)'}{hint}")
