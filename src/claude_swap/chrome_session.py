@@ -38,6 +38,16 @@ Switching accounts (the mechanism, verified end-to-end)
    new account. If the injected access token is expired, the SW auto-refreshes
    via the refresh token on adoption (self-heals).
 
+The claude.ai web login (cookies) must be the same account: when a refresh
+token fails, the extension re-authorizes silently (``prompt=none`` with
+``login_hint=<accountUuid>``) through that login, and a login to another
+account answers ``login_required``, which the extension (v1.0.109) treats as a
+definitive ``account_mismatch`` and stops on ``session_expired``. Its content
+script also reports the ``lastActiveOrg`` cookie as the org hint. So a switch
+moves the web login too: :class:`WebVault` keeps each account's identity
+cookies, captured only after ``/api/account`` (fetched by the extension's SW
+with the browser's cookies) confirms whose they are.
+
 Because the tokens live in in-memory session storage, capture requires the
 automation Chrome running + CDP (there is no on-disk / offline path, and no
 Keychain/openssl needed — unlike the old cookie approach).
@@ -653,6 +663,108 @@ def detach_extension_cdp(port: int) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# claude.ai web login (cookies) — kept on the same account as the extension
+# --------------------------------------------------------------------------- #
+CLAUDE_COOKIE_URL = "https://claude.ai"
+# The cookies that make up an account's web login. Everything else on
+# claude.ai (Cloudflare clearance, device id, analytics, UI prefs) belongs to
+# the browser and stays put.
+WEB_IDENTITY_COOKIES = frozenset({"sessionKey", "sessionKeyLC", "routingHint", "lastActiveOrg"})
+# Short-lived cookies the server binds to the current login: dropped on a
+# switch so it issues fresh ones for the new login instead of rejecting them.
+WEB_BOUND_COOKIES = frozenset({"__Host-sessionBinding", "__Host-sessionBindingGrace",
+                               "activitySessionId"})
+
+_WEB_IDENTITY_JS = r"""
+(async () => {
+  try {
+    const r = await fetch('https://claude.ai/api/account', {credentials: 'include'});
+    if (!r.ok) return JSON.stringify({status: r.status});
+    const j = await r.json();
+    return JSON.stringify({status: r.status, uuid: j.uuid || '', email: j.email_address || ''});
+  } catch (e) { return JSON.stringify({status: 0}); }
+})()
+"""
+
+
+def read_web_identity_cdp(port: int) -> dict | None:
+    """Whose claude.ai web login the browser holds: ``{"uuid", "email"}``.
+
+    Fetched by the extension's SW, which sends the browser's claude.ai
+    cookies (``<all_urls>`` host permission). None when signed out or
+    unreachable.
+    """
+    raw = _eval_in_sw(port, _WEB_IDENTITY_JS)
+    try:
+        data = json.loads(raw) if raw else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("status") != 200 or not data.get("uuid"):
+        return None
+    return {"uuid": data["uuid"], "email": data.get("email", "")}
+
+
+def _browser_call(port: int, method: str, params: dict | None = None) -> dict:
+    bws = _browser_ws(port)
+    if not bws:
+        raise RuntimeError("automation Chrome is not reachable")
+    cdp = _CDP(bws)
+    try:
+        return cdp.call(method, params or {})
+    finally:
+        cdp.close()
+
+
+def _claude_cookies(port: int) -> list[dict]:
+    cookies = _browser_call(port, "Storage.getCookies").get("cookies", [])
+    return [c for c in cookies if c.get("domain", "").lstrip(".") == "claude.ai"]
+
+
+def _cookie_param(c: dict) -> dict:
+    """A CDP cookie → a ``Storage.setCookies`` param that recreates it exactly.
+
+    A host-only cookie (domain without a leading dot, e.g. ``__Host-`` ones)
+    is set by URL, since passing a domain would make it a domain cookie.
+    """
+    param = {"name": c["name"], "value": c["value"], "path": c.get("path", "/"),
+             "secure": bool(c.get("secure")), "httpOnly": bool(c.get("httpOnly"))}
+    if c.get("domain", "").startswith("."):
+        param["domain"] = c["domain"]
+    else:
+        param["url"] = CLAUDE_COOKIE_URL + param["path"]
+    if c.get("sameSite"):
+        param["sameSite"] = c["sameSite"]
+    if not c.get("session") and c.get("expires", -1) > 0:
+        param["expires"] = c["expires"]
+    return param
+
+
+def capture_web_cookies_cdp(port: int) -> tuple[str, list[dict]] | None:
+    """``(account uuid, identity cookies)`` of the browser's claude.ai login."""
+    ident = read_web_identity_cdp(port)
+    if not ident:
+        return None
+    cookies = [_cookie_param(c) for c in _claude_cookies(port) if c["name"] in WEB_IDENTITY_COOKIES]
+    if not any(c["name"] == "sessionKey" for c in cookies):
+        return None
+    return ident["uuid"], cookies
+
+
+def apply_web_cookies_cdp(port: int, cookies: list[dict]) -> None:
+    """Replace the browser's claude.ai login with ``cookies`` (an empty list
+    signs the web out locally). Only identity and login-bound cookies are
+    touched; nothing is sent to claude.ai, so the replaced login stays valid.
+    """
+    expired = [{**_cookie_param(c), "value": "", "expires": 1}
+               for c in _claude_cookies(port)
+               if c["name"] in WEB_IDENTITY_COOKIES or c["name"] in WEB_BOUND_COOKIES]
+    if expired:
+        _browser_call(port, "Storage.setCookies", {"cookies": expired})
+    if cookies:
+        _browser_call(port, "Storage.setCookies", {"cookies": cookies})
+
+
+# --------------------------------------------------------------------------- #
 # Offline token refresh (keep-alive; no browser needed)
 # --------------------------------------------------------------------------- #
 REFRESH_OK = "ok"
@@ -913,6 +1025,31 @@ class ChromeVault:
             self._write(data)
 
 
+class WebVault(ChromeVault):
+    """Each account's claude.ai web-login cookies, chmod 600.
+
+    ``{"<n>": {"accountUuid": ..., "email": ..., "cookies": [...], "capturedAt": ms}}``.
+    A ``sessionKey`` signs in to claude.ai as that account, so it gets the
+    same protection as the OAuth tokens, in its own file.
+    """
+
+    def __init__(self, backup_root: Path):
+        self._path = Path(backup_root) / "chrome_web_sessions.json"
+
+    def get_web(self, account_num: str) -> dict | None:
+        entry = self._read().get(str(account_num))
+        return entry if isinstance(entry, dict) and entry.get("cookies") else None
+
+    def put_web(self, account_num: str, account_uuid: str, email: str, cookies: list[dict]) -> None:
+        data = self._read()
+        data[str(account_num)] = {"accountUuid": account_uuid, "email": email,
+                                  "cookies": cookies, "capturedAt": int(time.time() * 1000)}
+        self._write(data)
+
+    def account_numbers(self) -> set[str]:
+        return {k for k, v in self._read().items() if isinstance(v, dict) and v.get("cookies")}
+
+
 # --------------------------------------------------------------------------- #
 # Facade used by claude-swap's switcher (the only surface switcher.py imports)
 # --------------------------------------------------------------------------- #
@@ -947,6 +1084,7 @@ class ChromeSync:
     def __init__(self, settings: ChromeSyncSettings, backup_root: Path):
         self._s = settings
         self._vault = ChromeVault(backup_root)
+        self._web = WebVault(backup_root)
         self._backup_root = Path(backup_root)
         # Background mode (the menu bar): a switch hands the browser sync to a
         # worker thread instead of waiting the seconds an injection takes.
@@ -1022,24 +1160,59 @@ class ChromeSync:
             return False
         return automation_chrome_running(self._s.debug_port)
 
-    def _snapshot_current(self) -> None:
+    def _snapshot_current(self) -> str | None:
         """Re-capture the account the extension is *currently* on into its vault
         slot, before we inject a different one.
 
         The active account's access token rotates roughly every 8h, so its stored
         copy goes stale; snapshotting on the way out keeps the vault fresh and
         avoids ever re-injecting a dead token. Matched to a slot by accountUuid.
+        The claude.ai login is stored the same way; returns the slot it
+        belongs to (None if signed out or unmanaged).
         """
         try:
             current = capture_tokens_cdp(self._s.debug_port)
-            if not current:
-                return
-            num = self._vault.find_by_uuid(current.account_uuid)
-            if num:
-                self._vault.put(num, current)
-                _logger.info("chrome-sync: refreshed stored tokens for account %s (outgoing)", num)
+            if current:
+                num = self._vault.find_by_uuid(current.account_uuid)
+                if num:
+                    self._vault.put(num, current)
+                    _logger.info("chrome-sync: refreshed stored tokens for account %s (outgoing)", num)
         except Exception as e:  # noqa: BLE001
             _logger.info("chrome-sync: could not snapshot current account: %s", e)
+        return self._snapshot_web()
+
+    def _snapshot_web(self) -> str | None:
+        """Store the browser's claude.ai login under the slot it belongs to.
+
+        The slot is found by the login's own account uuid (``/api/account``),
+        never assumed to be the extension's account. Returns that slot.
+        """
+        try:
+            got = capture_web_cookies_cdp(self._s.debug_port)
+            if not got:
+                return None
+            uuid, cookies = got
+            num = self._vault.find_by_uuid(uuid)
+            if num:
+                stored = self._vault.get(num)
+                self._web.put_web(num, uuid, stored.email if stored else "", cookies)
+            return num
+        except Exception as e:  # noqa: BLE001
+            _logger.info("chrome-sync: could not snapshot the claude.ai login: %s", e)
+            return None
+
+    def _apply_web(self, account_num: str) -> None:
+        """Put ``account_num``'s claude.ai login in the browser, if stored."""
+        entry = self._web.get_web(account_num)
+        if entry is None:
+            _logger.info("chrome-sync: no claude.ai login stored for account %s; sign in to "
+                         "claude.ai as it in the Claude Browser, then `cswap chrome capture %s`",
+                         account_num, account_num)
+            return
+        try:
+            apply_web_cookies_cdp(self._s.debug_port, entry["cookies"])
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("chrome-sync: could not switch the claude.ai login: %s", e)
 
     def capture_checked(
         self, account_num: str, expected_org_uuid: str = "", expected_email: str = ""
@@ -1072,7 +1245,14 @@ class ChromeSync:
         self._vault.put(account_num, session)
         _logger.info("chrome-sync: captured extension tokens for account %s (%s)",
                      account_num, session.email or session.account_uuid)
+        web_slot = self._snapshot_web()
+        if web_slot != account_num:
+            _logger.info("chrome-sync: claude.ai is not signed in as account %s; its web login "
+                         "was not stored", account_num)
         return ""
+
+    def web_stored(self, account_num: str) -> bool:
+        return self._web.get_web(account_num) is not None
 
     def capture_for_account(
         self, account_num: str, expected_org_uuid: str = "", expected_email: str = ""
@@ -1102,6 +1282,9 @@ class ChromeSync:
             return False
         try:
             self._snapshot_current()
+            # Sign the web out locally as well: connecting the next account in
+            # the extension goes through the claude.ai login.
+            apply_web_cookies_cdp(self._s.debug_port, [])
             return detach_extension_cdp(self._s.debug_port)
         except Exception as e:  # noqa: BLE001
             _logger.warning("chrome-sync: detach failed: %s", e)
@@ -1169,10 +1352,16 @@ class ChromeSync:
             port = self._s.debug_port
             if _adopted(_read_state_cdp(port), session):
                 # Already there: keep the stored copy current, inject nothing.
-                self._snapshot_current()
+                if self._snapshot_current() != account_num:
+                    self._apply_web(account_num)
                 return True
-            # Keep the outgoing account's stored tokens fresh before we overwrite.
-            self._snapshot_current()
+            # Keep the outgoing account's stored tokens and web login fresh
+            # before we overwrite them.
+            web_slot = self._snapshot_current()
+            # The web login first: the wake tab then loads claude.ai as the
+            # target, and a silent re-auth runs through the right login.
+            if web_slot != account_num:
+                self._apply_web(account_num)
             # The snapshot may have just stored newer tokens for this very
             # account (e.g. the extension was on it but not yet confirmed);
             # never act on the copy read before it.

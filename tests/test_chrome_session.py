@@ -26,6 +26,7 @@ def _no_live_browser_or_network(monkeypatch):
     port) or the OAuth token endpoint; tests opt in to fakes explicitly."""
     monkeypatch.setattr(cs, "automation_chrome_running", lambda *a, **k: False)
     monkeypatch.setattr(cs, "_eval_in_sw", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "_browser_call", lambda *a, **k: pytest.fail("browser CDP call"))
     monkeypatch.setattr(cs, "refresh_session_detailed", lambda *a, **k: (None, cs.REFRESH_FAILED))
 
 
@@ -547,3 +548,89 @@ def test_wait_for_sw_gone_waits_for_the_old_worker_only(monkeypatch):
     # Still the old one at the deadline.
     monkeypatch.setattr(cs, "_sw_target", lambda *a, **k: {"id": "old"})
     assert cs._wait_for_sw_gone(1, "old", timeout=0) is False
+
+
+# --------------------------------------------------------------------------- #
+# claude.ai web login (cookies) follows the extension's account
+# --------------------------------------------------------------------------- #
+def _cdp_cookie(name, value="v", domain=".claude.ai", **kw):
+    return {"name": name, "value": value, "domain": domain, "path": "/", "secure": True,
+            "httpOnly": True, "sameSite": "Lax", "expires": 2_000_000_000, "session": False, **kw}
+
+
+def test_cookie_param_keeps_host_only_cookies_host_only():
+    assert cs._cookie_param(_cdp_cookie("sessionKey"))["domain"] == ".claude.ai"
+    host = cs._cookie_param(_cdp_cookie("__Host-sessionBinding", domain="claude.ai"))
+    assert "domain" not in host and host["url"] == "https://claude.ai/"
+    assert "expires" not in cs._cookie_param(_cdp_cookie("ion", session=True, expires=-1))
+
+
+def test_capture_web_cookies_takes_only_identity_cookies(monkeypatch):
+    monkeypatch.setattr(cs, "read_web_identity_cdp", lambda *a, **k: {"uuid": "acc", "email": "a@x"})
+    monkeypatch.setattr(cs, "_claude_cookies", lambda *a, **k: [
+        _cdp_cookie("sessionKey"), _cdp_cookie("routingHint"), _cdp_cookie("cf_clearance"),
+        _cdp_cookie("lastActiveOrg", domain="claude.ai"), _cdp_cookie("anthropic-device-id")])
+    uuid, cookies = cs.capture_web_cookies_cdp(1)
+    assert uuid == "acc"
+    assert sorted(c["name"] for c in cookies) == ["lastActiveOrg", "routingHint", "sessionKey"]
+
+
+def test_capture_web_cookies_needs_a_session_key(monkeypatch):
+    monkeypatch.setattr(cs, "read_web_identity_cdp", lambda *a, **k: {"uuid": "acc", "email": ""})
+    monkeypatch.setattr(cs, "_claude_cookies", lambda *a, **k: [_cdp_cookie("lastActiveOrg")])
+    assert cs.capture_web_cookies_cdp(1) is None
+
+
+def test_apply_web_cookies_expires_identity_and_bound_cookies_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cs, "_claude_cookies", lambda *a, **k: [
+        _cdp_cookie("sessionKey", "old"), _cdp_cookie("__Host-sessionBinding", domain="claude.ai"),
+        _cdp_cookie("cf_clearance")])
+    monkeypatch.setattr(cs, "_browser_call", lambda port, m, p=None: calls.append((m, p)) or {})
+    new = [cs._cookie_param(_cdp_cookie("sessionKey", "new"))]
+    cs.apply_web_cookies_cdp(1, new)
+    (m1, expire), (m2, put) = calls
+    assert m1 == m2 == "Storage.setCookies"
+    assert sorted(c["name"] for c in expire["cookies"]) == ["__Host-sessionBinding", "sessionKey"]
+    assert all(c["expires"] == 1 and c["value"] == "" for c in expire["cookies"])
+    assert put["cookies"] == new
+
+
+def test_snapshot_files_the_web_login_under_its_own_account(tmp_path, monkeypatch):
+    # The extension is on account 1 but claude.ai is signed in as account 2.
+    monkeypatch.setattr(cs, "is_supported", lambda: True)
+    vault = cs.ChromeVault(tmp_path)
+    vault.put("1", _session(account_uuid="acc-1", email="a@x"))
+    vault.put("2", _session(account_uuid="acc-2", email="b@x"))
+    monkeypatch.setattr(cs, "capture_tokens_cdp", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "capture_web_cookies_cdp",
+                        lambda *a, **k: ("acc-2", [{"name": "sessionKey", "value": "s2"}]))
+    sync = cs.ChromeSync(cs.ChromeSyncSettings(enabled=True), tmp_path)
+    assert sync._snapshot_current() == "2"
+    assert cs.WebVault(tmp_path).get_web("2")["cookies"][0]["value"] == "s2"
+    assert cs.WebVault(tmp_path).get_web("1") is None
+
+
+def test_sync_puts_the_target_web_login_in_before_injecting(tmp_path, monkeypatch):
+    sync = _sync_env(tmp_path, monkeypatch, live_state=_state(accountUuid="other"),
+                     settled=_session(account_uuid="acc"))
+    cs.ChromeVault(tmp_path).put("2", _session(account_uuid="acc"))
+    cs.WebVault(tmp_path).put_web("2", "acc", "b@x", [{"name": "sessionKey", "value": "s2"}])
+    monkeypatch.setattr(cs, "capture_web_cookies_cdp", lambda *a, **k: None)
+    order = []
+    monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda port, c: order.append(("web", c)))
+    monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: order.append(("inject",)) or True)
+    assert sync.sync_to_account("2") is True
+    assert order[0] == ("web", [{"name": "sessionKey", "value": "s2"}])
+    assert order[1] == ("inject",)
+
+
+def test_sync_leaves_the_web_alone_when_it_is_already_on_the_target(tmp_path, monkeypatch):
+    sync = _sync_env(tmp_path, monkeypatch, live_state=_state(accountUuid="other"),
+                     settled=_session(account_uuid="acc"))
+    cs.ChromeVault(tmp_path).put("2", _session(account_uuid="acc"))
+    monkeypatch.setattr(cs, "capture_web_cookies_cdp",
+                        lambda *a, **k: ("acc", [{"name": "sessionKey", "value": "s2"}]))
+    monkeypatch.setattr(cs, "apply_web_cookies_cdp", lambda *a, **k: pytest.fail("web replaced"))
+    monkeypatch.setattr(cs, "inject_tokens_cdp", lambda *a, **k: True)
+    assert sync.sync_to_account("2") is True
