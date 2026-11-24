@@ -12,6 +12,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+firstchair = [
+    { name = "firstchair" },
+]
 menubar = [
     { name = "rumps" },
 ]
@@ -25,11 +28,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "firstchair", marker = "extra == 'firstchair'", specifier = ">=0.1.0a3" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
     { name = "textual", specifier = ">=8.2.8,<9" },
     { name = "truststore", specifier = ">=0.10.4" },
 ]
-provides-extras = ["menubar"]
+provides-extras = ["menubar", "firstchair"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -54,6 +58,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/bf/89/780e11f9588d9e7128a3f87788354c7946a9cbb1401ad38a48c4db9a4f07/execnet-2.1.2.tar.gz", hash = "sha256:63d83bfdd9a23e35b9c6a3261412324f964c2ec8dcd8d3c6916ee9373e0befcd", size = 166622, upload-time = "2025-11-12T09:56:37.75Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ab/84/02fc1827e8cdded4aa65baef11296a9bbe595c474f0d6d758af082d849fd/execnet-2.1.2-py3-none-any.whl", hash = "sha256:67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec", size = 40708, upload-time = "2025-11-12T09:56:36.333Z" },
+]
+
+[[package]]
+name = "firstchair"
+version = "0.1.0a3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/a5/2ad5022f7ed962604722fc2feaaf5a0bb1241b685b5705f27a4541439a08/firstchair-0.1.0a3.tar.gz", hash = "sha256:b432eca877b81d3420a46e398297c4b2ca3a6fb42f21a0b9105d2891fe91226d", size = 132727, upload-time = "2026-11-24T17:55:20.663Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c2/13/79f7c8acb453c64831b833610056e24f10ab3fe1b927f6e91711781126c6/firstchair-0.1.0a3-py3-none-any.whl", hash = "sha256:68a754965034357b984af1d10f0436f1b349589b968afffab0e6fde4c18b4495", size = 85478, upload-time = "2026-11-24T17:55:19.467Z" },
 ]
 
 [[package]]
