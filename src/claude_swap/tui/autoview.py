@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -24,7 +25,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
-from claude_swap import oauth
+from claude_swap import balance, oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 _EVENT_ROLES = {
     "switch": "accent",
+    "model": "accent",
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
@@ -212,6 +214,16 @@ class AutoScreen(Screen):
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        # Name the strategy when it is not the default, so a screenshot
+        # says how the engine is deciding. For balance, also show the margin
+        # and the cooldown, which acts as the minimum time spent on an account.
+        if self._settings.strategy != "best":
+            text.append(f" · strategy {self._settings.strategy}", style=palette.accent)
+        if self._settings.strategy == "balance":
+            text.append(
+                f" (margin {pct_label(self._settings.balance_margin)}%,"
+                f" dwell {self._settings.cooldown_seconds / 60:.0f}m)"
+            )
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
@@ -317,6 +329,12 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
+        # The balance strategy ranks on scores, not headroom, so it gets its
+        # own panel instead of the candidate list below.
+        if settings is not None and settings.strategy == "balance":
+            return self._balance_text(
+                snap, active_number, settings, models, palette
+            )
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
         candidates = [
@@ -376,5 +394,86 @@ class AutoScreen(Screen):
             ],
             budget,
         ):
+            text.append(row)
+        return text
+
+    # -- balance strategy panel ------------------------------------------------
+    #
+    # With strategy "balance", the candidate list above is replaced by a
+    # panel that shows every account's balance score: the same numbers the
+    # engine ranks on, computed by the same functions (balance.py).
+
+    def _balance_text(self, snap, active_number, settings, models, palette) -> Text:
+        """Every account with its balance score, highest first.
+
+        One row per account, for example::
+
+             ● 1  someone@example.com            w5  score   41.7  [7d 40%/72h]
+
+        ``●`` marks the active account and ``w5`` is the plan weight. The
+        bracket shows the window that set the score (used %, hours to reset).
+        Rows also note an account over a line, and disabled accounts. The header
+        shows the score a candidate needs to take over.
+        """
+        weight_overrides = balance.parse_weight_overrides(settings.balance_weights)
+        now = time.time()
+
+        rows: list[tuple[float, str, Text]] = []  # (sort key, slot, rendered row)
+        active_score: float | None = None
+        for acc in snap.accounts:
+            is_active = acc.number == active_number
+            weight = weight_overrides.get(
+                acc.number, balance.weight_for_plan(acc.subscription_plan)
+            )
+            usage_view = acc.usage.last_good
+            rate = balance.spare_rate(usage_view, models, weight, now)
+            score = rate.score if rate else None
+            if is_active:
+                active_score = score
+
+            row = Text()
+            row.append(
+                f"\n {'●' if is_active else ' '}{acc.number:>2}  ",
+                style=palette.accent if is_active else palette.foreground,
+            )
+            row.append(f"{acc.email:<32}", style=palette.foreground)
+            row.append(f" w{weight:g}", style=palette.muted)
+            row.append(f"  score {balance.fmt(score):>6}", style=palette.foreground)
+            if rate:
+                row.append(f"  [{rate.detail}]", style=palette.muted)
+
+            # Over a line? Same per-account line the engine uses: the
+            # account's own policy threshold, else the session threshold.
+            account_line = (
+                acc.policy.threshold
+                if acc.policy.threshold is not None
+                else settings.threshold
+            )
+            binding = binding_window(
+                oauth.relevant_windows(usage_view, models),
+                account_line,
+                settings.weekly_threshold,
+                scale=settings.threshold,
+            )
+            if binding is not None and binding.over:
+                row.append(
+                    f"  over {binding.label} line", style=palette.severity(binding.pct)
+                )
+            if not acc.switchable and not is_active:
+                row.append("  disabled", style=palette.muted)
+
+            # Highest score first. Unknown scores sort last (as -1).
+            sort_key = -(score if score is not None else -1.0)
+            rows.append((sort_key, acc.number, row))
+
+        text = Text()
+        text.append(
+            f"Balance (score = weighted quota/h left x{balance.DISPLAY_SCALE:g})",
+            style=palette.muted,
+        )
+        if active_score is not None:
+            need = balance.required_score(active_score, settings.balance_margin)
+            text.append(f"  moves at >= {balance.fmt(need)}", style=palette.muted)
+        for _sort_key, _slot, row in sorted(rows):
             text.append(row)
         return text

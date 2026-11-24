@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import balance, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
@@ -1199,7 +1199,10 @@ class AutoSwitchEngine:
                 else (100.0 - active_headroom) < thresholds[current]
             )
             if below:
-                if settings.strategy != "consume-first" and not priority_mode:
+                if (
+                    settings.strategy not in ("consume-first", "balance")
+                    and not priority_mode
+                ):
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1217,7 +1220,15 @@ class AutoSwitchEngine:
                 # whichever account's weekly window resets soonest, to burn the
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
-                trigger = "priority" if priority_mode else "consume-first"
+                #
+                # balance: likewise looks for a move while below the lines, to
+                # an account whose plan-weighted spare rate beats the active
+                # one by the balance margin (see the balance block in _rank).
+                trigger = (
+                    "priority" if priority_mode
+                    else "balance" if settings.strategy == "balance"
+                    else "consume-first"
+                )
             else:
                 # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
@@ -1269,7 +1280,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first", "priority", "balance") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1293,7 +1304,7 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger in ("consume-first", "priority")
+            trigger in ("consume-first", "priority", "balance")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1425,7 +1436,7 @@ class AutoSwitchEngine:
             thresholds=thresholds,
         )
 
-        if (trigger == "consume-first" or priority_mode) and ordered:
+        if (trigger in ("consume-first", "balance") or priority_mode) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1462,7 +1473,7 @@ class AutoSwitchEngine:
         )
         if (
             not ordered and api_key_candidates
-            and trigger not in ("consume-first", "priority")
+            and trigger not in ("consume-first", "priority", "balance")
             and not priority_active_ready
         ):
             # Last resort when we must move: metered API-key accounts
@@ -1493,6 +1504,20 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "balance":
+                # Below the lines and no account is enough better paced:
+                # staying put is the intended outcome, never a block. The
+                # detail lists every score so the user can see why.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="balanced",
+                        detail=self._balance_detail(
+                            current, oauth_candidates, usage, settings,
+                            decided_now, thresholds,
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -1579,7 +1604,9 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first" or (priority_mode and num in oauth_candidates):
+            if trigger in ("consume-first", "balance") or (
+                priority_mode and num in oauth_candidates
+            ):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1651,6 +1678,40 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    # -- balance strategy (balance.py) ---------------------------------------
+
+    def _balance_scores(
+        self, nums, usage, settings: AutoSwitchSettings, now: float
+    ) -> dict[str, float]:
+        """Balance score per account in ``nums``. Accounts with no readable weekly window are left out."""
+        weights = balance.plan_weights(self.switcher, settings.balance_weights)
+        scores: dict[str, float] = {}
+        for num in nums:
+            rate = balance.spare_rate(
+                usage.get(num), self._models, weights.get(str(num), balance.DEFAULT_WEIGHT), now
+            )
+            if rate is not None:
+                scores[num] = rate.score
+        return scores
+
+    def _balance_detail(
+        self, current, candidates, usage, settings, now, thresholds
+    ) -> str:
+        """The "why we stayed" text for a balance tick that did not move.
+
+        Example: ``scores #1 41.7*, #2 12.5 (over 7d line); need +25% to move``.
+        The ``*`` marks the active account.
+        """
+        scores = self._balance_scores((*candidates, current), usage, settings, now)
+        parts = [f"#{current} {balance.fmt(scores.get(current))}*"]
+        for num in candidates:
+            binding = self._binding(usage.get(num), settings, thresholds[num])
+            over_note = f" (over {binding.label} line)" if binding is not None and binding.over else ""
+            parts.append(f"#{num} {balance.fmt(scores.get(num))}{over_note}")
+
+        margin = pct_label(settings.balance_margin)
+        return "scores " + ", ".join(parts) + f"; need +{margin}% to move"
 
     def _no_return_account(
         self,
@@ -2221,6 +2282,35 @@ class AutoSwitchEngine:
             # room bar.
             return (-h, _binding_recovery_ts(usage.get(num), self._models, now))
 
+        # The balance strategy ranks targets by plan-weighted spare rate
+        # (balance.py) instead of headroom. It applies to two triggers:
+        #   * "balance": the active account is below its lines and the engine
+        #     is only looking for a better-paced account. A candidate must
+        #     beat the active account's score by balance_margin percent,
+        #     otherwise staying put is cheaper.
+        #   * "proactive": the active account crossed a line and must be left.
+        #     The highest-scoring healthy account wins, with no margin.
+        # The escapes (at-limit, failover) and the case where every account
+        # is over its lines keep the ranking below: there, room to keep
+        # working matters more than pacing.
+        balance_rank = (
+            settings.strategy == "balance"
+            and trigger in ("balance", "proactive")
+            and not all_above
+        )
+        if balance_rank:
+            scores = self._balance_scores(
+                (*oauth_candidates, current), usage, settings, now
+            )
+            active_score = scores.get(current)
+            # The score a candidate must reach on a "balance" nudge. None when
+            # the active account has no score, and then no nudge is made.
+            need = (
+                balance.required_score(active_score, settings.balance_margin)
+                if active_score is not None
+                else None
+            )
+
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -2248,6 +2338,16 @@ class AutoSwitchEngine:
                 if binding is not None
                 else (100.0 - h) >= thresholds[num]
             )
+            if balance_rank:
+                if over:
+                    continue  # never land on an account already over a line
+                score = scores.get(num)
+                if score is None:
+                    continue  # no readable weekly window: cannot be paced
+                if trigger == "balance" and (need is None or score < need):
+                    continue  # not enough better to be worth a move
+                qualifying.append(((-score,), num))  # highest score first
+                continue
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now)
                 if consume_first or weekly_first
@@ -2541,7 +2641,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first", "priority", "balance") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

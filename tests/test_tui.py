@@ -1489,6 +1489,22 @@ class TestAutoScreen:
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
+    async def test_balance_strategy_shows_scores(self, tmp_path, fake_engine):
+        from dataclasses import replace as dc_replace
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            screen._settings = dc_replace(screen._settings, strategy="balance")
+            snap = app.snapshot
+            text = screen._candidates_text(snap, active_number=snap.active_number).plain
+            assert "Balance (score" in text
+            assert "score" in text and "w1" in text
+
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
