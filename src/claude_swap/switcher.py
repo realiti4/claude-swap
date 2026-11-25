@@ -3954,14 +3954,20 @@ class ClaudeAccountSwitcher:
             return creds
         # Same address, different org: naming the address twice says
         # nothing (it's the address that agrees) -- name the two
-        # organizations that disagree instead.
+        # organizations that disagree instead. Either side can be the stale
+        # one: the credential store may hold another organization's token,
+        # or the config may have been rewritten after a fresh login to the
+        # token's organization. The message gives the way out of both.
+        seen_label = f"organization {seen_org}" if seen_org else "your personal account"
+        config_label = f"organization {org_uuid}" if org_uuid else "your personal account"
         raise ConfigError(
-            f"The stored credential for {email} belongs to organization "
-            f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
-            f"Nothing was changed. Two accounts can share an email "
-            f"across organizations. Log in as {email} in the "
-            f"{org_uuid or 'personal'} organization in THIS environment, "
-            f"then re-run."
+            f"The stored credential for {email} belongs to {seen_label}, "
+            f"but the config names {config_label}. Nothing was changed. "
+            f"Two accounts can share an email across organizations, so one "
+            f"of the two is out of date. To add {config_label}, log in to "
+            f"{config_label} in THIS environment, then re-run. If you just "
+            f"logged in to {seen_label}, the config was rewritten after that "
+            f"login: log in to {seen_label} again, then re-run."
         )
 
     def _reject_live_api_key_capture(self, creds: str) -> None:
