@@ -2164,8 +2164,7 @@ class AutoSwitchEngine:
                 return (
                     self._rank_verified_landings(
                         oauth_candidates=kw["oauth_candidates"],
-                        entries=entries, usage=kw["usage"],
-                        headroom=kw["headroom"], settings=settings,
+                        entries=entries, usage=kw["usage"], settings=settings,
                         now=kw["now"], thresholds=thresholds, policies=policies,
                     ),
                     True,
@@ -3060,7 +3059,7 @@ class AutoSwitchEngine:
 
     def _rank_verified_landings(
         self, *, oauth_candidates: list[str], entries: Mapping[str, UsageEntry],
-        usage: dict[str, dict | str | None], headroom: dict[str, float | None],
+        usage: dict[str, dict | str | None],
         settings: AutoSwitchSettings, now: float,
         thresholds: Mapping[str, float], policies: Mapping[str, AccountPolicy],
     ) -> list[str]:
@@ -3081,27 +3080,40 @@ class AutoSwitchEngine:
         """
         by_reset = settings.strategy in (*CONSUME_FIRST_STRATEGIES, "weekly-first")
         by_tier = settings.strategy == "priority-consume-first"
-        ranked: list[tuple[tuple, str]] = []
-        for num in oauth_candidates:
-            h = headroom.get(num)
-            if h is None or h <= 0 or not _reading_verified(entries.get(num), now):
-                continue
-            room = self._room(usage.get(num), settings, thresholds[num])
-            if room is None:
-                room = thresholds[num] - (100.0 - h)
-            if room <= 0 or room < settings.hysteresis_pct:
-                continue
-            binding = self._binding(usage.get(num), settings, thresholds[num])
-            lh = binding.line_headroom if binding is not None else h
-            reset = _seven_day_reset_ts(usage.get(num), now)
-            soonest = reset if reset is not None else float("inf")
-            if by_tier:
-                key: tuple = (-policies.get(num, AccountPolicy()).priority, soonest)
-            elif by_reset:
-                key = (soonest, -lh)
-            else:
-                key = (-lh,)
-            ranked.append((key, num))
+        # `dynamic` ONLY, as in `_rank_candidates`: a model window is not a
+        # blackout, and the blind active was judged on 5h/7d alone, so a
+        # model-gated pass that lands nowhere is retried there.
+        for models in (
+            (self._models, ())
+            if self._models and settings.strategy == "dynamic"
+            else (self._models,)
+        ):
+            hr = _headroom_by_account(usage, models)
+            ranked: list[tuple[tuple, str]] = []
+            for num in oauth_candidates:
+                h = hr.get(num)
+                if h is None or h <= 0 or not _reading_verified(entries.get(num), now):
+                    continue
+                room = self._room(usage.get(num), settings, thresholds[num], models=models)
+                if room is None:
+                    room = thresholds[num] - (100.0 - h)
+                if room <= 0 or room < settings.hysteresis_pct:
+                    continue
+                binding = self._binding(
+                    usage.get(num), settings, thresholds[num], models=models
+                )
+                lh = binding.line_headroom if binding is not None else h
+                reset = _seven_day_reset_ts(usage.get(num), now)
+                soonest = reset if reset is not None else float("inf")
+                if by_tier:
+                    key: tuple = (-policies.get(num, AccountPolicy()).priority, soonest)
+                elif by_reset:
+                    key = (soonest, -lh)
+                else:
+                    key = (-lh,)
+                ranked.append((key, num))
+            if ranked:
+                break
         # List order (sequence order) breaks ties.
         ranked.sort(key=lambda t: t[0])
         return [num for _, num in ranked]

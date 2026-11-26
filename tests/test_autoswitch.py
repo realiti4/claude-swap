@@ -1885,6 +1885,42 @@ class TestAdaptiveScheduler:
         assert self._reasons(h) == ["active-usage-stale"]
         assert sum(counts.values()) <= 1  # the baseline slot only, no escalate-all
 
+    @pytest.mark.parametrize(
+        "strategy, active_fable, lands",
+        [("dynamic", 98.0, True), ("best", 50.0, False)],
+    )
+    def test_a_blind_active_lands_on_peers_over_only_their_model_line_under_dynamic(
+        self, temp_home, monkeypatch, strategy, active_fable, lands
+    ):
+        # Every peer is measured and has 5h/7d room, over only the pinned
+        # model's line. A model window is not a blackout under `dynamic`
+        # (`_rank_candidates` retries on 5h/7d), and the blind active is
+        # judged on 5h/7d too, so the landing reads that basis as well.
+        h = self._harness(temp_home, monkeypatch, strategy=strategy, model="Fable")
+
+        def fable(pct, fable_pct):
+            return {
+                "five_hour": {"pct": pct}, "seven_day": {"pct": pct},
+                "scoped": [{"name": "Fable", "pct": fable_pct,
+                            "resets_at": _iso_at(h.clock.now + 3 * 86400)}],
+            }
+
+        usage = {"1": fable(40, active_fable), "2": fable(10, 100), "3": fable(20, 100)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.clock.advance(400)
+        for _ in range(3):
+            self._tick(h, counts, usage)
+            h.clock.advance(60)
+        if lands:
+            assert self._switches(h) == [(1, 2, "active-stale")]
+        else:
+            assert self._switches(h) == []
+            assert self._reasons(h)[-1] == "no-verified-target"
+
     def test_a_429_frozen_active_reading_moves_to_a_measured_account(
         self, temp_home, monkeypatch
     ):

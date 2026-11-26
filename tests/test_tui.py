@@ -3386,9 +3386,13 @@ class TestNextBestFollowsTheTick:
             "unmanaged-active-account", "no-active-account", "active-api-key",
             "active-idle", "active-usage-unknown", "cooldown",
             "already-consuming-priority", "stale-usage", "no-viable-target",
-            "active-usage-stale", "active-usage-refreshed",
+            "active-usage-stale", "active-usage-refreshed", "no-verified-target",
         }
-        tree = ast.parse(textwrap.dedent(inspect.getsource(AutoSwitchEngine._tick_inner)))
+        # `_stay_blind` emits the blind active's hold, outside `_tick_inner`.
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(AutoSwitchEngine._tick_inner)
+            + inspect.getsource(AutoSwitchEngine._stay_blind)
+        ))
         emitted = {
             kw.value.value
             for call in ast.walk(tree)
