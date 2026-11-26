@@ -4002,6 +4002,46 @@ class TestActiveStaleLanding:
         ] == [trigger]
 
     @pytest.mark.parametrize(
+        ("frozen", "own_reset_s", "peer_reset_s", "waits"),
+        [
+            (98.0, 7200.0, 5 * 86400.0, True),     # the primary: 2 points are 1 short of its wall
+            (98.0, 6 * 86400.0, 7200.0, False),    # a peer is the primary: 3 points are the wall
+            (99.5, 7200.0, 5 * 86400.0, False),    # the primary at its wall
+        ],
+        ids=["the-primary-short-of-its-wall", "not-the-primary", "the-primary-at-its-wall"],
+    )
+    def test_a_blind_dynamic_active_refetches_its_peers_only_at_the_wall_it_leaves_by(
+        self, temp_home, frozen, own_reset_s, peer_reset_s, waits
+    ):
+        # The collector reads the same wall the tick leaves by: the primary's is
+        # one point (`_departure_wall`), so a blind primary short of it waits out
+        # its count on the stored reading and its peers keep their poll plans.
+        h = self._harness(temp_home, accounts=3, strategy="dynamic", unhealthy_ticks=3)
+        now = h.clock.now
+
+        def window(seven: float, reset_s: float) -> dict:
+            return {
+                "five_hour": {"pct": 10.0},
+                "seven_day": {"pct": seven, "resets_at": _iso_at(now + reset_s)},
+            }
+
+        entries = {
+            "1": self._blind(window(frozen, own_reset_s), now),
+            "2": self._read(window(10.0, peer_reset_s), now),
+            "3": self._read(window(20.0, 6 * 86400.0), now),
+        }
+        fetched: list[set] = []
+
+        def serve(fetch=None, **kwargs):
+            fetched.append(set(fetch or ()))
+            return entries
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=serve):
+            outcome = h.engine.tick()
+        assert any({"2", "3"} <= peers for peers in fetched) is (not waits), fetched
+        assert (outcome is TickOutcome.NO_ACTION) is waits
+
+    @pytest.mark.parametrize(
         "trusted, known",
         [(True, "5h 70% read 15m ago"), (False, "no current reading")],
     )

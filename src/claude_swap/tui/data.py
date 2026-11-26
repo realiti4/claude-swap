@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import sys
 import time
 from dataclasses import dataclass
@@ -27,12 +26,16 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     STATE_FILENAME,
     ThresholdMap,
+    _about_to_wall,
+    _active_reading_blind,
     _binding_at,
     _classify_dynamic_trigger,
     _departure_wall,
     _dynamic_active_headroom,
     _headroom_by_account,
+    _healthy_peers,
     _model_window_binds_everywhere,
+    _read_state_file,
     _seven_day_reset_ts,
     dynamic_candidate_order,
     dynamic_expiring_walk,
@@ -52,7 +55,7 @@ if TYPE_CHECKING:
 
 # Triggers where the ranking pass never runs -- keys the auto view's own
 # `_UNMODELED_TEXT` shares (kept in sync by a test, not by import).
-_UNMODELED_TRIGGERS = frozenset({"below-threshold", "unreadable-active"})
+_UNMODELED_TRIGGERS = frozenset({"below-threshold", "unreadable-active", "active-stale"})
 
 
 # ---------------------------------------------------------------------------
@@ -226,23 +229,23 @@ def clock_stamp() -> str:
     return time.strftime("%H:%M:%S")
 
 
-def read_last_active_at(backup_dir: Path) -> dict:
-    """Read-only ``lastActiveAt`` off the engine's own state file
-    (``<backup_dir>/autoswitch_state.json``).
+def read_engine_state(backup_dir: Path) -> dict:
+    """The engine's state file (``<backup_dir>/autoswitch_state.json``), read
+    without its lock and never raising: a missing or garbled file reads as no
+    state, as the engine's own ``_read_state`` does (one function reads both)."""
+    return _read_state_file(backup_dir / STATE_FILENAME)
 
-    ``AutoSwitchEngine._read_state`` is a bound method needing a live
-    engine (state_path, a lock file), so it is not importable as a pure
-    function here -- this mirrors its exact safety contract instead: a
-    missing or garbled file reads as no cached warm context, never raises.
-    """
-    try:
-        raw = json.loads((backup_dir / STATE_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    last_active_at = raw.get("lastActiveAt")
+
+def last_active_of(state: dict) -> dict:
+    """``lastActiveAt`` off a state read: a missing or malformed one reads as no
+    cached warm context."""
+    last_active_at = state.get("lastActiveAt")
     return last_active_at if isinstance(last_active_at, dict) else {}
+
+
+def read_last_active_at(backup_dir: Path) -> dict:
+    """Read-only ``lastActiveAt`` off the engine's own state file."""
+    return last_active_of(read_engine_state(backup_dir))
 
 
 def switch_bars(snap: AccountsSnapshot) -> dict[str, float]:
@@ -262,6 +265,7 @@ def rank_switch_candidates(
     active_number: str | None,
     last_active_at: dict | None = None,
     reasons_out: dict | None = None,
+    state: dict | None = None,
 ) -> tuple[list[str], str | None, str, bool]:
     """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
     admission and order. THE shared computation -- ``ordered_accounts`` and
@@ -313,23 +317,34 @@ def rank_switch_candidates(
             return "disabled-active"
         if _capped(active_number) is not None:
             return "weekly-capped"  # a cap is no line: it leaves now, below one too
+        dynamic = settings.strategy == "dynamic"
+        wall = _departure_wall(active_number, expiring, bars)
+        # Each window against its OWN line, as `_tick_inner` judges the active: the
+        # active's own bar stands in for the strategy's (`departure_pct`); `dynamic`
+        # reads the model-gated headroom against its wall.
+        departure_pct = bars.get(active_number, settings.threshold)
+        if active_headroom is None:
+            short_of_line = True
+        elif dynamic:
+            short_of_line = not _about_to_wall(model_headroom.get(active_number), wall)
+        else:
+            active_binding = _binding_at(
+                usage.get(active_number), settings, models, departure_pct
+            )
+            short_of_line = (
+                not active_binding.over
+                if active_binding is not None
+                else (100.0 - active_headroom) < departure_pct
+            )
+        # The tick's own count (`_active_reading_blind`): a stored reading it will not
+        # act on while it is short of every line, so no list is claimed from it.
+        if short_of_line and _active_reading_blind(entries.get(active_number), now):
+            return "active-stale"
         if active_headroom is None:
             return "unreadable-active"
-        if settings.strategy == "dynamic":
-            return _classify_dynamic_trigger(
-                active_headroom, _departure_wall(active_number, expiring, bars)
-            )
-        # Each window against its OWN line, as `_tick_inner` judges the active:
-        # the active's own bar stands in for the strategy's (`departure_pct`).
-        departure_pct = bars.get(active_number, settings.threshold)
-        active_binding = _binding_at(
-            usage.get(active_number), settings, models, departure_pct
-        )
-        if (
-            not active_binding.over
-            if active_binding is not None
-            else (100.0 - active_headroom) < departure_pct
-        ):
+        if dynamic:
+            return _classify_dynamic_trigger(active_headroom, wall)
+        if short_of_line:
             if settings.strategy == "priority-consume-first":
                 return "priority"  # ranks below the line too, by tier
             return (
@@ -346,7 +361,7 @@ def rank_switch_candidates(
         from the pieces the tick ranks by, never `rank_candidates_pass`: that pass's
         landing gate is a hysteresis MARGIN over the active, which a warm candidate
         with less headroom than a cold one can never clear against an about-to-wall
-        active. `last_active_at` comes from the caller (`read_last_active_at`, the
+        active. `last_active_at` comes from the caller (`read_engine_state`, the
         state file the engine writes `lastActiveAt` to on every switch): an unmeasured
         candidate reads cold, as in the engine. `expiring` is priced on the
         model-gated headroom, as the tick prices it, also on the unmodeled retry
@@ -359,7 +374,8 @@ def rank_switch_candidates(
         """
         headroom = _headroom_by_account(usage, axis)
         ordered, rank_axis = dynamic_candidate_order(
-            oauth_candidates, headroom, usage, entries, bars, last, settings, now,
+            oauth_candidates if trigger == "proactive" else healthy_peers,
+            headroom, usage, entries, bars, last, settings, now,
             current=active_number,
             expiring=expiring,
             trigger=trigger, model_window_dropped=dropped, reasons=reasons,
@@ -418,10 +434,12 @@ def rank_switch_candidates(
     # The primary the engine would walk to, priced on the model-gated headroom as the
     # tick prices it, also on the unmodeled retry (`dropped`); it is the wall of the
     # active when it is the active (`_departure_wall`).
-    last = last_active_at or {}
+    state = state or {}
+    last = last_active_at or last_active_of(state)
+    healthy_peers = _healthy_peers(settings, state, entries, active_number, oauth_candidates)
     walk = (
         dynamic_expiring_walk(
-            active_number, oauth_candidates, usage, model_headroom, bars, policies,
+            active_number, healthy_peers, usage, model_headroom, bars, policies,
             entries, last, settings, now,
         )
         if settings.strategy == "dynamic"
@@ -457,6 +475,9 @@ def rank_switch_candidates(
     ):
         ordered, rank_axis = api_key_candidates, None
     reasons.update(dict.fromkeys(vetoed, "at or over its own threshold"))
+    for num in oauth_candidates:
+        if num not in healthy_peers:
+            reasons.setdefault(num, "left while its usage was unreadable, not read since")
     return ordered, rank_axis, trigger, unmodeled
 
 
@@ -481,20 +502,21 @@ def ordered_accounts(
     settings: "AutoSwitchSettings",
     now: float,
     last_active_at: dict | None = None,
+    state: dict | None = None,
 ) -> list[str]:
     """Every account number, active first, then the rest as the engine's own
     pass would rank them: ranked-and-open, then every other switchable row
     (`non_candidate_key`: refused, capped, disabled, sentinel-blocked,
     spend-only), unswitchable last. THE one order every screen
     renders in -- a screen keeping slot order says so at its own call site.
-    ``last_active_at`` is the caller's own ``read_last_active_at`` read (one
-    file read feeds every screen), so ``dynamic``'s warm/cold pass ranks
-    the same way here as it does in the "Next best" panel.
+    ``state`` is the caller's own ``read_engine_state`` read (one file read feeds
+    every screen), so ``dynamic``'s warm/cold pass ranks the same way here as it
+    does in the "Next best" panel; ``last_active_at`` overrides its ``lastActiveAt``.
     """
     active_number = snap.active_number
     others = [acc for acc in snap.accounts if acc.number != active_number]
     ordered, *_ = rank_switch_candidates(
-        snap, settings, now, active_number, last_active_at
+        snap, settings, now, active_number, last_active_at, state=state
     )
     ordered_rank = {num: i for i, num in enumerate(ordered)}
 
@@ -525,6 +547,7 @@ __all__ = [
     "last_seen_note",
     "ordered_accounts",
     "rank_switch_candidates",
+    "read_engine_state",
     "read_last_active_at",
     "reset_clock",
     "reset_text",

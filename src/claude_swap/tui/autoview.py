@@ -87,6 +87,7 @@ _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 _UNMODELED_TEXT = {
     "below-threshold": "not previewed (active below threshold)",
     "unreadable-active": "not previewed (active status unknown)",
+    "active-stale": "not previewed (active status stale)",
 }
 
 _NO_PLAN_TEXT = "no plan (subscription inactive)"
@@ -413,7 +414,7 @@ class AutoScreen(Screen):
     def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
             return
-        self._last_active_at = data.read_last_active_at(self.app.switcher.backup_dir)
+        self._engine_state = data.read_engine_state(self.app.switcher.backup_dir)
         self.query_one("#candidates", Static).update(
             self._candidates_text(snap, active_number=snap.active_number)
         )
@@ -448,12 +449,12 @@ class AutoScreen(Screen):
         now = time.time()
         # THE engine's own admission and order -- `ordered_accounts` (data.py)
         # reads off this exact same call for every other listing screen.
-        # `getattr` (never plain `self._last_active_at`): a test instance
+        # `getattr` (never plain `self._engine_state`): a test instance
         # built via `AutoScreen.__new__` skips `__init__`/`_on_snapshot`.
-        last_active_at = getattr(self, "_last_active_at", None) or {}
+        state = getattr(self, "_engine_state", None) or {}
         reasons: dict[str, str] = {}   # the engine's own cause per refused row
         ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
-            snap, settings, now, active_number, last_active_at, reasons
+            snap, settings, now, active_number, reasons_out=reasons, state=state
         )
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Captured before the loop rebinds `now` below (per-row, for the

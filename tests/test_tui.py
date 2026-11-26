@@ -31,6 +31,7 @@ from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
+from tests._digest_harness import _entry_for
 
 
 # ---------------------------------------------------------------------------
@@ -1822,8 +1823,9 @@ ESCAPE_KEY = "soonest to recover, warm on a tie"
 ROOM_THEN_RESET = "Next best (room under its line, then soonest reset)"
 
 
-def _autoview_text(snap, active, settings, last_active_at=None):
-    """The "Next best" panel's rendered text."""
+def _autoview_text(snap, active, settings, last_active_at=None, state=None):
+    """The "Next best" panel's rendered text (``state``: the engine's state file as
+    the screen read it; else just its ``lastActiveAt``)."""
     from unittest.mock import MagicMock, patch
 
     from claude_swap.tui.autoview import AutoScreen
@@ -1831,7 +1833,7 @@ def _autoview_text(snap, active, settings, last_active_at=None):
 
     v = AutoScreen.__new__(AutoScreen)
     v._settings = settings
-    v._last_active_at = last_active_at or {}
+    v._engine_state = state if state is not None else {"lastActiveAt": last_active_at or {}}
     app = MagicMock(current_theme=CSWAP_DARK)
     # The rows are fitted to the box's width, which an unmounted screen has no query for.
     box = MagicMock(size=MagicMock(width=200))
@@ -2814,6 +2816,178 @@ class TestPanelOrderIsTheEnginesOrder:
         order = _autoview_order(snap, "1", settings)
         assert order == ["2", "4", "7", "8", "3", "5", "6", "9"], order
         assert tui_data.ordered_accounts(snap, settings, time.time())[1:] == order
+
+
+class TestPanelReadsABlindActiveAsTheTickDoes:
+    """A 429 on the active's usage refresh with its last reading older than
+    STALE_OK_S is `_active_reading_blind`: the store still serves that reading,
+    but the tick counts toward leaving (`active-usage-stale`) and moves only to
+    a peer it has read. The panel asks the same predicate, so it claims no list
+    from a reading the tick will not act on, and it prices the fleet on the
+    peers the tick keeps (`healthy_peers`), never on the account left blind and
+    not read since: one fleet names one primary."""
+
+    @staticmethod
+    def _fleet(temp_home, accounts=3, **settings):
+        """``accounts`` seeded accounts, 1 active, on a clock at the wall time."""
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home, **settings)
+        for n in range(1, accounts + 1):
+            h.seed(n, f"user{n}@example.com")
+        h.make_live("user1@example.com", 1)
+        h.clock.now = time.time()
+        return h
+
+    @staticmethod
+    def _win(five, seven=10.0, reset_s=None):
+        window = {"pct": seven}
+        if reset_s is not None:
+            window["resets_at"] = _iso_in(reset_s)
+        return {"five_hour": {"pct": five}, "seven_day": window}
+
+    @staticmethod
+    def _blind(value, now):
+        from tests.test_autoswitch import TestActiveStaleLanding
+
+        return TestActiveStaleLanding._blind(value, now)
+
+    @staticmethod
+    def _tick_and_panel(h, entries):
+        """Tick ``h``'s engine on ``entries`` (account 1 active); return the
+        snapshot, the state file as the tick read it and the panel's ranking of
+        the same entries."""
+        state = tui_data.read_engine_state(h.switcher.backup_dir)
+        h.tick_with_entries(entries)
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(n, active=n == "1", entry=e) for n, e in entries.items()
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        ranking = tui_data.rank_switch_candidates(
+            snap, h.settings, h.clock.now, "1", state=state
+        )
+        return snap, state, ranking
+
+    @staticmethod
+    def _holds(h):
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    def test_a_blind_active_below_its_lines_is_not_previewed(self, temp_home, strategy):
+        """Its stored 50% is a lower bound, so the tick holds `active-usage-stale`
+        while the panel, ranking on that reading, listed peers (or said "not
+        previewed (active below threshold)") for a move the tick does not make."""
+        h = self._fleet(temp_home, strategy=strategy)
+        now = h.clock.now
+        entries = {
+            "1": self._blind(self._win(50.0), now),
+            "2": _entry_for(self._win(10.0), now),
+            "3": _entry_for(self._win(20.0), now),
+        }
+        snap, state, (ordered, _axis, trigger, unmodeled) = self._tick_and_panel(h, entries)
+        assert self._holds(h) == ["active-usage-stale"]
+        assert (trigger, ordered, unmodeled) == ("active-stale", [], True)
+        rendered = _autoview_text(snap, "1", h.settings, state=state)
+        assert "not previewed (active status stale)" in rendered, rendered
+
+    @pytest.mark.parametrize(
+        ("strategy", "frozen"), [("best", 95.0), ("dynamic", 99.5)],
+        ids=["over-its-line", "at-its-wall"],
+    )
+    def test_a_blind_active_at_a_line_is_ranked_and_the_tick_lands_on_the_top_row(
+        self, temp_home, strategy, frozen
+    ):
+        """A lower bound can show a line reached: the tick acts on it at once,
+        and the panel lists the peers it would take, best first."""
+        h = self._fleet(temp_home, strategy=strategy)
+        now = h.clock.now
+        entries = {
+            "1": self._blind(self._win(frozen), now),
+            "2": _entry_for(self._win(10.0), now),
+            "3": _entry_for(self._win(40.0), now),
+        }
+        _snap, _state, (ordered, _axis, trigger, _unmodeled) = self._tick_and_panel(h, entries)
+        assert trigger == "proactive"
+        assert ordered and str(h.active_number()) == ordered[0]
+
+    @pytest.mark.parametrize(
+        ("own_reset_s", "peer_reset_s", "holds"),
+        [
+            (7200.0, 5 * 86400.0, True),    # the primary: left at 99, not at 97
+            (6 * 86400.0, 7200.0, False),   # a peer is the primary: left at 97
+        ],
+        ids=["the-primary", "not-the-primary"],
+    )
+    def test_a_blind_dynamic_active_at_98_waits_only_as_the_primary(
+        self, temp_home, own_reset_s, peer_reset_s, holds
+    ):
+        """98% reads 2 points of room: inside the 3-point wall of an ordinary
+        active, outside the 1-point wall of the primary, whose 7d resets first."""
+        h = self._fleet(temp_home, strategy="dynamic")
+        now = h.clock.now
+        entries = {
+            "1": self._blind(self._win(10.0, 98.0, own_reset_s), now),
+            "2": _entry_for(self._win(10.0, 10.0, peer_reset_s), now),
+            "3": _entry_for(self._win(20.0, 20.0, 6 * 86400.0), now),
+        }
+        _snap, _state, (ordered, _axis, trigger, _unmodeled) = self._tick_and_panel(h, entries)
+        if holds:
+            assert self._holds(h) == ["active-usage-stale"]
+            assert (trigger, ordered) == ("active-stale", [])
+        else:
+            assert trigger == "proactive"
+            assert ordered and str(h.active_number()) == ordered[0]
+
+    def test_every_trigger_the_tick_assigns_is_one_the_panel_classifies(self):
+        """The tick named `active-stale` (#620) and the panel had no case for it, so
+        every upstream merge that adds a trigger starts here: teach
+        `rank_switch_candidates`, or list it with the panel state it reads as."""
+        import inspect
+
+        from claude_swap.autoswitch import AutoSwitchEngine
+
+        ticked = set(re.findall(r'\btrigger = "([a-z-]+)"', inspect.getsource(AutoSwitchEngine._tick_inner)))
+        classified = set(re.findall(r'return "([a-z-]+)"', inspect.getsource(tui_data.rank_switch_candidates)))
+        # `alternation` is the move a `dynamic-healthy` ranking makes, `failover` what
+        # the panel reads as `unreadable-active`: the panel ranks from the state.
+        assert ticked - {"alternation", "failover"} <= classified, ticked - classified
+
+    def test_the_account_left_blind_is_not_the_panels_primary(self, temp_home):
+        """2 resets in 2 h with room, and was left under `active-stale`: its 87%
+        is the reading nobody trusted, so the tick prices the fleet without it and
+        moves to 3 (`TestAnExpiringWindowPullsTheSwitch`). Every screen lists 3
+        first; before, the panel put 2 first as the expiring window."""
+        from tests.test_autoswitch import (
+            TestAnExpiringWindowPullsTheSwitch,
+            _left_blind_state,
+            _xw_harness,
+        )
+
+        h = _xw_harness(temp_home)
+        _left_blind_state(h, left=2, landed_on=1)
+        usage = TestAnExpiringWindowPullsTheSwitch._fleet(h)
+        now = h.clock.now
+        entries = {n: _entry_for(v, now) for n, v in usage.items()}
+        entries["2"] = self._blind(usage["2"], now)
+        h.engine = h._make_engine()
+        reasons: dict = {}
+        state = tui_data.read_engine_state(h.switcher.backup_dir)
+        h.tick_with_entries(entries)
+        assert h.active_number() == 3
+        snap = AccountsSnapshot(
+            accounts=[make_account(n, active=n == "1", entry=e) for n, e in entries.items()],
+            active_number="1",
+            taken_at=0.0,
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(
+            snap, h.settings, now, "1", reasons_out=reasons, state=state
+        )
+        assert ordered == ["3"], ordered
+        assert tui_data.ordered_accounts(snap, h.settings, now, state=state)[1] == "3"
+        assert "not read since" in reasons["2"], reasons
 
 
 @pytest.mark.asyncio
@@ -4268,10 +4442,10 @@ class TestUnswitchableRowsAreListed:
         v = AutoScreen.__new__(AutoScreen)
         v._settings = settings or AutoSwitchSettings()
         # Real read off `backup_dir`'s state file when a test supplies one
-        # (`data.read_last_active_at`'s own safety contract otherwise applies
+        # (`data.read_engine_state`'s own safety contract otherwise applies
         # to `getattr`'s `{}` default -- no `backup_dir` here is not the
         # panel's "no access", just this call not exercising it).
-        v._last_active_at = tui_data.read_last_active_at(backup_dir) if backup_dir else {}
+        v._engine_state = tui_data.read_engine_state(backup_dir) if backup_dir else {}
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields

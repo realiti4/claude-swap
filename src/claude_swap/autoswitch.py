@@ -2210,6 +2210,25 @@ def _left_blind_unread(
     return left if entry is None or entry.consecutive_failures > 0 else None
 
 
+def _healthy_peers(
+    settings: AutoSwitchSettings,
+    state: dict,
+    entries: Mapping[str, UsageEntry],
+    current: str | None,
+    oauth_candidates: Sequence[str],
+) -> list[str]:
+    """``oauth_candidates`` less the account left under ``active-stale`` and not
+    read since (`_left_blind_unread`, `dynamic` only): the peers a healthy active's
+    own moves (the primary's walk, the rotation, the walled escape) may name. The
+    tick and the "Next best" panel both read it, so one fleet names one primary."""
+    unread = (
+        _left_blind_unread(state, entries, current)
+        if settings.strategy == "dynamic"
+        else None
+    )
+    return [n for n in oauth_candidates if n != unread]
+
+
 def _blind_detail(binding: BindingWindow | None, entry: UsageEntry | None) -> str:
     """What the engine last knew of an active account that is
     ``_active_reading_blind``, for the events that explain a hold or a move."""
@@ -3100,6 +3119,65 @@ class AutoSwitchEngine:
         # lowest line (`_refresh_poll_policy_inputs`).
         self._bars = thresholds
         self._active_wall = _wall_headroom(self._bars.get(current))
+        last_active_at = state.get("lastActiveAt")
+        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
+        switchable = self.switcher.switchable_account_numbers()
+
+        def _capped(
+            num: str, usage: Mapping[str, dict | str | None]
+        ) -> tuple[str, float] | None:
+            """(window, pct) past the account's weekly cap in ``usage``, else
+            None. A veto, applied to the active (must leave) and to the
+            candidate set before any ranking or escape reads it."""
+            return weekly_capped(
+                policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
+            )
+
+        own_bars: Mapping[str, float] = self._bars
+
+        def _over_own(num: str, usage: Mapping[str, dict | str | None]) -> bool:
+            """A veto like `_capped`: a peer at or over its OWN threshold is
+            never entered, by any trigger or regime."""
+            return over_own_threshold(num, usage, settings, self._models, own_bars)
+
+        # -- candidate selection ------------------------------------------
+        # One function of a reading of the store each, because the collector asks
+        # them on its own first read (`departure_wall`): the line it holds a blind
+        # active under must be the one the tick leaves it by.
+        def _peers_on(usage):
+            """(eligible, vetoed, candidates, oauth_candidates) on ``usage``."""
+            eligible = [
+                num
+                for num in switchable
+                if num != current and num not in quarantined and _capped(num, usage) is None
+            ]
+            vetoed = [num for num in eligible if _over_own(num, usage)]
+            candidates = [num for num in eligible if num not in vetoed]
+            oauth_candidates = [
+                n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+            ]
+            return eligible, vetoed, candidates, oauth_candidates
+
+        def _plan_on(entries, usage, oauth_candidates, now):
+            """(healthy_peers, walk, wall): the peers a healthy active's own moves
+            may name (`_healthy_peers`: a rotation, an expiring window or the
+            walled escape does not return to the account left under `active-stale`
+            until it is read; at the wall `_dynamic_rank` and the at-limit escape
+            rule), the primary's walk over them, and the wall the active leaves at.
+            T3400: the primary, the soonest-resetting usable account, is spent to
+            `PRIMARY_WALL_PCT` and the wall is that while it is the active, so the
+            classification below leaves it at a 99% reading. `_bars` stays the
+            owner's thresholds (it also feeds the poll cadence)."""
+            healthy_peers = _healthy_peers(settings, state, entries, current, oauth_candidates)
+            walk: tuple[float, _WalkRows] = (0.0, [])
+            if settings.strategy == "dynamic":
+                walk = dynamic_expiring_walk(
+                    current, healthy_peers, usage, _headroom_by_account(usage, self._models),
+                    self._bars, policies, entries, last_active_at, settings, now,
+                )
+            wall = _departure_wall(current, [n for n, _, _ in walk[1]], self._bars)
+            return healthy_peers, walk, wall
+
         entries, usage, headroom = self._collect_scheduled_usage(
             current,
             quarantined,
@@ -3113,62 +3191,19 @@ class AutoSwitchEngine:
                 thresholds[current],
             ),
             weekly_cap=active_cap,
+            departure_wall=lambda entries, usage, now: _plan_on(
+                entries, usage, _peers_on(usage)[3], now
+            )[2],
         )
-
-        def _capped(num: str) -> tuple[str, float] | None:
-            """(window, pct) past the account's weekly cap in the CURRENT
-            `usage`, else None. A veto, applied to the active (must leave) and
-            to the candidate set before any ranking or escape reads it."""
-            return weekly_capped(
-                policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
-            )
-
-        own_bars: Mapping[str, float] = self._bars
-
-        def _over_own(num: str) -> bool:
-            """A veto like `_capped`: a peer at or over its OWN threshold is
-            never entered, by any trigger or regime."""
-            return over_own_threshold(num, usage, settings, self._models, own_bars)
-
-        # -- candidate selection ------------------------------------------
-        switchable = self.switcher.switchable_account_numbers()
-        eligible = [
-            num
-            for num in switchable
-            if num != current and num not in quarantined and _capped(num) is None
-        ]
-        vetoed = [num for num in eligible if _over_own(num)]
+        eligible, vetoed, candidates, oauth_candidates = _peers_on(usage)
         self._veto_note = _vetoed_clause(vetoed, thresholds)
-        candidates = [num for num in eligible if num not in vetoed]
-        oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
-        ]
-        last_active_at = state.get("lastActiveAt")
-        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
-        # T3400: the primary, the soonest-resetting usable account, is spent to
-        # `PRIMARY_WALL_PCT` and `_active_wall` is that wall while it is the active, so
-        # the classification below leaves it at a 99% reading. `_bars` stays the owner's
-        # thresholds (it also feeds the poll cadence).
-        expiring: list[str] = []
-        walk: tuple[float, _WalkRows] = (0.0, [])
-        # A healthy active's own move (a rotation, an expiring window, the
-        # walled escape) does not return to an account left under
-        # `active-stale` until it is read: its reading is the one nobody
-        # trusted. At the wall `_dynamic_rank` and the at-limit escape rule.
-        unread = (
-            _left_blind_unread(state, entries, current)
-            if settings.strategy == "dynamic"
-            else None
+        # Read for the walk, which only `dynamic` runs: a tick of another strategy
+        # reads the clock where it always did (a test pins that order).
+        now = self.clock() if settings.strategy == "dynamic" else None
+        healthy_peers, walk, self._active_wall = _plan_on(
+            entries, usage, oauth_candidates, now
         )
-        healthy_peers = [n for n in oauth_candidates if n != unread]
-        if settings.strategy == "dynamic":
-            now = self.clock()
-            walk = dynamic_expiring_walk(
-                current, healthy_peers, usage, headroom, self._bars, policies,
-                entries, last_active_at, settings, now,
-            )
-            expiring = [n for n, _, _ in walk[1]]
-            self._active_wall = _departure_wall(current, expiring, self._bars)
+        expiring = [n for n, _, _ in walk[1]]
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
         self._emit(
             PollEvent(
@@ -3221,7 +3256,7 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
-        active_capped = _capped(current)
+        active_capped = _capped(current, usage)
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
         # THE ACTUAL (never-widened) MODEL-GATED READING, kept alongside the
@@ -3420,7 +3455,7 @@ class AutoSwitchEngine:
             }
             vetoed = [
                 n for n in eligible if n not in spent and (
-                    _over_own(n) or over_own_threshold(n, usage, settings, (), own_bars)
+                    _over_own(n, usage) or over_own_threshold(n, usage, settings, (), own_bars)
                 )
             ]
             self._veto_note = _vetoed_clause(vetoed, own_bars)
@@ -4087,7 +4122,7 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             # The fresh rows may have carried a candidate past its cap.
-            oauth_candidates = [n for n in oauth_candidates if _capped(n) is None]
+            oauth_candidates = [n for n in oauth_candidates if _capped(n, usage) is None]
 
         decided_now = self.clock()
         if dynamic_ordered is not None:
@@ -4142,10 +4177,10 @@ class AutoSwitchEngine:
             )
             decided_now = self.clock()
             # The fresh rows may have carried a candidate past its cap.
-            fresh = [n for n in oauth_candidates if _capped(n) is None]
-            vetoed += [n for n in fresh if _over_own(n)]
+            fresh = [n for n in oauth_candidates if _capped(n, usage) is None]
+            vetoed += [n for n in fresh if _over_own(n, usage)]
             self._veto_note = _vetoed_clause(vetoed, own_bars)
-            oauth_candidates = [n for n in fresh if not _over_own(n)]
+            oauth_candidates = [n for n in fresh if not _over_own(n, usage)]
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -5938,6 +5973,9 @@ class AutoSwitchEngine:
         threshold: float | None = None,
         weekly_threshold: float | None = None,
         weekly_cap: float | None = None,
+        departure_wall: Callable[
+            [dict, dict[str, dict | str | None], float], float
+        ] | None = None,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -5951,7 +5989,10 @@ class AutoSwitchEngine:
         switch line, or active usage unknown (failover must not run on stale
         candidate data). Not while the active account is blind below its
         lines (``_active_reading_blind``): its reading cannot move, and the
-        tick reads the landings itself once it may leave.
+        tick reads the landings itself once it may leave. Under ``dynamic`` the
+        line is the wall the tick leaves by (``departure_wall``, asked on this
+        first read: the primary's is a point wide); without it the engine's
+        ``_active_wall`` stands.
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
         escalation condition. ``disabled-active`` does not imply it (a disabled
@@ -6080,18 +6121,25 @@ class AutoSwitchEngine:
         # reading that cannot move. The tick reads the landings itself once
         # it may leave (`_tick_inner`), so refreshing every peer on each
         # waiting tick would only spend their request budgets.
+        blind = _active_reading_blind(entries.get(current), now)
         if self.settings.strategy == "dynamic":
-            # Leaves at its wall or its weekly cap, as `_tick_inner` does.
+            # Leaves at its wall or its weekly cap, as `_tick_inner` does. A
+            # waiting collector escalates nothing, so this first read is the one
+            # the tick decides on and the wall asked of it is the tick's own.
+            wall = (
+                departure_wall(entries, usage, now)
+                if blind and departure_wall is not None
+                else self._active_wall
+            )
             at_a_line = (
-                active_headroom is not None
-                and _about_to_wall(active_headroom, self._active_wall)
+                active_headroom is not None and _about_to_wall(active_headroom, wall)
             ) or weekly_capped(weekly_cap, active_value) is not None
         else:
             at_a_line = any(
                 pct >= window_line(label, threshold, weekly_threshold)
                 for label, pct, _ in active_windows
             )
-        waiting_blind = _active_reading_blind(entries.get(current), now) and not at_a_line
+        waiting_blind = blind and not at_a_line
         escalate = bool(candidates) and (
             # A disabled active switches on ANY headroom, including one well
             # below the band, which satisfies neither leg below — without this
