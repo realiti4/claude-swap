@@ -3704,6 +3704,8 @@ class AutoSwitchEngine:
             # once the count and the cooldown allow a move, so the ticks
             # spent waiting keep every peer on its own poll plan. The active
             # row is left to its own backoff.
+            if self._stop.is_set():
+                raise _EngineStopped()
             entries = self.switcher.usage_entries_by_account(
                 fetch=set(oauth_candidates)
             )
