@@ -877,7 +877,7 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's 5h window (or any window, "
-            "without a weekly line) reaches this utilization (50-99.9; "
+            "without a weekly line) reaches this utilization (40-99.9; "
             "default 90). Under --strategy dynamic the real switch point is "
             "fixed near 97%%; this value still decides the --model "
             "fleet-wide blackout, poll cadence, and the exhausted-fleet "

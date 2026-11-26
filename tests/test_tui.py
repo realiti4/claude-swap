@@ -2195,7 +2195,7 @@ class TestAutoScreen:
             assert "threshold 99.9% (session)" in summary.render().plain
             screen.action_threshold_step(-60.0)
             await pilot.pause()
-            assert screen._settings.threshold == 50.0  # spec's lower bound
+            assert screen._settings.threshold == 40.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         import json as _json
