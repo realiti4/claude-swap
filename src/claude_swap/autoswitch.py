@@ -1154,6 +1154,28 @@ def _reading_verified(entry: UsageEntry | None, now: float) -> bool:
     )
 
 
+def _parked_exhausted(
+    entry: UsageEntry | None, value: dict | str | None, models: Sequence[str],
+    now: float,
+) -> bool:
+    """Whether a spent account is parked on its exhausted-cadence plan: a
+    decision-trusted reading with no headroom and a poll plan at or beyond
+    that cadence not yet due. Such an account cannot be a target, so a read
+    that ignores plans (escalation, the ``active-stale`` landing) leaves it
+    alone: ``plan_after_fetch`` polls it again when the plan falls due."""
+    headroom = oauth.account_headroom(
+        value if isinstance(value, dict) else None, models
+    )
+    return (
+        entry is not None
+        and entry.next_poll_at is not None
+        and now < entry.next_poll_at
+        and (entry.poll_interval_s or 0.0) >= poll_policy.EXHAUSTED_INTERVAL_S
+        and headroom is not None
+        and headroom <= 0
+    )
+
+
 def _blind_detail(binding: BindingWindow | None, entry: UsageEntry | None) -> str:
     """What the engine last knew of an active account that is
     ``_active_reading_blind``, for the events that explain a hold or a move."""
@@ -2601,11 +2623,18 @@ class AutoSwitchEngine:
             # otherwise read every five to ten minutes. Asked for only now,
             # once the count and the cooldown allow a move, so the ticks
             # spent waiting keep every peer on its own poll plan. The active
-            # row is left to its own backoff.
+            # row is left to its own backoff, and a spent peer parked on its
+            # plan is not read (the read ignores plans, so every tick would).
             if self._stop.is_set():
                 raise _EngineStopped()
+            read_now = self.clock()
             entries = self.switcher.usage_entries_by_account(
-                fetch=set(oauth_candidates)
+                fetch={
+                    n for n in oauth_candidates
+                    if not _parked_exhausted(
+                        entries.get(n), usage.get(n), self._models, read_now
+                    )
+                }
             )
             if not _active_reading_blind(entries.get(current), self.clock()):
                 # Another surface read the active account while this tick
@@ -2638,7 +2667,17 @@ class AutoSwitchEngine:
         )
 
         if trigger == "active-stale" and not ordered:
-            return self._stay_blind(active_binding, active_entry)
+            # Every peer spent: wait for the earliest reset as an exhausted
+            # fleet does, not at the ordinary cadence.
+            spent = empty_pass_refusal(
+                trigger=trigger, any_known=any_known,
+                active_reset_ts=active_reset_ts,
+                waiting_for_recovery=waiting_for_recovery,
+                candidate_headrooms=[headroom.get(n) for n in oauth_candidates],
+            ) == "all-exhausted"
+            return self._stay_blind(
+                active_binding, active_entry, usage if spent else None
+            )
 
         if (
             trigger != "active-stale"
@@ -2826,21 +2865,9 @@ class AutoSwitchEngine:
             # cannot see, because those slivers are above zero. Reported as
             # the block above, it kept the ordinary cadence for the whole
             # window and never named the reset it had just measured.
-            self._blocked_wait_long = True
-            earliest, all_provable = self._earliest_recovery(usage)
-            earliest_ts = earliest.timestamp() if earliest is not None else None
-            if not all_provable:
-                # A blocked account that cannot prove its return may beat any
-                # reset we DID measure, so never sleep toward one -- and
-                # `_blocked_wait_long` above already holds the un-armed path
-                # at NO_RESET_FALLBACK_S, not the ordinary cadence.
-                # An exhausted fleet then has no end to name. A deliberate
-                # wait does: the earliest moment a blocked account PROVED,
-                # which is what it is holding out for.
-                if truly_exhausted:
-                    earliest_ts = None
-            elif earliest_ts is not None:
-                self._sleep_until_ts = earliest_ts + RESET_SLACK_S
+            earliest, earliest_ts = self._arm_reset_wait(
+                usage, truly_exhausted=truly_exhausted
+            )
             # THE ACTIVE CAN BE BLIND WITHOUT BEING SPENT. `truly_exhausted`
             # above answers only for the CANDIDATES; a `None` active_headroom
             # means this tick never measured the active at all (that is what
@@ -3538,21 +3565,53 @@ class AutoSwitchEngine:
             False,
         )
 
+    def _arm_reset_wait(
+        self, usage: dict[str, dict | str | None], *, truly_exhausted: bool
+    ) -> tuple[datetime | None, float | None]:
+        """Arm the bounded, reset-aware sleep an exhausted fleet takes (see
+        ``_next_delay``) and return the earliest reset and the instant the
+        sleep ends. Every tick that ends BLOCKED on a wait goes through here."""
+        self._blocked_wait_long = True
+        earliest, all_provable = self._earliest_recovery(usage)
+        earliest_ts = earliest.timestamp() if earliest is not None else None
+        if not all_provable:
+            # A blocked account that cannot prove its return may beat any
+            # reset we DID measure, so never sleep toward one -- and
+            # `_blocked_wait_long` above already holds the un-armed path
+            # at NO_RESET_FALLBACK_S, not the ordinary cadence.
+            # An exhausted fleet then has no end to name. A deliberate
+            # wait does: the earliest moment a blocked account PROVED,
+            # which is what it is holding out for.
+            if truly_exhausted:
+                earliest_ts = None
+        elif earliest_ts is not None:
+            self._sleep_until_ts = earliest_ts + RESET_SLACK_S
+        return earliest, earliest_ts
+
     def _stay_blind(
-        self, binding: BindingWindow | None, entry: UsageEntry | None
+        self,
+        binding: BindingWindow | None,
+        entry: UsageEntry | None,
+        spent_usage: dict[str, dict | str | None] | None = None,
     ) -> TickOutcome:
         """Keep a blind active account for want of a measured landing.
-        Staying is the decision, not a block: nothing measured is better."""
-        self._emit(
-            NoSwitchEvent(
-                reason="no-verified-target",
-                detail=(
-                    f"{_blind_detail(binding, entry)}; staying: no other "
-                    "account has a recent reading with room to spare"
-                ),
-            )
+        Staying is the decision, not a block: nothing measured is better.
+        Given ``spent_usage`` (every peer's reading, all of them spent) it is
+        a wait with an end, and ends BLOCKED so ``_next_delay`` honors it."""
+        detail = (
+            f"{_blind_detail(binding, entry)}; staying: no other "
+            "account has a recent reading with room to spare"
         )
-        return TickOutcome.NO_ACTION
+        outcome = TickOutcome.NO_ACTION
+        if spent_usage is not None:
+            earliest, _ = self._arm_reset_wait(spent_usage, truly_exhausted=True)
+            outcome = TickOutcome.BLOCKED
+            if earliest is not None:
+                detail += "; earliest reset " + earliest.isoformat().replace(
+                    "+00:00", "Z"
+                )
+        self._emit(NoSwitchEvent(reason="no-verified-target", detail=detail))
+        return outcome
 
     def _rank_verified_landings(
         self, *, oauth_candidates: list[str], entries: Mapping[str, UsageEntry],
@@ -4264,19 +4323,8 @@ class AutoSwitchEngine:
             # cadence (plan_after_fetch plans an exhausted row at exactly
             # that) instead of refetching that token.
             for num in tuple(escalation_fetch):
-                entry = entries.get(num)
-                value = usage.get(num)
-                planned_headroom = oauth.account_headroom(
-                    value if isinstance(value, dict) else None, self._models
-                )
-                if (
-                    entry is not None
-                    and entry.next_poll_at is not None
-                    and now < entry.next_poll_at
-                    and (entry.poll_interval_s or 0.0)
-                    >= poll_policy.EXHAUSTED_INTERVAL_S
-                    and planned_headroom is not None
-                    and planned_headroom <= 0
+                if _parked_exhausted(
+                    entries.get(num), usage.get(num), self._models, now
                 ):
                     escalation_fetch.remove(num)
             if self._stop.is_set():

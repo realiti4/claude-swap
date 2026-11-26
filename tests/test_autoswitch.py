@@ -13785,24 +13785,93 @@ class TestActiveUnknownIsNotReportedAsAnExhaustedFleet:
         assert reasons == ["no-qualifying-candidate"], reasons
         assert not any("active usage unknown" in (e.detail or "") for e in no_switches)
 
-    def test_a_429_blind_active_with_every_peer_spent_stays_without_claiming_exhaustion(
-        self, harness
+    @staticmethod
+    def _parked_peer(reset, now):
+        """A spent peer on its exhausted-cadence plan: read 200s ago, next due
+        in 400s, so the store still trusts the reading and the plan holds."""
+        return UsageEntry(
+            last_good=_usage(100.0, reset), fetched_at=now - 200.0, age_s=200.0,
+            next_poll_at=now + 400.0,
+            poll_interval_s=poll_policy.EXHAUSTED_INTERVAL_S, trust_extended=True,
+        )
+
+    @staticmethod
+    def _tick_recording_fetches(harness, entries, fresh=None):
+        """One tick; also every ``fetch`` set the engine asked the store for.
+        An account in ``fresh`` reads as that entry once it is asked for."""
+        asked: list = []
+
+        def collect(fetch=None, **_):
+            asked.append(set(fetch) if fetch is not None else None)
+            return {
+                n: (fresh or {}).get(n, e) if n in (fetch or ()) else e
+                for n, e in entries.items()
+            }
+
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            return harness.engine.tick(), asked
+
+    @pytest.mark.parametrize("shape", ["unread", "trusted-lower-bound"])
+    def test_a_429_blind_active_with_every_peer_spent_waits_for_the_earliest_reset(
+        self, harness, shape
     ):
         """The lmd42 shape under #620: the active's refresh is refused (429)
         and every peer is spent, so no measured landing has room. It stays on
-        `no-verified-target`; the fleet is not reported exhausted."""
+        `no-verified-target` without claiming exhaustion, and it waits as the
+        all-exhausted case does: to the earliest reset, never at the ordinary
+        cadence, and without reading a spent peer that is parked on its plan
+        (the landing read ignores plans, so each tick would re-read both)."""
+        from datetime import datetime
+
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        now = harness.clock.now
+        active = {
+            "unread": replace(self._blind_active_entry(now), last_error="http-429"),
+            "trusted-lower-bound": UsageEntry(
+                last_good=_usage(41.0), fetched_at=now - 900.0, age_s=900.0,
+                consecutive_failures=3, last_error="http-429",
+                backoff_until=now + 3000.0, trust_extended=True,
+            ),
+        }[shape]
+        entries = {
+            "1": active,
+            "2": self._parked_peer("2026-07-03T10:57:00Z", now),
+            "3": self._parked_peer("2026-07-03T12:00:00Z", now),
+        }
+        outcome, asked = self._tick_recording_fetches(harness, entries)
+        assert outcome is TickOutcome.BLOCKED
+        assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-verified-target"]
+        assert not [f for f in asked if f and f & {"2", "3"}], asked
+        assert harness.engine._blocked_wait_long is True
+        expected = (
+            datetime.fromisoformat("2026-07-03T10:57:00+00:00").timestamp()
+            + poll_policy.RESET_SLACK_S
+        )
+        assert harness.engine._sleep_until_ts == pytest.approx(expected)
+        assert harness.engine._next_delay(outcome) > 2 * harness.settings.interval_seconds
+
+    def test_a_blind_active_still_reads_and_lands_on_a_peer_that_is_not_spent(
+        self, harness
+    ):
+        """The landing read keeps asking for a peer that could verify: only
+        the parked spent one is left alone."""
         harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
         now = harness.clock.now
         entries = {
             "1": replace(self._blind_active_entry(now), last_error="http-429"),
-            "2": _entry_for(_usage(100.0), now),
-            "3": _entry_for(_usage(100.0), now),
+            "2": self._parked_peer("2026-07-03T10:57:00Z", now),
+            "3": UsageEntry(last_good=_usage(10.0), fetched_at=now - 200.0, age_s=200.0),
         }
-        outcome = harness.tick_with_entries(entries)
-        assert outcome is TickOutcome.NO_ACTION
-        assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
-        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["no-verified-target"]
+        outcome, asked = self._tick_recording_fetches(
+            harness, entries, fresh={"3": _entry_for(_usage(10.0), now)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+        assert {"3"} in asked and not [f for f in asked if f and "2" in f], asked
 
     @pytest.mark.parametrize(
         "kind",
