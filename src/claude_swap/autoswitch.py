@@ -1757,6 +1757,23 @@ def _reading_verified(entry: UsageEntry | None, now: float) -> bool:
     )
 
 
+def _left_blind_unread(
+    state: dict, entries: Mapping[str, UsageEntry], current: str | None
+) -> str | None:
+    """The account the engine left under ``active-stale`` and has not read
+    since, while the engine still stands where that move put it: its stored
+    reading is the number nobody trusted, so an ordinary move may not return
+    to it (`_left_account_recovered`, `dynamic`'s rotation and escapes)."""
+    if state.get("leftTrigger") != "active-stale" or state.get("lastSwitchFrom") is None:
+        return None
+    left = str(state["lastSwitchFrom"])
+    landed_on = state.get("lastSwitchTo")
+    if landed_on is not None and current is not None and str(landed_on) != str(current):
+        return None
+    entry = entries.get(left)
+    return left if entry is None or entry.consecutive_failures > 0 else None
+
+
 def _blind_detail(binding: BindingWindow | None, entry: UsageEntry | None) -> str:
     """What the engine last knew of an active account that is
     ``_active_reading_blind``, for the events that explain a hold or a move."""
@@ -2765,11 +2782,14 @@ class AutoSwitchEngine:
             active_binding = self._binding(
                 usage.get(current), settings, threshold=departure_pct
             )
-            below = (
-                not active_binding.over
-                if active_binding is not None
-                else (100.0 - active_headroom) < departure_pct
-            )
+            if settings.strategy == "dynamic":
+                # `dynamic` leaves at its wall, not at its line: a blind
+                # active short of the wall is still unmeasured.
+                below = not _about_to_wall(raw_active_headroom, self._active_wall)
+            elif active_binding is not None:
+                below = not active_binding.over
+            else:
+                below = (100.0 - active_headroom) < departure_pct
         active_entry = entries.get(current)
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
@@ -3023,6 +3043,16 @@ class AutoSwitchEngine:
         expiring: list[str] = []
         walk = (0.0, [])
         logged_trigger: str | None = None
+        # A healthy active's own move (a rotation, an expiring window, the
+        # walled escape) does not return to an account left under
+        # `active-stale` until it is read: its reading is the one nobody
+        # trusted. At the wall `_dynamic_rank` and the at-limit escape rule.
+        unread = (
+            _left_blind_unread(state, entries, current)
+            if trigger == "dynamic-healthy"
+            else None
+        )
+        healthy_peers = [n for n in oauth_candidates if n != unread]
         if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
             now = self.clock()
 
@@ -3035,7 +3065,7 @@ class AutoSwitchEngine:
                 )
 
             walk = _expiring_walk(
-                [current, *oauth_candidates], usage, headroom, self._bars,
+                [current, *healthy_peers], usage, headroom, self._bars,
                 {n: p.weekly_cap for n, p in policies.items()},
                 {n: getattr(e, "plan", None) for n, e in entries.items()},
                 _landing_cost, now,
@@ -3166,7 +3196,7 @@ class AutoSwitchEngine:
             # block F3's deliberate, healthy alternation between two
             # unchanged accounts (never "recovered").
             warm_ordered, cold_ordered = _rank_dynamic_candidates(
-                oauth_candidates, headroom, usage, now, last_active_at,
+                healthy_peers, headroom, usage, now, last_active_at,
                 settings.cache_ttl_seconds, self._bars,
             )
             # Kept alongside `warm_ordered`/`cold_ordered` (which the
@@ -3199,7 +3229,7 @@ class AutoSwitchEngine:
                 # same way once every candidate folds to headroom 0 on it.
                 unmodeled = _headroom_by_account(usage, ())
                 warm_ordered, cold_ordered = _rank_dynamic_candidates(
-                    oauth_candidates, unmodeled, usage, now, last_active_at,
+                    healthy_peers, unmodeled, usage, now, last_active_at,
                     settings.cache_ttl_seconds, self._bars,
                 )
                 floor_headroom = unmodeled
@@ -4387,13 +4417,11 @@ class AutoSwitchEngine:
         # two-null inference for it (unchanged behaviour for pre-upgrade
         # state).
         left_trigger = state.get("leftTrigger")
-        if left_trigger == "active-stale" and entries is not None:
-            # Left because a 429 kept it from being read. Until a refresh of
-            # it succeeds, the number it shows is the one that was not
-            # trusted, however good it looks beside the active's.
-            left = entries.get(barred)
-            if left is None or left.consecutive_failures > 0:
-                return False
+        # Left because a 429 kept it from being read. Until a refresh of it
+        # succeeds, the number it shows is the one that was not trusted,
+        # however good it looks beside the active's.
+        if entries is not None and _left_blind_unread(state, entries, current):
+            return False
         is_failover_snapshot = (
             # `active-stale` left with no baseline it trusted, like failover.
             left_trigger in ("failover", "active-stale")
@@ -5600,10 +5628,16 @@ class AutoSwitchEngine:
         # reading that cannot move. The tick reads the landings itself once
         # it may leave (`_tick_inner`), so refreshing every peer on each
         # waiting tick would only spend their request budgets.
-        waiting_blind = _active_reading_blind(entries.get(current), now) and not any(
-            pct >= window_line(label, threshold, weekly_threshold)
-            for label, pct, _ in active_windows
-        )
+        if self.settings.strategy == "dynamic":  # leaves at its wall, as `_tick_inner`
+            at_a_line = active_headroom is not None and _about_to_wall(
+                active_headroom, self._active_wall
+            )
+        else:
+            at_a_line = any(
+                pct >= window_line(label, threshold, weekly_threshold)
+                for label, pct, _ in active_windows
+            )
+        waiting_blind = _active_reading_blind(entries.get(current), now) and not at_a_line
         escalate = bool(candidates) and (
             # A disabled active switches on ANY headroom, including one well
             # below the band, which satisfies neither leg below — without this

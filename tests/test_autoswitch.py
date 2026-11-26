@@ -68,6 +68,14 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
 
 
+def _left_blind_state(h, left: int, landed_on: int) -> None:
+    """The engine's record of a move off ``left`` under ``active-stale``."""
+    h.engine._mutate_state(lambda s: s.update(
+        lastSwitchFrom=left, lastSwitchTo=str(landed_on), leftTrigger="active-stale",
+        leftHeadroom=None, leftRecoveryAt=None, lastSwitchAt=h.clock.now - 3600.0,
+    ))
+
+
 def _seed_org_twin(h, num, email, org):
     """Seed a slot, then give its roster row an organizationUuid."""
     h.seed(num, email)
@@ -1713,17 +1721,24 @@ class TestAdaptiveScheduler:
         ]
 
     @pytest.mark.parametrize(
-        "shape, pct, known",
+        "shape, pct, known, settings",
         [
-            ("far from its line", 50, "5h 50% read 8m ago"),
+            ("far from its line", 50, "5h 50% read 8m ago", {}),
             # Inside the band where a readable active has every peer refetched.
-            ("near its line", 86, "5h 86% read 8m ago"),
+            ("near its line", 86, "5h 86% read 8m ago", {}),
             # Its window reset inside the backoff: the store drops the reading.
-            ("reading lapsed", 50, "no current reading"),
+            ("reading lapsed", 50, "no current reading", {}),
+            ("reading lapsed", 50, "no current reading", {"strategy": "dynamic"}),
+            # `dynamic` leaves at its wall, not at the 90 line: a frozen 92% is
+            # still short of where it would move.
+            (
+                "between its line and the wall", 92, "5h 92% read 8m ago",
+                {"strategy": "dynamic"},
+            ),
         ],
     )
     def test_a_blind_active_counts_without_refetching_its_peers(
-        self, temp_home, monkeypatch, shape, pct, known
+        self, temp_home, monkeypatch, shape, pct, known, settings
     ):
         # The active account's refreshes are being refused (429 with a long
         # Retry-After) and its last reading has aged past STALE_OK_S. The
@@ -1731,7 +1746,7 @@ class TestAdaptiveScheduler:
         # the account is still below its line (#208). The tick counts toward
         # leaving and says why; the active account's backoff is respected,
         # and its peers keep their ordinary poll plan while the count runs.
-        h = self._harness(temp_home, monkeypatch)
+        h = self._harness(temp_home, monkeypatch, **settings)
         resets = _iso_at(h.clock.now + 300) if shape == "reading lapsed" else None
         usage = {"1": _usage(pct, resets), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -4029,6 +4044,29 @@ class TestActiveStaleLanding:
         assert h.active_number() == 3
 
     @pytest.mark.parametrize(
+        "frozen, outcome, trigger",
+        [
+            # Between its 90 line and dynamic's wall (97): not a place to
+            # leave on a number nobody can renew, so the count runs (#208).
+            (92, TickOutcome.SWITCHED, "active-stale"),
+            # At the wall the reading is acted on at once, like any other.
+            (98, TickOutcome.SWITCHED, "proactive"),
+        ],
+    )
+    def test_a_blind_dynamic_active_acts_at_its_wall_and_counts_short_of_it(
+        self, temp_home, frozen, outcome, trigger
+    ):
+        h = self._harness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        assert h.tick_with_entries({
+            "1": self._blind(_usage(frozen), now),
+            "2": self._read(_usage(10), now),
+        }) is outcome
+        assert [
+            e.trigger for e in h.events if isinstance(e, SwitchEvent)
+        ] == [trigger]
+
+    @pytest.mark.parametrize(
         "trusted, known",
         [(True, "5h 70% read 15m ago"), (False, "no current reading")],
     )
@@ -4097,6 +4135,45 @@ class TestActiveStaleLanding:
         assert [
             e.trigger for e in h.events if isinstance(e, SwitchEvent)
         ] == ["at-limit"]
+
+    @pytest.mark.parametrize("chunk_pct", [20.0, 0.0])
+    def test_a_dynamic_rotation_does_not_return_to_the_account_left_blind(
+        self, temp_home, chunk_pct
+    ):
+        # Account 1 was left on a frozen 70% and is still refused. Account 2
+        # then spends its stay (the percent step, or its dwell with
+        # `alternation_chunk_pct` 0), and rotation would take the warm 70%:
+        # the number nobody trusted. It waits until account 1 is read.
+        h = self._harness(temp_home, strategy="dynamic", alternation_chunk_pct=chunk_pct)
+        now = h.clock.now
+        assert h.tick_with_entries({
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(10), now),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(400)  # past the cooldown and the dwell
+        h.events.clear()
+        now = h.clock.now
+        h.tick_with_entries({  # the stay's start
+            "1": self._blind(_usage(70), now, age=1300.0),
+            "2": self._read(_usage(10), now),
+        })
+        h.clock.advance(700)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now, age=2000.0),
+            "2": self._read(_usage(35), now),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        # Read again, the same 70% is a measured, fair landing.
+        h.clock.advance(60)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._read(_usage(70), now),
+            "2": self._read(_usage(35), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == ["alternation"]
 
     def test_a_refresh_landing_while_the_peers_are_read_cancels_the_move(
         self, temp_home
@@ -16870,6 +16947,34 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
         )
         assert h.active_number() == 2
 
+    @pytest.mark.parametrize("read_since", [False, True])
+    def test_the_walled_escape_does_not_return_to_the_account_left_blind(
+        self, temp_home, read_since
+    ):
+        """The fleet above, but account 2 is the one the engine left under
+        `active-stale` and its refresh is still refused: its reading is the one
+        nobody trusted, so the escape waits until it is read."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "b@example.invalid"), (2, "a@example.invalid")):
+            h.seed(num, email)
+        h.make_live("b@example.invalid", 1)
+        t0 = h.clock.now
+        h.engine._mutate_state(lambda s: s.update(lastActiveAt={"1": t0, "2": t0}))
+        _left_blind_state(h, left=2, landed_on=1)
+        h.clock.advance(60.0)
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),
+            "2": self._u(0, 40, 100, days_out=4),
+        }
+        now = h.clock.now
+        entries = {n: _entry_for(v, now) for n, v in fleet.items()}
+        if not read_since:
+            entries["2"] = TestActiveStaleLanding._blind(fleet["2"], now)
+        outcome = h.tick_with_entries(entries)
+        assert (outcome, h.active_number()) == (
+            (TickOutcome.SWITCHED, 2) if read_since else (TickOutcome.NO_ACTION, 1)
+        )
+
     def test_the_blackout_bar_never_drops_below_the_real_switch_cost(
         self, temp_home
     ):
@@ -18269,6 +18374,22 @@ class TestAnExpiringWindowPullsTheSwitch:
         assert _xw_tick(h, self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert _xw_switch(h).trigger == "expiring-window"
+
+    def test_an_expiring_window_on_the_account_left_blind_does_not_pull_the_switch(
+        self, temp_home
+    ):
+        """Account 2's 87% reading is the one nobody trusted: it was left under
+        `active-stale` and is still refused, so its expiring window pulls nothing
+        and the active holds (3 is no better than 1's room)."""
+        h = _xw_harness(temp_home)
+        _left_blind_state(h, left=2, landed_on=1)
+        usage = self._fleet(h)
+        now = h.clock.now
+        entries = {n: _entry_for(v, now) for n, v in usage.items()}
+        entries["2"] = TestActiveStaleLanding._blind(usage["2"], now)
+        h.engine = h._make_engine()
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
     def test_a_window_resetting_in_hours_pulls_the_switch_whatever_the_burn_rate(self, temp_home):
         """2 resets in 6 h with 6 points of room on a fleet burning 4 pts/h: the old
