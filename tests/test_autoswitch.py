@@ -1859,6 +1859,32 @@ class TestAdaptiveScheduler:
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
+    def test_a_blind_dynamic_active_on_a_model_wall_leaves_its_peers_on_their_plan(
+        self, temp_home, monkeypatch
+    ):
+        # `dynamic` judges the active on 5h/7d with the pinned model's window
+        # dropped, so a frozen reading whose ONLY over-line window is the model
+        # wall is still below its line: the tick counts it, and the count must
+        # not refetch every peer on each waiting tick.
+        h = self._harness(temp_home, monkeypatch, strategy="dynamic", model="Fable")
+        frozen = {
+            "five_hour": {"pct": 40.0}, "seven_day": {"pct": 40.0},
+            "scoped": [{"name": "Fable", "pct": 98.0,
+                        "resets_at": _iso_at(h.clock.now + 3 * 86400)}],
+        }
+        usage = {"1": frozen, "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.clock.advance(400)
+        counts.clear()
+        h.events.clear()
+        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["active-usage-stale"]
+        assert sum(counts.values()) <= 1  # the baseline slot only, no escalate-all
+
     def test_a_429_frozen_active_reading_moves_to_a_measured_account(
         self, temp_home, monkeypatch
     ):

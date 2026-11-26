@@ -32,6 +32,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     ThresholdMap,
+    _active_reading_blind,
     _binding_at,
     _dynamic_active_headroom,
     _headroom_by_account,
@@ -85,12 +86,13 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 # Triggers whose pass the panel never runs, each with WHY: a state the tick
-# acts on out of sight of a snapshot (an unreadable active counts ticks toward
-# failover) or ranks through a pass of its own. Never "no candidate qualifies",
+# acts on out of sight of a snapshot (an unreadable or blind active counts
+# ticks toward leaving) or ranks through a pass of its own. Never "no candidate qualifies",
 # the claim only a real, empty pass earns.
 _UNMODELED_TEXT = {
     "below-threshold": "not previewed (active below threshold)",
     "unreadable-active": "not previewed (active status unknown)",
+    "active-stale": "not previewed (active status stale)",
     "priority": "not previewed (priority strategy)",
 }
 
@@ -135,13 +137,8 @@ def _engine_order(
     active_h = _dynamic_active_headroom(
         settings, models, usage, active_number, headroom.get(active_number)
     )
-    if settings.strategy == "priority-consume-first":
-        trigger = "priority"
-    elif any(a.number == active_number and a.disabled for a in snap.accounts):
-        trigger = "disabled-active"
-    elif active_h is None:
-        trigger = "unreadable-active"
-    else:
+    below = False
+    if active_h is not None:
         # Each window against its own line, on the set `active_h` was read on.
         binding = _binding_at(
             usage.get(active_number), settings,
@@ -153,14 +150,25 @@ def _engine_order(
             if binding is not None
             else (100.0 - active_h) < bars[active_number]
         )
-        if below:
-            trigger = (
-                settings.strategy
-                if settings.strategy in CONSUME_FIRST_STRATEGIES
-                else "below-threshold"
-            )
-        else:
-            trigger = "at-limit" if active_h <= 0 else "proactive"
+    active_entry = next((a.usage for a in snap.accounts if a.number == active_number), None)
+    if settings.strategy == "priority-consume-first":
+        trigger = "priority"
+    elif any(a.number == active_number and a.disabled for a in snap.accounts):
+        trigger = "disabled-active"
+    elif (active_h is None or below) and _active_reading_blind(active_entry, now):
+        # The tick counts toward `active-stale` here and ranks nothing it has
+        # not measured; a reading at or over a line is still acted on, below.
+        trigger = "active-stale"
+    elif active_h is None:
+        trigger = "unreadable-active"
+    elif below:
+        trigger = (
+            settings.strategy
+            if settings.strategy in CONSUME_FIRST_STRATEGIES
+            else "below-threshold"
+        )
+    else:
+        trigger = "at-limit" if active_h <= 0 else "proactive"
     if trigger in _UNMODELED_TEXT:
         return [], models, _UNMODELED_TEXT[trigger]
 

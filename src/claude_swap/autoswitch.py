@@ -3875,9 +3875,19 @@ class AutoSwitchEngine:
         # reading that cannot move. The tick reads the landings itself once
         # it may leave (`_tick_inner`), so refreshing every peer on each
         # waiting tick would only spend their request budgets.
+        # Under `dynamic` the tick reads the active's lines on 5h/7d with the
+        # model window dropped (`active_binding`), so a model window at its line
+        # does not end the wait there either.
+        blind_windows = (
+            oauth.relevant_windows(
+                active_value if isinstance(active_value, dict) else None, ()
+            )
+            if self.settings.strategy == "dynamic" and self._models
+            else active_windows
+        )
         waiting_blind = _active_reading_blind(entries.get(current), now) and not any(
             pct >= window_line(label, threshold, weekly_threshold)
-            for label, pct, _ in active_windows
+            for label, pct, _ in blind_windows
         )
         escalate = bool(candidates) and (
             # A disabled active switches on ANY headroom, including one well

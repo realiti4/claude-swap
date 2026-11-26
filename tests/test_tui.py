@@ -3270,6 +3270,45 @@ class TestNextBestFollowsTheTick:
         h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
         assert claim in _next_best_text(snap, "1", h.settings)
 
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    def test_a_blind_active_below_its_line_claims_no_order(self, strategy):
+        # The tick counts `active-usage-stale` for a usage 429 on a reading older
+        # than STALE_OK_S that is still under its line (#620), and previews
+        # nothing it has not measured. A frozen 40% must not be called "below
+        # the line" nor rank peers.
+        blind = dataclasses.replace(
+            make_entry(40.0, 10.0, age_s=STALE_OK_S + 60),
+            consecutive_failures=3, last_error="http-429", trust_extended=True,
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(1, active=True, entry=blind),
+                make_account(2, entry=make_entry(10.0, 10.0)),
+            ),
+            taken_at=0.0,
+        )
+        text = _next_best_text(snap, "1", AutoSwitchSettings(strategy=strategy))
+        assert "not previewed (active status stale)" in text
+
+    def test_a_blind_active_at_its_line_is_still_ranked(self):
+        # A reading at or over a line is acted on at once, so the panel ranks.
+        blind = dataclasses.replace(
+            make_entry(95.0, 10.0, age_s=STALE_OK_S + 60),
+            consecutive_failures=3, last_error="http-429", trust_extended=True,
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(1, active=True, entry=blind),
+                make_account(2, entry=make_entry(10.0, 10.0)),
+            ),
+            taken_at=0.0,
+        )
+        text = _next_best_text(snap, "1", AutoSwitchSettings(strategy="best"))
+        assert "not previewed" not in text
+        assert "user2@example.com" in text
+
     @pytest.mark.parametrize(
         "strategy, fleet, extra, disabled, designed",
         [
