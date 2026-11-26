@@ -53,6 +53,13 @@ _logger = logging.getLogger("claude-swap")
 # rejected the certificate.
 _NEVER_SENT = (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)
 
+# The token endpoint's error codes (RFC 6749 section 5.2). A refresh failure
+# is logged with one of these or as unrecognised, never with the reply text.
+_OAUTH_ERROR_CODES = frozenset({
+    "invalid_request", "invalid_client", "invalid_grant",
+    "unauthorized_client", "unsupported_grant_type", "invalid_scope",
+})
+
 
 def extract_access_token(credentials: str) -> str | None:
     """Extract the OAuth access token from a credentials JSON string."""
@@ -331,8 +338,15 @@ def try_refresh_oauth_credentials(
             json.dumps(data), None, _parse_token_account(resp_data)
         )
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
-        _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
+        # Reading the error body can fail too, when a gateway drops the
+        # connection part-way. That is a reply without a verdict.
+        unread = ""
+        try:
+            body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
+        except Exception as read_error:
+            body = ""
+            unread = f", body unread ({type(read_error).__name__})"
+        err = None
         # Permanent only when the server itself rejected the grant: a 4xx AND
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
@@ -349,12 +363,19 @@ def try_refresh_oauth_credentials(
                 err = json.loads(body).get("error")
             except (ValueError, AttributeError):
                 err = None
-            # invalid_grant: this slot's refresh lineage is dead.
-            # invalid_client: OUR client credential was rejected — systemic
-            # (client_id rotated/blocked), no evidence about any slot, so it
-            # keeps its own kind and lands no strike.
-            if err in ("invalid_grant", "invalid_client"):
-                return RefreshOutcome(None, err)
+        # The status and a known OAuth error code only: the body is whatever
+        # a server or a proxy chose to send.
+        known = isinstance(err, str) and err in _OAUTH_ERROR_CODES
+        _logger.debug(
+            "OAuth refresh failed: HTTP %s, error %s%s",
+            e.code, err if known else "unrecognised", unread,
+        )
+        # invalid_grant: this slot's refresh lineage is dead.
+        # invalid_client: OUR client credential was rejected — systemic
+        # (client_id rotated/blocked), no evidence about any slot, so it
+        # keeps its own kind and lands no strike.
+        if err in ("invalid_grant", "invalid_client"):
+            return RefreshOutcome(None, err)
         if e.code >= 500:
             # Not a verdict on the grant either: a gateway can report an error
             # for a request the origin already acted on.
@@ -365,7 +386,7 @@ def try_refresh_oauth_credentials(
         # name lookup, connect, TLS and writing the request. A failure while
         # reading the reply arrives unwrapped, below.
         reason = e.reason
-        what = reason if isinstance(reason, str) else type(reason).__name__
+        what = "URLError" if isinstance(reason, str) else type(reason).__name__
         if isinstance(reason, (str, *_NEVER_SENT)):
             # Nothing reached the server, so no grant can have been spent.
             # The ordinary offline case; it stays quiet.
