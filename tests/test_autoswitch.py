@@ -72,7 +72,6 @@ def _left_blind_state(h, left: int, landed_on: int) -> None:
     """The engine's record of a move off ``left`` under ``active-stale``."""
     h.engine._mutate_state(lambda s: s.update(
         lastSwitchFrom=left, lastSwitchTo=str(landed_on), leftTrigger="active-stale",
-        leftHeadroom=None, leftRecoveryAt=None, lastSwitchAt=h.clock.now - 3600.0,
     ))
 
 
@@ -16946,6 +16945,28 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "escape must fire immediately, not wait out a 600s dwell"
         )
         assert h.active_number() == 2
+
+    def test_a_blind_active_walled_on_its_model_window_escapes_at_once(self, temp_home):
+        """The fleet above with account 1's refresh refused: its frozen reading
+        is at the model wall (raw headroom 0), a line it is acted on at, however
+        much room its widened 5h/7d reading shows. It does not count first."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "b@example.invalid"), (2, "a@example.invalid")):
+            h.seed(num, email)
+        h.make_live("b@example.invalid", 1)
+        t0 = h.clock.now
+        h.engine._mutate_state(lambda s: s.update(lastActiveAt={"1": t0, "2": t0}))
+        h.clock.advance(60.0)
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),
+            "2": self._u(0, 40, 100, days_out=4),
+        }
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": TestActiveStaleLanding._blind(fleet["1"], now),
+            "2": _entry_for(fleet["2"], now),
+        })
+        assert (outcome, h.active_number()) == (TickOutcome.SWITCHED, 2)
 
     @pytest.mark.parametrize("read_since", [False, True])
     def test_the_walled_escape_does_not_return_to_the_account_left_blind(
