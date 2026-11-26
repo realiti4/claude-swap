@@ -1691,11 +1691,16 @@ class TestAdaptiveScheduler:
         assert counts["1"] == 3
         assert counts["2"] == 2  # now stale → the escalation refreshes it
 
-    def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
+    def test_active_in_backoff_is_unknown_not_its_last_reading(
+        self, temp_home, monkeypatch
+    ):
         # The active account's fetches are being refused (429 with a long
-        # Retry-After). Its last-good data ages past STALE_OK_S, but the
-        # staleness is deliberate: headroom stays known, so no unhealthy
-        # ticks and no escalate-all burst while the server is rate limiting.
+        # Retry-After) and its last-good reading has aged past STALE_OK_S.
+        # The store still trusts that reading as a lower bound, but the
+        # active account is the one being consumed, so the decision treats
+        # its usage as unknown (#208): an unhealthy tick that says why, a
+        # refresh of the candidates (each its own token), and the active
+        # account's backoff still respected.
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -1708,11 +1713,67 @@ class TestAdaptiveScheduler:
         )
         h.clock.advance(400)  # active data now well past STALE_OK_S, in backoff
         counts.clear()
+        h.events.clear()
+        outcome = self._tick(h, counts, usage)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 1
+        unknown = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in unknown] == ["active-usage-unknown"]
+        assert "http-429" in unknown[0].detail
+        assert "1" not in counts  # backoff respected
+        assert counts == {"2": 1, "3": 1}  # candidates refreshed for failover
+
+    def test_a_429_frozen_active_reading_fails_over_instead_of_holding(
+        self, temp_home, monkeypatch
+    ):
+        # #208 as reported: line 85, the active account's last reading 58%,
+        # then every refresh 429s while the account keeps being used. The
+        # frozen 58% must not keep answering "below the line"; after
+        # unhealthy_ticks unknown ticks the engine fails over.
+        h = self._harness(temp_home, monkeypatch, threshold=85.0, strategy="best")
+        usage = {"1": _usage(58), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        h.events.clear()
+        errors = {"1": "http-429"}
+        outcomes = []
+        for _ in range(12):
+            h.clock.advance(60)
+            outcomes.append(self._tick(h, counts, usage, errors))
+            if outcomes[-1] is TickOutcome.SWITCHED:
+                break
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert outcomes[-1] is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        # While the reading is younger than STALE_OK_S it still decides
+        # ("below-threshold"); once it ages past, 1/3 and 2/3 unknown ticks,
+        # then the failover. Never "below-threshold" on the frozen reading.
+        assert reasons[-2:] == ["active-usage-unknown", "active-usage-unknown"]
+        assert reasons.count("below-threshold") == len(reasons) - 2
+
+    def test_one_failed_refresh_of_a_recent_active_reading_is_trusted(
+        self, temp_home, monkeypatch
+    ):
+        # A single 429 on a reading younger than STALE_OK_S changes nothing:
+        # the reading is as recent as any trusted one.
+        h = self._harness(temp_home, monkeypatch, strategy="best")
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.switcher._usage_store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=600.0)},
+            {"1": ("a@example.com", "")},
+        )
+        h.clock.advance(120)
+        h.events.clear()
         outcome = self._tick(h, counts, usage)
         assert outcome is TickOutcome.NO_ACTION
         assert h.engine._unhealthy_ticks == 0
-        assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "below-threshold"
+        ]
 
     def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
         self, temp_home, monkeypatch
