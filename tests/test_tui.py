@@ -2665,6 +2665,7 @@ class TestUnswitchableRowsAreListed:
         a.login_expires_at = None  # the re-login note reads it; a MagicMock is not a time
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
+        a.usage.consecutive_failures = 0  # _decision_usage reads it; a MagicMock is not a count
         a.usage.decision_value.return_value = sentinel or last_good  # what the pass reads
         a.disabled = False
         return a
