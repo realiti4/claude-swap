@@ -57,7 +57,7 @@ Usage polling is adaptive — a couple of accounts per check, busy alternates wa
 
 ## When something fails
 
-It fails safe: if a usage check errors it keeps trusting the last-known numbers, for a bounded time, while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
+It fails safe: if a usage check errors it keeps trusting the last-known numbers, for a bounded time, while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message). The active account is the exception: it is the one being used, so its last-known numbers only show how far it had got. Once a failing check leaves them more than five minutes old, its usage counts as unknown, the check reports `active-usage-unknown`, and after `autoswitch.unhealthyTicks` such checks it fails over.
 
 An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 
