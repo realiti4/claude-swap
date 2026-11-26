@@ -9403,6 +9403,53 @@ class TestSharedOAuthCredentialPreservation:
             "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         }
 
+    @staticmethod
+    def _cred(token, pointer=None):
+        data = {"claudeAiOauth": {"accessToken": token}}
+        if pointer is not None:
+            data["keychainOverflow"] = pointer
+        return json.dumps(data)
+
+    @pytest.mark.parametrize("target_pointer", [{"slot": "a", "key": "stale"}, None])
+    def test_shared_only_keychain_overflow_pointer_follows_the_switch(
+        self, temp_home, target_pointer
+    ):
+        switcher = ClaudeAccountSwitcher()
+        live_pointer = {"slot": "b", "key": "current"}
+
+        composed = json.loads(switcher._prepare_credentials_for_activation(
+            self._cred("target", target_pointer), self._cred("live", live_pointer)
+        ))
+
+        assert composed["keychainOverflow"] == live_pointer
+
+    @pytest.mark.parametrize(
+        "a_pointer, b_pointer",
+        [
+            pytest.param({"slot": "a", "key": "k", "login": "h"}, None, id="b-has-none"),
+            pytest.param(
+                {"slot": "a", "key": "k", "login": "h"},
+                {"slot": "b", "key": "k", "member": "m"},
+                id="b-mixed",
+            ),
+            pytest.param(None, {"slot": "b", "key": "k", "member": "m"}, id="a-has-none"),
+            pytest.param("opaque", None, id="a-non-dict"),
+        ],
+    )
+    def test_mixed_keychain_overflow_pointer_returns_as_stored_after_a_b_a(
+        self, temp_home, a_pointer, b_pointer
+    ):
+        switcher = ClaudeAccountSwitcher()
+        a_saved = self._cred("a", a_pointer)
+
+        on_b = switcher._prepare_credentials_for_activation(
+            self._cred("b", b_pointer), a_saved
+        )
+        back_on_a = switcher._prepare_credentials_for_activation(a_saved, on_b)
+
+        assert json.loads(back_on_a) == json.loads(a_saved)
+        assert json.loads(on_b).get("keychainOverflow") == b_pointer
+
     def test_account_bound_and_unknown_siblings_stay_target_owned(
         self, temp_home
     ):
