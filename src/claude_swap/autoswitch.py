@@ -2627,12 +2627,11 @@ class AutoSwitchEngine:
             # plan is not read (the read ignores plans, so every tick would).
             if self._stop.is_set():
                 raise _EngineStopped()
-            read_now = self.clock()
             entries = self.switcher.usage_entries_by_account(
                 fetch={
                     n for n in oauth_candidates
                     if not _parked_exhausted(
-                        entries.get(n), usage.get(n), self._models, read_now
+                        entries.get(n), usage.get(n), self._models, self.clock()
                     )
                 }
             )
@@ -3594,10 +3593,10 @@ class AutoSwitchEngine:
         entry: UsageEntry | None,
         spent_usage: dict[str, dict | str | None] | None = None,
     ) -> TickOutcome:
-        """Keep a blind active account for want of a measured landing.
-        Staying is the decision, not a block: nothing measured is better.
-        Given ``spent_usage`` (every peer's reading, all of them spent) it is
-        a wait with an end, and ends BLOCKED so ``_next_delay`` honors it."""
+        """Keep a blind active account for want of a measured landing: a
+        decision, so NO_ACTION. With every peer spent (``spent_usage``, their
+        readings) it is a wait with an end, and ends BLOCKED so
+        ``_next_delay`` honors it."""
         detail = (
             f"{_blind_detail(binding, entry)}; staying: no other "
             "account has a recent reading with room to spare"

@@ -2186,6 +2186,43 @@ class TestAdaptiveScheduler:
         assert self._tick(h, counts, usage) is TickOutcome.SWITCHED
         assert self._switches(h) == [(1, 2, "active-stale")]
 
+    def test_a_blind_active_with_every_peer_spent_reads_them_on_their_plan_only(
+        self, temp_home, monkeypatch
+    ):
+        # The lmd42 shape through the real store: the active is refused (429)
+        # and both peers are spent. Past the count the landing read ignores
+        # poll plans, so each tick used to re-read both peers about every
+        # SERVE_TTL_S, a refresh-spending fetch apiece. They are read on the
+        # spent cadence instead, and the tick waits for the earliest reset.
+        h = self._harness(temp_home, monkeypatch)
+        reset = h.clock.now + 7200.0
+        usage = {
+            "1": _usage(50),
+            "2": _usage(100, _iso_at(reset)),
+            "3": _usage(100, _iso_at(reset + 1800.0)),
+        }
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        self._refuse(h, "1")
+        h.clock.advance(400)
+        outcomes = []
+        for _ in range(2):  # the count: two ticks before the move is allowed
+            outcomes.append(self._tick(h, counts, usage))
+            h.clock.advance(60)
+        before = dict(counts)
+        h.events.clear()
+        for _ in range(8):  # 480 s: one 600 s spent plan falls due, not three TTLs
+            outcomes.append(self._tick(h, counts, usage))
+            h.clock.advance(60)
+        assert {n: counts[n] - before[n] for n in ("2", "3")} == {"2": 1, "3": 1}
+        assert outcomes[-1] is TickOutcome.BLOCKED
+        assert self._reasons(h) == ["no-verified-target"] * 8
+        assert h.engine._sleep_until_ts == pytest.approx(
+            reset + poll_policy.RESET_SLACK_S
+        )
+        assert h.engine._next_delay(outcomes[-1]) > 2 * h.settings.interval_seconds
+        assert h.active_number() == 1
+
     def test_an_active_unreadable_for_another_reason_still_fails_over(
         self, temp_home, monkeypatch
     ):
