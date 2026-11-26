@@ -33,6 +33,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     ThresholdMap,
     _binding_at,
+    _decision_usage,
     _dynamic_active_headroom,
     _headroom_by_account,
     binding_pct,
@@ -126,7 +127,9 @@ def _engine_order(
     previewed, empty when somebody is. State a snapshot lacks (cooldown, the
     no-return bar, quarantine, the failover count) is not modeled."""
     models = parse_model_names(settings.model)
-    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+    usage = _decision_usage(
+        {acc.number: acc.usage for acc in snap.accounts}, active_number, now
+    )
     bars = ThresholdMap(
         {a.number: a.policy.threshold for a in snap.accounts if a.policy.threshold is not None},
         settings.threshold,
