@@ -4761,7 +4761,9 @@ class AutoSwitchEngine:
             and active_headroom <= 100.0 - thresholds[current]
         )
         if active_at_threshold:
-            room = self._room(usage.get(barred), settings, thresholds[barred])
+            room = _room_at(
+                usage.get(barred), settings, self._models, thresholds[barred]
+            )
             if room is not None and room >= settings.hysteresis_pct:
                 return True
         if h is not None:
