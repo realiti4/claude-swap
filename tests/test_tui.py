@@ -3223,27 +3223,6 @@ class TestNextBestFollowsTheTick:
         assert h.tick_with_entries(entries) is not TickOutcome.SWITCHED
         assert "not previewed (active status unknown)" in _next_best_text(snap, h.settings)
 
-    def test_a_blind_active_reading_claims_no_order(self):
-        """The tick reads an aged reading its refreshes failed to renew as
-        unknown (#208), so the panel must not call the active below its line."""
-        from claude_swap.settings import AutoSwitchSettings
-
-        blind = dataclasses.replace(
-            make_entry(40.0, 10.0, age_s=STALE_OK_S + 60),
-            consecutive_failures=3, trust_extended=True,
-        )
-        snap = AccountsSnapshot(
-            active_number="1",
-            accounts=(
-                make_account(1, active=True, entry=blind),
-                make_account(2, entry=make_entry(10.0, 10.0)),
-            ),
-            taken_at=0.0,
-        )
-        assert "not previewed (active status unknown)" in _next_best_text(
-            snap, AutoSwitchSettings(strategy="best")
-        )
-
     def test_a_walled_active_reading_is_never_blind(self):
         """A wall mark outranks the frozen reading in `decision_value`, so a
         walled active whose refreshes fail is full, not unknown."""
@@ -3337,6 +3316,7 @@ class TestNextBestFollowsTheTick:
         not_modelled = {
             "unmanaged-active-account", "no-active-account", "active-api-key",
             "active-idle", "active-usage-unknown", "cooldown", "account-refused",
+            "active-usage-stale", "active-usage-refreshed",
             "already-consuming-priority", "stale-usage", "no-viable-target",
             "invalid_grant", "target-credential-unconfirmed",
         }
