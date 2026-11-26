@@ -1814,11 +1814,16 @@ class TestAdaptiveScheduler:
         assert counts["1"] == 3
         assert counts["2"] == 2  # now stale → the escalation refreshes it
 
-    def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
+    def test_active_in_backoff_is_unknown_not_its_last_reading(
+        self, temp_home, monkeypatch
+    ):
         # The active account's fetches are being refused (429 with a long
-        # Retry-After). Its last-good data ages past STALE_OK_S, but the
-        # staleness is deliberate: headroom stays known, so no unhealthy
-        # ticks and no escalate-all burst while the server is rate limiting.
+        # Retry-After) and its last-good reading has aged past STALE_OK_S.
+        # The store still trusts that reading as a lower bound, but the
+        # active account is the one being consumed, so the decision treats
+        # its usage as unknown (#208): an unhealthy tick that says why, a
+        # refresh of the candidates (each its own token), and the active
+        # account's backoff still respected.
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -1831,11 +1836,69 @@ class TestAdaptiveScheduler:
         )
         h.clock.advance(400)  # active data now well past STALE_OK_S, in backoff
         counts.clear()
+        h.events.clear()
+        outcome = self._tick(h, counts, usage)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 1
+        unknown = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in unknown] == ["active-usage-unknown"]
+        assert "http-429" in unknown[0].detail
+        assert "1" not in counts  # backoff respected
+        assert counts == {"2": 1, "3": 1}  # candidates refreshed for failover
+
+    def test_a_429_frozen_active_reading_fails_over_instead_of_holding(
+        self, temp_home, monkeypatch
+    ):
+        # #208 as reported: line 85, the active account's last reading 58%,
+        # then every refresh 429s while the account keeps being used. The
+        # frozen 58% must not keep answering "below the line"; after
+        # unhealthy_ticks unknown ticks the engine fails over.
+        # Pinned: "below-threshold" is not emitted under the consume-first default.
+        h = self._harness(temp_home, monkeypatch, threshold=85.0, strategy="best")
+        usage = {"1": _usage(58), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        h.events.clear()
+        errors = {"1": "http-429"}
+        outcomes = []
+        for _ in range(12):
+            h.clock.advance(60)
+            outcomes.append(self._tick(h, counts, usage, errors))
+            if outcomes[-1] is TickOutcome.SWITCHED:
+                break
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert outcomes[-1] is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        # While the reading is younger than STALE_OK_S it still decides
+        # ("below-threshold"); once it ages past, 1/3 and 2/3 unknown ticks,
+        # then the failover. Never "below-threshold" on the frozen reading.
+        assert reasons[-2:] == ["active-usage-unknown", "active-usage-unknown"]
+        assert reasons.count("below-threshold") == len(reasons) - 2
+
+    def test_one_failed_refresh_of_a_recent_active_reading_is_trusted(
+        self, temp_home, monkeypatch
+    ):
+        # A single 429 on a reading younger than STALE_OK_S changes nothing:
+        # the reading is as recent as any trusted one.
+        # Pinned: "below-threshold" is not emitted under the consume-first default.
+        h = self._harness(temp_home, monkeypatch, strategy="best")
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.switcher._usage_store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=600.0)},
+            {"1": ("a@example.com", "")},
+        )
+        h.clock.advance(120)
+        h.events.clear()
         outcome = self._tick(h, counts, usage)
         assert outcome is TickOutcome.NO_ACTION
         assert h.engine._unhealthy_ticks == 0
-        assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "below-threshold"
+        ]
 
     def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
         self, temp_home, monkeypatch
@@ -4121,6 +4184,16 @@ def _model_usage(five_h: float, fable: float) -> dict:
     }
 
 
+def _rolled_model_usage(five_h: float, fable: float, now: float) -> dict:
+    """`_model_usage` whose Fable window's own reset is already past `now`."""
+    from datetime import datetime, timezone
+
+    past = datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat()
+    usage = _model_usage(five_h, fable)
+    usage["scoped"][0]["resets_at"] = past.replace("+00:00", "Z")
+    return usage
+
+
 class TestModelAwareSwitch:
     """`autoswitch.model` folds a per-model weekly limit into the decision."""
 
@@ -4157,6 +4230,110 @@ class TestModelAwareSwitch:
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
+
+    def test_a_rolled_model_window_is_dropped_from_the_scheduled_read(
+        self, temp_home
+    ):
+        # Fable's own reset has passed, so its 98% is the window that just
+        # ended (#325) and the 20% 5h is all the active has: it holds. The
+        # decision reads the pinned model's windows (`_decision_usage`).
+        h = self._seed(temp_home, model="Fable", strategy="best")
+        now = h.clock.now
+        rows = {
+            "1": _entry_for(_rolled_model_usage(20, 98, now), now),
+            "2": _entry_for(_model_usage(5, 30), now),
+            "3": _entry_for(_model_usage(5, 60), now),
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=rows
+        ) as read:
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+        # A 98% active would be in the band and refetch the whole fleet.
+        assert {"1", "2", "3"} not in [c.kwargs.get("fetch") for c in read.call_args_list]
+
+    def test_a_rolled_model_window_is_dropped_from_the_escalation_read(
+        self, temp_home
+    ):
+        # The active's 80% 5h is inside the band, so the tick refetches the
+        # fleet; the refetched row carries the rolled Fable window.
+        h = self._seed(temp_home, model="Fable", strategy="best")
+        now = h.clock.now
+        peers = {"2": _model_usage(5, 30), "3": _model_usage(5, 60)}
+        reads = [
+            {"1": _model_usage(80, 0), **peers},
+            {"1": _rolled_model_usage(80, 98, now), **peers},
+        ]
+        calls: list = []
+
+        def entries(**_kw):
+            calls.append(1)
+            row = reads[min(len(calls), 2) - 1]
+            return {n: _entry_for(v, now) for n, v in row.items()}
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_a_rolled_model_window_is_dropped_from_the_phase_two_refetch(
+        self, temp_home
+    ):
+        # consume-first re-decides on a refetch before it switches. The pick
+        # (#2, sooner reset) carries a rolled Fable window there: dropped,
+        # it is still the pick; kept, its 98% would bar it.
+        h = self._seed(temp_home, model="Fable", strategy="consume-first")
+        now = h.clock.now
+
+        def fleet(fable_2: dict) -> dict:
+            rows = {
+                "1": _usage7(10, 20, _R_LATEST),
+                "2": _usage7(10, 10, _R_SOON),
+                "3": _usage7(10, 10, _R_LATER),
+            }
+            for num, fable in (("1", {"pct": 10.0}), ("2", fable_2), ("3", {"pct": 10.0})):
+                rows[num]["scoped"] = [{"name": "Fable", **fable}]
+            return {n: _entry_for(v, now) for n, v in rows.items()}
+
+        calls: list = []
+
+        def entries(**_kw):
+            calls.append(1)
+            # The pre-read and the plan fetch come first; the third is the refetch.
+            return fleet({"pct": 98.0, "resets_at": _R_PAST} if len(calls) > 2 else {"pct": 10.0})
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_reading_nulled_by_a_rolled_model_window_is_not_called_refresh_failing(
+        self, temp_home
+    ):
+        # An aged, failing active whose Fable window rolled: the store no
+        # longer trusts the reading for the pinned model, so "last reading
+        # Nm old, refresh failing" would blame the refresh for a reset.
+        h = self._seed(temp_home, model="Fable", strategy="best")
+        now = h.clock.now
+        entry = UsageEntry(
+            last_good=_rolled_model_usage(20, 60, now),
+            fetched_at=now - STALE_OK_S - 100,
+            age_s=STALE_OK_S + 100,
+            consecutive_failures=3,
+            last_error="http-429",
+            trust_extended=True,
+        )
+        assert h.tick_with_entries({
+            "1": entry,
+            "2": _entry_for(_model_usage(5, 30), now),
+            "3": _entry_for(_model_usage(5, 60), now),
+        }) is TickOutcome.NO_ACTION
+        unknown = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in unknown] == ["active-usage-unknown"]
+        assert unknown[0].detail == "1/3 before failover"
 
     def test_model_headroom_still_gated_by_session_window(self, temp_home):
         # Fable has room on every account, but #1's 5h is maxed → still leaves.

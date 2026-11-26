@@ -68,7 +68,12 @@ from claude_swap.settings import (
     parse_model_names,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    STALE_OK_S,
+    UsageEntry,
+    due_candidate,
+    plan_oversleeps_interval,
+)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -1086,6 +1091,57 @@ def classify_candidate_block(
     if full is not None:
         return "full", full
     return "model", blocking[0][0]
+
+
+def _active_reading_blind(entry: UsageEntry | None, now: float) -> bool:
+    """Whether the ACTIVE account's stored reading is too old to stay on.
+
+    The store keeps a failing row's last-good reading decision-trusted past
+    ``STALE_OK_S`` (up to the window's reset after a 429), on the grounds
+    that usage only rises within a window, so the old reading is a lower
+    bound. A lower bound is the right input for judging a candidate: nothing
+    consumes it, so its real usage stays at that reading. It is the wrong
+    input for the test "is the active account still below its line": that
+    account is the one being consumed, its real usage can be anywhere above
+    the reading, and the test then answers "below" for as long as the fetches
+    fail (#208: a 429-frozen 58% read as 58% for half an hour while the
+    account reached 98%).
+
+    So for the active account only, a reading the last fetch failed to renew
+    is trusted only while it is younger than ``STALE_OK_S``, the age every
+    other reading has to meet. Past that its usage is unknown, and the
+    engine's unknown path takes over: candidates are refreshed, the tick
+    reports ``active-usage-unknown``, and ``unhealthy_ticks`` such ticks fail
+    over. A slow plan with no failure (the scheduler chose the cadence) and a
+    reading another machine hands over (``cswap import-usage``) are still
+    trusted, as are sentinels.
+    """
+    return (
+        entry is not None
+        and entry.sentinel is None
+        and entry.last_good is not None
+        and entry.consecutive_failures > 0
+        and entry.age_s is not None
+        and entry.age_s > STALE_OK_S
+        and not entry.held(now)
+    )
+
+
+def _decision_usage(
+    entries: dict[str, UsageEntry],
+    current: str | None,
+    now: float,
+    models: tuple[str, ...],
+) -> dict[str, dict | str | None]:
+    """Decision values per account, as switch decisions must read them.
+
+    ``UsageEntry.decision_value(models)`` for every account, except that the
+    active account's reading is unknown (None) when ``_active_reading_blind``.
+    """
+    usage = {num: entry.decision_value(models) for num, entry in entries.items()}
+    if current is not None and _active_reading_blind(entries.get(current), now):
+        usage[current] = None
+    return usage
 
 
 class AutoSwitchEngine:
@@ -2109,14 +2165,25 @@ class AutoSwitchEngine:
                 self._idle_hold_since = None
             self._unhealthy_ticks += 1
             if self._unhealthy_ticks < settings.unhealthy_ticks:
-                self._emit(
-                    NoSwitchEvent(
-                        reason="active-usage-unknown",
-                        detail=(
-                            f"{self._unhealthy_ticks}/{settings.unhealthy_ticks} "
-                            "before failover"
-                        ),
+                detail = (
+                    f"{self._unhealthy_ticks}/{settings.unhealthy_ticks} "
+                    "before failover"
+                )
+                active_entry = entries.get(current)
+                # The store still trusts the reading, the decision withdrew
+                # it: that is `_active_reading_blind`, said without a second
+                # clock read inside the tick.
+                if (
+                    active_entry is not None
+                    and active_entry.decision_value(self._models) is not None
+                    and usage.get(current) is None
+                ):
+                    detail += (
+                        f"; last reading {round(active_entry.age_s / 60)}m old, "
+                        f"refresh failing: {active_entry.last_error or 'error'}"
                     )
+                self._emit(
+                    NoSwitchEvent(reason="active-usage-unknown", detail=detail)
                 )
                 return TickOutcome.NO_ACTION
             trigger = "failover"
@@ -2316,14 +2383,12 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {
-                num: entry.decision_value(self._models) for num, entry in entries.items()
-            }
+            decided_now = self.clock()
+            usage = _decision_usage(entries, current, decided_now, self._models)
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = _dynamic_active_headroom(
                 settings, self._models, usage, current, headroom.get(current)
             )
-            decided_now = self.clock()
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -3918,9 +3983,7 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
-        usage = {
-            num: entry.decision_value(self._models) for num, entry in entries.items()
-        }
+        usage = _decision_usage(entries, current, now, self._models)
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -3979,9 +4042,7 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
-            usage = {
-                num: entry.decision_value(self._models) for num, entry in entries.items()
-            }
+            usage = _decision_usage(entries, current, now, self._models)
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom

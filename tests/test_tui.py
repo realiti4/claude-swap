@@ -3938,6 +3938,28 @@ class TestNextBestFollowsTheTick:
         h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
         assert claim in _next_best_text(snap, "1", h.settings)
 
+    def test_a_blind_active_reading_claims_no_order(self):
+        # The tick reads an aged reading its refreshes failed to renew as
+        # unknown (#208), so the panel must not call the active below its line.
+        from claude_swap.settings import AutoSwitchSettings
+
+        blind = dataclasses.replace(
+            make_entry(40.0, 10.0, age_s=STALE_OK_S + 60),
+            consecutive_failures=3, trust_extended=True,
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(1, active=True, entry=blind),
+                make_account(2, entry=make_entry(10.0, 10.0)),
+            ),
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best")
+        assert "not previewed (active status unknown)" in _next_best_text(
+            snap, "1", settings
+        )
+
     @pytest.mark.parametrize(
         "strategy, fleet, extra, disabled, designed",
         [
