@@ -1118,12 +1118,14 @@ def _active_reading_blind(entry: UsageEntry | None, now: float) -> bool:
     reports ``active-usage-unknown``, and ``unhealthy_ticks`` such ticks fail
     over. A slow plan with no failure (the scheduler chose the cadence) and a
     reading another machine hands over (``cswap import-usage``) are still
-    trusted, as are sentinels.
+    trusted, as are sentinels and a wall mark (``walled``: fresher knowledge
+    than the frozen reading, which ``decision_value`` already overrides).
     """
     return (
         entry is not None
         and entry.sentinel is None
         and entry.last_good is not None
+        and not entry.walled
         and entry.consecutive_failures > 0
         and entry.age_s is not None
         and entry.age_s > STALE_OK_S

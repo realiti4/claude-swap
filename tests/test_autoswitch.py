@@ -2092,6 +2092,34 @@ class TestAdaptiveScheduler:
         assert reasons[-2:] == ["active-usage-unknown", "active-usage-unknown"]
         assert reasons.count("below-threshold") == len(reasons) - 2
 
+    def test_a_walled_active_with_a_stale_failing_reading_leaves_at_limit(
+        self, temp_home, monkeypatch
+    ):
+        # The wall mark is fresher knowledge than the frozen reading: a
+        # walled active whose fetches fail and whose reading is past
+        # STALE_OK_S is full at once, not "unknown" for unhealthy_ticks.
+        h = self._harness(temp_home, monkeypatch, threshold=85.0, strategy="best")
+        usage = {"1": _usage(58), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        ident = {"1": ("a@example.com", "")}
+        store = h.switcher._usage_store
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=600.0)}, ident)
+        store.mark_at_limit("1", ident, ("all",), account_uuid="uuid-1")
+        h.clock.advance(290)  # +350 total: past STALE_OK_S
+        h.events.clear()
+        assert self._tick(h, counts, usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == [
+            "at-limit"
+        ]
+        assert not [
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "active-usage-unknown"
+        ]
+
     def test_one_failed_refresh_of_a_recent_active_reading_is_trusted(
         self, temp_home, monkeypatch
     ):

@@ -3244,6 +3244,27 @@ class TestNextBestFollowsTheTick:
             snap, AutoSwitchSettings(strategy="best")
         )
 
+    def test_a_walled_active_reading_is_never_blind(self):
+        """A wall mark outranks the frozen reading in `decision_value`, so a
+        walled active whose refreshes fail is full, not unknown."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        walled = dataclasses.replace(
+            make_entry(40.0, 10.0, age_s=STALE_OK_S + 60),
+            consecutive_failures=3, trust_extended=True, walled=True,
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(1, active=True, entry=walled),
+                make_account(2, entry=make_entry(10.0, 10.0)),
+            ),
+            taken_at=0.0,
+        )
+        assert "active status unknown" not in _next_best_text(
+            snap, AutoSwitchSettings(strategy="best")
+        )
+
     @pytest.mark.parametrize(
         "strategy, fleet, extra, disabled, designed",
         [
