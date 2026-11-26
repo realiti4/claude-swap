@@ -3193,6 +3193,21 @@ class TestActiveStaleLanding:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
+    def test_dynamic_lands_on_the_soonest_weekly_reset_not_the_most_room(
+        self, temp_home
+    ):
+        # `dynamic` orders a forced move as `consume-first` does. Account 3
+        # has the most room, account 2 resets first.
+        h = self._harness(temp_home, accounts=3, strategy="dynamic")
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage7(20, 20, _R_LATER), now),
+            "2": self._read(_usage7(40, 40, _R_SOON), now),
+            "3": self._read(_usage7(10, 10, _R_LATEST), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_priority_lands_on_the_highest_tier(self, temp_home):
         h = self._harness(
             temp_home, accounts=3, strategy="priority-consume-first"

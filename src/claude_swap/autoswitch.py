@@ -2423,9 +2423,7 @@ class AutoSwitchEngine:
                 for num, entry in entries.items()
             }
             headroom = _headroom_by_account(usage, self._models)
-            active_headroom = _dynamic_active_headroom(
-                settings, self._models, usage, current, headroom.get(current)
-            )
+            active_headroom = headroom.get(current)
 
         # The engine's own state, not a fresh read: two-phase commit re-ranks
         # on later usage but the same tick's cooldown record, so a probe
