@@ -2668,6 +2668,7 @@ class AutoSwitchEngine:
                 None if settings.strategy == "dynamic" else settings.weekly_threshold,
                 thresholds[current],
             ),
+            weekly_cap=active_cap,
         )
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
         self._emit(
@@ -4685,7 +4686,10 @@ class AutoSwitchEngine:
         every one of its own lines, with the hysteresis margin of room under
         each (the room a ``consume-first`` landing needs, for the same
         reason: the cooldown this move starts must not hold the engine on an
-        account about to cross). The active's stored number is not compared
+        account about to cross). Under ``dynamic`` the bar is its wall instead
+        (``_wall_headroom``, as ``_rank_dynamic_candidates`` admits), since a
+        fleet sits between its line and its wall by design and the cooldown
+        yields at the wall. The active's stored number is not compared
         against, since it is the one figure here that is not a measurement.
 
         Ordered as the strategy orders a forced move: by tier then soonest
@@ -4693,6 +4697,7 @@ class AutoSwitchEngine:
         under ``consume-first``, ``dynamic`` and ``weekly-first``, else most
         headroom against the account's own lines.
         """
+        dynamic = settings.strategy == "dynamic"
         by_reset = settings.strategy in (*CONSUME_FIRST_STRATEGIES, "weekly-first")
         by_tier = settings.strategy == "priority-consume-first"
         ranked: list[tuple[tuple, str]] = []
@@ -4700,11 +4705,15 @@ class AutoSwitchEngine:
             h = headroom.get(num)
             if h is None or h <= 0 or not _reading_verified(entries.get(num), now):
                 continue
-            room = self._room(usage.get(num), settings, thresholds[num])
-            if room is None:
-                room = thresholds[num] - (100.0 - h)
-            if room <= 0 or room < settings.hysteresis_pct:
-                continue
+            if dynamic:
+                if h <= _wall_headroom(thresholds.get(num)):
+                    continue
+            else:
+                room = self._room(usage.get(num), settings, thresholds[num])
+                if room is None:
+                    room = thresholds[num] - (100.0 - h)
+                if room <= 0 or room < settings.hysteresis_pct:
+                    continue
             binding = self._binding(usage.get(num), settings, thresholds[num])
             lh = binding.line_headroom if binding is not None else h
             reset = _seven_day_reset_ts(usage.get(num), now)
@@ -5486,6 +5495,7 @@ class AutoSwitchEngine:
         *,
         threshold: float | None = None,
         weekly_threshold: float | None = None,
+        weekly_cap: float | None = None,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -5628,10 +5638,12 @@ class AutoSwitchEngine:
         # reading that cannot move. The tick reads the landings itself once
         # it may leave (`_tick_inner`), so refreshing every peer on each
         # waiting tick would only spend their request budgets.
-        if self.settings.strategy == "dynamic":  # leaves at its wall, as `_tick_inner`
-            at_a_line = active_headroom is not None and _about_to_wall(
-                active_headroom, self._active_wall
-            )
+        if self.settings.strategy == "dynamic":
+            # Leaves at its wall or its weekly cap, as `_tick_inner` does.
+            at_a_line = (
+                active_headroom is not None
+                and _about_to_wall(active_headroom, self._active_wall)
+            ) or weekly_capped(weekly_cap, active_value) is not None
         else:
             at_a_line = any(
                 pct >= window_line(label, threshold, weekly_threshold)

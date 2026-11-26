@@ -1768,6 +1768,26 @@ class TestAdaptiveScheduler:
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
+    def test_a_blind_dynamic_active_past_its_weekly_cap_refetches_its_peers(
+        self, temp_home, monkeypatch
+    ):
+        # A cap is a line no strategy relaxes: the active leaves as
+        # `weekly-capped` at once, so it is not waiting out a count and its
+        # peers are read afresh for the move, not served from their poll plan.
+        h = self._harness(temp_home, monkeypatch, strategy="dynamic")
+        frozen = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 60.0}}
+        usage = {"1": frozen, "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.switcher.set_account_weekly_cap("1", 50)
+        h.clock.advance(400)
+        counts.clear()
+        h.events.clear()
+        assert self._tick(h, counts, usage) is TickOutcome.SWITCHED
+        assert [(a, t) for a, _, t in self._switches(h)] == [(1, "weekly-capped")]
+        assert set(counts) == {"2", "3"}  # 1 is in backoff; both peers read
+
     def test_a_429_frozen_active_reading_moves_to_a_measured_account(
         self, temp_home, monkeypatch
     ):
@@ -4003,6 +4023,35 @@ class TestActiveStaleLanding:
                 "5h 70% read 15m ago, usage refresh rate-limited; staying: "
                 "no other account has a recent reading with room to spare"
             )
+
+    @pytest.mark.parametrize(
+        "peer_pct, own_line, lands",
+        [
+            # A dynamic fleet sits between its line and its wall by design: a
+            # peer short of the wall is a landing, not one with the hysteresis
+            # margin of room under the 90 line (else a frozen 92% stays, #208).
+            (85, None, True),
+            (96, None, True),
+            (97, None, False),  # at the wall
+            (85, 80, False),    # past its OWN line, which is its wall
+        ],
+    )
+    def test_a_blind_dynamic_active_lands_on_a_peer_short_of_its_wall(
+        self, temp_home, peer_pct, own_line, lands
+    ):
+        h = self._harness(temp_home, strategy="dynamic")
+        if own_line is not None:
+            h.switcher.set_account_threshold("2", own_line)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(92), now),
+            "2": self._read(_usage(peer_pct), now),
+        })
+        assert outcome is (TickOutcome.SWITCHED if lands else TickOutcome.NO_ACTION)
+        assert h.active_number() == (2 if lands else 1)
+        assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == (
+            ["active-stale"] if lands else []
+        )
 
     def test_the_landing_with_the_most_room_wins(self, temp_home):
         h = self._harness(temp_home, accounts=3)
