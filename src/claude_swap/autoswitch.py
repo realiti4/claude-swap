@@ -1390,14 +1390,12 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
-        if (
-            trigger == "active-stale"
-            and not oauth_candidates
-            and active_headroom is not None
-        ):
-            # No OAuth peer to measure, and a last reading below its lines:
-            # staying, as "nothing to do". An API-key account is the last
-            # resort for an account that must be left, which this is not.
+        if trigger == "active-stale" and not oauth_candidates:
+            # No OAuth peer to measure: staying, as "nothing to do", whether
+            # or not the store still serves the last reading, so the outcome
+            # does not change when that reading's window resets. An API-key
+            # account is the last resort for an account that must be left,
+            # which this is not.
             return self._stay_blind(active_binding, active_entry)
         if (
             trigger in ("consume-first", "priority")

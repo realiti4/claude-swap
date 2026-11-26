@@ -2168,12 +2168,16 @@ class TestActiveStaleLanding:
     from being read (`_active_reading_blind`), one decision per tick."""
 
     @staticmethod
-    def _blind(value: dict, now: float, age: float = 900.0) -> UsageEntry:
-        """The active account: read ``age`` seconds ago, refused since."""
+    def _blind(
+        value: dict, now: float, age: float = 900.0, trusted: bool = True
+    ) -> UsageEntry:
+        """The active account: read ``age`` seconds ago, refused since.
+        ``trusted`` is whether the store still serves that reading; it stops
+        once the reading's window has reset."""
         return UsageEntry(
             last_good=value, fetched_at=now - age, age_s=age,
             consecutive_failures=3, last_error="http-429",
-            backoff_until=now + 3000, trust_extended=True,
+            backoff_until=now + 3000, trust_extended=trusted,
         )
 
     @staticmethod
@@ -2269,18 +2273,25 @@ class TestActiveStaleLanding:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_a_blind_account_with_no_peer_says_why_it_stays(self, temp_home):
+    @pytest.mark.parametrize(
+        "trusted, known",
+        [(True, "5h 70% read 15m ago"), (False, "no current reading")],
+    )
+    def test_a_blind_account_with_no_peer_says_why_it_stays(
+        self, temp_home, trusted, known
+    ):
         # Nowhere to go: "nothing to do" (exit code 2), never a "blocked" a
         # cron wrapper would act on, and not a bare "below-threshold" on a
-        # reading that cannot show it.
+        # reading that cannot show it. The same before and after the
+        # reading's window resets inside the backoff.
         h = self._harness(temp_home, accounts=1)
         outcome = h.tick_with_entries(
-            {"1": self._blind(_usage(70), h.clock.now)}
+            {"1": self._blind(_usage(70), h.clock.now, trusted=trusted)}
         )
         assert outcome is TickOutcome.NO_ACTION
-        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
-            "no-verified-target"
-        ]
+        hold = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in hold] == ["no-verified-target"]
+        assert hold[0].detail.startswith(f"{known}, usage refresh rate-limited")
 
     def test_an_api_key_account_is_not_a_landing(self, temp_home):
         # The last resort is for an account that must be left. A blind one
