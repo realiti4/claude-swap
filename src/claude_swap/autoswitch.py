@@ -1391,11 +1391,20 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger in ("consume-first", "priority", "active-stale")
+            trigger == "active-stale"
             and not oauth_candidates
             and active_headroom is not None
         ):
-            # Below-threshold account with no OAuth peer to compare
+            # No OAuth peer to measure, and a last reading below its lines:
+            # staying, as "nothing to do". An API-key account is the last
+            # resort for an account that must be left, which this is not.
+            return self._stay_blind(active_binding, active_entry)
+        if (
+            trigger in ("consume-first", "priority")
+            and not oauth_candidates
+            and active_headroom is not None
+        ):
+            # Healthy below-threshold account with no OAuth peer to compare
             # against — the same state `best` reports as below-threshold
             # NO_ACTION before ever reaching candidate selection. API-key
             # candidates don't change the outcome: they have no weekly window
@@ -1504,6 +1513,7 @@ class AutoSwitchEngine:
                 kw["now"],
                 kw["current"],
                 thresholds=kw["thresholds"],
+                entries=entries,
             )
             no_return = self._no_return_account(
                 trigger,
@@ -1527,11 +1537,23 @@ class AutoSwitchEngine:
             # The landing must be measured in this pass, and an idle peer is
             # otherwise read every five to ten minutes. Asked for only now,
             # once the count and the cooldown allow a move, so the ticks
-            # spent waiting cost no requests. The active row is left to its
-            # own backoff.
+            # spent waiting keep every peer on its own poll plan. The active
+            # row is left to its own backoff.
             entries = self.switcher.usage_entries_by_account(
                 fetch=set(oauth_candidates)
             )
+            if not _active_reading_blind(entries.get(current), self.clock()):
+                # Another surface read the active account while this tick
+                # ran. The reason to leave is gone; the next tick decides on
+                # the new reading.
+                self._unhealthy_ticks = 0
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-usage-refreshed",
+                        detail="read again during this check",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
@@ -1551,18 +1573,7 @@ class AutoSwitchEngine:
         )
 
         if trigger == "active-stale" and not ordered:
-            # Staying is the decision, not a block: the last reading was
-            # below its lines and nothing measured is better.
-            self._emit(
-                NoSwitchEvent(
-                    reason="no-verified-target",
-                    detail=(
-                        f"{_blind_detail(active_binding, active_entry)}; staying: "
-                        "no other account has a recent reading with room to spare"
-                    ),
-                )
-            )
-            return TickOutcome.NO_ACTION
+            return self._stay_blind(active_binding, active_entry)
 
         if (
             trigger != "active-stale"
@@ -1934,6 +1945,9 @@ class AutoSwitchEngine:
         # today's exact semantics: one global line for every account. The
         # engine's own tick always passes the resolved map explicitly.
         thresholds: Mapping[str, float] | None = None,
+        # The tick's entries, for the one departure that is judged on more
+        # than a decision value (`active-stale`, below).
+        entries: Mapping[str, UsageEntry] | None = None,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -2064,8 +2078,15 @@ class AutoSwitchEngine:
         # two-null inference for it (unchanged behaviour for pre-upgrade
         # state).
         left_trigger = state.get("leftTrigger")
+        if left_trigger == "active-stale" and entries is not None:
+            # Left because a 429 kept it from being read. Until a refresh of
+            # it succeeds, the number it shows is the one that was not
+            # trusted, however good it looks beside the active's.
+            left = entries.get(barred)
+            if left is None or left.consecutive_failures > 0:
+                return False
         is_failover_snapshot = (
-            # `active-stale` left on a reading it did not trust either.
+            # `active-stale` left with no baseline it trusted, like failover.
             left_trigger in ("failover", "active-stale")
             if left_trigger is not None
             else (left_headroom is None and left_recovery is None)
@@ -2252,6 +2273,22 @@ class AutoSwitchEngine:
             any(headroom.get(num) is not None for num in oauth_candidates),
             _seven_day_reset_ts(usage.get(current), now),
         )
+
+    def _stay_blind(
+        self, binding: BindingWindow | None, entry: UsageEntry | None
+    ) -> TickOutcome:
+        """Keep a blind active account for want of a measured landing.
+        Staying is the decision, not a block: nothing measured is better."""
+        self._emit(
+            NoSwitchEvent(
+                reason="no-verified-target",
+                detail=(
+                    f"{_blind_detail(binding, entry)}; staying: no other "
+                    "account has a recent reading with room to spare"
+                ),
+            )
+        )
+        return TickOutcome.NO_ACTION
 
     def _rank_verified_landings(
         self, *, oauth_candidates: list[str], entries: Mapping[str, UsageEntry],
@@ -2560,7 +2597,9 @@ class AutoSwitchEngine:
         before any switch decision when a switch could be near: one of the
         active account's windows within ``ESCALATION_MARGIN_PCT`` of its own
         switch line, or active usage unknown (failover must not run on stale
-        candidate data).
+        candidate data). Not while the active account is blind below its
+        lines (``_active_reading_blind``): its reading cannot move, and the
+        tick reads the landings itself once it may leave.
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
         escalation condition (the deliberate exception: an owned-and-expired
@@ -2665,13 +2704,24 @@ class AutoSwitchEngine:
         # window closing on its line under a flat, higher weekly window is a
         # switch that is near, whatever the binding max says. With one line
         # this is exactly "binding utilization within the margin".
-        near_a_line = any(
-            pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
-            for label, pct, _ in oauth.relevant_windows(
+        active_windows = list(
+            oauth.relevant_windows(
                 active_value if isinstance(active_value, dict) else None, self._models
             )
         )
-        escalate = bool(candidates) and (
+        near_a_line = any(
+            pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
+            for label, pct, _ in active_windows
+        )
+        # A blind active below its lines is waiting out its count, on a
+        # reading that cannot move. The tick reads the landings itself once
+        # it may leave (`_tick_inner`), so refreshing every peer on each
+        # waiting tick would only spend their request budgets.
+        waiting_blind = _active_reading_blind(entries.get(current), now) and not any(
+            pct >= window_line(label, threshold, weekly_threshold)
+            for label, pct, _ in active_windows
+        )
+        escalate = bool(candidates) and not waiting_blind and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (active_headroom is not None and near_a_line)
         )

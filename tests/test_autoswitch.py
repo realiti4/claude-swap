@@ -1050,17 +1050,28 @@ class TestAdaptiveScheduler:
             if isinstance(e, SwitchEvent)
         ]
 
+    @pytest.mark.parametrize(
+        "shape, pct, known",
+        [
+            ("far from its line", 50, "5h 50% read 8m ago"),
+            # Inside the band where a readable active has every peer refetched.
+            ("near its line", 86, "5h 86% read 8m ago"),
+            # Its window reset inside the backoff: the store drops the reading.
+            ("reading lapsed", 50, "no current reading"),
+        ],
+    )
     def test_a_blind_active_counts_without_refetching_its_peers(
-        self, temp_home, monkeypatch
+        self, temp_home, monkeypatch, shape, pct, known
     ):
         # The active account's refreshes are being refused (429 with a long
         # Retry-After) and its last reading has aged past STALE_OK_S. The
         # store still trusts that reading as a lower bound, which cannot say
         # the account is still below its line (#208). The tick counts toward
         # leaving and says why; the active account's backoff is respected,
-        # and its peers are not refetched while the count runs.
+        # and its peers keep their ordinary poll plan while the count runs.
         h = self._harness(temp_home, monkeypatch)
-        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        resets = _iso_at(h.clock.now + 300) if shape == "reading lapsed" else None
+        usage = {"1": _usage(pct, resets), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         h.clock.advance(60)
@@ -1075,7 +1086,7 @@ class TestAdaptiveScheduler:
         stale = [e for e in h.events if isinstance(e, NoSwitchEvent)]
         assert [e.reason for e in stale] == ["active-usage-stale"]
         assert stale[0].detail == (
-            "5h 50% read 8m ago, usage refresh rate-limited; 1/3 before "
+            f"{known}, usage refresh rate-limited; 1/3 before "
             "moving to an account with a recent reading"
         )
         assert "1" not in counts  # backoff respected
@@ -1275,8 +1286,9 @@ class TestAdaptiveScheduler:
         self, temp_home, monkeypatch, pct, trigger
     ):
         # A lower bound does show a crossing. A refused refresh must not make
-        # the engine wait out the count on a reading already at its line.
-        h = self._harness(temp_home, monkeypatch, accounts=2)
+        # the engine wait out the count on a reading already at its line, nor
+        # cost it the refresh of every peer that picks the best landing.
+        h = self._harness(temp_home, monkeypatch)
         reading = _usage(pct, _iso_at(h.clock.now + 3 * 3600))
         h.switcher._usage_store.record(
             {"1": FetchRecord(usage=reading)}, {"1": ("a@example.com", "")}
@@ -1284,10 +1296,12 @@ class TestAdaptiveScheduler:
         self._refuse(h, "1")
         h.clock.advance(400)
         counts: dict[str, int] = {}
-        outcome = self._tick(h, counts, {"1": reading, "2": _usage(10)})
+        outcome = self._tick(
+            h, counts, {"1": reading, "2": _usage(40), "3": _usage(10)}
+        )
         assert outcome is TickOutcome.SWITCHED
-        assert self._switches(h) == [(1, 2, trigger)]
-        assert "1" not in counts
+        assert self._switches(h) == [(1, 3, trigger)]
+        assert counts == {"2": 1, "3": 1}
 
     def test_one_failed_refresh_of_a_recent_active_reading_is_trusted(
         self, temp_home, monkeypatch
@@ -2255,16 +2269,17 @@ class TestActiveStaleLanding:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_a_blind_account_with_no_peer_reports_below_threshold(self, temp_home):
-        # Nowhere to go and a last reading below the line: "below-threshold"
-        # and exit code 2, not a "blocked" a cron wrapper would act on.
+    def test_a_blind_account_with_no_peer_says_why_it_stays(self, temp_home):
+        # Nowhere to go: "nothing to do" (exit code 2), never a "blocked" a
+        # cron wrapper would act on, and not a bare "below-threshold" on a
+        # reading that cannot show it.
         h = self._harness(temp_home, accounts=1)
         outcome = h.tick_with_entries(
             {"1": self._blind(_usage(70), h.clock.now)}
         )
         assert outcome is TickOutcome.NO_ACTION
         assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
-            "below-threshold"
+            "no-verified-target"
         ]
 
     def test_an_api_key_account_is_not_a_landing(self, temp_home):
@@ -2281,6 +2296,69 @@ class TestActiveStaleLanding:
         })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+    def test_no_proactive_return_to_the_account_left_blind_until_it_is_read(
+        self, temp_home
+    ):
+        # Account 1 was left on a frozen 70% and is still refused when
+        # account 2 crosses its line. That 70% is the number nobody trusted,
+        # so it is no landing for an ordinary move. The escape at the limit
+        # keeps its rule: any account with quota beats a spent one.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        assert h.tick_with_entries({
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(10), now),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(400)  # past the cooldown
+        h.events.clear()
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now, age=1300.0),
+            "2": self._read(_usage(91), now),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 2
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "no-qualifying-candidate"
+        ]
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now, age=1300.0),
+            "2": self._read(_usage(100), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert [
+            e.trigger for e in h.events if isinstance(e, SwitchEvent)
+        ] == ["at-limit"]
+
+    def test_a_refresh_landing_while_the_peers_are_read_cancels_the_move(
+        self, temp_home
+    ):
+        # Another surface reads the active account between this tick's own
+        # collection and its reading of the peers. The reason to leave is
+        # gone, so the move is too.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        before = {
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(10), now),
+        }
+        after = {**before, "1": self._read(_usage(12), now)}
+
+        def entries_for(fetch=None, **kwargs):
+            return after if fetch == {"2"} else before
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=entries_for
+        ):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert h.engine._unhealthy_ticks == 0
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "active-usage-refreshed"
+        ]
 
     def test_a_later_proactive_move_may_return_to_the_account_left_blind(
         self, temp_home
