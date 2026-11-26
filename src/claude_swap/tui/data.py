@@ -236,18 +236,6 @@ def read_engine_state(backup_dir: Path) -> dict:
     return _read_state_file(backup_dir / STATE_FILENAME)
 
 
-def last_active_of(state: dict) -> dict:
-    """``lastActiveAt`` off a state read: a missing or malformed one reads as no
-    cached warm context."""
-    last_active_at = state.get("lastActiveAt")
-    return last_active_at if isinstance(last_active_at, dict) else {}
-
-
-def read_last_active_at(backup_dir: Path) -> dict:
-    """Read-only ``lastActiveAt`` off the engine's own state file."""
-    return last_active_of(read_engine_state(backup_dir))
-
-
 def switch_bars(snap: AccountsSnapshot) -> dict[str, float]:
     """Each account's own switch threshold, as the engine reads it (`_bars`);
     an account without one is absent and takes the strategy's bar."""
@@ -435,7 +423,8 @@ def rank_switch_candidates(
     # tick prices it, also on the unmodeled retry (`dropped`); it is the wall of the
     # active when it is the active (`_departure_wall`).
     state = state or {}
-    last = last_active_at or last_active_of(state)
+    last = last_active_at or state.get("lastActiveAt")
+    last = last if isinstance(last, dict) else {}
     healthy_peers = _healthy_peers(settings, state, entries, active_number, oauth_candidates)
     walk = (
         dynamic_expiring_walk(
@@ -548,7 +537,6 @@ __all__ = [
     "ordered_accounts",
     "rank_switch_candidates",
     "read_engine_state",
-    "read_last_active_at",
     "reset_clock",
     "reset_text",
     "run_action",

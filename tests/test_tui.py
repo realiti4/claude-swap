@@ -1842,25 +1842,25 @@ def _autoview_text(snap, active, settings, last_active_at=None, state=None):
         return str(v._candidates_text(snap, active_number=active))
 
 
-def _autoview_order(snap, active, settings, last_active_at=None):
+def _autoview_order(snap, active, settings, last_active_at=None, state=None):
     """The account numbers "Next best" renders, in its own displayed order."""
-    rendered = _autoview_text(snap, active, settings, last_active_at)
+    rendered = _autoview_text(snap, active, settings, last_active_at, state)
     others = [acc.number for acc in snap.accounts if acc.number != active]
     return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
 
 
-class TestReadLastActiveAt:
-    """Mirrors `AutoSwitchEngine._read_state`'s own safety contract: a
-    missing or garbled state file reads as no cached warm context, never
-    raises -- the file being unreadable is no different from the engine's
-    own read of it."""
+class TestReadEngineState:
+    """The engine's own safety contract (`_read_state_file`): a missing or
+    garbled state file reads as no state (no cached warm context, no account
+    left blind), never raises -- the file being unreadable is no different
+    from the engine's own read of it."""
 
     def test_no_file_returns_empty(self, tmp_path):
-        assert tui_data.read_last_active_at(tmp_path) == {}
+        assert tui_data.read_engine_state(tmp_path) == {}
 
     def test_non_json_file_returns_empty(self, tmp_path):
         (tmp_path / "autoswitch_state.json").write_text("not json{")
-        assert tui_data.read_last_active_at(tmp_path) == {}
+        assert tui_data.read_engine_state(tmp_path) == {}
 
 
 class TestOrderedAccounts:
@@ -1982,13 +1982,13 @@ class TestOrderedAccounts:
         (tmp_path / "autoswitch_state.json").write_text(json.dumps({
             "lastActiveAt": {"2": time.time() - 20 * 60},
         }))
-        last_active_at = tui_data.read_last_active_at(tmp_path)
+        state = tui_data.read_engine_state(tmp_path)
         order = tui_data.ordered_accounts(
-            snap, _WARM_ORDER_SETTINGS, time.time(), last_active_at
+            snap, _WARM_ORDER_SETTINGS, time.time(), state=state
         )
         assert order[1:] == ["2", "3"], order
         assert order[1:] == _autoview_order(
-            snap, "1", _WARM_ORDER_SETTINGS, last_active_at
+            snap, "1", _WARM_ORDER_SETTINGS, state=state
         )
 
     def test_an_unranked_no_plan_slot_sorts_after_an_unswitchable_one(self):
@@ -2955,6 +2955,29 @@ class TestPanelReadsABlindActiveAsTheTickDoes:
         # the panel reads as `unreadable-active`: the panel ranks from the state.
         assert ticked - {"alternation", "failover"} <= classified, ticked - classified
 
+    @pytest.mark.parametrize("strategy", ["dynamic", "best"])
+    def test_an_active_at_its_wall_takes_the_account_left_blind_when_it_has_the_most_room(
+        self, temp_home, strategy
+    ):
+        """The filter is for a healthy active's own moves (the walk, the rotation).
+        At the wall the tick's pool is whole, and an account with room beats a
+        spent one: 1 at 98% goes to 2, left under `active-stale` but roomiest, and
+        the panel's top row is the same 2 (`proactive` keeps `oauth_candidates`)."""
+        from tests.test_autoswitch import _left_blind_state
+
+        h = self._fleet(temp_home, strategy=strategy)
+        _left_blind_state(h, left=2, landed_on=1)
+        h.engine = h._make_engine()
+        now = h.clock.now
+        entries = {
+            "1": _entry_for(self._win(98.0, 98.0), now),
+            "2": self._blind(self._win(10.0), now),
+            "3": _entry_for(self._win(40.0), now),
+        }
+        _snap, _state, (ordered, _axis, trigger, _unmodeled) = self._tick_and_panel(h, entries)
+        assert trigger == "proactive"
+        assert (str(h.active_number()), ordered[0]) == ("2", "2"), ordered
+
     def test_the_account_left_blind_is_not_the_panels_primary(self, temp_home):
         """2 resets in 2 h with room, and was left under `active-stale`: its 87%
         is the reading nobody trusted, so the tick prices the fleet without it and
@@ -3028,10 +3051,9 @@ class TestSharedAccountOrder:
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await app.workers.wait_for_complete()
-            last_active_at = tui_data.read_last_active_at(tmp_path)
             order = tui_data.ordered_accounts(
                 fake.accounts_snapshot(), app.auto_settings, time.time(),
-                last_active_at,
+                state=tui_data.read_engine_state(tmp_path),
             )
             assert order[1:] == ["2", "3"], order  # warm outranks sooner cold
             panel = app.screen.query_one(AccountsPanel).render().plain
