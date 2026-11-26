@@ -4922,6 +4922,21 @@ class TestUnswitchableRowsAreListed:
         ), active="1")
         assert "not previewed (active status unknown)" in out and "not a candidate" not in out, out
 
+    def test_a_blind_active_reading_claims_no_order(self):
+        """The tick reads an aged reading its refreshes failed to renew as unknown
+        (#208, `_active_reading_blind`), so the panel must not call the active
+        below its line: it reaches the same `unreadable-active` claim."""
+        blind = dataclasses.replace(
+            make_entry(40.0, 10.0, age_s=STALE_OK_S + 60),
+            consecutive_failures=3, trust_extended=True,
+        )
+        candidate = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, usage=blind),
+            self._acct("2", "candidate@x.com", switchable=True, last_good=candidate),
+        ), active="1")
+        assert "not previewed (active status unknown)" in out, out
+
     def test_the_legend_prints_the_engines_own_axis(self):
         """The legend names `_rank_candidates_pass`'s own 5th return value,
         not a re-derived key. With every account over its line the engine

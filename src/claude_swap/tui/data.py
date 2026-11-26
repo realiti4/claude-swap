@@ -29,6 +29,7 @@ from claude_swap.autoswitch import (
     ThresholdMap,
     _binding_at,
     _classify_dynamic_trigger,
+    _decision_usage,
     _departure_wall,
     _dynamic_active_headroom,
     _headroom_by_account,
@@ -272,8 +273,9 @@ def rank_switch_candidates(
     reasons = {} if reasons_out is None else reasons_out
     models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
-    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
     entries = {acc.number: acc.usage for acc in snap.accounts}
+    # The tick reads an active whose failing refreshes froze its reading as unknown (#208).
+    usage = _decision_usage(entries, active_number, now)
     # The engine's own tick map (`_resolve_thresholds`): `.get` reads the
     # overrides only, `[num]` falls back to the global threshold.
     bars = ThresholdMap(switch_bars(snap), settings.threshold)
