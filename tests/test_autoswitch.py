@@ -4258,24 +4258,15 @@ class TestModelAwareSwitch:
         self, temp_home
     ):
         # The active's 80% 5h is inside the band, so the tick refetches the
-        # fleet; the refetched row carries the rolled Fable window.
+        # fleet and decides on that read, which carries the rolled Fable window.
         h = self._seed(temp_home, model="Fable", strategy="best")
         now = h.clock.now
-        peers = {"2": _model_usage(5, 30), "3": _model_usage(5, 60)}
-        reads = [
-            {"1": _model_usage(80, 0), **peers},
-            {"1": _rolled_model_usage(80, 98, now), **peers},
-        ]
-        calls: list = []
-
-        def entries(**_kw):
-            calls.append(1)
-            row = reads[min(len(calls), 2) - 1]
-            return {n: _entry_for(v, now) for n, v in row.items()}
-
-        with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries):
-            outcome = h.engine.tick()
-        assert outcome is TickOutcome.NO_ACTION
+        rows = {
+            "1": _entry_for(_rolled_model_usage(80, 98, now), now),
+            "2": _entry_for(_model_usage(5, 30), now),
+            "3": _entry_for(_model_usage(5, 60), now),
+        }
+        assert h.tick_with_entries(rows) is TickOutcome.NO_ACTION
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
