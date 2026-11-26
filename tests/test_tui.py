@@ -3223,26 +3223,58 @@ class TestNextBestFollowsTheTick:
         assert h.tick_with_entries(entries) is not TickOutcome.SWITCHED
         assert "not previewed (active status unknown)" in _next_best_text(snap, h.settings)
 
-    def test_a_walled_active_reading_is_never_blind(self):
-        """A wall mark outranks the frozen reading in `decision_value`, so a
-        walled active whose refreshes fail is full, not unknown."""
-        from claude_swap.settings import AutoSwitchSettings
-
-        walled = dataclasses.replace(
-            make_entry(40.0, 10.0, age_s=STALE_OK_S + 60),
-            consecutive_failures=3, trust_extended=True, walled=True,
+    @staticmethod
+    def _frozen_active_snapshot(pct5: float, **fields):
+        """An active read STALE_OK_S + 60 s ago whose refreshes are 429-refused,
+        with one healthy peer."""
+        frozen = dataclasses.replace(
+            make_entry(pct5, 10.0, age_s=STALE_OK_S + 60),
+            consecutive_failures=3, last_error="http-429", trust_extended=True,
+            **fields,
         )
-        snap = AccountsSnapshot(
+        return AccountsSnapshot(
             active_number="1",
             accounts=(
-                make_account(1, active=True, entry=walled),
+                make_account(1, active=True, entry=frozen),
                 make_account(2, entry=make_entry(10.0, 10.0)),
             ),
             taken_at=0.0,
         )
-        assert "active status unknown" not in _next_best_text(
-            snap, AutoSwitchSettings(strategy="best")
+
+    def test_a_walled_active_reading_is_never_blind(self):
+        """A wall mark outranks the frozen reading in `decision_value`, so a
+        walled active whose refreshes fail is full, not stale."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        text = _next_best_text(
+            self._frozen_active_snapshot(40.0, walled=True),
+            AutoSwitchSettings(strategy="best"),
         )
+        assert "not previewed" not in text
+        assert "user2@example.com" in text
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_a_blind_active_below_its_line_claims_no_order(self, strategy):
+        # The tick counts `active-usage-stale` for a usage 429 on a reading older
+        # than STALE_OK_S that is still under its line (#620), and previews
+        # nothing it has not measured. A frozen 40% must not be called "below
+        # the line" nor rank peers.
+        from claude_swap.settings import AutoSwitchSettings
+
+        text = _next_best_text(
+            self._frozen_active_snapshot(40.0), AutoSwitchSettings(strategy=strategy)
+        )
+        assert "not previewed (active status stale)" in text
+
+    def test_a_blind_active_at_its_line_is_still_ranked(self):
+        # A reading at or over a line is acted on at once, so the panel ranks.
+        from claude_swap.settings import AutoSwitchSettings
+
+        text = _next_best_text(
+            self._frozen_active_snapshot(95.0), AutoSwitchSettings(strategy="best")
+        )
+        assert "not previewed" not in text
+        assert "user2@example.com" in text
 
     @pytest.mark.parametrize(
         "strategy, fleet, extra, disabled, designed",

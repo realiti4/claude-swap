@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     ThresholdMap,
+    _active_reading_blind,
     _binding_at,
     _headroom_by_account,
     consume_first_rank_key,
@@ -89,12 +90,13 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 
 # Triggers whose pass the panel never runs, each with WHY: a state the tick
-# acts on out of sight of a snapshot (an unreadable active counts ticks toward
-# failover) or ranks through a pass of its own. Never "no candidate qualifies",
-# the claim only a real, empty pass earns.
+# acts on out of sight of a snapshot (an unreadable or blind active counts
+# ticks toward leaving) or ranks through a pass of its own. Never "no candidate
+# qualifies", the claim only a real, empty pass earns.
 _UNMODELED_TEXT = {
     "below-threshold": "not previewed (active below threshold)",
     "unreadable-active": "not previewed (active status unknown)",
+    "active-stale": "not previewed (active status stale)",
     "priority": "not previewed (priority strategy)",
 }
 
@@ -144,6 +146,9 @@ def _engine_order(
     )
     headroom = _headroom_by_account(usage, models)
     active_h = headroom.get(active_number)
+    blind = _active_reading_blind(
+        next((a.usage for a in snap.accounts if a.number == active_number), None), now
+    )
     if settings.strategy == "priority-consume-first":
         trigger = "priority"
     elif any(a.number == active_number and a.disabled for a in snap.accounts):
@@ -152,7 +157,7 @@ def _engine_order(
         # Before `overloaded`: the burst outranks the headroom read only on
         # the tick's own gates (an API-key active it may not leave, a hold on
         # the active's last reading), which a snapshot cannot see.
-        trigger = "unreadable-active"
+        trigger = "active-stale" if blind else "unreadable-active"
     elif overloaded:
         trigger = "overloaded"
     else:
@@ -163,7 +168,11 @@ def _engine_order(
             if binding is not None
             else (100.0 - active_h) < bars[active_number]
         )
-        if below:
+        if below and blind:
+            # The tick counts toward `active-stale` here and ranks nothing it
+            # has not measured; a reading at or over a line is acted on, below.
+            trigger = "active-stale"
+        elif below:
             trigger = "consume-first" if settings.strategy == "consume-first" else "below-threshold"
         else:
             trigger = "at-limit" if active_h <= 0 else "proactive"
