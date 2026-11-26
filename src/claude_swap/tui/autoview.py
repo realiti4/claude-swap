@@ -32,7 +32,6 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     ThresholdMap,
     _binding_at,
-    _decision_usage,
     _dynamic_active_headroom,
     _headroom_by_account,
     binding_pct,
@@ -144,7 +143,7 @@ def _engine_order(
     refetch then makes fresh."""
     models = parse_model_names(settings.model)
     entries = {acc.number: acc.usage for acc in snap.accounts}
-    usage = _decision_usage(entries, active_number, now, models)
+    usage = {num: entry.decision_value(models) for num, entry in entries.items()}
     headroom = _headroom_by_account(usage, models)
     active_h = _dynamic_active_headroom(
         settings, models, usage, active_number, headroom.get(active_number)
