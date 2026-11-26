@@ -2988,7 +2988,7 @@ class AutoSwitchEngine:
         def _dynamic_rank(cands, hroom, at_now, active_h):
             recovered = self._left_account_recovered(
                 state, usage, hroom, active_h, settings, at_now, current,
-                thresholds=thresholds,
+                thresholds=thresholds, entries=entries,
             )
             no_return = self._no_return_account(
                 "proactive", state, hroom, active_h, recovered, settings, current,
@@ -3691,6 +3691,8 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
+            # The fresh rows may have carried a candidate past its cap.
+            oauth_candidates = [n for n in oauth_candidates if _capped(n) is None]
 
         decided_now = self.clock()
         if dynamic_ordered is not None:

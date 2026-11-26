@@ -1866,15 +1866,61 @@ class TestAdaptiveScheduler:
         assert h.active_number() == 2
 
     @pytest.mark.parametrize(
-        "strategy",
-        ["best", "weekly-first", "consume-first", "dynamic", "priority-consume-first"],
+        "strategy, lands_on",
+        [
+            ("best", "2"),
+            ("weekly-first", "3"),
+            ("consume-first", "3"),
+            ("dynamic", "3"),
+            ("priority-consume-first", "3"),
+        ],
     )
-    def test_every_strategy_leaves_a_blind_active_for_a_measured_account(
-        self, temp_home, monkeypatch, strategy
+    def test_a_blind_active_lands_as_its_strategy_orders_a_forced_move(
+        self, temp_home, monkeypatch, strategy, lands_on
     ):
-        h = self._harness(temp_home, monkeypatch, accounts=2, strategy=strategy)
-        self._leave_blind_for_2(h, {}, {"1": _usage(50), "2": _usage(10)})
-        assert self._switches(h) == [(1, 2, "active-stale")]
+        # 2 has the most room, 3 the sooner weekly reset, and 1 (the active)
+        # resets soonest of all, so no peer pulls it away before it goes blind.
+        h = self._harness(temp_home, monkeypatch, strategy=strategy)
+
+        def week(pct, days):
+            return {
+                "five_hour": {"pct": pct},
+                "seven_day": {"pct": pct, "resets_at": _iso_at(h.clock.now + days * 86400)},
+            }
+
+        usage = {"1": week(50, 0.1), "2": week(10, 6), "3": week(30, 1)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        self._refuse(h, "1")
+        h.clock.advance(400)
+        for _ in range(3):
+            self._tick(h, counts, usage)
+            h.clock.advance(60)
+        assert self._switches(h) == [(1, int(lands_on), "active-stale")]
+
+    def test_a_peer_read_past_its_weekly_cap_by_the_landing_check_is_no_landing(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        for num in ("2", "3"):
+            h.switcher.set_account_weekly_cap(num, 50)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(10)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        self._refuse(h, "1")
+        h.clock.advance(400)
+        for _ in range(2):
+            self._tick(h, counts, usage)
+            h.clock.advance(60)
+        # Under their 90 line with room, but past their cap: the peer the
+        # tick's own poll did not read is first read by the landing check.
+        h.clock.advance(300)
+        for num in ("2", "3"):
+            usage[num] = {"five_hour": {"pct": 10}, "seven_day": {"pct": 60.0}}
+        h.events.clear()
+        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        assert self._switches(h) == []
+        assert self._reasons(h)[-1] == "no-verified-target"
 
     def test_the_account_left_blind_is_not_returned_to_on_its_old_reading(
         self, temp_home, monkeypatch
@@ -1892,6 +1938,23 @@ class TestAdaptiveScheduler:
             h.clock.advance(60)
         assert h.active_number() == 2
         assert self._reasons(h)[-1] == "no-verified-target"
+
+    def test_the_account_left_blind_is_not_returned_to_by_a_dynamic_departure(
+        self, temp_home, monkeypatch
+    ):
+        # The dynamic arm ranks on its own path, with its own no-return bar.
+        h = self._harness(
+            temp_home, monkeypatch, accounts=2, cooldown_seconds=0, strategy="dynamic"
+        )
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        self._leave_blind_for_2(h, counts, usage)
+        usage["2"] = _usage(98)  # 2 reaches dynamic's own switch point
+        h.clock.advance(300)
+        for _ in range(3):
+            self._tick(h, counts, usage)
+            h.clock.advance(60)
+        assert self._switches(h) == [(1, 2, "active-stale")]
 
     def test_the_account_left_blind_is_returned_to_once_it_reads_again(
         self, temp_home, monkeypatch
