@@ -2665,7 +2665,6 @@ class TestUnswitchableRowsAreListed:
         a.login_expires_at = None  # the re-login note reads it; a MagicMock is not a time
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
-        a.usage.consecutive_failures = 0  # _decision_usage reads it; a MagicMock is not a count
         a.usage.decision_value.return_value = sentinel or last_good  # what the pass reads
         a.disabled = False
         return a
@@ -3271,26 +3270,6 @@ class TestNextBestFollowsTheTick:
         h, snap = _harness_and_panel_snapshot(temp_home, {"strategy": strategy}, fleet)
         assert claim in _next_best_text(snap, "1", h.settings)
 
-    def test_a_blind_active_reading_claims_no_order(self):
-        # The tick reads an aged reading its refreshes failed to renew as
-        # unknown (#208), so the panel must not call the active below its line.
-        blind = dataclasses.replace(
-            make_entry(40.0, 10.0, age_s=STALE_OK_S + 60),
-            consecutive_failures=3, trust_extended=True,
-        )
-        snap = AccountsSnapshot(
-            active_number="1",
-            accounts=(
-                make_account(1, active=True, entry=blind),
-                make_account(2, entry=make_entry(10.0, 10.0)),
-            ),
-            taken_at=0.0,
-        )
-        settings = AutoSwitchSettings(strategy="best")
-        assert "not previewed (active status unknown)" in _next_best_text(
-            snap, "1", settings
-        )
-
     @pytest.mark.parametrize(
         "strategy, fleet, extra, disabled, designed",
         [
@@ -3361,12 +3340,14 @@ class TestNextBestFollowsTheTick:
         )
         from claude_swap.tui.autoview import _REFUSAL_TEXT
 
-        # Before the pass or beyond the snapshot (cooldown, the failover
-        # count), the priority strategy's own pass, or after a pass that admitted.
+        # Before the pass or beyond the snapshot (cooldown, the failover and
+        # blind-reading counts), the priority strategy's own pass, or after a
+        # pass that admitted.
         not_modelled = {
             "unmanaged-active-account", "no-active-account", "active-api-key",
             "active-idle", "active-usage-unknown", "cooldown",
             "already-consuming-priority", "stale-usage", "no-viable-target",
+            "active-usage-stale", "active-usage-refreshed",
         }
         tree = ast.parse(textwrap.dedent(inspect.getsource(AutoSwitchEngine._tick_inner)))
         emitted = {
