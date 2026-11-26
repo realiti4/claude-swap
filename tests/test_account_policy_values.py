@@ -53,6 +53,7 @@ class TestNormalizeAccountThreshold:
     @pytest.mark.parametrize(
         "raw,expected",
         [
+            (40, 40.0),
             (50, 50.0),
             (99, 99.0),
             (85, 85.0),
@@ -62,6 +63,7 @@ class TestNormalizeAccountThreshold:
             ("85", 85.0),
             ("85.5", 85.5),
             ("  85.5  ", 85.5),
+            ("40", 40.0),
             ("50", 50.0),
             ("99.9", 99.9),
         ],
@@ -71,7 +73,7 @@ class TestNormalizeAccountThreshold:
         assert result == pytest.approx(expected)
         assert isinstance(result, float), "must return a float regardless of input type"
 
-    @pytest.mark.parametrize("raw", [20, 49.9, 100, 99.91, 0, -85, 1000])
+    @pytest.mark.parametrize("raw", [20, 39.9, 100, 99.91, 0, -85, 1000])
     def test_rejects_out_of_range(self, raw):
         with pytest.raises(ValueError):
             normalize_account_threshold(raw)
@@ -104,7 +106,7 @@ class TestNormalizeAccountThreshold:
         with pytest.raises(ValueError) as excinfo:
             normalize_account_threshold(raw)
         message = str(excinfo.value)
-        assert "50" in message, f"message must name the lower bound: {message!r}"
+        assert "40" in message, f"message must name the lower bound: {message!r}"
         assert "99.9" in message, f"message must name the upper bound: {message!r}"
 
     def test_boundaries_are_inclusive(self):
@@ -125,7 +127,7 @@ class TestThresholdBoundsMatchSettings:
     """The bounds are declared in `models.py` but owned by `SETTING_SPECS`."""
 
     def test_constants_have_the_documented_values(self):
-        assert ACCOUNT_THRESHOLD_MIN == 50.0
+        assert ACCOUNT_THRESHOLD_MIN == 40.0
         assert ACCOUNT_THRESHOLD_MAX == 99.9
 
     def test_constants_equal_the_global_threshold_spec_bounds(self):
