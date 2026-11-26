@@ -644,6 +644,58 @@ class TestTryRefreshOAuthCredentials:
             assert "unknown" in message
             assert "spent" not in message
 
+    @pytest.mark.parametrize("code, warned", [(502, True), (400, False)])
+    def test_an_error_reply_that_stops_mid_read_is_transient(
+        self, caplog, code, warned
+    ):
+        """A gateway can drop the connection while the error body is read.
+        That must come back as an outcome, not raise through the caller."""
+        import http.client
+        import logging
+
+        err = self._http_error(code, b"")
+        err.read = MagicMock(side_effect=http.client.IncompleteRead(b"par"))
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err
+        ), caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error == "transient"
+        assert outcome.credentials is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert bool(warnings) is warned
+        assert "IncompleteRead" in caplog.text
+
+    def test_reply_text_stays_out_of_the_log_at_every_level(self, caplog):
+        """The error body is whatever a server or a proxy chose to send, and
+        --debug output gets pasted into issues: only the status, a known
+        OAuth error code and exception types are logged."""
+        import logging
+
+        failures = (
+            self._http_error(
+                400, b'{"error": "invalid_request", "error_description": "MARKER"}'
+            ),
+            self._http_error(400, b'{"error": "MARKER"}'),
+            self._http_error(400, b'{"error": {"nested": "MARKER"}}'),
+            self._http_error(503, b"<html>MARKER</html>"),
+            urllib.error.URLError("MARKER"),
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            for failure in failures:
+                with patch(
+                    "claude_swap.oauth.urllib.request.urlopen", side_effect=failure
+                ):
+                    outcome = oauth.try_refresh_oauth_credentials(
+                        self._make_credentials()
+                    )
+                assert outcome.error == "transient"
+
+        assert "MARKER" not in caplog.text
+        assert "HTTP 400, error invalid_request" in caplog.text
+        assert "HTTP 400, error unrecognised" in caplog.text
+
     def test_answered_refresh_is_not_logged_as_no_reply(self, caplog):
         """A 4xx is the server's answer to the request, whatever it says."""
         import logging

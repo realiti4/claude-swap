@@ -4567,6 +4567,11 @@ class AutoSwitchEngine:
                       baseline — longer than one poll cycle, so jitter on a
                       reset timestamp is not a recovery.
 
+        AN ACTIVE AT ITS OWN LINE RELEASES a peer with `hysteresis_pct` of room
+        under all of its own, ahead of those legs: that crossing is a change in
+        the active that a ranking flip never produces, so returning is forced,
+        not a flap.
+
         NO SNAPSHOT MEANS RELEASE. State written before this field existed, or
         by a switch that never recorded one, carries no evidence either way —
         and of the two failure modes the permanent proactive lockout is the
@@ -4755,6 +4760,10 @@ class AutoSwitchEngine:
             active_headroom is not None
             and active_headroom <= 100.0 - thresholds[current]
         )
+        if active_at_threshold:
+            room = self._room(usage.get(barred), settings, thresholds[barred])
+            if room is not None and room >= settings.hysteresis_pct:
+                return True
         if h is not None:
             if active_headroom is not None:
                 if (

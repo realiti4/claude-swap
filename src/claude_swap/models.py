@@ -55,7 +55,7 @@ def normalize_alias(name: str) -> str:
 #: literals rather than imported: ``models`` is a leaf and must not import
 #: ``settings``. The two are asserted equal in
 #: ``tests/test_account_policy_values.py`` so they cannot drift apart.
-ACCOUNT_THRESHOLD_MIN = 50.0
+ACCOUNT_THRESHOLD_MIN = 40.0
 ACCOUNT_THRESHOLD_MAX = 99.9
 
 

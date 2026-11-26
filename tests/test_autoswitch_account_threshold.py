@@ -447,6 +447,61 @@ class TestAntiFlapUsesTheBarredAccountsThreshold:
         ) is None
 
 
+class TestReturnToAVoluntarilyLeftAccount:
+    """An active AT its own line returns to the account it left once that
+    account is under all of its own lines: a crossing of the active's line is a
+    change in the active that a ranking flip never produces, so the return is
+    forced, not a flap. Account 1 carries the roster line 50; account 2 is the
+    one it left. Each reset is a fixed instant, so burn alone moves nothing.
+    """
+
+    def _fleet(self, temp_home):
+        h = _fleet(temp_home, strategy="dynamic")
+        h.switcher.set_account_threshold("1", 50.0)
+        h.engine = h._make_engine()
+        h.engine._mutate_state(lambda st: st.update({
+            "lastSwitchFrom": "2", "lastSwitchTo": "1", "leftHeadroom": 99.0,
+            "leftRecoveryAt": h.clock.now + 6 * 86400, "leftTrigger": "alternation",
+            "lastSwitchAt": h.clock.now - 3600,
+        }))
+        return h
+
+    def _reading(self, h, pct1, pct2):
+        reset = _iso_at(h.clock.now + 6 * 86400)
+        return {
+            "1": _usage7(0.0, pct1, reset),
+            "2": _usage7(0.0, pct2, reset),
+        }
+
+    def test_the_active_at_its_own_line_returns_to_the_peer_it_left(self, temp_home):
+        h = self._fleet(temp_home)
+        assert h.tick_with_usage(self._reading(h, 50.0, 1.0)) is TickOutcome.SWITCHED, (
+            _reasons(h), _details(h),
+        )
+        assert h.active_number() == 2
+
+    def test_the_return_is_not_undone_by_the_next_tick(self, temp_home):
+        h = self._fleet(temp_home)
+        usage = self._reading(h, 50.0, 1.0)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        h.clock.advance(3600.0)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize(
+        "active,peer,released", [(49.0, 1.0, False), (50.0, 1.0, True), (50.0, 85.0, False)]
+    )
+    def test_the_release_needs_the_active_at_its_line_and_the_peer_with_room(
+        self, temp_home, active, peer, released
+    ):
+        h = self._fleet(temp_home)
+        assert h.engine._left_account_recovered(
+            h.engine._read_state(), self._reading(h, active, peer),
+            {"1": 100.0 - active, "2": 100.0 - peer}, 100.0 - active,
+            h.settings, h.clock.now, "1", thresholds=h.engine._resolve_thresholds(),
+        ) is released
+
+
 class TestPollPolicyMinimumThreshold:
     """`set_poll_policy_inputs` receives the fleet **minimum**.
 
@@ -1447,7 +1502,7 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
     def test_threshold_departure_with_no_viable_target_blocks(self, temp_home):
         live = self._stage(temp_home,
                            expires_at=int(1_000_000.0 * 1000) + 3_600_000)
-        # `ACCOUNT_THRESHOLD_MIN` is 50: the lowest line the store accepts,
+        # 50 is a line the store accepts (`ACCOUNT_THRESHOLD_MIN` is 40),
         # crossed here at 60%.
         live.switcher.set_account_threshold("1", 50.0)
         live.engine = live._make_engine()
