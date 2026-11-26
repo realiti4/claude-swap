@@ -3140,6 +3140,14 @@ class AutoSwitchEngine:
             never entered, by any trigger or regime."""
             return over_own_threshold(num, usage, settings, self._models, own_bars)
 
+        def _after_refetch(peers: list[str], usage: Mapping[str, dict | str | None]) -> list[str]:
+            """``peers`` still eligible on a fresh read: it can carry one past its
+            weekly cap or its own line. Both vetoes apply, and the line's is named."""
+            fresh = [n for n in peers if _capped(n, usage) is None]
+            vetoed.extend(n for n in fresh if _over_own(n, usage))
+            self._veto_note = _vetoed_clause(vetoed, own_bars)
+            return [n for n in fresh if not _over_own(n, usage)]
+
         # -- candidate selection ------------------------------------------
         # One function of a reading of the store each, because the collector asks
         # them on its own first read (`departure_wall`): the line it holds a blind
@@ -4123,8 +4131,7 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
-            # The fresh rows may have carried a candidate past its cap.
-            oauth_candidates = [n for n in oauth_candidates if _capped(n, usage) is None]
+            oauth_candidates = _after_refetch(oauth_candidates, usage)
 
         decided_now = self.clock()
         if dynamic_ordered is not None:
@@ -4178,11 +4185,7 @@ class AutoSwitchEngine:
                 thresholds,
             )
             decided_now = self.clock()
-            # The fresh rows may have carried a candidate past its cap.
-            fresh = [n for n in oauth_candidates if _capped(n, usage) is None]
-            vetoed += [n for n in fresh if _over_own(n, usage)]
-            self._veto_note = _vetoed_clause(vetoed, own_bars)
-            oauth_candidates = [n for n in fresh if not _over_own(n, usage)]
+            oauth_candidates = _after_refetch(oauth_candidates, usage)
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,

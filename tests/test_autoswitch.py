@@ -4178,6 +4178,31 @@ class TestActiveStaleLanding:
             "active-usage-refreshed"
         ]
 
+    @pytest.mark.parametrize("strategy, own_line", [("best", 60), ("dynamic", 80)])
+    def test_a_peer_read_past_its_own_line_by_the_landing_read_is_named_and_no_landing(
+        self, temp_home, strategy, own_line
+    ):
+        # Under its own line at the plan read, over it at the landing read: the
+        # landing read re-applies the own-line veto as every other refetch does,
+        # so the stay names the peer and its line, not a bare "no room".
+        h = self._harness(temp_home, strategy=strategy)
+        h.switcher.set_account_threshold("2", own_line)
+        now = h.clock.now
+        blind = self._blind(_usage(92 if strategy == "dynamic" else 70), now)
+        plan = {"1": blind, "2": self._read(_usage(own_line - 20), now)}
+        landing = {**plan, "2": self._read(_usage(own_line + 10), now)}
+
+        def entries_for(fetch=None, **kwargs):
+            return landing if fetch == {"2"} else plan
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries_for):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        hold = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in hold] == ["no-verified-target"]
+        assert f"Account-2 (line {own_line}%) at or over its own threshold" in hold[0].detail
+
     def test_a_stopped_engine_does_not_read_the_landings(self, temp_home):
         # The landing read POSTs one-time refresh grants, so it is gated like
         # every other fetch: a stop landing after the plan read ends the tick.
