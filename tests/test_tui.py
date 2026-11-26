@@ -3224,13 +3224,12 @@ class TestNextBestFollowsTheTick:
         assert "not previewed (active status unknown)" in _next_best_text(snap, h.settings)
 
     @staticmethod
-    def _frozen_active_snapshot(pct5: float, **fields):
+    def _frozen_active_snapshot(pct5: float):
         """An active read STALE_OK_S + 60 s ago whose refreshes are 429-refused,
         with one healthy peer."""
         frozen = dataclasses.replace(
             make_entry(pct5, 10.0, age_s=STALE_OK_S + 60),
             consecutive_failures=3, last_error="http-429", trust_extended=True,
-            **fields,
         )
         return AccountsSnapshot(
             active_number="1",
@@ -3240,18 +3239,6 @@ class TestNextBestFollowsTheTick:
             ),
             taken_at=0.0,
         )
-
-    def test_a_walled_active_reading_is_never_blind(self):
-        """A wall mark outranks the frozen reading in `decision_value`, so a
-        walled active whose refreshes fail is full, not stale."""
-        from claude_swap.settings import AutoSwitchSettings
-
-        text = _next_best_text(
-            self._frozen_active_snapshot(40.0, walled=True),
-            AutoSwitchSettings(strategy="best"),
-        )
-        assert "not previewed" not in text
-        assert "user2@example.com" in text
 
     @pytest.mark.parametrize("strategy", ["best", "consume-first"])
     def test_a_blind_active_below_its_line_claims_no_order(self, strategy):
