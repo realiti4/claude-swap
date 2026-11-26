@@ -2161,16 +2161,22 @@ class AutoSwitchEngine:
                 # Its own landing rule, and no no-return bar: the account
                 # this engine left qualifies again only once it has been
                 # read anew, which is what the bar would otherwise ask.
-                return (
-                    self._rank_verified_landings(
-                        oauth_candidates=kw["oauth_candidates"],
-                        entries=entries, usage=kw["usage"], settings=settings,
-                        now=kw["now"], thresholds=thresholds, policies=policies,
-                    ),
-                    True,
-                    None,
-                    False,
+                landing = dict(
+                    oauth_candidates=kw["oauth_candidates"], entries=entries,
+                    usage=kw["usage"], settings=settings, now=kw["now"],
+                    thresholds=thresholds, policies=policies,
                 )
+                landings = self._rank_verified_landings(
+                    headroom=kw["headroom"], **landing
+                )
+                # `dynamic` only, as in `_rank_candidates`: the blind active
+                # is judged on 5h/7d, so a model window is no blackout here.
+                if not landings and self._models and settings.strategy == "dynamic":
+                    landings = self._rank_verified_landings(
+                        headroom=_headroom_by_account(kw["usage"], ()),
+                        models=(), **landing,
+                    )
+                return landings, True, None, False
             if priority_mode:
                 # Strict landing and a stable priority/reset ordering make the
                 # legacy escape/no-return heuristics unnecessary. A recovered
@@ -3059,9 +3065,10 @@ class AutoSwitchEngine:
 
     def _rank_verified_landings(
         self, *, oauth_candidates: list[str], entries: Mapping[str, UsageEntry],
-        usage: dict[str, dict | str | None],
+        usage: dict[str, dict | str | None], headroom: dict[str, float | None],
         settings: AutoSwitchSettings, now: float,
         thresholds: Mapping[str, float], policies: Mapping[str, AccountPolicy],
+        models: Sequence[str] | None = None,
     ) -> list[str]:
         """Where an ``active-stale`` move may land, best first.
 
@@ -3077,43 +3084,33 @@ class AutoSwitchEngine:
         weekly reset under ``priority-consume-first``, soonest weekly reset
         under ``consume-first``, ``dynamic`` and ``weekly-first``, else most
         headroom against the account's own lines.
+
+        ``models`` is the window set ``headroom`` was read on (default the
+        pinned model set), so room and binding read the same one.
         """
         by_reset = settings.strategy in (*CONSUME_FIRST_STRATEGIES, "weekly-first")
         by_tier = settings.strategy == "priority-consume-first"
-        # `dynamic` ONLY, as in `_rank_candidates`: a model window is not a
-        # blackout, and the blind active was judged on 5h/7d alone, so a
-        # model-gated pass that lands nowhere is retried there.
-        for models in (
-            (self._models, ())
-            if self._models and settings.strategy == "dynamic"
-            else (self._models,)
-        ):
-            hr = _headroom_by_account(usage, models)
-            ranked: list[tuple[tuple, str]] = []
-            for num in oauth_candidates:
-                h = hr.get(num)
-                if h is None or h <= 0 or not _reading_verified(entries.get(num), now):
-                    continue
-                room = self._room(usage.get(num), settings, thresholds[num], models=models)
-                if room is None:
-                    room = thresholds[num] - (100.0 - h)
-                if room <= 0 or room < settings.hysteresis_pct:
-                    continue
-                binding = self._binding(
-                    usage.get(num), settings, thresholds[num], models=models
-                )
-                lh = binding.line_headroom if binding is not None else h
-                reset = _seven_day_reset_ts(usage.get(num), now)
-                soonest = reset if reset is not None else float("inf")
-                if by_tier:
-                    key: tuple = (-policies.get(num, AccountPolicy()).priority, soonest)
-                elif by_reset:
-                    key = (soonest, -lh)
-                else:
-                    key = (-lh,)
-                ranked.append((key, num))
-            if ranked:
-                break
+        ranked: list[tuple[tuple, str]] = []
+        for num in oauth_candidates:
+            h = headroom.get(num)
+            if h is None or h <= 0 or not _reading_verified(entries.get(num), now):
+                continue
+            room = self._room(usage.get(num), settings, thresholds[num], models=models)
+            if room is None:
+                room = thresholds[num] - (100.0 - h)
+            if room <= 0 or room < settings.hysteresis_pct:
+                continue
+            binding = self._binding(usage.get(num), settings, thresholds[num], models=models)
+            lh = binding.line_headroom if binding is not None else h
+            reset = _seven_day_reset_ts(usage.get(num), now)
+            soonest = reset if reset is not None else float("inf")
+            if by_tier:
+                key: tuple = (-policies.get(num, AccountPolicy()).priority, soonest)
+            elif by_reset:
+                key = (soonest, -lh)
+            else:
+                key = (-lh,)
+            ranked.append((key, num))
         # List order (sequence order) breaks ties.
         ranked.sort(key=lambda t: t[0])
         return [num for _, num in ranked]
