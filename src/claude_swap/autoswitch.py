@@ -2326,17 +2326,25 @@ class AutoSwitchEngine:
                 # Its own landing rule, and no no-return bar: the account
                 # this engine left qualifies again only once it has been
                 # read anew, which is what the bar would otherwise ask.
-                return (
-                    self._rank_verified_landings(
-                        oauth_candidates=kw["oauth_candidates"],
-                        entries=entries, usage=kw["usage"],
-                        headroom=kw["headroom"], settings=settings,
-                        now=kw["now"], thresholds=thresholds, policies=policies,
-                    ),
-                    True,
-                    None,
-                    False,
+                # No probe either: clear the pick a consume-first tick left,
+                # or it would name this switch "probe".
+                self._last_probe_num = None
+                landing = dict(
+                    oauth_candidates=kw["oauth_candidates"], entries=entries,
+                    usage=kw["usage"], settings=settings, now=kw["now"],
+                    thresholds=thresholds, policies=policies,
                 )
+                landings = self._rank_verified_landings(
+                    headroom=kw["headroom"], **landing
+                )
+                # `dynamic` only, as in `_rank_candidates`: the blind active
+                # is judged on 5h/7d, so a model window is no blackout here.
+                if not landings and self._models and settings.strategy == "dynamic":
+                    landings = self._rank_verified_landings(
+                        headroom=_headroom_by_account(kw["usage"], ()),
+                        models=(), **landing,
+                    )
+                return landings, True, None, False
             if priority_mode:
                 # Strict landing and a stable priority/reset ordering make the
                 # legacy escape/no-return heuristics unnecessary. A recovered
@@ -2393,6 +2401,8 @@ class AutoSwitchEngine:
             # once the count and the cooldown allow a move, so the ticks
             # spent waiting keep every peer on its own poll plan. The active
             # row is left to its own backoff.
+            if self._stop.is_set():
+                raise _EngineStopped()
             entries = self.switcher.usage_entries_by_account(
                 fetch=set(oauth_candidates)
             )
@@ -3270,6 +3280,7 @@ class AutoSwitchEngine:
         usage: dict[str, dict | str | None], headroom: dict[str, float | None],
         settings: AutoSwitchSettings, now: float,
         thresholds: Mapping[str, float], policies: Mapping[str, AccountPolicy],
+        models: Sequence[str] | None = None,
     ) -> list[str]:
         """Where an ``active-stale`` move may land, best first.
 
@@ -3285,6 +3296,9 @@ class AutoSwitchEngine:
         weekly reset under ``priority-consume-first``, soonest weekly reset
         under ``consume-first``, ``dynamic`` and ``weekly-first``, else most
         headroom against the account's own lines.
+
+        ``models`` is the window set ``headroom`` was read on (default the
+        pinned model set), so room and binding read the same one.
         """
         by_reset = settings.strategy in (*CONSUME_FIRST_STRATEGIES, "weekly-first")
         by_tier = settings.strategy == "priority-consume-first"
@@ -3293,12 +3307,14 @@ class AutoSwitchEngine:
             h = headroom.get(num)
             if h is None or h <= 0 or not _reading_verified(entries.get(num), now):
                 continue
-            room = self._room(usage.get(num), settings, thresholds[num])
+            room = self._room(usage.get(num), settings, thresholds[num], models=models)
             if room is None:
                 room = thresholds[num] - (100.0 - h)
             if room <= 0 or room < settings.hysteresis_pct:
                 continue
-            binding = self._binding(usage.get(num), settings, thresholds[num])
+            binding = self._binding(
+                usage.get(num), settings, thresholds[num], models=models
+            )
             lh = binding.line_headroom if binding is not None else h
             reset = _seven_day_reset_ts(usage.get(num), now)
             soonest = reset if reset is not None else float("inf")
@@ -4184,9 +4200,19 @@ class AutoSwitchEngine:
         # reading that cannot move. The tick reads the landings itself once
         # it may leave (`_tick_inner`), so refreshing every peer on each
         # waiting tick would only spend their request budgets.
+        # Under `dynamic` the tick reads the active's lines on 5h/7d with the
+        # model window dropped (`active_binding`), so a model window at its line
+        # does not end the wait there either.
+        blind_windows = (
+            oauth.relevant_windows(
+                active_value if isinstance(active_value, dict) else None, ()
+            )
+            if self.settings.strategy == "dynamic" and self._models
+            else active_windows
+        )
         waiting_blind = _active_reading_blind(entries.get(current), now) and not any(
             pct >= window_line(label, threshold, weekly_threshold)
-            for label, pct, _ in active_windows
+            for label, pct, _ in blind_windows
         )
         escalate = bool(candidates) and (
             # A disabled active switches on ANY headroom, including one well

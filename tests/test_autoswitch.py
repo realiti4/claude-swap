@@ -1877,6 +1877,32 @@ class TestAdaptiveScheduler:
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
+    def test_a_blind_dynamic_active_on_a_model_wall_leaves_its_peers_on_their_plan(
+        self, temp_home, monkeypatch
+    ):
+        # `dynamic` judges the active on 5h/7d with the pinned model's window
+        # dropped, so a frozen reading whose ONLY over-line window is the model
+        # wall is still below its line: the tick counts it, and the count must
+        # not refetch every peer on each waiting tick.
+        h = self._harness(temp_home, monkeypatch, strategy="dynamic", model="Fable")
+        frozen = {
+            "five_hour": {"pct": 40.0}, "seven_day": {"pct": 40.0},
+            "scoped": [{"name": "Fable", "pct": 98.0,
+                        "resets_at": _iso_at(h.clock.now + 3 * 86400)}],
+        }
+        usage = {"1": frozen, "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.clock.advance(400)
+        counts.clear()
+        h.events.clear()
+        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["active-usage-stale"]
+        assert sum(counts.values()) <= 1  # the baseline slot only, no escalate-all
+
     def test_a_429_frozen_active_reading_moves_to_a_measured_account(
         self, temp_home, monkeypatch
     ):
@@ -3086,6 +3112,73 @@ class TestActiveStaleLanding:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+    @pytest.mark.parametrize(
+        "strategy, lands", [("dynamic", True), ("best", False)]
+    )
+    def test_dynamic_lands_on_a_peer_over_only_its_model_line(
+        self, temp_home, strategy, lands
+    ):
+        # A model window is no blackout under `dynamic`, which judges the
+        # blind active on 5h/7d alone: the peer is read in this pass with
+        # room on both, so it lands though Fable is over its line. `best`
+        # never looks past a model wall the owner pinned.
+        h = self._harness(temp_home, strategy=strategy, model="Fable")
+        now = h.clock.now
+        walled = {
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 98.0}],
+        }
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now), "2": self._read(walled, now),
+        })
+        if lands:
+            assert outcome is TickOutcome.SWITCHED
+            assert h.active_number() == 2
+            switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+            assert switch.trigger == "active-stale"
+        else:
+            assert outcome is TickOutcome.NO_ACTION
+            hold = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+            assert [e.reason for e in hold] == ["no-verified-target"]
+
+    def test_a_probe_pick_an_earlier_tick_left_does_not_name_the_move(
+        self, temp_home
+    ):
+        # `_last_probe_num` is the consume-first pass's side channel, and this
+        # landing ranks without that pass: it must not inherit a pick from a
+        # tick before, which would log the move as "probe".
+        h = self._harness(temp_home)
+        h.engine._last_probe_num = "2"
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now), "2": self._read(_usage(10), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "active-stale"
+
+    def test_a_stopped_engine_does_not_read_the_landings(self, temp_home):
+        # The landing read POSTs one-time refresh grants, so it is gated like
+        # every other fetch: a stop landing after the plan read ends the tick.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        entries = {
+            "1": self._blind(_usage(70), now), "2": self._read(_usage(10), now),
+        }
+        late: list = []
+
+        def read(**kw):
+            if h.engine._stop.is_set() and kw.get("fetch"):
+                late.append(kw["fetch"])
+            if "scheduled" in kw:  # the plan read, the last before the tick decides
+                h.engine._stop.set()
+            return entries
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=read):
+            h.engine.tick()
+        assert late == []
+        assert h.active_number() == 1
 
     def test_consume_first_lands_on_the_soonest_weekly_reset(self, temp_home):
         # Every measured account with room qualifies, a later reset than the
