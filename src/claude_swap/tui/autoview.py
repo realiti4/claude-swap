@@ -87,8 +87,8 @@ _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 # Triggers whose pass the panel never runs, each with WHY: a state the tick
 # acts on out of sight of a snapshot (an unreadable or blind active counts
-# ticks toward leaving) or ranks through a pass of its own. Never "no candidate qualifies",
-# the claim only a real, empty pass earns.
+# ticks toward leaving) or ranks through a pass of its own. Never "no
+# candidate qualifies", the claim only a real, empty pass earns.
 _UNMODELED_TEXT = {
     "below-threshold": "not previewed (active below threshold)",
     "unreadable-active": "not previewed (active status unknown)",
