@@ -2521,6 +2521,7 @@ class AutoSwitchEngine:
                         entries=entries, usage=kw["usage"],
                         headroom=kw["headroom"], settings=settings,
                         now=kw["now"], thresholds=thresholds, policies=policies,
+                        overload_backoff=overload_backoff,
                     ),
                     True,
                     None,
@@ -3558,6 +3559,7 @@ class AutoSwitchEngine:
         usage: dict[str, dict | str | None], headroom: dict[str, float | None],
         settings: AutoSwitchSettings, now: float,
         thresholds: Mapping[str, float], policies: Mapping[str, AccountPolicy],
+        overload_backoff: Mapping[str, float] | None = None,
     ) -> list[str]:
         """Where an ``active-stale`` move may land, best first.
 
@@ -3581,6 +3583,8 @@ class AutoSwitchEngine:
             h = headroom.get(num)
             if h is None or h <= 0 or not _reading_verified(entries.get(num), now):
                 continue
+            if now < ((overload_backoff or {}).get(num) or 0):
+                continue  # barred (escaped or API-refused); staying needs no release
             room = self._room(usage.get(num), settings, thresholds[num])
             if room is None:
                 room = thresholds[num] - (100.0 - h)

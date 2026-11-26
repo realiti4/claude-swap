@@ -3638,6 +3638,25 @@ class TestActiveStaleLanding:
             "active-usage-refreshed"
         ]
 
+    @pytest.mark.parametrize("bar", ["escaped", "refused"])
+    def test_a_barred_peer_is_not_a_landing(self, temp_home, bar):
+        # The API refused model requests on the peer, or the engine escaped it
+        # for `overloaded` (`overload_backoff`): every trigger skips it, and an
+        # active-stale move, which may always stay, has no release either.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        peer = self._read(_usage(10), now)
+        if bar == "escaped":
+            h.engine._overload_backoff = {"2": now + 900.0}
+        else:
+            peer = replace(peer, refused_until=now + 900.0)
+        outcome = h.tick_with_entries({"1": self._blind(_usage(70), now), "2": peer})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "no-verified-target"
+        ]
+
     def test_a_stopped_engine_does_not_read_the_landings(self, temp_home):
         # The landing read POSTs one-time refresh grants, so it is gated like
         # every other fetch: a stop landing after the plan read ends the tick.
