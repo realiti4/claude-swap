@@ -4178,6 +4178,28 @@ class TestActiveStaleLanding:
             "active-usage-refreshed"
         ]
 
+    def test_a_stopped_engine_does_not_read_the_landings(self, temp_home):
+        # The landing read POSTs one-time refresh grants, so it is gated like
+        # every other fetch: a stop landing after the plan read ends the tick.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        entries = {
+            "1": self._blind(_usage(70), now), "2": self._read(_usage(10), now),
+        }
+        late: list = []
+
+        def read(**kw):
+            if h.engine._stop.is_set() and kw.get("fetch"):
+                late.append(kw["fetch"])
+            if "scheduled" in kw:  # the plan read, the last before the tick decides
+                h.engine._stop.set()
+            return entries
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=read):
+            h.engine.tick()
+        assert late == []
+        assert h.active_number() == 1
+
     def test_a_later_proactive_move_may_return_to_the_account_left_blind(
         self, temp_home
     ):
