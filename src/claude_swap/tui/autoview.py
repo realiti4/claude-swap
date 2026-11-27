@@ -618,10 +618,10 @@ class AutoScreen(Screen):
                 # candidate clearing this label can still fail that one. The
                 # two print `kind == "full"` in different words on purpose
                 # (the elif below): the log always says "full", this panel
-                # reserves "full" for a window actually at or over 100 and
-                # says nothing otherwise. A passed window's chip reads `?`
-                # but the label still classifies its stored figure, as the
-                # log does. Always on `models`, the full pinned
+                # reserves "full" for a window actually at or over 100 (or a
+                # passed one) and says nothing otherwise. A passed window's
+                # chip reads `?` but the label still classifies its stored
+                # figure, as the log does. Always on `models`, the full pinned
                 # set: this label explains why the row is not simply "open"
                 # on the criteria the user actually configured, independent
                 # of whether the pass above retried on the 5h/7d-only axis
@@ -640,11 +640,12 @@ class AutoScreen(Screen):
                         # "full" is reserved for actual exhaustion (the
                         # window's own pct at or over 100); a window merely
                         # at or over the bar carries no marker (the chip
-                        # already shows the figure).
+                        # shows the figure), unless it is a passed one: its
+                        # chip reads `?`, so the label is all the row says.
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
-                        if window_pct >= 100.0:
+                        if window_pct >= 100.0 or blocked_model in passed:
                             entry.append(
                                 f"  {blocked_model} full", style=palette.muted
                             )

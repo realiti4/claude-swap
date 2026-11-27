@@ -5287,6 +5287,29 @@ class TestUnswitchableRowsAreListed:
         })
         assert "5h ?" in out and "  5h full" in out and "Fable-walled" not in out, out
 
+    @pytest.mark.parametrize("active_pct", [95.0, 20.0], ids=["engine-ran", "engine-not-run"])
+    @pytest.mark.parametrize("window", ["5h", "7d"])
+    def test_a_passed_window_over_its_line_but_under_100_still_reads_full(self, active_pct, window):
+        """A passed window stored at 95% against a line of 90 reads `?` on its
+        chip, so the chip shows no figure: the decision log's `(5h full)` must
+        print on the row too, or the row has no figure, label or reason."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        stored = {"pct": 95.0, "resets_at": _iso_in(-60)}
+        other = {"pct": 5.0, "resets_at": _iso_in(86400 * 3)}
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": active_pct}, "seven_day": {"pct": 20.0},
+            }),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": stored if window == "5h" else other,
+                "seven_day": stored if window == "7d" else other,
+            }),
+        ), active="1", settings=AutoSwitchSettings(
+            threshold=90.0, weekly_threshold=90.0, strategy="best"))
+        assert f"{window} ?" in out and f"  {window} full" in out, out
+        assert "95%" not in out and "not a candidate" not in out, out
+
     def test_a_passed_model_window_alone_still_reads_walled_as_the_log_does(self):
         """A model window past its reset (stored 100%) with 5h/7d open is
         still what the engine and the decision log call Fable-walled."""
