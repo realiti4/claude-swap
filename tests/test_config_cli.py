@@ -10,7 +10,6 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
-from claude_swap.settings import _read_raw, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -35,11 +34,6 @@ def _settings_file(capsys) -> Path:
     code, out, _ = _run(["path"], capsys)
     assert code == 0
     return Path(out.strip())
-
-
-def _local_file(capsys) -> Path:
-    """Where every write lands: the untracked overlay beside settings.json."""
-    return _settings_file(capsys).with_name("settings.local.json")
 
 
 class TestConfigList:
@@ -172,7 +166,7 @@ class TestConfigSetGet:
     def test_set_writes_only_that_key(self, temp_home, capsys):
         """The trap guard: no other defaults get materialized into the file."""
         _run(["set", "autoswitch.threshold", "80"], capsys)
-        raw = json.loads(_local_file(capsys).read_text())
+        raw = json.loads(_settings_file(capsys).read_text())
         assert set(raw) == {"schemaVersion", "autoswitch"}
         assert set(raw["autoswitch"]) == {"threshold"}
         assert raw["autoswitch"]["threshold"] == 80.0
@@ -183,7 +177,7 @@ class TestConfigSetGet:
         )
         assert code == 0
         assert "= false" in out
-        raw = json.loads(_local_file(capsys).read_text())
+        raw = json.loads(_settings_file(capsys).read_text())
         assert raw["autoswitch"]["includeApiKeyAccounts"] is False
 
     def test_fable_probe_alone_says_it_needs_the_header_probe(
@@ -205,14 +199,9 @@ class TestConfigSetGet:
             "futureSection": {"x": 1},
             "autoswitch": {"threshold": 80, "futureKnob": True},
         }))
-        before = path.read_bytes()
         code, _, _ = _run(["set", "autoswitch.threshold", "70"], capsys)
         assert code == 0
-        assert path.read_bytes() == before, "settings.json is never written"
-        assert json.loads(_local_file(capsys).read_text()) == {
-            "autoswitch": {"threshold": 70.0},
-        }
-        raw = _read_raw(path)
+        raw = json.loads(path.read_text())
         assert raw["futureSection"] == {"x": 1}
         assert raw["autoswitch"]["futureKnob"] is True
         assert raw["autoswitch"]["threshold"] == 70.0
@@ -317,18 +306,20 @@ class TestConfigUnset:
         code, out, _ = _run(["get", "autoswitch.threshold"], capsys)
         assert out.strip() == "90"
         # The emptied autoswitch section is removed entirely.
-        raw = json.loads(_local_file(capsys).read_text())
+        raw = json.loads(_settings_file(capsys).read_text())
         assert "autoswitch" not in raw
 
-    def test_unset_of_a_tracked_value_reads_default(self, temp_home, capsys):
+    def test_unset_with_an_overlay_reports_the_base_value(self, temp_home, capsys):
         path = _settings_file(capsys)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"autoswitch": {"threshold": 80}}))
-        code, _, _ = _run(["unset", "autoswitch.threshold"], capsys)
+        path.with_name("settings.local.json").write_text(
+            json.dumps({"autoswitch": {"threshold": 70}})
+        )
+        code, out, _ = _run(["unset", "autoswitch.threshold"], capsys)
         assert code == 0
-        _, out, _ = _run(["get", "autoswitch.threshold", "--json"], capsys)
-        assert json.loads(out)["value"] == 90.0
-        assert json.loads(out)["isSet"] is False
+        assert "80" in out and "default" not in out
+        assert _run(["get", "autoswitch.threshold"], capsys)[1].strip() == "80"
 
     def test_unset_when_not_set_is_a_noop(self, temp_home, capsys):
         code, _, err = _run(["unset", "autoswitch.threshold"], capsys)
@@ -341,6 +332,23 @@ class TestConfigMisc:
         code, out, _ = _run(["path"], capsys)
         assert code == 0
         assert out.strip().endswith("settings.json")
+
+    def test_path_names_the_file_a_write_lands_in(self, temp_home, capsys):
+        path = _settings_file(capsys)
+        assert path.name == "settings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.with_name("settings.local.json").write_text("{}")
+        assert _settings_file(capsys).name == "settings.local.json"
+        _, out, _ = _run(["--json"], capsys)
+        assert json.loads(out)["path"].endswith("settings.local.json")
+
+    def test_set_false_over_a_base_zero_reads_false(self, temp_home, capsys):
+        path = _settings_file(capsys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"updates": {"check": 0}}))
+        path.with_name("settings.local.json").write_text("{}")
+        assert _run(["set", "updates.check", "false"], capsys)[0] == 0
+        assert _run(["get", "updates.check"], capsys)[1].strip() == "false"
 
     def test_config_help(self, temp_home, capsys):
         code, out, _ = _run(["--help"], capsys)
@@ -435,10 +443,14 @@ class TestWeeklyThresholdConfig:
 
 
 class TestSettingsCache:
-    def test_poll_inputs_see_a_write_to_the_overlay(self, temp_home):
-        """The cached poll policy keys on both files, so a write that only
-        touches settings.local.json invalidates it."""
+    def test_cached_policy_sees_an_overlay_created_later(self, temp_home):
+        """The cached poll policy and usage settings key on both files."""
         sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
         assert sw._poll_policy_inputs()[0] == 90.0
-        set_setting(sw.backup_dir, "autoswitch.threshold", "70")
+        assert sw._usage_settings().header_probe is False
+        sw.backup_dir.joinpath("settings.local.json").write_text(
+            json.dumps({"autoswitch": {"threshold": 70}, "usage": {"headerProbe": True}})
+        )
         assert sw._poll_policy_inputs()[0] == 70.0
+        assert sw._usage_settings().header_probe is True

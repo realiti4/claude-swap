@@ -6,12 +6,11 @@ atomically with the backup dir's 0600/0700 modes. v1 carries the
 be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
-``settings.json`` is the tracked base (often a dotfiles symlink) and is never
-written. An untracked ``settings.local.json`` beside it overrides it, and every
-write lands there as the difference from the base: a section present in both
-merges key by key (local wins), any other value is replaced, and a ``null`` in
-the local file deletes the key. A value written back equal to the base leaves
-the local file, so an override that restates the base follows later base edits.
+``settings.local.json`` beside it is opt-in: once someone creates it, it
+overrides ``settings.json`` (a section present in both merges key by key, local
+wins; any other value is replaced) and takes every write, so a version-controlled
+``settings.json`` is left alone. ``settings_write_path`` names the file a write
+lands in.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
@@ -318,47 +317,19 @@ def settings_stamp(backup_root: Path) -> tuple[float | None, float | None]:
     return tuple(stamp)
 
 
-def _local_path(path: Path) -> Path | None:
-    """The overlay beside a settings.json, or None for any other file.
-
-    Gated on the name: no other ``atomic_write_json`` caller writes a file
-    called settings.json (the pin's certdir copy goes through the switcher's
-    ``_write_json``, which does not reach it).
-    """
-    return path.with_name(LOCAL_SETTINGS_FILENAME) if path.name == SETTINGS_FILENAME else None
+def settings_write_path(backup_root: Path) -> Path:
+    """The file a settings write lands in: ``settings.local.json`` once someone
+    has created it, else ``settings.json``."""
+    local = backup_root / LOCAL_SETTINGS_FILENAME
+    return local if local.exists() else settings_path(backup_root)
 
 
 def _overlay(base: dict, local: dict) -> dict:
     """``base`` with ``local`` laid over it, one level under each section."""
     out = dict(base)
     for key, value in local.items():
-        if value is None:
-            out.pop(key, None)
-        elif isinstance(value, dict):
-            old = out[key] if isinstance(out.get(key), dict) else {}
-            out[key] = {k: v for k, v in {**old, **value}.items() if v is not None}
-        else:
-            out[key] = value
-    return out
-
-
-def _diff(data: dict, base: dict) -> dict:
-    """What ``_overlay(base, result)`` needs to equal ``data``: changed or new
-    keys, and ``None`` for each key ``data`` dropped from ``base``. A dropped
-    section is tombstoned key by key, so keys the base adds to it later show."""
-    out: dict = {}
-    for key, value in data.items():
-        old = base.get(key)
-        if key in base and value == old:
-            continue
-        if isinstance(value, dict) and isinstance(old, dict):
-            out[key] = {k: v for k, v in value.items() if not (k in old and old[k] == v)}
-            out[key].update({k: None for k in old if k not in value})
-        else:
-            out[key] = value
-    for key, old in base.items():
-        if key not in data:
-            out[key] = {k: None for k in old} if isinstance(old, dict) and old else None
+        old = out.get(key)
+        out[key] = {**old, **value} if isinstance(value, dict) and isinstance(old, dict) else value
     return out
 
 
@@ -434,9 +405,8 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
 
 def _read_raw(path: Path) -> dict:
-    raw = _read_file(path)
-    local = _local_path(path)
-    return raw if local is None else _overlay(raw, _read_file(local))
+    """``settings.json`` with the ``settings.local.json`` beside it laid over it."""
+    return _overlay(_read_file(path), _read_file(path.with_name(LOCAL_SETTINGS_FILENAME)))
 
 
 def _read_file(path: Path) -> dict:
@@ -612,8 +582,8 @@ def load_usage_settings(backup_root: Path) -> UsageSettings:
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
-    path = settings_path(backup_root)
-    raw = _read_raw(path)
+    path = settings_write_path(backup_root)
+    raw = _read_file(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get("autoswitch")
     if not isinstance(section, dict):
@@ -709,15 +679,8 @@ def _read_raw_for_write(path: Path) -> dict:
 
     ``_read_raw``'s degrade-to-defaults is right for reads, but a
     read-modify-write starting from ``{}`` would replace a malformed (and
-    maybe hand-recoverable) file with a near-empty one. Strict on the
-    overlay too.
+    maybe hand-recoverable) file with a near-empty one.
     """
-    raw = _read_file_strict(path)
-    local = _local_path(path)
-    return raw if local is None else _overlay(raw, _read_file_strict(local))
-
-
-def _read_file_strict(path: Path) -> dict:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -749,7 +712,7 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     """
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
-    path = settings_path(backup_root)
+    path = settings_write_path(backup_root)
     raw = _read_raw_for_write(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get(spec.section)
@@ -762,9 +725,9 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
 
 
 def unset_setting(backup_root: Path, dotted_key: str) -> bool:
-    """Remove one key from the effective settings; False if it wasn't set (no write)."""
+    """Remove one key from the file writes land in; False if not set there (no write)."""
     spec = setting_spec(dotted_key)
-    path = settings_path(backup_root)
+    path = settings_write_path(backup_root)
     raw = _read_raw_for_write(path)
     section = raw.get(spec.section)
     if not isinstance(section, dict) or spec.json_key not in section:
@@ -825,9 +788,7 @@ def atomic_write_json(path: Path, data: dict) -> None:
     """Atomically write JSON with the backup dir's 0600/0700 modes.
 
     Shared by settings.json and the autoswitch state file (and any future
-    machine-local state files beside them). A write to a settings.json is
-    redirected: ``data`` is the full merged view, and only its difference from
-    the file on disk lands in settings.local.json (see the module docstring).
+    machine-local state files beside them).
 
     **Writes THROUGH a symlink, never over it.** A rename swaps a directory
     ENTRY and does not follow links, so renaming onto a symlinked path
@@ -848,10 +809,6 @@ def atomic_write_json(path: Path, data: dict) -> None:
       ours to chmod. The written file still gets 0600, and ``mkstemp``
       creates it 0600 to begin with, so the secret is never exposed.
     """
-    local = _local_path(path)
-    if local is not None:
-        data = _diff(data, _read_file_strict(path))
-        path = local
     target = publish_target(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
