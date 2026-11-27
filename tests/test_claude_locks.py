@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import errno
 import logging
-import math
 import os
 import shutil
 import sys
@@ -863,8 +862,8 @@ class TestProperLockfile:
         "os_name,op,refusals,outcome",
         [
             ("nt", "mkdir", 1, None),
-            ("nt", "mkdir", math.inf, ClaudeCodeLockTimeout),
-            ("nt", "stat", math.inf, ClaudeCodeLockTimeout),
+            ("nt", "mkdir", float("inf"), ClaudeCodeLockTimeout),
+            ("nt", "stat", float("inf"), ClaudeCodeLockTimeout),
             ("posix", "mkdir", 1, PermissionError),
             ("posix", "stat", 1, PermissionError),
         ],

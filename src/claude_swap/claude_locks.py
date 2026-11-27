@@ -291,11 +291,7 @@ def config_lock_dir() -> Path:
 
 
 def _delete_pending(exc: OSError) -> bool:
-    """Windows answers EACCES for a name whose `rmdir` is still delete-pending.
-
-    A peer's release, not a permission, so it is contention there. On POSIX it
-    is a real EACCES and stays an error.
-    """
+    """EACCES from a name whose `rmdir` is still delete-pending: Windows only."""
     return os.name == "nt" and isinstance(exc, PermissionError)
 
 
