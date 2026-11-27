@@ -20,6 +20,7 @@ from claude_swap.process_detection import (
     get_claude_dir,
     get_running_instances,
     is_pid_alive,
+    list_codex_processes,
     list_ide_instances,
     list_sessions,
     pid_matches_record,
@@ -679,6 +680,47 @@ class TestGetRunningInstances:
         sessions, ides = get_running_instances(tmp_path)
         assert sessions == []
         assert ides == []
+
+
+def test_list_codex_processes_labels_and_cwds():
+    from subprocess import CompletedProcess
+
+    ps = "\n".join([
+        "  10 codex",
+        "  11 /opt/homebrew/bin/codex exec fix it",
+        "  12 /Applications/ChatGPT.app/Contents/Resources/codex-cli/codex -c x=1 exec-server",
+        "  13 /Users/u/.codex/bin/codex app-server --listen unix://",
+        "  14 node /usr/lib/node_modules/@openai/codex/bin/codex.js",
+        "  15 /usr/bin/codex-helper",
+    ])
+    # pid 13 has exited by the time lsof runs: no record, and lsof exits 1.
+    lsof = "p10\nfcwd\nn/work/a\np11\nfcwd\nn/work/b\np12\nfcwd\nn/\n"
+    calls = []
+
+    def run(argv, **_):
+        calls.append(argv)
+        out = ps if argv[0] == "ps" else lsof
+        return CompletedProcess(argv, 0 if argv[0] == "ps" else 1, out, "")
+
+    with patch("claude_swap.process_detection.sys.platform", "darwin"), \
+         patch("claude_swap.process_detection.spawn.run", side_effect=run):
+        procs = list_codex_processes()
+
+    assert [(p.pid, p.label, p.cwd) for p in procs] == [
+        (10, "Codex CLI", "/work/a"),
+        (11, "Codex exec", "/work/b"),
+        (12, "Codex app", "/"),
+        (13, "Codex app", "?"),
+    ]
+    assert calls[1][-1] == "10,11,12,13"  # one lsof call for every pid
+
+
+def test_list_codex_processes_empty_on_windows_and_failure():
+    with patch("claude_swap.process_detection.sys.platform", "win32"):
+        assert list_codex_processes() == []
+    with patch("claude_swap.process_detection.sys.platform", "darwin"), \
+         patch("claude_swap.process_detection.spawn.run", side_effect=OSError):
+        assert list_codex_processes() == []
 
 
 # --- Display helpers (in switcher.py) ---

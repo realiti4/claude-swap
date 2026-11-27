@@ -93,7 +93,11 @@ from claude_swap.paths import (
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
 )
-from claude_swap.process_detection import get_running_instances
+from claude_swap.process_detection import (
+    get_running_instances,
+    list_codex_processes,
+    list_sessions,
+)
 from claude_swap import poll_policy
 from claude_swap.settings import (
     UsageSettings,
@@ -6405,7 +6409,7 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         tag_mode = load_ui_settings(self.backup_dir).org_tag
         emails = [info[1] for info in accounts_info]
-        print(bolded("Accounts:"))
+        print(bolded("Claude accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
             tag = self._tag_suffix(tag_mode, emails, email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
@@ -6439,36 +6443,72 @@ class ClaudeAccountSwitcher:
             for msg in lockstep_warnings:
                 warning(msg)
 
+        try:
+            from claude_swap import codex_accounts
+
+            codex_lines = codex_accounts.list_lines()
+            if codex_lines:
+                print("\n" + "\n".join(codex_lines))
+        except Exception:
+            self._logger.debug("Failed to list Codex accounts", exc_info=True)
+
         # Running instances
         try:
-            sessions, ide_instances = get_running_instances()
+            from claude_swap.session import session_dir_for
 
-            if sessions or ide_instances:
-                # Group by (label, folder) to avoid repetitive lines
-                groups: dict[tuple[str, str], dict[str, int]] = {}
-                for session in sessions:
-                    label = entrypoint_label(session.entrypoint)
+            sessions, ide_instances = get_running_instances()
+            # Instances on the default login run as the active account (macOS
+            # picks up a switch once Claude's ~30s Keychain cache expires);
+            # `cswap run` sessions live in their own account's profile.
+            active = next((a for a in accounts_info if a[4]), None)
+            default_account = (
+                f"{active[0]}: {active[6] or active[1]}" if active else "unmanaged login"
+            )
+            tagged = [(s, default_account) for s in sessions]
+            for num, email, _, _, _, _, alias in accounts_info:
+                profile = session_dir_for(self.backup_dir, str(num), email)
+                tagged += [(s, f"{num}: {alias or email}") for s in list_sessions(profile)]
+            # ponytail: every codex process is assumed to use the default
+            # CODEX_HOME, so all run as the live Codex login.
+            codex = list_codex_processes()
+            if codex:
+                try:
+                    codex_account = codex_accounts.active_account() or "unmanaged login"
+                except Exception:
+                    codex_account = "unknown Codex login"
+
+            if tagged or ide_instances or codex:
+                # Group by (label, folder, account) to avoid repetitive lines
+                groups: dict[tuple[str, str, str], dict[str, int]] = {}
+                for session, account in tagged:
+                    label = f"Claude {entrypoint_label(session.entrypoint)}"
                     cwd = abbreviate_path(session.cwd)
-                    key = (label, cwd)
+                    key = (label, cwd, account)
                     counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
                     counts["sessions"] += 1
                 for ide in ide_instances:
-                    name = ide_short_name(ide.ide_name)
+                    name = f"Claude {ide_short_name(ide.ide_name)}"
                     for folder in ide.workspace_folders:
-                        key = (name, abbreviate_path(folder))
+                        key = (name, abbreviate_path(folder), default_account)
                         counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
                         counts["ide"] += 1
+                for proc in codex:
+                    key = (proc.label, abbreviate_path(proc.cwd), codex_account)
+                    groups.setdefault(key, {"sessions": 0, "ide": 0})["sessions"] += 1
 
                 print()
                 print(bolded("Running instances:"))
-                for (label, cwd), counts in groups.items():
+                for (label, cwd, account), counts in groups.items():
                     parts = []
                     s = counts["sessions"]
                     if s:
                         parts.append(f"{s} session{'s' if s > 1 else ''}")
                     if counts["ide"]:
                         parts.append("IDE")
-                    print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
+                    print(
+                        f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  "
+                        f"{dimmed(f'({", ".join(parts)})')}  {accent(account)}"
+                    )
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 

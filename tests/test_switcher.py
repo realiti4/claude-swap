@@ -1861,6 +1861,70 @@ class TestListAccountsUsage:
         assert "  2: account2@example.com" in output
         assert "(account2@example.com)" not in output
 
+    def test_list_running_instances_show_their_account(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A default-profile session runs as the active account; a `cswap run`
+        session runs as its profile's account."""
+        from claude_swap.session import session_dir_for
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        def record(sessions_dir: Path, cwd: str) -> None:
+            sessions_dir.mkdir(parents=True)
+            (sessions_dir / f"{os.getpid()}.json").write_text(json.dumps(
+                {"pid": os.getpid(), "cwd": cwd, "entrypoint": "cli"}
+            ))
+
+        record(temp_home / ".claude" / "sessions", "/work/default")
+        profile = session_dir_for(switcher.backup_dir, "2", "account2@example.com")
+        record(profile / "sessions", "/work/profile")
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            switcher.list_accounts()
+
+        lines = capsys.readouterr().out.splitlines()
+        default_line = next(l for l in lines if "/work/default" in l)
+        profile_line = next(l for l in lines if "/work/profile" in l)
+        assert default_line.endswith("1: test@example.com")
+        assert profile_line.endswith("2: account2@example.com")
+        assert "Claude CLI" in default_line
+
+    def test_list_running_codex_instances_show_live_codex_account(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """Codex processes are listed under the live Codex login, after the
+        Claude and OpenAI account sections."""
+        from claude_swap.process_detection import CodexProcess
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        procs = [CodexProcess(7, "Codex CLI", "/work/codex"), CodexProcess(8, "Codex CLI", "/work/codex")]
+
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.switcher.list_codex_processes", return_value=procs), \
+             patch("claude_swap.codex_accounts.list_lines", return_value=["OpenAI accounts:"]), \
+             patch("claude_swap.codex_accounts.active_account", return_value="2: c@example.com"):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        assert out.index("Claude accounts:") < out.index("OpenAI accounts:") < out.index("Running instances:")
+        codex_line = next(l for l in out.splitlines() if "/work/codex" in l)
+        assert "Codex CLI" in codex_line and "(2 sessions)" in codex_line
+        assert codex_line.endswith("2: c@example.com")
+
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
