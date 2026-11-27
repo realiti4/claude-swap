@@ -1398,6 +1398,33 @@ class TestReserve:
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
+    def test_struck_ok_lifts_the_dead_token_gate_for_the_named_slot_only(
+        self, store, clock
+    ):
+        store.record(
+            {
+                "1": FetchRecord(error="invalid_grant"),
+                "2": FetchRecord(error="invalid_grant"),
+            },
+            IDENT,
+        )
+        clock.advance(TRUST_MAX_AGE_S)
+        won = store.reserve(["1", "2"], IDENT, respect_plans=True, struck_ok={"1"})
+        assert set(won) == {"1"}
+        # Winning the claim clears nothing: the outcome decides the strike.
+        assert store.entries(IDENT)["1"].token_dead()
+
+    def test_struck_ok_still_waits_out_backoff_and_a_live_claim(self, store, clock):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        clock.advance(BACKOFF_BASE_S - 1)
+        assert store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"}) == {}
+        clock.advance(2)
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"})
+        ) == {"1"}
+        # A second collector meets the first one's lease.
+        assert store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"}) == {}
+
     def test_unknown_row_and_identity_mismatch_win(self, store, clock):
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
         # Slot reused by a different account: the old row is invisible and

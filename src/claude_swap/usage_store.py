@@ -220,6 +220,7 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # does, so there is nothing to gain by retrying (and each retry with a dead
 # token just draws a fresh 401/429). At this many strikes the account is
 # quarantined: no more fetches, and the collector surfaces "re-login needed".
+# (``reserve``'s ``struck_ok`` is how a replacement login gets its attempt.)
 # A single success — or a credential refresh via login/add — resets the count
 # and lifts the quarantine. Raise to 2 if a buffer against a one-off
 # misclassification is ever wanted; the trade-off is a ~10-min-slower verdict
@@ -1060,6 +1061,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        struck_ok: Iterable[str] = (),
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1083,10 +1085,17 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+
+        ``struck_ok`` names slots the dead-token gate does not hold back: the
+        caller has found a login for them other than the struck generation
+        and will save it before it fetches. Every other gate still applies,
+        so the attempt is paced like any fetch, and the strike itself is left
+        for the outcome to clear.
         """
         nums = list(nums)
         if not nums:
             return {}
+        struck_ok = set(struck_ok)
         now = self.clock()
         won: dict[str, str] = {}
         with self._lock():
@@ -1099,7 +1108,11 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row,
+                        now,
+                        respect_plans,
+                        repair_overslept,
+                        struck_ok=num in struck_ok,
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -1332,11 +1345,17 @@ def _num_or_none(value: object) -> float | None:
 
 
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    *,
+    struck_ok: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
-    (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    (see :meth:`UsageStore.reserve` for the two caller modes and
+    ``struck_ok``)."""
+    if not struck_ok and int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:

@@ -13431,6 +13431,204 @@ class TestActiveSlotStrikeParity:
         resync.assert_not_called()
 
 
+class TestActiveReloginRecovery:
+    """Issue #456: logging in again with Claude Code replaces the live login
+    only, so a quarantined active slot's backup keeps the struck generation.
+    The collector gives such a slot a paced attempt that saves the new login
+    before it fetches."""
+
+    EMAIL, UUID, ORG = "owner@example.com", "owner-uuid", "owner-org"
+    IDENT = {"1": (EMAIL, ORG)}
+    USAGE = {"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}}
+
+    @staticmethod
+    def _cred(name: str, expires_in_s: int = 3600, refresh: bool = True) -> str:
+        data = {
+            "accessToken": f"at-{name}",
+            "expiresAt": int((time.time() + expires_in_s) * 1000),
+        }
+        if refresh:
+            data["refreshToken"] = f"rt-{name}"
+        return json.dumps({"claudeAiOauth": data})
+
+    def _quarantined(self, temp_home, monkeypatch, old, *, fingerprint=True):
+        """Slot 1 is the active account and ``old`` (live and backup) was
+        refused. Returns the switcher and one mock per endpoint."""
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": self.EMAIL, "accountUuid": self.UUID,
+            "organizationUuid": self.ORG,
+        }}))
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "sequence": [1],
+            "accounts": {"1": {
+                "email": self.EMAIL, "uuid": self.UUID,
+                "organizationUuid": self.ORG,
+            }},
+        })
+        s._write_account_credentials("1", self.EMAIL, old)
+        s._write_credentials(old)
+        claims = s._usage_store.reserve(["1"], self.IDENT, respect_plans=False)
+        s._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(old) if fingerprint else None,
+            )},
+            self.IDENT, claims,
+        )
+        net = MagicMock()
+        net.usage.return_value = oauth.UsageOutcome(usage=self.USAGE)
+        net.profile.return_value = {
+            "uuid": self.UUID, "email": self.EMAIL, "organizationUuid": self.ORG,
+        }
+        net.refresh.return_value = oauth.RefreshOutcome(
+            credentials=None, error="invalid_grant"
+        )
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", net.usage)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", net.profile)
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", net.refresh)
+        # Past the strike's failure backoff, and frozen there: a failed
+        # attempt's backoff then covers the next pass.
+        after_backoff = s._usage_store.clock() + 600
+        s._usage_store.clock = lambda: after_backoff
+        return s, net
+
+    @staticmethod
+    def _collect(s, **kwargs) -> UsageEntry:
+        return s._collect_usage_entries(s._build_accounts_info(), **kwargs)["1"]
+
+    def _row(self, s) -> UsageEntry:
+        return s._usage_store.entries(self.IDENT)["1"]
+
+    def test_new_login_is_saved_then_fetched(self, temp_home: Path, monkeypatch):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        assert self._collect(s).sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+
+        new = self._cred("new")
+        s._write_credentials(new)  # Claude Code's /login
+        entry = self._collect(s)
+
+        assert entry.sentinel is None and entry.last_good == self.USAGE
+        assert s._read_account_credentials("1", self.EMAIL) == new
+        assert not self._row(s).token_dead()
+        # Ownership is settled and the backup saved before the usage request.
+        assert [c[0] for c in net.mock_calls] == ["profile", "usage"]
+        net.profile.assert_called_once_with("at-new")
+
+    def test_no_attempt_inside_the_backoff(self, temp_home: Path, monkeypatch):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        strike_time = s._usage_store.clock() - 600
+        s._usage_store.clock = lambda: strike_time
+        assert self._collect(s).sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+
+    def test_cache_only_pass_makes_no_attempt(self, temp_home: Path, monkeypatch):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        assert self._collect(s, fetch=set()).sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+
+    @pytest.mark.parametrize("profile", [
+        None,
+        {"uuid": "other-uuid", "email": "other@example.com",
+         "organizationUuid": "owner-org"},
+    ], ids=["lookup-unavailable", "another-account"])
+    def test_unverified_login_is_not_fetched_and_the_retry_is_paced(
+        self, temp_home: Path, monkeypatch, profile
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        net.profile.return_value = profile
+
+        for _ in range(3):
+            assert self._collect(s).sentinel == USAGE_RELOGIN_REQUIRED
+
+        # One lookup, then the failure backoff holds the next attempt; no
+        # usage is read with a login nobody attributed to this slot.
+        assert [c[0] for c in net.mock_calls] == ["profile"]
+        assert s._read_account_credentials("1", self.EMAIL) == old
+        assert self._row(s).token_dead() and self._row(s).last_good is None
+
+    def test_the_refused_grant_is_never_posted_again(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The shape in which the active fetch falls back to the backup's
+        grant: the new token is refused and the backup expires later."""
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", 7200)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        new = self._cred("new", 3600)
+        s._write_credentials(new)
+        net.usage.return_value = oauth.UsageOutcome(usage=None, error="http-401")
+
+        entry = self._collect(s)
+
+        posted = [
+            oauth.credential_fingerprint(c.args[0])
+            for c in net.refresh.call_args_list
+        ]
+        assert posted == [oauth.credential_fingerprint(new)]
+        # The new login was refused in its own right, and says so.
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert self._row(s).struck_fingerprint == oauth.credential_fingerprint(new)
+
+    def test_usage_failure_after_the_save_leaves_the_slot_out_of_quarantine(
+        self, temp_home: Path, monkeypatch
+    ):
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        new = self._cred("new")
+        s._write_credentials(new)
+        net.usage.return_value = oauth.UsageOutcome(usage=None, error="http-429")
+
+        assert self._collect(s).sentinel is None
+        assert s._read_account_credentials("1", self.EMAIL) == new
+        assert self._collect(s).sentinel is None
+        assert not self._row(s).token_dead()
+        net.refresh.assert_not_called()
+
+    @pytest.mark.parametrize("case", [
+        "same-generation", "expired", "no-refresh-token", "degraded-read",
+        "strike-without-fingerprint",
+    ])
+    def test_anything_short_of_a_usable_new_login_stays_quarantined(
+        self, temp_home: Path, monkeypatch, case
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", 3600 if case == "same-generation" else -3600)
+        s, net = self._quarantined(
+            temp_home, monkeypatch, old,
+            fingerprint=case != "strike-without-fingerprint",
+        )
+        if case == "expired":
+            s._write_credentials(self._cred("new", -3600))
+        elif case == "no-refresh-token":
+            s._write_credentials(self._cred("new", refresh=False))
+        elif case != "same-generation":
+            s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+        if case == "degraded-read":
+            s._record_active_verdict(ActiveCredentials(info[0][5], False, True))
+
+        assert s._collect_usage_entries(info)["1"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+        assert s._read_account_credentials("1", self.EMAIL) == old
+        # No attempt was claimed either: the row still carries the strike's
+        # own failure, not a failed save.
+        assert self._row(s).last_error == "invalid_grant"
+
+
 class TestUltraReviewCoverageGaps:
     """Ultra-review test-coverage findings: demotion re-read branch,
     degraded+force_refresh, active-path struck_fp stamping, add-path
