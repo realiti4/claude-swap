@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace, subscription
+from claude_swap import codex_usage, oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -389,6 +389,19 @@ def _usage_entry_lines(
     if login_line is not None:
         out.append(f"{dimmed('└')} {login_line}")
     return out
+
+
+def _codex_lines(codex: codex_usage.CodexUsage) -> list[str]:
+    """The ``cswap list`` block for Codex, shaped like an account's.
+
+    The header says which plan and when Codex wrote the figures; the rows are
+    the 5h / 7d ones. No pace marker: pace assumes a fixed weekly cadence,
+    which is not known for Codex.
+    """
+    plan = f" {muted('·')} {muted(codex.plan_label)}" if codex.plan_label else ""
+    header = f"  Codex{plan} {dimmed('(as of ' + codex.read_clock() + ')')}"
+    rows = _usage_entry_lines(UsageEntry(last_good=codex.usage()))
+    return [header, *(f"     {row}" for row in rows)]
 
 
 def _label_token_status(source: str, credentials: str) -> str | None:
@@ -6425,6 +6438,18 @@ class ClaudeAccountSwitcher:
                     print(f"     {dimmed('•')} {muted(line)}")
             if i < len(accounts_info) - 1:
                 print()
+
+        # Codex is an extra: whatever goes wrong there leaves the accounts alone.
+        try:
+            codex = codex_usage.read()
+            codex_lines = _codex_lines(codex) if codex is not None else []
+        except Exception:
+            self._logger.debug("Failed to show Codex usage", exc_info=True)
+            codex_lines = []
+        if codex_lines:
+            print()
+            for line in codex_lines:
+                print(line)
 
         # Safety copies (unclaimed credentials) are deliberately NOT surfaced
         # here: users can't act on them (recovery is always /login + cswap
