@@ -567,13 +567,23 @@ class AutoScreen(Screen):
                 # exist for this account.
                 now = time.time()
                 windows = oauth.relevant_windows(acc.usage.last_good, models)
+                # A window past its reset reads `5h ?` here as on the dashboard:
+                # the stored pct describes the window that ended. The engine's
+                # inputs are untouched; this is how the row is drawn.
+                passed = {
+                    label for label, _p, resets_at in windows
+                    if oauth.window_reset_passed({"resets_at": resets_at}, now)
+                }
                 for i, (label, wpct, resets_at) in enumerate(windows):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
-                    entry.append(
-                        data.chip_label(label, data.reset_text({"resets_at": resets_at}, now)),
-                        style=palette.muted,
-                    )
-                    entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
+                    if label in passed:
+                        entry.append(f"{label} ?", style=palette.muted)
+                    else:
+                        entry.append(
+                            data.chip_label(label, data.reset_text({"resets_at": resets_at}, now)),
+                            style=palette.muted,
+                        )
+                        entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
                     # Once the lines differ, name the one the BINDING window is
                     # judged against; the raw pct stays.
                     if (
@@ -614,8 +624,10 @@ class AutoScreen(Screen):
                 # for ORDERING purposes.
                 kind = "open"
                 if self._settings:
+                    # A `?` chip is left out: a `full` beside it would contradict it.
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), row_bar, weekly,
+                        ((label, p) for label, p, _ in windows if label not in passed),
+                        row_bar, weekly,
                     )
                     if kind == "model":
                         entry.append(

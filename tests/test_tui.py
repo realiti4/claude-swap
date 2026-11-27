@@ -5207,6 +5207,46 @@ class TestUnswitchableRowsAreListed:
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
 
+    def test_a_passed_window_reads_the_same_on_the_panel_and_the_dashboard(self):
+        """One account must not read two ways on two screens. Upstream #625
+        draws a window whose reset has passed as `5h ?` (the stored figure
+        describes the window that ended); the Next-best row drew
+        `5h(⟳now):100%` beside a `5h full` label for the same account."""
+        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        passed = {"resets_at": _iso_in(-60)}
+        entry = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 100.0, **passed},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_in(86400 * 3)},
+                "scoped": [{"name": "Fable", "pct": 100.0, **passed}],
+            },
+            fetched_at=now - 10, age_s=10.0,
+        )
+        panel = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=entry),
+        ), active="1", settings=AutoSwitchSettings(model="Fable"))
+        mini = mini_account_text(make_account(2, entry=entry), now).plain
+        for out in (panel, mini):
+            assert "5h ? · 7d(⟳" in out and "):5%" in out, out
+            assert "100%" not in out and "5h(⟳" not in out, out
+        assert "Fable ?" in panel and "full" not in panel and "-only" not in panel, panel
+
+    def test_the_panel_still_calls_a_window_that_has_not_reset_full(self):
+        """CONTROL for the test above: a window that has not reset keeps its
+        figure, its countdown and the `5h full` label."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 100.0, "resets_at": _iso_in(3600)},
+                "seven_day": {"pct": 5.0},
+            }),
+        ), active="1")
+        assert "5h(⟳" in out and "100%" in out and "  5h full" in out, out
+
     def test_the_full_tag_reads_the_dynamic_switch_bar_not_the_threshold(self):
         """`full` is reserved for actual exhaustion (a window's own pct at
         or over 100) -- never merely at or over the landing bar
