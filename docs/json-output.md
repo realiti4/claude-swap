@@ -15,7 +15,8 @@ Each account row has a `usage` object with `fiveHour` and `sevenDay` windows (`p
 - A window's `pct` is `null` when the usage API reported `utilization: null` for it.
 - A window the account does not have (an Ultra account's `fiveHour`) is omitted.
 - A per-model `scoped` window carries `probeAfter` (ISO-8601) when a setup-token's Fable probe (`usage.fableProbe`) found it used up: the row is kept as read, and Fable is not asked again before that time.
-- Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`).
+- Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view heads them with their age and the failure, e.g. `last read 6m ago (timeout)`).
+- A window's `pct` is the figure as last read. Once its `resetsAt` has passed, that figure describes the window that ended; the human views print `?` for it, and the JSON is unchanged.
 
 ## Optional row fields
 
