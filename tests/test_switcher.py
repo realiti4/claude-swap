@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -1778,6 +1779,12 @@ class TestOrgTagShown:
         assert org_tag_shown(mode, email, emails) is shown
 
 
+def _iso_ahead(**delta) -> str:
+    """A reset time still ahead of the clock, as the usage API writes one."""
+    ahead = datetime.now(timezone.utc) + timedelta(**delta)
+    return ahead.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -1789,8 +1796,8 @@ class TestListAccountsUsage:
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
 
         usage_response = {
-            "five_hour": {"utilization": 10.0, "resets_at": "2026-01-01T00:00:00Z"},
-            "seven_day": {"utilization": 50.0, "resets_at": "2026-01-02T00:00:00Z"},
+            "five_hour": {"utilization": 10.0, "resets_at": _iso_ahead(hours=3)},
+            "seven_day": {"utilization": 50.0, "resets_at": _iso_ahead(days=3)},
         }
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps(usage_response).encode()
@@ -1891,7 +1898,7 @@ class TestListAccountsUsage:
 
         usage_response = {
             "five_hour": {"utilization": 0.0, "resets_at": None},
-            "seven_day": {"utilization": 100.0, "resets_at": "2026-04-03T02:59:59Z"},
+            "seven_day": {"utilization": 100.0, "resets_at": _iso_ahead(days=3)},
         }
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps(usage_response).encode()
@@ -11473,12 +11480,13 @@ class TestFormatUsageLines:
         assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
 
     def test_seven_day_ahead_of_pace_marker(self):
-        # 1 day elapsed of the week (resets_at 6 days out), 50% used -> far
-        # ahead of the ~14% expected at that point (issue #125).
+        # 2 days elapsed of the week (resets_at 5 days out), 50% used -> far
+        # ahead of the ~29% expected at that point (issue #125), and a day
+        # clear of the 24 h suppression after a reset.
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
-        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        now = time.time()
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=5)
         usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
         line = _format_usage_lines(usage, now)[0]
         assert "(ahead of pace)" in line
@@ -11487,7 +11495,7 @@ class TestFormatUsageLines:
         # Pace applies only to weekly windows, never the 5h one (issue #125).
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
+        now = time.time()
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)
         usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at.isoformat()}}
         line = _format_usage_lines(usage, now)[0]
@@ -11496,8 +11504,8 @@ class TestFormatUsageLines:
     def test_scoped_ahead_of_pace_marker_when_under_limit(self):
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
-        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        now = time.time()
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=5)
         usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at.isoformat()}]}
         line = _format_usage_lines(usage, now)[0]
         assert "(ahead of pace)" in line
@@ -11517,11 +11525,107 @@ class TestFormatUsageLines:
         # Just reset (elapsed ~0) -> suppressed even though pct looks "ahead".
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
+        now = time.time()
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)
         usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
         line = _format_usage_lines(usage, now)[0]
         assert "pace" not in line
+
+    def test_window_past_its_reset_has_no_figure_and_no_marker(self):
+        # The stored percentage describes the window that ended (issue #376):
+        # no figure, no "in 0m", no pace or at-limit marker, and the clock in
+        # the same column as a current row's.
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        passed = (now - timedelta(hours=43)).isoformat()
+        ahead = (now + timedelta(days=3, minutes=30)).isoformat()
+        usage = {
+            "five_hour": {"pct": 19.0, "resets_at": passed},
+            "seven_day": {"pct": 22.0, "resets_at": ahead},
+            "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": passed}],
+        }
+        five, seven, fable = _format_usage_lines(usage, now.timestamp())
+        clock = oauth.format_reset(passed)[1]
+        assert five == f"5h:       ?   reset  {clock}"
+        assert fable == f"Fable:    ?   reset  {clock}"
+        assert seven.startswith("7d:     22%   resets ") and "in 3d 0h" in seven
+        assert five.index(clock) == seven.index(oauth.format_reset(ahead)[1])
+
+    def test_weekly_window_past_its_reset_is_not_measured_against_pace(self):
+        from datetime import datetime, timedelta, timezone
+
+        fetched = datetime.now(timezone.utc) - timedelta(days=2)
+        resets_at = (fetched + timedelta(days=1)).isoformat()  # passed a day ago
+        usage = {"seven_day": {"pct": 90.0, "resets_at": resets_at}}
+        line = _format_usage_lines(usage, fetched.timestamp())[0]
+        assert line.startswith("7d:    ?   reset ") and "pace" not in line
+
+
+class TestUsageEntryLinesAge:
+    """Where ``_usage_entry_lines`` puts a reading's age (issue #376)."""
+
+    @staticmethod
+    def _entry(age_s: float, five_hour_resets_in_s: float = 3 * 3600, **fields) -> UsageEntry:
+        now = datetime.now(timezone.utc)
+
+        def at(seconds: float) -> str:
+            return (now + timedelta(seconds=seconds)).isoformat()
+
+        usage = {
+            "five_hour": {"pct": 19.0, "resets_at": at(five_hour_resets_in_s)},
+            "seven_day": {"pct": 22.0, "resets_at": at(3 * 86400)},
+            "scoped": [{"name": "Fable", "pct": 0.0, "resets_at": at(3 * 86400)}],
+        }
+        return UsageEntry(
+            last_good=usage, fetched_at=now.timestamp() - age_s, age_s=age_s, **fields
+        )
+
+    def test_reading_frozen_by_a_429_is_headed_and_its_passed_window_has_no_figure(self):
+        # The report: 45 hours of 429s, the 5h window long over, the weekly
+        # one still open. No row may read as current.
+        entry = self._entry(
+            45 * 3600, five_hour_resets_in_s=-43 * 3600,
+            last_error="http-429", consecutive_failures=40,
+        )
+        head, five, seven, fable = _usage_entry_lines(entry)
+        assert head == "last read 1d ago (http-429)"
+        assert five.startswith("├ 5h:       ?   reset  ") and "19%" not in five
+        assert seven.startswith("├ 7d:     22%   resets ")
+        assert fable.startswith("└ Fable:   0%   resets ")
+        assert "in 0m" not in five and not any("ago" in row for row in (five, seven, fable))
+
+    def test_failed_fetch_heads_a_reading_the_engine_still_trusts(self):
+        # A 429-frozen reading stays decision-trusted until its window resets;
+        # a person reading the list is told at once.
+        entry = self._entry(
+            90 * 60, last_error="http-429", consecutive_failures=3, trust_extended=True
+        )
+        assert entry.decision_value() is not None
+        assert _usage_entry_lines(entry)[0] == "last read 1h ago (http-429)"
+
+    def test_failure_is_worded_as_the_unavailable_line_words_it(self):
+        entry = self._entry(600, last_error="tls-cert", consecutive_failures=1)
+        head = _usage_entry_lines(entry)[0]
+        assert head.startswith("last read 10m ago (the TLS certificate was refused")
+
+    def test_reading_too_old_to_decide_on_is_headed_without_a_failure(self):
+        entry = self._entry(3 * 3600)
+        assert entry.decision_value() is None
+        head, *rows = _usage_entry_lines(entry)
+        assert head == "last read 3h ago"
+        assert not any("ago" in row for row in rows)
+
+    def test_reading_waiting_for_its_scheduled_poll_keeps_the_note_on_its_last_row(self):
+        entry = self._entry(8 * 60, trust_extended=True)
+        lines = _usage_entry_lines(entry)
+        assert [line[:4] for line in lines] == ["├ 5h", "├ 7d", "└ Fa"]
+        assert lines[-1].endswith(" · 8m ago")
+        assert not any("ago" in line for line in lines[:-1])
+
+    def test_fresh_reading_has_no_age(self):
+        lines = _usage_entry_lines(self._entry(30))
+        assert len(lines) == 3 and not any("ago" in line for line in lines)
 
 
 def _read_safety_copy(switcher, entry_id: str) -> str:

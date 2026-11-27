@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
 
@@ -204,33 +204,18 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     return f"{minutes}m"
 
 
-_WEEKLY_PERIOD_S = 7 * 86400  # weekly limits reset on a fixed 7-day cadence
-
-
-def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
-    """A weekly window with a passed reset advanced to its next 7-day boundary.
-
-    Weekly limits reset on a fixed weekly cadence, so once the stored
-    ``resets_at`` is in the past we know the window rolled over — the stored pct
-    belongs to a window that no longer exists. Return a copy reflecting the reset
-    state (``pct`` 0, ``resets_at`` advanced to the next future boundary) so the
-    menu bar shows the reset from the static schedule alone, without waiting to
-    spend tokens on a fresh fetch. Missing/future/unparseable windows are
-    returned unchanged.
+def _title_figure(window: dict | None, now: float) -> str | None:
+    """A window's figure for the title: ``"47%"``, or ``"?"`` once its
+    recorded reset has passed (``oauth.window_reset_passed``: the stored
+    figure describes the window that ended). The placeholder stands in for
+    the figure, labelled like it (``5h ?``) in the two-window title.
+    None for a window the account lacks or one reported without a figure.
     """
-    if not isinstance(window, dict):
-        return window
-    ts = _resets_at_ts(window)
-    if ts == float("inf") or ts > now:
-        return window
-    missed = int((now - ts) // _WEEKLY_PERIOD_S) + 1
-    new_ts = ts + missed * _WEEKLY_PERIOD_S
-    rolled = dict(window)
-    rolled["pct"] = 0.0
-    rolled["resets_at"] = datetime.fromtimestamp(new_ts, tz=timezone.utc).isoformat()
-    rolled.pop("countdown", None)  # recomputed live from the rolled resets_at
-    rolled.pop("clock", None)
-    return rolled
+    if oauth.window_reset_passed(window, now):
+        return "?"
+    if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+        return f"{window['pct']:.0f}%"
+    return None
 
 
 MENU_NOTE_LIMIT = 40
@@ -383,14 +368,13 @@ def usage_summary(
         parts.append(seg)
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
+        if oauth.window_reset_passed(window, now):
+            # The stored figure describes the window that ended: no figure,
+            # and nothing to measure against pace.
+            parts.append(f"{label} ?")
+            continue
         pace_result = None
         if key == "seven_day":
-            window = _rolled_weekly_window(window, now)  # reflect a passed weekly reset
-            # Pace against the rolled window, not the raw one: a stale window
-            # rolled to 0% has no current-cycle data to compare against, so
-            # its (correctly zeroed) pct naturally never reads as "ahead" —
-            # computing pace pre-roll would otherwise pair last cycle's high
-            # pct with this cycle's freshly-reset 0% display.
             pace_result = pace.compute_pace(window, fetched_at=fetched_at)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             seg = f"{label} {window['pct']:.0f}%"
@@ -402,8 +386,11 @@ def usage_summary(
             parts.append(seg)
     # Per-model weekly limits (e.g. Fable), from the usage API's ``limits`` array.
     for window in usage.get("scoped") or []:
-        window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
-        pace_result = pace.compute_pace(window, fetched_at=fetched_at)  # against the rolled window, see above
+        if oauth.window_reset_passed(window, now):
+            if window.get("name"):
+                parts.append(f"{window['name']} ?")  # as the 5h/7d rows above
+            continue
+        pace_result = pace.compute_pace(window, fetched_at=fetched_at)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
             seg = f"{window['name']} {window['pct']:.0f}%"
             if window["pct"] >= 100:
@@ -490,26 +477,21 @@ def format_title(
     if isinstance(active_usage, dict) and isinstance(active_usage.get("rejected"), dict):
         segments.append("rejected (!)")
     active_usage = oauth.display_usage(active_usage)  # no running 5h window shows no 5h
+    windows = active_usage if isinstance(active_usage, dict) else {}
     # Both numbers are labelled: with the 5h window gone the one left would
     # otherwise be a 7d figure sitting where the 5h one used to be.
-    both = settings.title_pct == "both"
-    if settings.title_pct in ("5h", "both"):
-        p = _window_pct(active_usage, "five_hour")
-        if p is not None:
-            segments.append(f"{'5h ' if both else ''}{p:.0f}%")
-    if settings.title_pct in ("7d", "both"):
-        seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
-        seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
-        p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
-        if p is not None:
-            segments.append(f"{'7d ' if both else ''}{p:.0f}%")
-    if settings.title_scoped and isinstance(active_usage, dict):
-        # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
-        # dropdown rows; named so multiple scoped models stay distinguishable.
-        for window in active_usage.get("scoped") or []:
-            window = _rolled_weekly_window(window, now)
-            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-                segments.append(f"{window['name']} {window['pct']:.0f}%")
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        if settings.title_pct in (label, "both"):
+            figure = _title_figure(windows.get(key), now)
+            if figure is not None:
+                segments.append(f"{label} {figure}" if settings.title_pct == "both" else figure)
+    if settings.title_scoped:
+        # Per-model weekly limits (e.g. Fable), same shape as the dropdown
+        # rows; named so multiple scoped models stay distinguishable.
+        for window in windows.get("scoped") or []:
+            figure = _title_figure(window, now)
+            if figure is not None and window.get("name"):
+                segments.append(f"{window['name']} {figure}")
     if not segments:
         return icon
     return f"{icon} " + " · ".join(segments)

@@ -780,6 +780,29 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
+def window_reset_passed(window: dict | None, now: float | None = None) -> bool:
+    """Whether a usage window's recorded reset has come.
+
+    From then on the stored percentage describes a window that has ended, so
+    the human views print no figure for it. Claude Code 2.1.332 applies the
+    same test to the windows it holds: one is kept only while ``resets_at``
+    lies ahead. A window whose ``resets_at`` is missing or unreadable has not
+    passed one; ``format_reset`` reads exactly the values this accepts, so a
+    passed window always has a clock to print.
+    """
+    if not isinstance(window, dict) or not window.get("resets_at"):
+        return False
+    now_utc = (
+        datetime.now(timezone.utc)
+        if now is None
+        else datetime.fromtimestamp(now, tz=timezone.utc)
+    )
+    try:
+        return datetime.fromisoformat(window["resets_at"]) <= now_utc
+    except (ValueError, TypeError):
+        return False
+
+
 def request_usage_data(
     access_token: str, *, request_log: bool = False, slot: str | None = None
 ) -> dict:

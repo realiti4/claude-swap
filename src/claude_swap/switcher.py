@@ -198,6 +198,19 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
     return "  (ahead of pace)" if result and result.ahead else ""
 
 
+def _passed_reset_body(window: dict) -> str:
+    """Row body for a window whose reset has passed
+    (``oauth.window_reset_passed``): when it ended, with no figure and no
+    marker, since the stored ones describe the window that ended. Laid out
+    like a current row, so the clocks share a column::
+
+        ├ 5h:    ?   reset  Nov 26 03:20
+        └ 7d:  22%   resets Nov 30 22:20  in 2d 23h
+    """
+    _countdown, clock = oauth.fresh_reset_strings(window)
+    return f"   ?   {'reset':<6} {clock}"
+
+
 def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str, str]]:
     """(label, body) rows for one usage measurement, unpadded.
 
@@ -219,6 +232,9 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
+            if oauth.window_reset_passed(w):
+                rows.append((label, _passed_reset_body(w)))
+                continue
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
             marker = _pace_marker(w, fetched_at) if label == "7d" else ""
             # ``pct`` None (utilization unavailable) renders as ``?``, never 0%.
@@ -230,6 +246,9 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
             else:
                 rows.append((label, f"{pct}{marker}"))
     for w in usage.get("scoped") or []:
+        if oauth.window_reset_passed(w):
+            rows.append((w["name"], _passed_reset_body(w)))
+            continue
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
         marker = "  (!)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
@@ -432,13 +451,24 @@ def _usage_entry_lines(
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
-    line when an older measurement exists. Measurements render as usual, age-
-    annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served); an account
-    with no measurement at all shows "usage unavailable" plus the last fetch
-    error, so a failing endpoint is visible instead of a silent blank. A
-    "login" row (``_login_row``) ends the block while the slot's stored login
-    is due for renewal, whichever branch, so it shows under a sentinel or a
-    missing measurement too.
+    line when an older measurement exists. Measurements render as usual, with
+    their age once older than ``_USAGE_AGE_NOTE_S``. A reading that is only
+    waiting for its next scheduled poll carries the age on its last row. One
+    whose latest fetch failed, or that is too old to drive a switch decision
+    (``UsageEntry.decision_value``), is headed by it instead, with the
+    failure, so no row below reads as current::
+
+        last read 1d ago (http-429)
+        ├ 5h:    ?   reset  Nov 26 03:20
+        └ 7d:  22%   resets Nov 30 22:20  in 2d 23h
+
+    Claude Code 2.1.332's usage screen heads a reading it could not refresh
+    the same way ("Showing last-known usage as of ... (couldn't refresh)").
+    An account with no measurement at all shows "usage unavailable" plus the
+    last fetch error, so a failing endpoint is visible instead of a silent
+    blank. A "login" row (``_login_row``) ends the block while the slot's
+    stored login is due for renewal, whichever branch, so it shows under a
+    sentinel or a missing measurement too.
     """
     login_row = _login_row(login_expires_at, entry.sentinel == USAGE_RELOGIN_REQUIRED)
     login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1)) if login_row else None
@@ -459,17 +489,26 @@ def _usage_entry_lines(
         extra = (login_row,) if login_row is not None else ()
         lines = _format_usage_lines(entry.last_good, entry.fetched_at, extra_rows=extra)
         usage_count = len(lines) - len(extra)
+        out = []
         if (
             usage_count
             and entry.age_s is not None
             and entry.age_s > _USAGE_AGE_NOTE_S
             and entry.fetched_at is not None
         ):
-            lines[usage_count - 1] += f" · {format_age(int(entry.fetched_at * 1000))}"
-        return [
+            age = format_age(int(entry.fetched_at * 1000))
+            if entry.last_error:
+                note = ERROR_NOTES.get(entry.last_error, entry.last_error)
+                out.append(dimmed(f"last read {age} ({note})"))
+            elif entry.decision_value() is None:
+                out.append(dimmed(f"last read {age}"))
+            else:
+                lines[usage_count - 1] += f" · {age}"
+        out.extend(
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
-        ]
+        )
+        return out
     detail = "usage unavailable"
     if entry.last_error:
         detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"

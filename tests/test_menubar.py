@@ -233,23 +233,18 @@ def test_usage_summary_no_pace_marker_without_fetched_at():
     assert "ahead" not in out
 
 
-def test_usage_summary_no_pace_marker_on_window_rolled_to_zero():
-    # A weekly window whose resets_at has already passed (stale cache, not
-    # refetched since the actual reset) is rolled to a display pct of 0% —
-    # pace must be computed against that rolled 0%, not the raw stale pct,
-    # or the display would show "7d 0% (ahead)" (a marker paired with a
-    # percentage it doesn't correspond to).
+def test_usage_summary_no_pace_marker_on_a_window_past_its_reset():
+    # The stored 95% describes the week that ended (stale cache, not refetched
+    # since the reset): no figure, so nothing to call ahead of pace.
     usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-3 * 86400)}}
-    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
-    assert "ahead" not in out
-    assert "7d 0%" in out
+    assert menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400) == "7d ?"
 
 
-def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
-    usage = {"scoped": [{"name": "Fable", "pct": 95.0, "resets_at": _iso(-3 * 86400)}]}
-    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
-    assert "ahead" not in out
-    assert "Fable 0%" in out
+def test_usage_summary_scoped_no_marker_on_a_window_past_its_reset():
+    # Neither "(ahead)" nor the at-limit "(!)" outlives the window it was read in.
+    for pct in (95.0, 100.0):
+        usage = {"scoped": [{"name": "Fable", "pct": pct, "resets_at": _iso(-3 * 86400)}]}
+        assert menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400) == "Fable ?"
 
 
 def test_format_account_label():
@@ -508,9 +503,8 @@ def test_usage_summary_live_countdown_from_resets_at():
     assert menubar.usage_summary(usage, _NOW) == "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ 30%"
 
 
-def test_usage_summary_omits_countdown_when_passed_or_missing():
-    # 5h reset already passed (stale data) -> omit; 7d has no resets_at -> omit
-    usage = {"five_hour": {"pct": 53.0, "resets_at": _iso(-60)}, "seven_day": {"pct": 8.0}}
+def test_usage_summary_omits_countdown_when_missing():
+    usage = {"five_hour": {"pct": 53.0}, "seven_day": {"pct": 8.0}}
     assert menubar.usage_summary(usage, _NOW) == "5h 53% · 7d 8%"
 
 
@@ -643,50 +637,67 @@ def test_take_worker_snapshot_bypasses_store_only_on_explicit_refresh():
     assert calls[-1] == (False, False)
 
 
-# --- weekly reset roll-forward (static 7-day cadence) --------------------------
+# --- a window whose recorded reset has passed (issue #376) ---------------------
 
-def test_rolled_weekly_window_advances_passed_reset():
-    w = {"pct": 95.0, "resets_at": _iso(-3 * 86400), "countdown": "stale", "clock": "old"}
-    rolled = menubar._rolled_weekly_window(w, _NOW)
-    assert rolled["pct"] == 0.0  # the window objectively rolled over
-    assert abs(menubar._resets_at_ts(rolled) - (_NOW + 4 * 86400)) < 1
-    assert "countdown" not in rolled and "clock" not in rolled  # stale strings dropped
-
-
-def test_rolled_weekly_window_advances_multiple_missed_weeks():
-    w = {"pct": 80.0, "resets_at": _iso(-10 * 86400)}  # two boundaries crossed
-    rolled = menubar._rolled_weekly_window(w, _NOW)
-    assert abs(menubar._resets_at_ts(rolled) - (_NOW + 4 * 86400)) < 1
+def test_usage_summary_shows_no_figure_for_a_window_past_its_reset():
+    # The report's reading: the 5h window is over, the weekly one still open.
+    usage = {
+        "five_hour": {"pct": 19.0, "resets_at": _iso(-43 * 3600)},
+        "seven_day": {"pct": 22.0, "resets_at": _iso(3 * 86400)},
+    }
+    assert menubar.usage_summary(usage, _NOW) == "5h ? · 7d 22% (3d 0h)"
 
 
-def test_rolled_weekly_window_leaves_future_or_unknown_untouched():
-    future = {"pct": 42.0, "resets_at": _iso(2 * 86400)}
-    assert menubar._rolled_weekly_window(future, _NOW) is future
-    no_reset = {"pct": 42.0}
-    assert menubar._rolled_weekly_window(no_reset, _NOW) is no_reset
-    assert menubar._rolled_weekly_window(None, _NOW) is None
-
-
-def test_usage_summary_reflects_passed_weekly_reset():
-    # 7d reset a day ago: show it as reset (0%) with the next weekly boundary,
-    # from the static schedule alone. 5h is untouched (dynamic session window).
+def test_usage_summary_does_not_project_a_passed_weekly_reset():
+    # No 0% and no next reset worked out from a 7-day cadence: nothing has
+    # been read since the reset, so nothing is claimed about the new week.
     usage = {
         "five_hour": {"pct": 10.0},
         "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
     }
-    assert menubar.usage_summary(usage, _NOW) == "5h 10% · 7d 0% (6d 0h)"
+    assert menubar.usage_summary(usage, _NOW) == "5h 10% · 7d ?"
+    weeks_ago = {"seven_day": {"pct": 80.0, "resets_at": _iso(-10 * 86400)}}
+    assert menubar.usage_summary(weeks_ago, _NOW) == "7d ?"
 
 
-def test_usage_summary_scoped_reflects_passed_weekly_reset():
-    usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(-86400)}]}
-    # rolled to 0% → the over-limit "(!)" marker is gone too
-    assert menubar.usage_summary(usage, _NOW) == "Fable 0% (6d 0h)"
+def test_usage_summary_passed_from_the_reset_instant_on():
+    at_reset = {"five_hour": {"pct": 53.0, "resets_at": _iso(0)}}
+    assert menubar.usage_summary(at_reset, _NOW) == "5h ?"
+    a_minute_left = {"five_hour": {"pct": 53.0, "resets_at": _iso(60)}}
+    assert menubar.usage_summary(a_minute_left, _NOW) == "5h 53% (1m)"
 
 
-def test_format_title_reflects_passed_weekly_reset():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
-    usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
-    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
+def test_measured_zero_and_missing_window_are_not_a_passed_reset():
+    # A measured 0% is a figure, and a window the account lacks has no row;
+    # neither is the "?" of a window whose reset has passed.
+    usage = {"seven_day": {"pct": 0.0, "resets_at": _iso(6 * 86400)}}
+    assert menubar.usage_summary(usage, _NOW) == "7d 0% (6d 0h)"
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 7d 0%"
+
+
+def test_format_title_keeps_each_figure_in_place_past_a_reset():
+    # A window past its reset leaves a labelled placeholder, not a gap.
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    five_passed = {
+        "five_hour": {"pct": 19.0, "resets_at": _iso(-43 * 3600)},
+        "seven_day": {"pct": 22.0, "resets_at": _iso(3 * 86400)},
+    }
+    assert menubar.format_title("a@x.com", five_passed, s, _NOW) == "⇄ 5h ? · 7d 22%"
+    weekly_passed = {
+        "five_hour": {"pct": 19.0, "resets_at": _iso(3600)},
+        "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
+    }
+    assert menubar.format_title("a@x.com", weekly_passed, s, _NOW) == "⇄ 5h 19% · 7d ?"
+
+
+def test_format_title_scoped_past_its_reset():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off", title_scoped=True)
+    usage = {"scoped": [
+        {"name": "Fable", "pct": 100.0, "resets_at": _iso(-86400)},
+        {"name": "Opus", "pct": 7.0, "resets_at": _iso(86400)},
+    ]}
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ Fable ? · Opus 7%"
 
 
 # --- run() app glue ------------------------------------------------------------
