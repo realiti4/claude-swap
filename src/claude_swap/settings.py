@@ -6,6 +6,12 @@ atomically with the backup dir's 0600/0700 modes. v1 carries the
 be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
+``settings.local.json`` beside it is opt-in: once someone creates it, it
+overrides ``settings.json`` (a section present in both merges key by key, local
+wins; any other value is replaced) and takes every write, so a version-controlled
+``settings.json`` is left alone. ``settings_write_path`` names the file a write
+lands in.
+
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
 A key nothing reads (a typo, or a key from another version) is kept in the
@@ -30,6 +36,7 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
+LOCAL_SETTINGS_FILENAME = "settings.local.json"
 AUTOSWITCH_STRATEGIES = (
     "best", "weekly-first", "consume-first", "priority-consume-first",
 )
@@ -308,6 +315,34 @@ def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
 
 
+def settings_stamp(backup_root: Path) -> tuple[float | None, float | None]:
+    """Change token for the effective settings: both files' mtimes."""
+    stamp = []
+    for path in (settings_path(backup_root), backup_root / LOCAL_SETTINGS_FILENAME):
+        try:
+            stamp.append(path.stat().st_mtime)
+        except OSError:
+            stamp.append(None)
+    return tuple(stamp)
+
+
+def settings_write_path(backup_root: Path) -> Path:
+    """The file a settings write lands in: ``settings.local.json`` once someone
+    has created it, else ``settings.json``. ``lexists``: a dangling link counts,
+    as it does for ``atomic_write_json``."""
+    local = backup_root / LOCAL_SETTINGS_FILENAME
+    return local if os.path.lexists(local) else settings_path(backup_root)
+
+
+def _overlay(base: dict, local: dict) -> dict:
+    """``base`` with ``local`` laid over it, one level under each section."""
+    out = dict(base)
+    for key, value in local.items():
+        old = out.get(key)
+        out[key] = {**old, **value} if isinstance(value, dict) and isinstance(old, dict) else value
+    return out
+
+
 def parse_model_names(value: str | None) -> tuple[str, ...]:
     """Split a comma-separated model list, trimmed and case-insensitively
     deduped (first spelling wins). Shared by the auto engine and the manual
@@ -380,8 +415,13 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
 
 def _read_raw(path: Path) -> dict:
+    """``settings.json`` with the ``settings.local.json`` beside it laid over it."""
+    return _overlay(_read_file(path), _read_file(path.with_name(LOCAL_SETTINGS_FILENAME)))
+
+
+def _read_file(path: Path) -> dict:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8").strip() or "{}")
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -552,8 +592,8 @@ def load_usage_settings(backup_root: Path) -> UsageSettings:
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
-    path = settings_path(backup_root)
-    raw = _read_raw(path)
+    path = settings_write_path(backup_root)
+    raw = _read_file(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get("autoswitch")
     if not isinstance(section, dict):
@@ -658,7 +698,7 @@ def _read_raw_for_write(path: Path) -> dict:
     except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"could not read {path}: {e}") from e
     try:
-        raw = json.loads(text)
+        raw = json.loads(text.strip() or "{}")  # a touched, empty file is {}
     except json.JSONDecodeError as e:
         raise ConfigError(
             f"{path} is not valid JSON ({e}); fix or delete it before "
@@ -682,7 +722,7 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     """
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
-    path = settings_path(backup_root)
+    path = settings_write_path(backup_root)
     raw = _read_raw_for_write(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get(spec.section)
@@ -695,9 +735,9 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
 
 
 def unset_setting(backup_root: Path, dotted_key: str) -> bool:
-    """Remove one key from settings.json; False if it wasn't set (no write)."""
+    """Remove one key from the file writes land in; False if not set there (no write)."""
     spec = setting_spec(dotted_key)
-    path = settings_path(backup_root)
+    path = settings_write_path(backup_root)
     raw = _read_raw_for_write(path)
     section = raw.get(spec.section)
     if not isinstance(section, dict) or spec.json_key not in section:
@@ -713,9 +753,10 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
 def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, bool]]:
     """(spec, effective value, explicitly set?) per key, in registry order.
 
-    "Set" means the key is present in the raw file — an explicit value equal
-    to the default still counts — so `cswap config`'s "(default)" marker
-    reflects the file, not value equality.
+    "Set" means the key is present in the merged settings.json plus
+    settings.local.json — an explicit value equal to the default still counts
+    — so `cswap config`'s "(default)" marker reflects the files, not value
+    equality.
     """
     raw = _read_raw(settings_path(backup_root))
     loaded = {
