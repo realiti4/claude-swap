@@ -1315,7 +1315,11 @@ class UsageStore:
         self._mutate(identities, plans.keys(), apply)
 
     def clear_dead_token(
-        self, nums: Iterable[str], identities: dict[str, Identity]
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        *,
+        keep_claim: bool = False,
     ) -> None:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
@@ -1323,14 +1327,20 @@ class UsageStore:
         strike count (and the failure/backoff state riding with it) no longer
         reflects reality, and the account must become fetch-eligible again so the
         next pass can prove the new token good. A no-op for rows with no strikes.
+
+        ``keep_claim`` is for the caller that holds the row's lease and is
+        about to fetch with the new credential: its lease stays, so
+        :meth:`record` accepts that fetch's outcome and the backoff a failure
+        sets is the row's own.
         """
         nums = list(nums)
         if not nums:
             return
 
         def apply(_num: str, row: dict) -> None:
-            row["claimId"] = None
-            row["claimUntil"] = 0.0
+            if not keep_claim:
+                row["claimId"] = None
+                row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0

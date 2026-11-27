@@ -13583,24 +13583,78 @@ class TestActiveReloginRecovery:
         assert entry.sentinel == USAGE_RELOGIN_REQUIRED
         assert self._row(s).struck_fingerprint == oauth.credential_fingerprint(new)
 
-    def test_usage_failure_after_the_save_leaves_the_slot_out_of_quarantine(
+    def test_a_429_after_the_save_keeps_its_deadline(
         self, temp_home: Path, monkeypatch
     ):
         old = self._cred("old", -3600)
         s, net = self._quarantined(temp_home, monkeypatch, old)
         new = self._cred("new")
         s._write_credentials(new)
-        net.usage.return_value = oauth.UsageOutcome(usage=None, error="http-429")
+        net.usage.return_value = oauth.UsageOutcome(
+            usage=None, error="http-429", retry_after_s=900.0
+        )
 
         assert self._collect(s).sentinel is None
+        row = self._row(s)
         assert s._read_account_credentials("1", self.EMAIL) == new
+        assert not row.token_dead() and row.last_error == "http-429"
+        assert row.backoff_until is not None
+        assert row.backoff_until >= s._usage_store.clock() + 900
+
+        # The strike went with the save, so no later pass clears the row and
+        # the server's deadline with it.
         assert self._collect(s).sentinel is None
-        assert not self._row(s).token_dead()
+        assert net.usage.call_count == 1
+        assert self._row(s).backoff_until == row.backoff_until
         net.refresh.assert_not_called()
 
+    def test_another_collector_during_the_request_leaves_its_outcome_to_land(
+        self, temp_home: Path, monkeypatch
+    ):
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+
+        def during_the_request(*_args, **_kwargs):
+            # A second surface's cache-only pass while the first is waiting.
+            s._collect_usage_entries(info, fetch=set())
+            return oauth.UsageOutcome(
+                usage=None, error="http-429", retry_after_s=900.0
+            )
+
+        net.usage.side_effect = during_the_request
+        s._collect_usage_entries(info)
+
+        row = self._row(s)
+        assert row.last_error == "http-429"
+        assert row.backoff_until is not None
+
+    def test_a_backup_another_writer_replaced_is_not_taken_for_the_save(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The struck grant is gone from the backup, but not because this
+        login was verified and saved."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        third = self._cred("third")
+
+        def failed_lookup(_token):
+            s._write_account_credentials("1", self.EMAIL, third)
+            return None
+
+        net.profile.side_effect = failed_lookup
+        self._collect(s)
+
+        net.usage.assert_not_called()
+        assert self._row(s).last_error == "login-unverified"
+        assert self._row(s).last_good is None
+        assert s._read_account_credentials("1", self.EMAIL) == third
+
     @pytest.mark.parametrize("case", [
-        "same-generation", "expired", "no-refresh-token", "degraded-read",
-        "strike-without-fingerprint",
+        "same-generation", "expired", "no-expiry", "infinite-expiry",
+        "no-refresh-token", "degraded-read", "strike-without-fingerprint",
     ])
     def test_anything_short_of_a_usable_new_login_stays_quarantined(
         self, temp_home: Path, monkeypatch, case
@@ -13613,6 +13667,13 @@ class TestActiveReloginRecovery:
         )
         if case == "expired":
             s._write_credentials(self._cred("new", -3600))
+        elif case in ("no-expiry", "infinite-expiry"):
+            login = json.loads(self._cred("new"))
+            if case == "no-expiry":
+                del login["claudeAiOauth"]["expiresAt"]
+            else:
+                login["claudeAiOauth"]["expiresAt"] = float("inf")
+            s._write_credentials(json.dumps(login))
         elif case == "no-refresh-token":
             s._write_credentials(self._cred("new", refresh=False))
         elif case != "same-generation":

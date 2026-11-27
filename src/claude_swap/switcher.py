@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -5768,9 +5769,7 @@ class ClaudeAccountSwitcher:
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             entry = entries.get(num) if entries else None
-            if num in relogged and not (
-                entry is not None and self._save_active_login(entry, info)
-            ):
+            if num in relogged and not self._save_active_login(info):
                 # An error, not a sentinel: the store's failure backoff then
                 # paces the next attempt.
                 self._logger.info(
@@ -5960,10 +5959,11 @@ class ClaudeAccountSwitcher:
         and the fetch that wins the claim saves the new login first
         (:meth:`_save_active_login`).
 
-        False for an expired or incomplete live credential, which has
-        nothing to verify with; for a degraded read, whose bytes may be a
-        stale copy; and for a strike recorded without a fingerprint, which
-        cannot be told apart from the live generation.
+        False for an incomplete live credential, and for one that is expired
+        or carries no finite expiry time, which has nothing to verify with;
+        for a degraded read, whose bytes may be a stale copy; and for a strike
+        recorded without a fingerprint, which cannot be told apart from the
+        live generation.
         """
         _num, _email, _org_name, _org_uuid, is_active, creds, _alias = account_info
         if not is_active or self._active_read_degraded:
@@ -5971,28 +5971,45 @@ class ClaudeAccountSwitcher:
         live = oauth.extract_oauth_data(creds)
         if not (live and live.get("accessToken") and live.get("refreshToken")):
             return False
-        if oauth.is_oauth_token_expired(live.get("expiresAt")):
+        expires_at = live.get("expiresAt")
+        if not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
+            return False
+        if oauth.is_oauth_token_expired(expires_at):
             return False
         return not entry.token_dead(stored_fp=oauth.credential_fingerprint(creds))
 
     def _save_active_login(
-        self,
-        entry: UsageEntry,
-        account_info: tuple[int, str, str, str, bool, str, str],
+        self, account_info: tuple[int, str, str, str, bool, str, str]
     ) -> bool:
-        """Save a quarantined active slot's new live login as its backup.
-        True once no stored source holds the struck generation.
+        """Save a quarantined active slot's new live login as its backup and
+        lift the quarantine. True once the backup holds that login.
 
         The write is :meth:`_resync_rotated_backup`'s: the profile endpoint
         must name this slot's account, and the live store is re-read under
-        the locks. Nothing is sent to the token endpoint. On False the backup
-        and the strike are as they were and the caller does not fetch: while
-        the struck grant is still stored, the active fetch could fall back to
-        posting it.
+        the locks. Nothing is sent to the token endpoint. The strike is
+        cleared here, with the caller's lease kept, so that the fetch that
+        follows records as any other: its failure sets the row's backoff, and
+        no later pass has a stale strike left to clear.
+
+        On False the backup and the strike are untouched and the caller does
+        not fetch. A backup that some other writer replaced meanwhile answers
+        False too: the struck grant is gone, but this login was not the one
+        saved, and the next pass treats the slot by the ordinary rules.
         """
-        num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
+        num, email, _org_name, org_uuid, _active, creds, _alias = account_info
         self._resync_rotated_backup(str(num), email, org_uuid, creds)
-        return not self._entry_token_dead(entry, str(num), email, creds, is_active)
+        backup, unreadable = self._read_account_credentials_ex(str(num), email)
+        if (
+            unreadable
+            or not backup
+            or oauth.credential_fingerprint(backup)
+            != oauth.credential_fingerprint(creds)
+        ):
+            return False
+        self._usage_store.clear_dead_token(
+            [str(num)], {str(num): (email, org_uuid or "")}, keep_claim=True
+        )
+        return True
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?

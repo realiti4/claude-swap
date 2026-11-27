@@ -1320,6 +1320,26 @@ class TestDeadTokenQuarantine:
         assert entry.last_error is None
         assert entry.backoff_until is None
 
+    def test_clear_dead_token_keeps_the_lease_only_when_asked(self, store, clock):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S)
+        outcome = {"1": FetchRecord(error="http-429", retry_after_s=900.0)}
+
+        claims = store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"})
+        store.clear_dead_token(["1"], IDENT, keep_claim=True)
+        assert not store.entries(IDENT)["1"].token_dead()
+        # The lease holder's outcome lands, and its backoff is the row's own.
+        assert store.record(outcome, IDENT, claims) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_error == "http-429"
+        assert entry.consecutive_failures == 1
+        assert entry.backoff_until >= clock.now + 900
+
+        clock.advance(TRUST_MAX_AGE_S)
+        claims = store.reserve(["1"], IDENT, respect_plans=False)
+        store.clear_dead_token(["1"], IDENT)
+        assert store.record(outcome, IDENT, claims) == set()
+
 
 class TestReserve:
     """Atomic fetch reservation: eligibility re-checked under the lock."""
