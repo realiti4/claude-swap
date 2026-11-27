@@ -45,6 +45,9 @@ class ClaudeSession:
     kind: str  # "interactive", "bg", "daemon", "daemon-worker"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
     status: str | None = None  # "busy", "idle", "waiting"
+    # Remote Control bridge id; Claude Code writes it when the bridge attaches
+    # and null when it detaches.
+    bridge_session_id: str | None = None
 
 
 @dataclass
@@ -292,6 +295,12 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
                 kind=data.get("kind", ""),
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
+                bridge_session_id=(
+                    bridge_id
+                    if isinstance(bridge_id := data.get("bridgeSessionId"), str)
+                    and bridge_id
+                    else None
+                ),
             ))
         except (
             json.JSONDecodeError,   # malformed JSON
@@ -360,6 +369,11 @@ def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
         ) as exc:
             logger.debug("Skipping IDE lockfile %s: %s", path, exc)
     return instances
+
+
+def remote_control_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
+    """Live sessions currently attached to Remote Control."""
+    return [s for s in list_sessions(claude_dir) if s.bridge_session_id]
 
 
 def get_running_instances(
