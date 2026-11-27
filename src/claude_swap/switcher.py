@@ -3954,13 +3954,20 @@ class ClaudeAccountSwitcher:
             return creds
         # Same address, different org: naming the address twice says
         # nothing (it's the address that agrees) -- name the two
-        # organizations that disagree instead.
+        # organizations that disagree instead. Either side can be the stale
+        # one: the credential store may hold another organization's token,
+        # or the config may name the organization of an earlier login. A
+        # new login repairs either, so the message gives that one way out
+        # without picking a side: Claude Code 2.1.332 stores ``oauthAccount``
+        # from the new token's profile on sign-in, then saves the token.
+        seen_label = f"organization {seen_org}" if seen_org else "your personal account"
+        config_label = f"organization {org_uuid}" if org_uuid else "your personal account"
         raise ConfigError(
-            f"The stored credential for {email} belongs to organization "
-            f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
-            f"Nothing was changed. Two accounts can share an email "
-            f"across organizations. Log in as {email} in the "
-            f"{org_uuid or 'personal'} organization in THIS environment, "
+            f"The stored credential for {email} belongs to {seen_label}, "
+            f"but the config names {config_label}. Nothing was changed. "
+            f"Two accounts can share an email across organizations, and "
+            f"either the credential or the config is out of date. Log in "
+            f"again in THIS environment to the account you want to add, "
             f"then re-run."
         )
 
