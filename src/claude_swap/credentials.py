@@ -290,6 +290,8 @@ def _credential_object(credentials: str | None) -> dict | None:
 _STAMPED_ID_KEYS = ("accountUuid", "organizationUuid")
 # Bound on each lock the observed-login strip takes: the next pass retries.
 _STRIP_LOCK_TIMEOUT_S = 2.0
+# Holds the fingerprint of the generation `_reseat_blank_keychain_login` last seated.
+_RESEAT_MARKER = ".reseated-login"
 
 
 def _drop_stamped_ids(credentials: str) -> str:
@@ -300,6 +302,28 @@ def _drop_stamped_ids(credentials: str) -> str:
         return credentials
     data["claudeAiOauth"] = {k: v for k, v in login.items() if k not in _STAMPED_ID_KEYS}
     return json.dumps(data)
+
+
+def _seatable_login(credentials: str) -> "dict | None":
+    """``credentials``' ``claudeAiOauth`` without the stamped ids, when it is a
+    complete pair with an unexpired access token; else None."""
+    login = oauth.extract_oauth_data(_drop_stamped_ids(credentials))
+    expires = login.get("expiresAt") if login else None
+    if (
+        login and login.get("accessToken") and login.get("refreshToken")
+        and isinstance(expires, (int, float)) and not oauth.is_oauth_token_expired(expires)
+    ):
+        return login
+    return None
+
+
+def _blank_item(stored: "str | None") -> "dict | None":
+    """The parsed Keychain item when its ``claudeAiOauth`` has both tokens empty
+    (what Claude Code's invalid_grant handler leaves), else None."""
+    data = _credential_object(stored)
+    login = data.get("claudeAiOauth") if data else None
+    blank = isinstance(login, dict) and not login.get("accessToken") and not login.get("refreshToken")
+    return data if blank else None
 
 
 # The credential object's siblings of claudeAiOauth are not uniformly owned:
@@ -1517,21 +1541,7 @@ class CredentialStore:
                     return creds
                 if keychain:
                     macos_keychain.set_password(*item, stripped)
-                    # Claude Code drops its memoized login only on a file mtime
-                    # change; the file may hold another lineage, so never write it.
-                    # Stamp it to the item's mdat as the adopt sync does: "now" would
-                    # outrun the item and `_fresher_plaintext_login` would serve it.
-                    mdat = self._active_oauth_keychain_mdat()
-                    if mdat is not None:
-                        try:
-                            os.utime(get_credentials_path(), (mdat, mdat))
-                        except FileNotFoundError:
-                            pass
-                        except OSError as e:
-                            self._host._logger.warning(
-                                f"Could not stamp .credentials.json after the strip ({e}); "
-                                "a running session may keep the ids until restart"
-                            )
+                    self._stamp_credentials_file_to_item_mdat("the strip")
                 else:
                     self._write_active_credentials_file(stripped)
         except (ClaudeSwitchError, *macos_keychain.KEYCHAIN_ERRORS) as e:
@@ -1544,6 +1554,100 @@ class CredentialStore:
             creds, slot=None, outcome="stripped the stamped ids from the live store",
         )
         return stripped
+
+    def _stamp_credentials_file_to_item_mdat(self, after: str) -> None:
+        """Set a present ``.credentials.json``'s mtime to the Keychain item's mdat.
+
+        Claude Code drops its memoized login only on a file mtime change; the
+        file may hold another lineage, so its bytes are never written. "now"
+        would outrun the item and `_fresher_plaintext_login` would serve the
+        file, so the adopt sync's stamp is used. Non-raising.
+        """
+        mdat = self._active_oauth_keychain_mdat()
+        if mdat is None:
+            return
+        try:
+            os.utime(get_credentials_path(), (mdat, mdat))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self._host._logger.warning(
+                f"Could not stamp .credentials.json after {after} ({e}); "
+                "a running session may keep the old login until restart"
+            )
+
+    def _reseat_blank_keychain_login(
+        self, active: ActiveCredentials, account_num: str, email: str, creds: str,
+    ) -> str:
+        """The login the pass continues on, with a blanked Keychain item re-seated.
+
+        Claude Code's invalid_grant handler empties the item's tokens while the
+        file and the slot backup still hold the live generation; the active read
+        only answers for itself, and Claude Code reads the Keychain first. Writes
+        the file's ``claudeAiOauth`` (ids dropped, the item's sibling keys kept)
+        when the item's fresh locked read has both tokens empty and the file is
+        the backup's lineage with a complete unexpired pair. No POST, no item
+        created, the file only has its mtime stamped.
+
+        Once per generation across processes: the fingerprint is recorded in
+        ``credentials_dir`` before the write (no record, no write) and removed
+        when the write fails, so the next pass retries.
+        """
+        if (
+            active.degraded or active.keychain_unavailable
+            or not self._use_keychain()
+            or not _active_store_is_the_default_secure_store()
+        ):
+            return creds
+        cred_file = get_credentials_path()
+        marker = self._host.credentials_dir / _RESEAT_MARKER
+        item = (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+        try:
+            text = cred_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return creds
+        login = _seatable_login(text)
+        fp = oauth.credential_fingerprint(text)
+        try:
+            if login is None or marker.read_text(encoding="utf-8") == fp:
+                return creds
+        except OSError:
+            pass
+        try:
+            if (
+                _blank_item(macos_keychain.get_password(*item)) is None
+                or oauth.credential_fingerprint(
+                    self._read_backup_uncached(account_num, email)
+                ) != fp
+            ):
+                return creds
+            with (
+                claude_credentials_lock(timeout=_STRIP_LOCK_TIMEOUT_S),
+                claude_storage_write_lock(timeout=_STRIP_LOCK_TIMEOUT_S),
+            ):
+                with macos_keychain.fresh_reads():
+                    blank = _blank_item(macos_keychain.get_password(*item))
+                if blank is None or cred_file.read_text(encoding="utf-8") != text:
+                    return creds
+                seated = json.dumps({**blank, "claudeAiOauth": login})
+                atomic_write_text(marker, fp)
+                try:
+                    macos_keychain.set_password(*item, seated)
+                except macos_keychain.KEYCHAIN_ERRORS:
+                    marker.unlink(missing_ok=True)
+                    raise
+                self._stamp_credentials_file_to_item_mdat("the re-seat")
+        except (ClaudeSwitchError, UnicodeDecodeError, *macos_keychain.KEYCHAIN_ERRORS) as e:
+            self._log_detected_login(
+                text, slot=account_num, email=email,
+                outcome=f"blank Keychain login left: {type(e).__name__}",
+            )
+            return creds
+        self._log_detected_login(
+            seated, slot=account_num, email=email,
+            outcome="re-seated the blank Keychain login from the plaintext file",
+        )
+        return seated
 
     # Cap on `_log_detected_login`'s dedup set. Generous for a single
     # long-lived TUI/daemon process (a handful of accounts, a handful of
