@@ -43,12 +43,21 @@ def _blank(keep_stamp=True):
 
 
 def _reseated(file_login):
-    """The blank item with ``claudeAiOauth`` replaced and its own siblings kept."""
-    return {"claudeAiOauth": _drop_ids(file_login), "mcpOAuth": {"srv": {"accessToken": "live"}}}
+    """The blank item with ``claudeAiOauth`` replaced (ids dropped), its own siblings kept."""
+    login = {k: v for k, v in file_login["claudeAiOauth"].items() if k not in IDS}
+    return {"claudeAiOauth": login, "mcpOAuth": {"srv": {"accessToken": "live"}}}
 
 
-def _drop_ids(login):
-    return {k: v for k, v in login["claudeAiOauth"].items() if k not in IDS}
+SLOTS = {1: (EMAIL, _login()), 2: ("b@example.com", _login(refresh="rt-2", access="sk-2"))}
+
+
+def _activate(s, num):
+    """Make ``num`` the active slot of the roster and of the live identity."""
+    data = s._get_sequence_data()
+    data["activeAccountNumber"] = num
+    s._write_json(s.sequence_file, data)
+    s._get_claude_config_path().write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": SLOTS[num][0], "organizationUuid": ""}}), encoding="utf-8")
 
 
 def _mac(temp_home: Path, kc, *, item=None, file=None, platform=Platform.MACOS):
@@ -57,12 +66,13 @@ def _mac(temp_home: Path, kc, *, item=None, file=None, platform=Platform.MACOS):
     s.platform = Platform.LINUX
     s._setup_directories()
     s._write_json(s.sequence_file, {
-        "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z", "sequence": [1],
-        "accounts": {"1": {"email": EMAIL, "uuid": "uuid-1", "added": "2024-01-01T00:00:00Z"}},
+        "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z", "sequence": [1, 2],
+        "accounts": {str(n): {"email": e, "uuid": f"uuid-{n}", "added": "2024-01-01T00:00:00Z"}
+                     for n, (e, _) in SLOTS.items()},
     })
-    s._get_claude_config_path().write_text(json.dumps(
-        {"oauthAccount": {"emailAddress": EMAIL, "organizationUuid": ""}}), encoding="utf-8")
-    s._write_account_credentials("1", EMAIL, json.dumps(_login()))
+    _activate(s, 1)
+    for n, (e, login) in SLOTS.items():
+        s._write_account_credentials(str(n), e, json.dumps(login))
     live = temp_home / ".claude" / ".credentials.json"
     live.write_text(json.dumps(file or _login(**IDS)), encoding="utf-8")
     old = time.time() - 3600
@@ -113,6 +123,7 @@ def test_a_blank_item_that_lost_its_refresh_stamp_is_reseated_and_the_pass_runs_
     temp_home: Path, block_real_keychain, no_refresh,
 ):
     s, _live = _mac(temp_home, block_real_keychain, item=_blank(keep_stamp=False))
+    (s.credentials_dir / ".reseated-1").write_bytes(b"\xff\xfe")  # a garbled record is no record
 
     row = s._build_accounts_info()[0]
 
@@ -134,9 +145,10 @@ def test_a_blank_item_that_lost_its_refresh_stamp_is_reseated_and_the_pass_runs_
         ({"item": _blank()}, "read_only"),
         ({"item": _blank()}, "dry_run"),
         ({"item": _blank()}, "custom_profile"),
+        ({"item": _blank()}, "roster_elsewhere"),
     ],
     ids=["item-has-tokens", "absent-item", "other-lineage", "expired", "incomplete-pair",
-         "linux", "read-only", "dry-run", "custom-profile"],
+         "linux", "read-only", "dry-run", "custom-profile", "roster-elsewhere"],
 )
 def test_a_pass_that_may_not_reseat_leaves_the_item_as_it_was(
     temp_home: Path, block_real_keychain, no_refresh, monkeypatch, setup, mode,
@@ -147,6 +159,10 @@ def test_a_pass_that_may_not_reseat_leaves_the_item_as_it_was(
     before = dict(block_real_keychain.data)
     mtime = live.stat().st_mtime
     s._suppress_login_restore_write = mode == "dry_run"
+    if mode == "roster_elsewhere":  # the live identity is slot 1, the roster names slot 2
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        s._write_json(s.sequence_file, data)
 
     s._build_accounts_info(read_only=mode == "read_only")
 
@@ -200,3 +216,17 @@ def test_the_same_generation_blanked_again_is_not_reseated_but_the_next_one_is(
 
     assert json.loads(block_real_keychain.data[KEY]) == _reseated(gen2)
     no_refresh.assert_not_called()
+
+
+def test_each_slot_keeps_its_own_record_of_the_generation_it_was_seated(
+    temp_home: Path, block_real_keychain, no_refresh,
+):
+    s, live = _mac(temp_home, block_real_keychain, item=_blank())
+    s._build_accounts_info()  # slot 1 seated
+    for num in (2, 1):  # slot 2 seated; slot 1 blanked again after that
+        block_real_keychain.data[KEY] = json.dumps(_blank())
+        _activate(s, num)
+        live.write_text(json.dumps(SLOTS[num][1]), encoding="utf-8")
+        s._build_accounts_info()
+
+    assert json.loads(block_real_keychain.data[KEY]) == _blank(), "slot 1's generation seated twice"

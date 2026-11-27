@@ -290,8 +290,6 @@ def _credential_object(credentials: str | None) -> dict | None:
 _STAMPED_ID_KEYS = ("accountUuid", "organizationUuid")
 # Bound on each lock the observed-login strip takes: the next pass retries.
 _STRIP_LOCK_TIMEOUT_S = 2.0
-# Holds the fingerprint of the generation `_reseat_blank_keychain_login` last seated.
-_RESEAT_MARKER = ".reseated-login"
 
 
 def _drop_stamped_ids(credentials: str) -> str:
@@ -1589,9 +1587,10 @@ class CredentialStore:
         the backup's lineage with a complete unexpired pair. No POST, no item
         created, the file only has its mtime stamped.
 
-        Once per generation across processes: the fingerprint is recorded in
-        ``credentials_dir`` before the write (no record, no write) and removed
-        when the write fails, so the next pass retries.
+        Once per slot and generation across processes: the fingerprint is
+        recorded in ``credentials_dir/.reseated-<slot>`` before the write (no
+        record, no write) and removed when the write fails, so the next pass
+        retries.
         """
         if (
             active.degraded or active.keychain_unavailable
@@ -1600,7 +1599,7 @@ class CredentialStore:
         ):
             return creds
         cred_file = get_credentials_path()
-        marker = self._host.credentials_dir / _RESEAT_MARKER
+        marker = self._host.credentials_dir / f".reseated-{account_num}"
         item = (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
         try:
             text = cred_file.read_text(encoding="utf-8")
@@ -1611,7 +1610,7 @@ class CredentialStore:
         try:
             if login is None or marker.read_text(encoding="utf-8") == fp:
                 return creds
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             pass
         try:
             if (
