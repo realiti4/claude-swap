@@ -569,10 +569,12 @@ class AutoScreen(Screen):
                 windows = oauth.relevant_windows(acc.usage.last_good, models)
                 # A window past its reset reads `5h ?` here as on the dashboard:
                 # the stored pct describes the window that ended. The engine's
-                # inputs are untouched; this is how the row is drawn.
+                # inputs are untouched; this is how the row is drawn. A refused
+                # probe (`rejected`) is a limit, not a window that ended.
                 passed = {
                     label for label, _p, resets_at in windows
-                    if oauth.window_reset_passed({"resets_at": resets_at}, now)
+                    if label != oauth.REJECTED_LABEL
+                    and oauth.window_reset_passed({"resets_at": resets_at}, now)
                 }
                 for i, (label, wpct, resets_at) in enumerate(windows):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
@@ -624,11 +626,14 @@ class AutoScreen(Screen):
                 # for ORDERING purposes.
                 kind = "open"
                 if self._settings:
-                    # A `?` chip is left out: a `full` beside it would contradict it.
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows if label not in passed),
-                        row_bar, weekly,
+                        ((label, p) for label, p, _ in windows), row_bar, weekly,
                     )
+                    if blocked_model in passed:
+                        # The engine still reads the stored figure, but a label
+                        # beside a `?` chip would contradict it: say nothing, and
+                        # let the "not a candidate" gate print the engine's reason.
+                        kind = "open"
                     if kind == "model":
                         entry.append(
                             f"  {model_block_label(blocked_model)}",

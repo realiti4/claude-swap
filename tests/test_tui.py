@@ -5233,7 +5233,7 @@ class TestUnswitchableRowsAreListed:
         for out in (panel, mini):
             assert "5h ? · 7d(⟳" in out and "):5%" in out, out
             assert "100%" not in out and "5h(⟳" not in out, out
-        assert "Fable ?" in panel and "full" not in panel and "-only" not in panel, panel
+        assert "Fable ?" in panel and "full" not in panel and "-walled" not in panel, panel
         # Every window past its reset: nothing is left to classify.
         only = UsageEntry(
             last_good={"five_hour": {"pct": 100.0, **passed}},
@@ -5244,6 +5244,43 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "b@x.com", switchable=True, usage=only),
         ), active="1", settings=AutoSwitchSettings())
         assert "5h ?" in out and "100%" not in out and "full" not in out, out
+
+    def test_a_passed_window_the_engine_still_reads_is_not_called_model_walled(self):
+        """The engine reads the stored 5h figure whether or not its reset has
+        passed, so a 5h past its reset at 100% still refuses the row as "at its
+        limit". With the pinned model's live window also over its line, the
+        panel must not read `Fable-walled` ("5h/7d have room"); the passed
+        window only draws as `5h ?` and the engine's own reason prints."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0},
+                "scoped": [{"name": "Fable", "pct": 20.0}],
+            }),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_in(86400 * 3)},
+                "scoped": [{"name": "Fable", "pct": 100.0,
+                            "resets_at": _iso_in(86400 * 3)}],
+            }),
+        ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
+        assert "Fable-walled" not in out and "5h full" not in out, out
+        assert "5h ?" in out and "not a candidate (at its limit)" in out, out
+
+    def test_a_rejected_probe_keeps_its_reading_after_its_reset_passes(self):
+        """A refused probe is not a usage window that ended: it stays at its
+        limit as `rejected full`, never `rejected ?`."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "refused@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "rejected": {"retry_after_s": None, "resets_at": _iso_in(-60)},
+            }),
+        ), active="1", settings=AutoSwitchSettings())
+        assert "rejected ?" not in out and "  rejected full" in out, out
 
     def test_the_panel_still_calls_a_window_that_has_not_reset_full(self):
         """CONTROL for the test above: a window that has not reset keeps its
