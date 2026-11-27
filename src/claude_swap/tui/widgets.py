@@ -9,6 +9,7 @@ auto-switch trigger line), and stale-measurement dimming.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
 from rich.cells import cell_len
@@ -105,6 +106,20 @@ def _reset_parts(window: dict, now: float) -> tuple[str | None, str | None]:
     return reset, f"{reset} · {clock}" if clock else reset
 
 
+def _passed_reset_parts(window: dict, now: float) -> tuple[str, str]:
+    """``_reset_parts`` for a window whose reset has passed
+    (``oauth.window_reset_passed``): how long ago, then when.
+
+    ``("reset 3h 5m ago", "reset 3h 5m ago · Nov 26 03:42")``.
+    """
+    reset_utc = datetime.fromisoformat(window["resets_at"])
+    ago = f"reset {data.format_duration(now - reset_utc.timestamp())} ago"
+    clock = oauth.reset_clock_string(
+        reset_utc, datetime.fromtimestamp(now, tz=timezone.utc)
+    )
+    return ago, f"{ago} · {clock}"
+
+
 def _pace_suffix(window: dict, fetched_at: float | None) -> str:
     """"(ahead of pace)" when a weekly window is meaningfully ahead, else ""."""
     result = pace.compute_pace(window, fetched_at=fetched_at)
@@ -116,7 +131,10 @@ def usage_rows(
 ) -> list[tuple[str, float | None, str, str]]:
     """(label, pct, suffix, suffix_full) rows mirroring the CLI's
     ``_format_usage_lines``. ``pct`` is None for a 5h/7d window reported
-    without a figure; ``usage_bar`` draws that row as ``usage unknown``.
+    without a figure and for a 5h, 7d or per-model window whose reset has
+    passed (``oauth.window_reset_passed``), which then carries no marker and
+    says when it ended instead; ``usage_bar`` draws that row as ``usage
+    unknown``.
 
     ``suffix_full`` extends the reset countdown with the absolute clock time
     (``resets 2h 13m · 20:39``) for rows that have room; otherwise it equals
@@ -140,6 +158,9 @@ def usage_rows(
     for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
+            if oauth.window_reset_passed(window, now):
+                rows.append((label, None, *_passed_reset_parts(window, now)))
+                continue
             reset, reset_full = _reset_parts(window, now)
             suffix, suffix_full = reset or "", reset_full or ""
             if key == "seven_day":
@@ -155,6 +176,9 @@ def usage_rows(
                 suffix_full,
             ))
     for window in last_good.get("scoped") or []:
+        if oauth.window_reset_passed(window, now):
+            rows.append((window["name"], None, *_passed_reset_parts(window, now)))
+            continue
         pct = float(window["pct"])
         suffix, suffix_full = _reset_parts(window, now)
         suffix, suffix_full = suffix or "", suffix_full or ""
@@ -422,8 +446,10 @@ def mini_account_text(
             continue
         if parts:
             text.append(" · ", style=palette.track)
-        if not isinstance(window.get("pct"), (int, float)):
-            # No figure: unknown, not 0%.
+        if not isinstance(
+            window.get("pct"), (int, float)
+        ) or oauth.window_reset_passed(window, now):
+            # No figure, or one for a window that has ended: unknown, not 0%.
             text.append(f"{label} ", style=palette.muted)
             text.append("?", style=palette.muted)
             parts += 1
@@ -445,6 +471,12 @@ def mini_account_text(
         pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
+        if oauth.window_reset_passed(window, now):
+            # Same rule as the 5h/7d loop above: an ended window has no figure.
+            text.append(f"{window['name']} ", style=palette.muted)
+            text.append("?", style=palette.muted)
+            parts += 1
+            continue
         color = palette.severity(pct)
         # Same chip helper the 5h/7d loop above uses — a scoped window reads
         # the same way whether it is the account's only window or sits

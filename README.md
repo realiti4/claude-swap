@@ -257,7 +257,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died until you [re-add them](#refresh-expired-tokens)
-- Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
+- Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck. A `last read 2h ago (http-429)` line above an account's numbers means its latest check failed, and a row reading `?   reset <time>` (a bare `?` in the menu bar) is a window that has reset since the numbers were read.
 - The plan shown after each slot (`· Ultra`, `· Pro`, `· Team`) comes from your account profile and refreshes every six hours, independently of usage; a subscription that has lapsed shows as a highlighted `Free`.
 
 ## Data locations
@@ -305,7 +305,7 @@ cswap menubar --foreground          # run attached to this terminal, for debuggi
 
 ### Configuration
 
-Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges.
+Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges. To keep a `settings.json` under version control untouched, create an untracked `settings.local.json` beside it: it overrides `settings.json`, and edits are then written to it alone.
 
 <details>
 <summary>Commands & usage</summary>
@@ -320,6 +320,7 @@ cswap config set run.shareHistory false   # each account keeps its own chat hist
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request
+cswap config set usage.requestLog true    # opt in: log one line per usage request (slot, token tag, request id, cf-ray)
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

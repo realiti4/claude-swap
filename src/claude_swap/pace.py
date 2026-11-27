@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-# Weekly windows reset on a fixed 7-day cadence (matches menubar._WEEKLY_PERIOD_S).
+# Weekly windows reset on a fixed 7-day cadence.
 WEEKLY_PERIOD_S = 7 * 86400.0
 
 # Suppress the marker for this long after a weekly reset. Right after reset,
