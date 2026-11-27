@@ -14,6 +14,8 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -28,11 +30,20 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _seven_day_reset_ts,
     pct_label,
 )
-from claude_swap.lines import binding_window
+from claude_swap.exceptions import ConfigError
+from claude_swap.lines import binding_window, line_room
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import (
+    AUTOSWITCH_STRATEGIES,
+    SETTING_SPECS,
+    load_settings,
+    parse_model_names,
+    set_setting,
+    unset_setting,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -66,7 +77,10 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
+        Binding("s", "cycle_strategy", "Strategy"),
+        Binding("m", "cycle_model", "Models"),
         Binding("t", "adjust_threshold", "Threshold"),
+        Binding("d", "save_defaults", "Save defaults"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -87,6 +101,14 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Same session-only rule for the strategy (s cycles it). Both
+        # ``_configured_*`` values are the settings.json baseline: the
+        # "(session)" tags compare against them, and ``d`` (save defaults)
+        # is the only thing that moves them after mount.
+        self._configured_strategy: str | None = None
+        # And for the model watch (m cycles it): the per-model weekly limits
+        # that bind the switch decision, None when only 5h/7d do.
+        self._configured_model: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -108,6 +130,8 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
+        self._configured_strategy = self._settings.strategy
+        self._configured_model = self._settings.model
         self.app.threshold_pct = self._settings.threshold
         # The weekly line is not session-adjustable, so this is only the same
         # sync-to-the-file correction; nothing to restore on unmount.
@@ -130,9 +154,7 @@ class AutoScreen(Screen):
     def _on_theme_change(self, _theme: str) -> None:
         self._update_summary()
         self._update_badge()
-        snap = self.app.snapshot
-        if snap is not None:
-            self._on_snapshot(snap)
+        self._refresh_candidates()
 
     def action_back(self) -> None:
         if self._adjusting:
@@ -175,12 +197,9 @@ class AutoScreen(Screen):
             return  # no net change: nothing to announce, no tick to force
         if self._engine is not None:
             self._engine.wake()  # show a decision at the new value now
-        self.query_one("#event-log", RichLog).write(
-            Text(
-                f"— threshold set to {pct_label(self._settings.threshold)}% "
-                "for this session —",
-                style=Palette.from_theme(self.app.current_theme).muted,
-            )
+        self._note(
+            f"— threshold set to {pct_label(self._settings.threshold)}% "
+            "for this session —"
         )
 
     def _set_threshold(self, value: float) -> None:
@@ -201,6 +220,10 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
+        text.append(f"strategy {self._settings.strategy}")
+        if self._settings.strategy != self._configured_strategy:
+            text.append(" (session)", style=palette.muted)
+        text.append(" · ")
         text.append(
             f"threshold {pct_label(self._settings.threshold)}%",
             style=palette.accent if self._adjusting else "",
@@ -211,10 +234,136 @@ class AutoScreen(Screen):
             text.append(
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
+        # Always shown, "off" included: an unwatched per-model limit is why
+        # an account with (say) Fable spent can still rank first.
+        text.append(f" · models {self._settings.model or 'off'}")
+        if self._settings.model != self._configured_model:
+            text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
+
+    # -- strategy (s), model watch (m) and save as defaults (d) ----------------
+
+    def action_cycle_strategy(self) -> None:
+        """Next strategy in AUTOSWITCH_STRATEGIES order, session-only like the
+        threshold. The engine reads it on its next tick; wake it so the log
+        shows a decision under the new strategy right away."""
+        choices = AUTOSWITCH_STRATEGIES
+        current = self._settings.strategy
+        nxt = (
+            choices[(choices.index(current) + 1) % len(choices)]
+            if current in choices
+            else choices[0]
+        )
+        self._settings = replace(self._settings, strategy=nxt)
+        if self._engine is not None:
+            self._engine.apply_strategy(nxt)
+            self._engine.wake()
+        self._update_summary()
+        self._refresh_candidates()
+        self._note(f"— strategy → {nxt} for this session —")
+
+    def _model_choices(self) -> list[str | None]:
+        """The m cycle: off, every per-model window, then each model the
+        accounts report by name, in the order first seen. A saved list the
+        cycle would not otherwise reach (e.g. "Fable,Opus") is kept at the
+        end, so cycling never loses the configured value."""
+        choices: list[str | None] = [None, "all"]
+        seen = {"all"}
+        snap = self.app.snapshot
+        for acc in snap.accounts if snap is not None else ():
+            for window in (acc.usage.last_good or {}).get("scoped") or []:
+                name = window.get("name") if isinstance(window, dict) else None
+                if isinstance(name, str) and name.lower() not in seen:
+                    seen.add(name.lower())
+                    choices.append(name)
+        configured = self._configured_model
+        if configured is not None and configured.lower() not in seen:
+            choices.append(configured)
+        return choices
+
+    def action_cycle_model(self) -> None:
+        """Next model watch, session-only like the strategy. The Next list
+        reads the same setting, so it re-ranks at once."""
+        choices = self._model_choices()
+        current = self._settings.model
+        nxt = (
+            choices[(choices.index(current) + 1) % len(choices)]
+            if current in choices
+            else choices[0]
+        )
+        self._settings = replace(self._settings, model=nxt)
+        if self._engine is not None:
+            self._engine.apply_model(nxt)
+            self._engine.wake()
+        self._update_summary()
+        self._refresh_candidates()
+        self._note(f"— models → {nxt or 'off'} for this session —")
+
+    def action_save_defaults(self) -> None:
+        if self._adjusting:
+            self._end_adjust()  # save what the user is looking at, mode closed
+        s = self._settings
+        if (s.strategy, s.threshold, s.model) == (
+            self._configured_strategy,
+            self._configured_threshold,
+            self._configured_model,
+        ):
+            self._note(
+                "— strategy, threshold and models are already the defaults —"
+            )
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                "Save as defaults?\n\n"
+                f"  strategy {s.strategy}\n"
+                f"  threshold {pct_label(s.threshold)}%\n"
+                f"  models {s.model or 'off'}\n\n"
+                "Written to settings.json. A `cswap auto` or menu-bar engine "
+                "that is already running picks them up on its next start.",
+                title="Save defaults",
+                yes_label="Save",
+            ),
+            self._on_save_confirm,
+        )
+
+    def _on_save_confirm(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        s = self._settings
+        root = self.app.switcher.backup_dir
+        # Single-key writes through `cswap config set`'s path: validated,
+        # and every other key in the file survives. Each baseline moves only
+        # once its own write landed, so after a partial failure the
+        # "(session)" tags still tell the truth about what is on disk.
+        try:
+            set_setting(root, "autoswitch.strategy", s.strategy)
+            self._configured_strategy = s.strategy
+            set_setting(root, "autoswitch.threshold", str(s.threshold))
+            self._configured_threshold = s.threshold
+            # "off" removes the key rather than storing an empty string.
+            if s.model is None:
+                unset_setting(root, "autoswitch.model")
+            else:
+                set_setting(root, "autoswitch.model", s.model)
+            self._configured_model = s.model
+        except (ConfigError, OSError) as e:
+            self._update_summary()
+            self._note(f"— could not save defaults: {e} —", role="sev_warn")
+            return
+        self._update_summary()
+        self._note(
+            f"— saved as defaults: strategy {s.strategy}, "
+            f"threshold {pct_label(s.threshold)}%, models {s.model or 'off'} —"
+        )
+
+    def _note(self, message: str, *, role: str = "muted") -> None:
+        palette = Palette.from_theme(self.app.current_theme)
+        self.query_one("#event-log", RichLog).write(
+            Text(message, style=getattr(palette, role))
+        )
 
     # -- engine -------------------------------------------------------------
 
@@ -303,34 +452,61 @@ class AutoScreen(Screen):
             self._candidates_text(snap, active_number=snap.active_number)
         )
 
+    def _refresh_candidates(self) -> None:
+        """Redraw from the current snapshot after a strategy/threshold/theme
+        change, without waiting for the next usage refresh."""
+        self._on_snapshot(self.app.snapshot)
+
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by headroom against their own switch lines
-        (best first) — the engine's own ordering."""
-        # Same window set AND the same lines as the engine: autoswitch.model,
-        # each account's own line (its policy threshold, else the session
-        # threshold — `_settings` is what `_set_threshold` replaces), the
-        # weekly line, and the session threshold as the ruler every account is
-        # scored on, so the displayed ranking can never disagree with the
-        # account it picks.
+        """Switch targets in the order the session strategy ranks them.
+
+        Same window set AND the same lines as the engine: autoswitch.model,
+        each account's own line (its policy threshold, else the session
+        threshold — `_settings` is what `_set_threshold` replaces), the weekly
+        line, and the session threshold as the ruler every account is scored
+        on. Then the engine's key for the session strategy, so the list never
+        contradicts the account it picks:
+
+        - ``best``: most policy headroom.
+        - ``weekly-first`` / ``consume-first``: soonest weekly reset among
+          accounts under their lines (ties to most policy headroom), those
+          with fewer than ``hysteresisPct`` points left before a line after
+          the ones with that room.
+        - ``priority-consume-first``: highest account priority, then soonest
+          weekly reset, among accounts under their lines.
+
+        Accounts over their lines follow (the engine will not land on them
+        proactively), by policy headroom; unread rows last. It is the
+        strategy's order, not the engine's next move — anti-flap, cooldown and
+        consume-first's "only for a sooner reset" gates still apply on top.
+        """
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
+        strategy = settings.strategy if settings else "best"
+        by_reset = strategy in ("weekly-first", "consume-first")
+        by_priority = strategy == "priority-consume-first"
+        now = time.time()
         candidates = [
             acc for acc in snap.accounts
             if acc.number != active_number and acc.switchable
         ]
-        ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
+        # (tier, primary, secondary) ascending: tier 0 the strategy's own
+        # order, 1 the reset strategies' landings without room, 2 over-line,
+        # 3 unread (sentinels ahead of plain unknowns).
+        ranked: list[tuple[tuple[int, float, float], str]] = []
         lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
         for acc in candidates:
+            last_good = acc.usage.last_good
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
             )
             binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models),
+                oauth.relevant_windows(last_good, models),
                 line,
                 weekly,
                 scale=threshold,
@@ -342,10 +518,10 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
+                key = (3, 0.0, 998.0)
             elif binding is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
+                key = (3, 0.0, 999.0)
             else:
                 # The raw pct of the window that binds, and — only once the
                 # lines differ, globally or for this account — the line it is
@@ -358,15 +534,53 @@ class AutoScreen(Screen):
                     entry.append(
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
-                ranked.append((-binding.line_headroom, acc.number))
+                if by_priority and acc.policy.priority:
+                    entry.append(
+                        f" · priority {acc.policy.priority}", style=palette.muted
+                    )
+                if by_reset or by_priority:
+                    reset = data.window_reset_text(last_good, "seven_day", now)
+                    if reset:
+                        entry.append(f" · {reset}", style=palette.muted)
+                lh = binding.line_headroom
+                if binding.over and (by_reset or by_priority):
+                    key = (2, -lh, 0.0)
+                elif by_reset or by_priority:
+                    reset_ts = _seven_day_reset_ts(last_good, now)
+                    soonest = math.inf if reset_ts is None else reset_ts
+                    if by_priority:
+                        key = (0, -acc.policy.priority, soonest)
+                    else:
+                        # The engine's `tight`: a landing needs hysteresisPct
+                        # points before its nearest line, each window in its
+                        # own points (`lines.line_room`).
+                        room = line_room(
+                            oauth.relevant_windows(last_good, models), line, weekly
+                        )
+                        tight = room is not None and room < settings.hysteresis_pct
+                        key = (1 if tight else 0, soonest, -lh)
+                else:
+                    key = (0, -lh, 0.0)
+                # Alternates are refetched every 5-10 min (rate budget), so a
+                # ranking can rest on old numbers; say so, same rule as the
+                # active row (silent while fresh).
+                age = data.format_age(acc.usage.age_s)
+                if age:
+                    entry.append(f" {age}", style=palette.muted)
+            ranked.append((key, acc.number))
             lines[acc.number] = (acc, head, entry)
 
         text = Text()
-        text.append("Next best", style=palette.muted)
+        heading = {
+            "weekly-first": "Next (soonest weekly reset)",
+            "consume-first": "Next (soonest weekly reset)",
+            "priority-consume-first": "Next (priority, then soonest weekly reset)",
+        }.get(strategy, "Next best")
+        text.append(heading, style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        order = [lines[number] for _pct, number in sorted(ranked)]
+        order = [lines[number] for _key, number in sorted(ranked)]
         # The box has no width before its first layout; its CSS padding is 2 a side.
         budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
         for row in fit_login(
