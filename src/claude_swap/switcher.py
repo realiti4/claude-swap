@@ -5751,13 +5751,15 @@ class ClaudeAccountSwitcher:
         self,
         infos: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry] | None = None,
-        relogged: frozenset[str] = frozenset(),
+        relogged: dict[str, str] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant. ``entries``
         is the pre-fetch snapshot, for each row's refused-credential stamp
-        and stored reading. A slot in ``relogged`` is fetched only once its
-        new login is saved as its backup (:meth:`_save_active_login`)."""
+        and stored reading. A slot in ``relogged`` (slot → the lease this
+        collector holds on its row) is fetched only once its new login is
+        saved as its backup (:meth:`_save_active_login`)."""
+        relogged = relogged or {}
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
@@ -5766,14 +5768,16 @@ class ClaudeAccountSwitcher:
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             entry = entries.get(num) if entries else None
-            if num in relogged and not self._save_active_login(info):
+            if num in relogged and not self._save_active_login(
+                info, relogged[num]
+            ):
                 # An error, not a sentinel: the store's failure backoff then
                 # paces the next attempt.
                 self._logger.info(
-                    "Account %s's new login was not saved as its backup "
-                    "(ownership unverified, or a store was busy); it still "
-                    "shows re-login needed and is tried again after the "
-                    "backoff.",
+                    "Account %s's new login was not taken up this pass "
+                    "(ownership unverified, a store busy, or the row taken "
+                    "over by another collector); the next attempt waits for "
+                    "the backoff.",
                     num,
                 )
                 return num, FetchRecord(error="login-unverified")
@@ -5849,9 +5853,12 @@ class ClaudeAccountSwitcher:
                 # generation — the fingerprint healed the verdict.
                 # Clear the stale strike ROW too: display and fetch
                 # eligibility (_row_eligible gates on the raw count) must
-                # agree, or the slot silently freezes at last-good.
+                # agree, or the slot silently freezes at last-good. A row
+                # under another collector's lease is left to it (``claims``):
+                # that collector has just saved a new login and its fetch is
+                # in flight.
                 self._usage_store.clear_dead_token(
-                    [num], {num: identities[num]}
+                    [num], {num: identities[num]}, claims={}
                 )
                 entries = store.entries(identities, models)
         requested = [
@@ -5909,7 +5916,9 @@ class ClaudeAccountSwitcher:
         if claims:
             pre = entries
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims], pre, frozenset(relogged)
+                [info_by_num[num] for num in claims],
+                pre,
+                {num: claims[num] for num in relogged if num in claims},
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
@@ -5976,26 +5985,31 @@ class ClaudeAccountSwitcher:
         return not entry.token_dead(stored_fp=oauth.credential_fingerprint(creds))
 
     def _save_active_login(
-        self, account_info: tuple[int, str, str, str, bool, str, str]
+        self,
+        account_info: tuple[int, str, str, str, bool, str, str],
+        claim_id: str,
     ) -> bool:
         """Save a quarantined active slot's new live login as its backup and
-        lift the quarantine. True once the backup holds that login.
+        lift the quarantine. True once the backup holds that login and the
+        strike is cleared under ``claim_id``, the caller's lease on the row.
 
         The write is :meth:`_resync_rotated_backup`'s: the profile endpoint
         must name this slot's account, and the live store is re-read under
         the locks. Nothing is sent to the token endpoint. The strike is
-        cleared here, with the caller's lease kept, so that the fetch that
-        follows records as any other: its failure sets the row's backoff, and
-        no later pass has a stale strike left to clear.
+        cleared here, with the lease kept, so that the fetch that follows
+        records as any other: its failure sets the row's backoff, and no
+        later pass has a stale strike left to clear.
 
-        On False the backup and the strike are untouched and the caller does
-        not fetch. A backup that some other writer replaced meanwhile answers
-        False too: the struck grant is gone, but this login was not the one
-        saved, and the next pass treats the slot by the ordinary rules.
+        On False the caller does not fetch. Either the backup and the strike
+        are untouched, or some other writer replaced the backup meanwhile
+        (the struck grant is gone, but this login was not the one saved), or
+        the lease is no longer this collector's and its outcome would not be
+        recorded. The next pass treats the slot by the ordinary rules.
         """
         num, email, _org_name, org_uuid, _active, creds, _alias = account_info
-        self._resync_rotated_backup(str(num), email, org_uuid, creds)
-        backup, unreadable = self._read_account_credentials_ex(str(num), email)
+        slot = str(num)
+        self._resync_rotated_backup(slot, email, org_uuid, creds)
+        backup, unreadable = self._read_account_credentials_ex(slot, email)
         if (
             unreadable
             or not backup
@@ -6003,10 +6017,10 @@ class ClaudeAccountSwitcher:
             != oauth.credential_fingerprint(creds)
         ):
             return False
-        self._usage_store.clear_dead_token(
-            [str(num)], {str(num): (email, org_uuid or "")}, keep_claim=True
+        cleared = self._usage_store.clear_dead_token(
+            [slot], {slot: (email, org_uuid or "")}, claims={slot: claim_id}
         )
-        return True
+        return slot in cleared
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?

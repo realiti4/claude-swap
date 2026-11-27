@@ -1320,25 +1320,47 @@ class TestDeadTokenQuarantine:
         assert entry.last_error is None
         assert entry.backoff_until is None
 
-    def test_clear_dead_token_keeps_the_lease_only_when_asked(self, store, clock):
+    OUTCOME = {"1": FetchRecord(error="http-429", retry_after_s=900.0)}
+
+    def _struck_and_leased(self, store, clock) -> dict[str, str]:
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         clock.advance(TRUST_MAX_AGE_S)
-        outcome = {"1": FetchRecord(error="http-429", retry_after_s=900.0)}
+        return store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"})
 
-        claims = store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"})
-        store.clear_dead_token(["1"], IDENT, keep_claim=True)
+    def test_a_lease_holders_clear_keeps_its_lease(self, store, clock):
+        claims = self._struck_and_leased(store, clock)
+        assert store.clear_dead_token(["1"], IDENT, claims=claims) == {"1"}
         assert not store.entries(IDENT)["1"].token_dead()
-        # The lease holder's outcome lands, and its backoff is the row's own.
-        assert store.record(outcome, IDENT, claims) == {"1"}
+        # Its outcome lands, and the backoff is the row's own.
+        assert store.record(self.OUTCOME, IDENT, claims) == {"1"}
         entry = store.entries(IDENT)["1"]
         assert entry.last_error == "http-429"
         assert entry.consecutive_failures == 1
         assert entry.backoff_until >= clock.now + 900
 
-        clock.advance(TRUST_MAX_AGE_S)
-        claims = store.reserve(["1"], IDENT, respect_plans=False)
-        store.clear_dead_token(["1"], IDENT)
-        assert store.record(outcome, IDENT, claims) == set()
+    def test_a_collector_without_the_lease_leaves_a_leased_row_alone(
+        self, store, clock
+    ):
+        claims = self._struck_and_leased(store, clock)
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == set()
+        assert store.clear_dead_token(["1"], IDENT, claims={"1": "not-mine"}) == set()
+        assert store.entries(IDENT)["1"].token_dead()
+        assert store.record(self.OUTCOME, IDENT, claims) == {"1"}
+        # The lease ended with that record: now the stale strike may go.
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == {"1"}
+        assert not store.entries(IDENT)["1"].token_dead()
+
+    def test_a_lease_nobody_finished_stops_holding_the_row_when_it_expires(
+        self, store, clock
+    ):
+        self._struck_and_leased(store, clock)
+        clock.advance(CLAIM_TTL_S + 1)
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == {"1"}
+
+    def test_a_clear_without_claims_takes_the_lease_with_it(self, store, clock):
+        claims = self._struck_and_leased(store, clock)
+        assert store.clear_dead_token(["1"], IDENT) == {"1"}
+        assert store.record(self.OUTCOME, IDENT, claims) == set()
 
 
 class TestReserve:

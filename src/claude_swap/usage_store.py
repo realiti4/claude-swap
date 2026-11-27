@@ -1319,8 +1319,8 @@ class UsageStore:
         nums: Iterable[str],
         identities: dict[str, Identity],
         *,
-        keep_claim: bool = False,
-    ) -> None:
+        claims: dict[str, str] | None = None,
+    ) -> set[str]:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
         Called after a re-login/add rewrites a slot's stored credential: the
@@ -1328,19 +1328,42 @@ class UsageStore:
         reflects reality, and the account must become fetch-eligible again so the
         next pass can prove the new token good. A no-op for rows with no strikes.
 
-        ``keep_claim`` is for the caller that holds the row's lease and is
-        about to fetch with the new credential: its lease stays, so
-        :meth:`record` accepts that fetch's outcome and the backoff a failure
-        sets is the row's own.
+        Without ``claims`` the row's lease goes with the strike: the caller
+        replaced the credential itself, and a fetch still in flight on the old
+        one must not record.
+
+        A collector passes ``claims``, the slot → lease ids it holds itself
+        (empty when it holds none). It clears on what it read, so it must not
+        take a row away from a fetch in flight:
+
+        - a slot named in ``claims`` is cleared only while that lease is still
+          the row's, and the lease is kept: :meth:`record` then accepts the
+          holder's outcome, and the backoff a failure sets is the row's own;
+        - any other slot is cleared only when no live lease is on it. The
+          holder clears it, or a later pass does once the lease has ended.
+
+        Returns the slots cleared.
         """
         nums = list(nums)
         if not nums:
-            return
+            return set()
+        now = self.clock()
+        cleared: set[str] = set()
 
-        def apply(_num: str, row: dict) -> None:
-            if not keep_claim:
+        def apply(num: str, row: dict) -> None:
+            if claims is None:
                 row["claimId"] = None
                 row["claimUntil"] = 0.0
+            elif num in claims:
+                if row.get("claimId") != claims[num]:
+                    return
+            elif _live_claim(
+                _num_or_none(row.get("claimUntil")),
+                _num_or_none(row.get("lastAttemptAt")),
+                now,
+            ):
+                return
+            cleared.add(num)
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0
@@ -1348,6 +1371,7 @@ class UsageStore:
             row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
+        return cleared
 
 
 def _num_or_none(value: object) -> float | None:

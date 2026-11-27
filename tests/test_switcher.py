@@ -13633,6 +13633,59 @@ class TestActiveReloginRecovery:
         assert row.last_error == "http-429"
         assert row.backoff_until is not None
 
+    def test_another_collector_right_after_the_save_leaves_the_lease_alone(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The moment the backup holds the new login and the strike is still
+        on the row is when a second collector's own stale-strike clear would
+        fire. The row is under the first collector's lease, so it waits."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+        save = s._resync_rotated_backup
+
+        def save_then_second_collector(*args):
+            save(*args)
+            s._collect_usage_entries(info, fetch=set())
+
+        monkeypatch.setattr(s, "_resync_rotated_backup", save_then_second_collector)
+        net.usage.return_value = oauth.UsageOutcome(
+            usage=None, error="http-429", retry_after_s=900.0
+        )
+        s._collect_usage_entries(info)
+
+        row = self._row(s)
+        assert row.last_error == "http-429" and not row.token_dead()
+        assert row.backoff_until is not None
+        assert row.backoff_until >= s._usage_store.clock() + 900
+        monkeypatch.setattr(s, "_resync_rotated_backup", save)
+        self._collect(s)
+        assert net.usage.call_count == 1
+
+    def test_a_lost_lease_stops_the_attempt_before_the_fetch(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A `cswap add` elsewhere clears the row and takes the lease with
+        it. An outcome under the old lease would not be recorded, so the
+        request is not sent."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        new = self._cred("new")
+        s._write_credentials(new)
+        verified = net.profile.return_value
+
+        def lookup_while_the_row_is_cleared(_token):
+            s._usage_store.clear_dead_token(["1"], self.IDENT)
+            return verified
+
+        net.profile.side_effect = lookup_while_the_row_is_cleared
+        self._collect(s)
+
+        net.usage.assert_not_called()
+        assert s._read_account_credentials("1", self.EMAIL) == new
+        assert self._row(s).last_error is None
+
     def test_a_backup_another_writer_replaced_is_not_taken_for_the_save(
         self, temp_home: Path, monkeypatch
     ):
