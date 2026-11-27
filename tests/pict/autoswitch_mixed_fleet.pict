@@ -1,0 +1,18 @@
+# T3167: pairwise model of the percent alternation step on a mixed fleet.
+# Regenerate: pict tests/pict/autoswitch_mixed_fleet.pict /e:tests/pict/autoswitch_mixed_fleet.seed > tests/pict/autoswitch_mixed_fleet.cases
+# The test (tests/test_alternation_mixed_fleet.py) holds every generated row and the
+# decision the rules give it; the seed rows pin the interactions pairwise may skip.
+# Plan is candidate 2's plan (it shares the row's windows); PartnerPlan is the plan of
+# candidate 3, a second cold candidate with a fixed 5h 20% / 7d 60% reading.
+# No plan constraint on FiveHour: oauth.five_hour_live says the plan never decides it,
+# the 5h window is being removed account by account.
+Plan: max5x, max20x
+PartnerPlan: max5x, max20x
+FiveHour: running, idle, removed
+SevenDay: low, mid, tight, edge, near_cap, reset_from_full
+Partner: warm, cold
+Context: small, large
+Pinned: none, open, full
+
+# A running 5h window means the account was used since its 7d reset, so it is not at 0%.
+IF [FiveHour] = "running" THEN [SevenDay] <> "reset_from_full";
