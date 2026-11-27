@@ -194,6 +194,47 @@ class TestFormatReset:
         assert "h" not in countdown
 
 
+class TestWindowResetPassed:
+    """Test window_reset_passed."""
+
+    NOW = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _passed(self, seconds: float) -> bool:
+        from datetime import timedelta
+        resets_at = (self.NOW + timedelta(seconds=seconds)).isoformat()
+        return oauth.window_reset_passed({"resets_at": resets_at}, self.NOW.timestamp())
+
+    def test_passed_from_the_reset_instant_on(self):
+        # The boundary Claude Code 2.1.332 uses: a window is current only
+        # while its reset lies ahead.
+        assert self._passed(-43 * 3600)
+        assert self._passed(0)
+        assert not self._passed(1)
+        assert not self._passed(3 * 86400)
+
+    def test_reads_the_api_spelling_and_the_clock_by_default(self):
+        assert oauth.window_reset_passed({"resets_at": "2020-01-01T00:00:00Z"})
+        assert not oauth.window_reset_passed({"resets_at": "2999-01-01T00:00:00Z"})
+
+    @pytest.mark.parametrize(
+        "window",
+        [
+            None,
+            {},
+            {"pct": 5.0},
+            {"resets_at": None},
+            {"resets_at": "not-a-date"},
+            {"resets_at": 1774267200},
+            # No UTC offset: ``format_reset`` cannot place it either.
+            {"resets_at": "2020-01-01T00:00:00"},
+            # The fetch-time strings alone say nothing about now.
+            {"pct": 5.0, "clock": "15:59", "countdown": "0m"},
+        ],
+    )
+    def test_no_readable_reset_has_not_passed(self, window):
+        assert not oauth.window_reset_passed(window)
+
+
 class TestFetchUsage:
     """Test fetch_usage."""
 
