@@ -760,3 +760,28 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+class TestFixedUsageIntervals:
+    def test_set_load_and_unset_preserves_other_settings(self, tmp_path):
+        set_setting(tmp_path, "usage.headerProbe", "true")
+        set_setting(tmp_path, "usage.activeIntervalSeconds", "120")
+        set_setting(tmp_path, "usage.candidateIntervalSeconds", "300")
+        assert load_usage_settings(tmp_path) == UsageSettings(
+            header_probe=True, active_interval_seconds=120, candidate_interval_seconds=300,
+        )
+        unset_setting(tmp_path, "usage.activeIntervalSeconds")
+        settings = load_usage_settings(tmp_path)
+        assert settings.active_interval_seconds is None
+        assert settings.candidate_interval_seconds == 300
+        assert settings.header_probe is True
+
+    @pytest.mark.parametrize("value", [True, "120", float("nan"), float("inf"), {}, []])
+    def test_invalid_interval_loads_adaptive_default(self, tmp_path, value):
+        settings_path(tmp_path).write_text(json.dumps({"usage": {"activeIntervalSeconds": value}}))
+        assert load_usage_settings(tmp_path).active_interval_seconds is None
+
+    @pytest.mark.parametrize("value", ["119", "1801", "nan", "inf", "true"])
+    def test_invalid_cli_interval_is_rejected(self, tmp_path, value):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "usage.activeIntervalSeconds", value)

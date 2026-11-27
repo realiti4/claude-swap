@@ -49,7 +49,20 @@ When the usage API reports no `five_hour` window for an account (verified Ultra 
 
 ## Usage polling
 
-Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
+Usage polling is adaptive by default — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s).
+
+To use a fixed interval of **2 minutes for the current account** and **5 minutes for every other account**:
+
+```bash
+cswap config set usage.activeIntervalSeconds 120
+cswap config set usage.candidateIntervalSeconds 300
+```
+
+These settings accept 120–1800 seconds independently. An unset setting retains adaptive polling for that role. Use `cswap config unset usage.activeIntervalSeconds` or `cswap config unset usage.candidateIntervalSeconds` to restore the default. Settings persist across restarts and apply to every usage collector, including the daily scheduler.
+
+Fixed polling has no jitter, idle slowdown, exhaustion slowdown or urgent acceleration. A known window reset can bring a query forward to the reset plus 60 seconds. The shared store enforces the fixed deadline even when the default 180-second cache would otherwise prevent a 120-second query, or an escalation would otherwise query a candidate early. On the next collection after switching accounts or changing settings, both roles are replanned from their last successful samples. An overdue plan is eligible immediately; checks never postpone it by anchoring to the current time.
+
+Failure backoff, provider rate limits, post-429 recovery, imported-reading holds, dead-token quarantine and concurrent request leases still take precedence. A 120-second interval does not guarantee provider acceptance. Fixed settings never cause inference on their own. Queries run on the collector's next check after the deadline, so loop time, sleep and network latency affect the observed interval.
 
 ## When something fails
 

@@ -41,9 +41,11 @@ from claude_swap.poll_policy import (
     EDGE_BACKOFF_S,
     EXHAUSTED_INTERVAL_S,
     JITTER_FRAC,
+    POST_429_MIN_INTERVAL_S,
     RECENT_429_WINDOW_S,
     RESET_SLACK_S,
     SERVE_TTL_S,
+    fixed_poll_plan,
     parse_reset_ts,
 )
 from claude_swap.settings import atomic_write_json
@@ -1060,6 +1062,8 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        fixed_intervals: dict[str, float | None] | None = None,
+        models: tuple[str, ...] = (),
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1085,17 +1089,24 @@ class UsageStore:
           not.
         """
         nums = list(nums)
-        if not nums:
+        if not nums and not fixed_intervals:
             return {}
         now = self.clock()
         won: dict[str, str] = {}
         with self._lock():
             rows = self._read_rows()
+            changed = False
+            for num, interval in (fixed_intervals or {}).items():
+                row = rows.get(num)
+                if self._matches(row, identities[num]):
+                    changed = _sync_fixed_poll_plan(row, interval, now, models) or changed
             for num in nums:
                 identity = identities[num]
                 row = rows.get(num)
                 if not self._matches(row, identity):
                     rows[num] = row = self._fresh_row(identity)
+                    if fixed_intervals is not None and num in fixed_intervals:
+                        _sync_fixed_poll_plan(row, fixed_intervals[num], now, models)
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
@@ -1107,7 +1118,7 @@ class UsageStore:
                 row["claimId"] = claim_id
                 row["claimUntil"] = now + CLAIM_TTL_S
                 won[num] = claim_id
-            if won:
+            if won or changed:
                 self._write_rows(rows)
         return won
 
@@ -1331,6 +1342,43 @@ def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _sync_fixed_poll_plan(
+    row: dict, interval: float | None, now: float, models: tuple[str, ...],
+) -> bool:
+    if _live_claim(
+        _num_or_none(row.get("claimUntil")),
+        _num_or_none(row.get("lastAttemptAt")), now,
+    ):
+        return False
+    previous = _num_or_none(row.get("fixedPollIntervalS"))
+    if previous == interval and (interval is None or row.get("nextPollAt") is not None):
+        return False
+    before = dict(row)
+    entry = UsageEntry(
+        last_429_at=_num_or_none(row.get("last429At")),
+        last_error=row.get("lastError"),
+        backoff_until=_num_or_none(row.get("backoffUntil")),
+    )
+    previous_interval = _num_or_none(row.get("pollIntervalS")) or 0.0
+    recovering = entry.recent_429(now) or (
+        previous is not None and previous_interval > previous
+    )
+    if interval is None:
+        row.pop("fixedPollIntervalS", None)
+        if not recovering:
+            row["nextPollAt"] = None
+            row["pollIntervalS"] = None
+    else:
+        row["fixedPollIntervalS"] = interval
+        fetched_at = _num_or_none(row.get("fetchedAt"))
+        if fetched_at is not None:
+            effective = max(interval, previous_interval, POST_429_MIN_INTERVAL_S) if recovering else interval
+            row["nextPollAt"], row["pollIntervalS"] = fixed_poll_plan(
+                fetched_at, effective, row.get("lastGood"), models,
+            )
+    return row != before
+
+
 def _row_eligible(
     row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
 ) -> bool:
@@ -1354,6 +1402,8 @@ def _row_eligible(
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
     poll_due = next_poll_at is not None and now >= next_poll_at
+    if _num_or_none(row.get("fixedPollIntervalS")) is not None:
+        return poll_due or next_poll_at is None
     overslept = repair_overslept and _plan_oversleeps_interval(
         next_poll_at,
         _num_or_none(row.get("pollIntervalS")),

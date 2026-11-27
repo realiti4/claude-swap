@@ -27,6 +27,7 @@ from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import atomic_write_text, publish_target
+from claude_swap.poll_policy import FIXED_MIN_INTERVAL_S, FIXED_MAX_INTERVAL_S
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -130,6 +131,8 @@ class UsageSettings:
 
     header_probe: bool = False
     fable_probe: bool = False
+    active_interval_seconds: float | None = None
+    candidate_interval_seconds: float | None = None
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -233,6 +236,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "usage", "fableProbe", "fable_probe", "bool",
             help="With usage.headerProbe, also read Fable's weekly limit from a 1-token Fable request (opt-in: uses Fable quota)",
+        ),
+        SettingSpec(
+            "usage", "activeIntervalSeconds", "active_interval_seconds", "float",
+            FIXED_MIN_INTERVAL_S, FIXED_MAX_INTERVAL_S,
+            help="Fixed active-account usage polling interval; unset uses adaptive polling",
+        ),
+        SettingSpec(
+            "usage", "candidateIntervalSeconds", "candidate_interval_seconds", "float",
+            FIXED_MIN_INTERVAL_S, FIXED_MAX_INTERVAL_S,
+            help="Fixed other-account usage polling interval; unset uses adaptive polling",
         ),
     )
 }
@@ -517,26 +530,31 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
 
 
 def load_usage_settings(backup_root: Path) -> UsageSettings:
-    """Load the usage section; missing/corrupt file → defaults, and a
-    non-bool value → that key's default."""
+    """Load usage preferences, default invalid types and clamp numeric ranges."""
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("usage")
     default = UsageSettings()
     if not isinstance(section, dict):
         return default
-    values: dict[str, bool] = {}
-    for spec in SETTING_SPECS.values():  # every usage key is a boolean
+    values: dict[str, bool | float | None] = {}
+    for spec in SETTING_SPECS.values():
         if spec.section != "usage":
             continue
         field, json_key = spec.field, spec.json_key
         fallback = getattr(default, field)
         value = section.get(json_key, fallback)
-        if not isinstance(value, bool):
+        if spec.kind == "bool" and not isinstance(value, bool):
             _logger.warning(
                 "settings.json: usage.%s must be true or false, got %r; "
                 "using %r", json_key, value, fallback,
             )
             value = fallback
+        elif spec.kind == "float" and value is not None:
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or (isinstance(value, float) and not math.isfinite(value))):
+                value = fallback
+            else:
+                value = float(min(max(value, spec.lo), spec.hi))
         values[field] = value
     return UsageSettings(**values)
 

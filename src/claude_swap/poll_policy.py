@@ -27,7 +27,7 @@ tokens for one account may share one budget, which is what
 Error bars: the horizon is bracketed to ~55-64 minutes from a single
 transition event, the exact edge algorithm (likely a Cloudflare
 sliding-window approximation) is undocumented, and Anthropic can retune it
-any day — so the constants below lean only on the robust parts: a sustained
+any day — so the defaults below lean only on the robust parts: a sustained
 rate safely under the cap, and an ~hour recovery horizon. The budget target
 is an **average of at most ~1 request / 3 minutes** (20/hour vs the ~28-30/
 hour cap), leaving ~8-10 requests/hour of headroom for manual commands,
@@ -70,10 +70,12 @@ from datetime import datetime
 from claude_swap import oauth
 from claude_swap.lines import window_line
 
-# Freshness floor shared by every collector: an entry younger than this is
-# served from the store without any fetch, so the maximum sustained rate on
-# one token is 1/SERVE_TTL_S regardless of how many surfaces are open.
+# Default freshness floor for on-demand collection; configured fixed plans
+# and the auto engine's due plans use their own deadlines.
 SERVE_TTL_S = 180.0
+
+FIXED_MIN_INTERVAL_S = 120.0
+FIXED_MAX_INTERVAL_S = 1800.0
 
 # Normal cadence floor — movement can halve an interval down to this, never
 # below.
@@ -250,6 +252,17 @@ def scoped_probe_paused(row: dict, now: float) -> bool:
     return reset_ts is None or now < reset_ts
 
 
+def fixed_poll_plan(
+    fetched_at: float, interval_s: float, usage: dict | None,
+    models: tuple[str, ...] = (),
+) -> tuple[float, float]:
+    next_poll = fetched_at + interval_s
+    reset_ts = earliest_future_reset_ts(usage, fetched_at, models)
+    if reset_ts is not None:
+        next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
+    return next_poll, interval_s
+
+
 def plan_after_fetch(
     *,
     prev_interval_s: float | None,
@@ -261,6 +274,7 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     weekly_threshold: float | None = None,
+    fixed_interval_s: float | None = None,
     rng: Callable[[], float] = random.random,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
@@ -279,6 +293,16 @@ def plan_after_fetch(
     poll instead of sleeping until that reset, so an early provider-side
     quota grant is observed and its decision-grade status stays current.
     """
+    if fixed_interval_s is not None:
+        interval = fixed_interval_s
+        if recent_429:
+            increased = max(
+                (prev_interval_s or interval) * POST_429_BACKOFF_MULT,
+                POST_429_MIN_INTERVAL_S,
+            )
+            interval = max(interval, min(POST_429_MAX_INTERVAL_S, increased))
+        return fixed_poll_plan(now, interval, new_usage, models)
+
     default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
     ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
     base = prev_interval_s or default
