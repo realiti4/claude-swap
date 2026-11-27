@@ -126,10 +126,15 @@ class UsageSettings:
     show its row. A second opt-in because it spends Fable quota, which
     agreeing to a Haiku token did not cover. It acts only with
     ``header_probe`` on.
+
+    ``request_log``: log one INFO line per usage endpoint request (outcome,
+    slot, a token tag, process, request and cf-ray ids) so a 429 can be traced
+    to what sent it. Off by default; it adds no request.
     """
 
     header_probe: bool = False
     fable_probe: bool = False
+    request_log: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -233,6 +238,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "usage", "fableProbe", "fable_probe", "bool",
             help="With usage.headerProbe, also read Fable's weekly limit from a 1-token Fable request (opt-in: uses Fable quota)",
+        ),
+        SettingSpec(
+            "usage", "requestLog", "request_log", "bool",
+            help="Log one line per usage request (slot, token tag, request id, cf-ray) to trace a 429 (opt-in)",
         ),
     )
 }

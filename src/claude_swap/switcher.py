@@ -2113,15 +2113,17 @@ class ClaudeAccountSwitcher:
         return loaded
 
     def _probe_options(self, last_usage: dict | None) -> dict:
-        """The header-probe arguments of ``oauth.try_fetch_usage_for_account``
-        for a setup-token account: ``usage.headerProbe``, ``usage.fableProbe``
-        and the account's stored reading, which tells the probe that a
-        per-model bucket is spent and not to be asked about again yet."""
+        """The usage-setting arguments of ``oauth.try_fetch_usage_for_account``:
+        ``usage.requestLog``, and for a setup-token account ``usage.headerProbe``,
+        ``usage.fableProbe`` and the account's stored reading, which tells the
+        probe that a per-model bucket is spent and not to be asked about again
+        yet."""
         usage = self._usage_settings()
         return {
             "header_probe": usage.header_probe,
             "scoped_probe": usage.fable_probe,
             "last_usage": last_usage,
+            "request_log": usage.request_log,
         }
 
     def switchable_account_numbers(self) -> list[str]:
