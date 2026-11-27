@@ -178,9 +178,9 @@ def test_a_pass_that_may_not_reseat_leaves_the_item_as_it_was(
     no_refresh.assert_not_called()
 
 
-@pytest.mark.parametrize("record_unlink_denied", [False, True])
+@pytest.mark.parametrize("record_stays", [False, True])
 def test_a_failed_keychain_write_leaves_the_item_blank_and_the_next_pass_retries(
-    temp_home: Path, block_real_keychain, no_refresh, monkeypatch, record_unlink_denied,
+    temp_home: Path, block_real_keychain, no_refresh, monkeypatch, record_stays,
 ):
     s, live = _mac(temp_home, block_real_keychain, item=_blank())
     blank = block_real_keychain.data[KEY]
@@ -189,15 +189,15 @@ def test_a_failed_keychain_write_leaves_the_item_blank_and_the_next_pass_retries
     outcomes = []
     monkeypatch.setattr(
         s._store, "_log_detected_login", lambda _c, *, outcome, **_k: outcomes.append(outcome))
-    if record_unlink_denied:  # a record that cannot be removed must not keep the retry from the next pass
-        real_unlink = Path.unlink
+    if record_stays:  # the record cannot be emptied: it must not replace the Keychain error
+        real_write = credentials.atomic_write_text
 
-        def _deny(self, *a, **k):
-            if self.name.startswith(".reseated-"):
+        def _deny(path, text, **k):
+            if text == "":
                 raise PermissionError("denied")
-            return real_unlink(self, *a, **k)
+            return real_write(path, text, **k)
 
-        monkeypatch.setattr(Path, "unlink", _deny)
+        monkeypatch.setattr(credentials, "atomic_write_text", _deny)
 
     def _refused(*_a):
         raise macos_keychain.KeychainError("no GUI session")
@@ -213,7 +213,9 @@ def test_a_failed_keychain_write_leaves_the_item_blank_and_the_next_pass_retries
     monkeypatch.setattr(macos_keychain, "set_password", real)
     s._build_accounts_info()
 
-    assert json.loads(block_real_keychain.data[KEY]) == _reseated(_login())
+    # a record that stayed keeps its skip: bounded, never a loop
+    want = json.loads(blank) if record_stays else _reseated(_login())
+    assert json.loads(block_real_keychain.data[KEY]) == want
 
 
 @pytest.mark.parametrize("lands", ["item", "file", "held"])
