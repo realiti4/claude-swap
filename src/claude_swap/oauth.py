@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import socket
 import ssl
 import sys
 import urllib.error
@@ -46,6 +47,18 @@ USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 USAGE_PROBE_SCOPED_MODELS = {"claude-fable-5-1": "7d_oi"}
 
 _logger = logging.getLogger("claude-swap")
+
+# Refresh failures that happen before any byte of the request is written: the
+# name did not resolve, the connection was refused, or the TLS handshake
+# rejected the certificate.
+_NEVER_SENT = (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)
+
+# The token endpoint's error codes (RFC 6749 section 5.2). A refresh failure
+# is logged with one of these or as unrecognised, never with the reply text.
+_OAUTH_ERROR_CODES = frozenset({
+    "invalid_request", "invalid_client", "invalid_grant",
+    "unauthorized_client", "unsupported_grant_type", "invalid_scope",
+})
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -305,8 +318,15 @@ def try_refresh_oauth_credentials(
             json.dumps(data), None, _parse_token_account(resp_data)
         )
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
-        _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
+        # Reading the error body can fail too, when a gateway drops the
+        # connection part-way. That is a reply without a verdict.
+        unread = ""
+        try:
+            body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
+        except Exception as read_error:
+            body = ""
+            unread = f", body unread ({type(read_error).__name__})"
+        err = None
         # Permanent only when the server itself rejected the grant: a 4xx AND
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
@@ -323,16 +343,76 @@ def try_refresh_oauth_credentials(
                 err = json.loads(body).get("error")
             except (ValueError, AttributeError):
                 err = None
-            # invalid_grant: this slot's refresh lineage is dead.
-            # invalid_client: OUR client credential was rejected — systemic
-            # (client_id rotated/blocked), no evidence about any slot, so it
-            # keeps its own kind and lands no strike.
-            if err in ("invalid_grant", "invalid_client"):
-                return RefreshOutcome(None, err)
+        # The status and a known OAuth error code only: the body is whatever
+        # a server or a proxy chose to send.
+        known = isinstance(err, str) and err in _OAUTH_ERROR_CODES
+        _logger.debug(
+            "OAuth refresh failed: HTTP %s, error %s%s",
+            e.code, err if known else "unrecognised", unread,
+        )
+        # invalid_grant: this slot's refresh lineage is dead.
+        # invalid_client: OUR client credential was rejected — systemic
+        # (client_id rotated/blocked), no evidence about any slot, so it
+        # keeps its own kind and lands no strike.
+        if err in ("invalid_grant", "invalid_client"):
+            return RefreshOutcome(None, err)
+        if e.code >= 500:
+            # Not a verdict on the grant either: a gateway can report an error
+            # for a request the origin already acted on.
+            _warn_grant_fate_unknown(credentials, f"HTTP {e.code}")
+        return RefreshOutcome(None, "transient")
+    except urllib.error.URLError as e:
+        # urllib wraps every failure before the reply is read in URLError:
+        # name lookup, connect, TLS and writing the request. A failure while
+        # reading the reply arrives unwrapped, below.
+        reason = e.reason
+        what = "URLError" if isinstance(reason, str) else type(reason).__name__
+        if isinstance(reason, (str, *_NEVER_SENT)):
+            # Nothing reached the server, so no grant can have been spent.
+            # The ordinary offline case; it stays quiet.
+            _logger.debug("OAuth refresh not sent: %s", what)
+        else:
+            # A timeout or a reset here can be the connect or the write, and
+            # the exception does not say which. INFO, because the default log
+            # keeps it and it is not a reason for alarm.
+            _logger.info(
+                "OAuth refresh for %s failed while connecting or sending "
+                "(%s); whether the request reached the server is unknown.",
+                credential_fingerprint(credentials)[:19],
+                what,
+            )
         return RefreshOutcome(None, "transient")
     except Exception as e:
-        _logger.debug("OAuth refresh failed: %r", e)
+        # The request went out and no usable reply came back: a timeout or
+        # reset while waiting, or a reply that could not be read. The type
+        # name only: a decode error's repr holds the reply bytes.
+        _logger.debug("OAuth refresh failed: %s", type(e).__name__)
+        _warn_grant_fate_unknown(credentials, type(e).__name__)
         return RefreshOutcome(None, "transient")
+
+
+def _warn_grant_fate_unknown(credentials: str, what: str) -> None:
+    """Log a refresh that went out and came back without a verdict on the grant.
+
+    The outcome stays ``transient``: a retry is the only move either way. But
+    a timeout, a reset or a server error is not proof that nothing was spent,
+    and if the server did rotate the grant, the next refresh of these same
+    bytes gets invalid_grant. WARNING is a level the default log keeps, so
+    that later strike can be traced back to this exchange.
+
+    This module is not told which account it serves, so the line carries the
+    head of the credential fingerprint ("sha256:" and 12 hex digits): the
+    value the usage store writes as ``struckFingerprint``. ``what`` is a
+    status or an exception type name, never a repr: a decode error's repr is
+    the reply body, and a reply body can hold tokens.
+    """
+    _logger.warning(
+        "OAuth refresh for %s got no usable reply (%s). The refresh token "
+        "on disk may now be spent; if the next refresh fails with "
+        "invalid_grant, re-run `cswap --add-account` after logging in.",
+        credential_fingerprint(credentials)[:19],
+        what,
+    )
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:
@@ -1282,9 +1362,11 @@ def fetch_usage(access_token: str) -> dict | None:
 # `consume-busy` belongs here for a reason the other two make obvious only in
 # hindsight: the retry re-enters the same gate, finds it still held, and the
 # distinct kind arrives as generic "refresh-failed" — hiding it, and spending a
-# guaranteed 401 per pass to learn nothing.
+# guaranteed 401 per pass to learn nothing. `live-login` is the gate declining
+# a grant the live login also holds; the retry would be declined the same way.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "live-login",
 )
 
 

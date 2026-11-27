@@ -90,9 +90,12 @@ class AutoSwitchSettings:
 @dataclass(frozen=True)
 class UiSettings:
     """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection."""
+    color theme; ``auto`` follows terminal-background detection. ``org_tag``
+    picks when listings draw the ``[org]`` tag: ``on``, ``off``, or ``auto``
+    (only on accounts sharing an email with another managed account)."""
 
     theme: str = "auto"
+    org_tag: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -179,7 +182,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.dotted: spec
     for spec in (
         SettingSpec(
-            "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
+            "autoswitch", "threshold", "threshold", "float", 40.0, 99.9,
             help="Switch when the 5h window (or any window, if no weekly line) reaches this pct",
         ),
         SettingSpec(
@@ -218,6 +221,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "ui", "orgTag", "org_tag", "choice", choices=("auto", "on", "off"),
+            help="Show the [org] tag beside accounts; auto only where accounts share an email",
         ),
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
@@ -522,20 +529,23 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
-    """Load the ui section; missing/corrupt file or unknown theme → default."""
+    """Load the ui section; missing/corrupt file or a bad value → its default."""
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("ui")
     default = UiSettings()
     if not isinstance(section, dict):
         return default
-    theme = section.get("theme", default.theme)
-    if theme not in SETTING_SPECS["ui.theme"].choices:
-        _logger.warning(
-            "settings.json: unsupported ui.theme %r; using %r",
-            theme, default.theme,
-        )
-        return default
-    return UiSettings(theme=theme)
+    fields = {}
+    for spec in (SETTING_SPECS["ui.theme"], SETTING_SPECS["ui.orgTag"]):
+        value = section.get(spec.json_key, spec.default)
+        if value not in spec.choices:
+            _logger.warning(
+                "settings.json: unsupported %s %r; using %r",
+                spec.dotted, value, spec.default,
+            )
+            value = spec.default
+        fields[spec.field] = value
+    return UiSettings(**fields)
 
 
 def load_run_settings(backup_root: Path) -> RunSettings:

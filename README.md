@@ -88,13 +88,13 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
 
 ```bash
-cswap auto                     # foreground loop, polls every 60s
-cswap auto --threshold 80      # switch earlier
-cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
-cswap auto --model Fable       # also switch when the Fable weekly limit is hit
-cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first (more strategies below)
-cswap auto --once              # single check-and-switch, for cron/scripts
-cswap auto --dry-run           # log what it would do, never switch
+cswap auto                           # foreground loop, polls every 60s
+cswap auto --threshold 80            # switch earlier
+cswap auto --weekly-threshold 97     # let the weekly window run higher before switching
+cswap auto --model Fable             # also switch when the Fable weekly limit is hit
+cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first
+cswap auto --once                    # single check-and-switch, for cron/scripts
+cswap auto --dry-run                 # log what it would do, never switch
 ```
 
 <details>
@@ -114,7 +114,7 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 **Per-account controls**
 
 - `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target.
-- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
+- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (40–99.9) in place of the global one.
 - `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
 
 **Good to know**
@@ -163,6 +163,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 - **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead. When that login holds no usable token any more (missing, or emptied by Claude Code after a failed refresh), the account launches in its session profile from its stored login instead, since plain `claude` would only stop at "Not logged in".
 - **Tokens.** A session refreshes its own copy of the account's token; once it exits, the credential it rotated is captured back into the account's stored backup before a switch, swap, move, or usage check uses it. While the session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail) — exit the session first, or pick another account.
 - **Usage.** While a session runs, its account's usage is read with the session's own credential, which cswap never refreshes. A read the server refuses shows as token expired, and isn't retried, until the session renews the credential on its next call.
+- **Scripting.** cswap writes its own launch notices to stderr, so stdout carries only what claude prints: `cswap run 2 -- -p "…" --output-format json | jq` works.
 
 </details>
 
@@ -266,6 +267,8 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
+
+The log file, `claude-swap.log`, is in the backup directory too. Add `--debug` to a command (`cswap list --debug`) to record debug detail and print it to the terminal.
 
 ## Menu bar (macOS)
 

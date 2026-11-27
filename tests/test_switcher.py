@@ -635,6 +635,43 @@ class TestStatus:
 
         switcher.status()
 
+    @pytest.mark.parametrize(
+        "mode, other_email, tagged",
+        [
+            ("auto", "other@example.com", False),
+            ("auto", "test@example.com", True),
+            ("on", "other@example.com", True),
+            ("off", "test@example.com", False),
+        ],
+    )
+    def test_status_org_tag_follows_ui_org_tag(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys, mode, other_email, tagged,
+    ):
+        accounts = sample_sequence_data["accounts"]
+        accounts["1"].update(
+            email="test@example.com", organizationUuid="", organizationName="orgA"
+        )
+        accounts["2"].update(
+            email=other_email, organizationUuid="org-2", organizationName="orgB"
+        )
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)):
+            switcher.status()
+
+        output = capsys.readouterr().out
+        assert ("[orgA]" in output) is tagged
+        assert ("(test@example.com)" in output) is not tagged
+
 
 class TestStatusCache:
     """status() shares the usage.json cache with list_accounts."""
@@ -1716,6 +1753,23 @@ class TestLiveSessionGuardOnAnUnreadableRecord:
         switcher._ensure_no_live_session("2", "test@example.com", "the operation")
 
 
+class TestOrgTagShown:
+    @pytest.mark.parametrize(
+        "mode, email, shown",
+        [
+            ("on", "solo@x.com", True),
+            ("off", "dup@x.com", False),
+            ("auto", "dup@x.com", True),
+            ("auto", "solo@x.com", False),
+        ],
+    )
+    def test_modes(self, mode, email, shown):
+        from claude_swap.models import org_tag_shown
+
+        emails = ["dup@x.com", "dup@x.com", "solo@x.com"]
+        assert org_tag_shown(mode, email, emails) is shown
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -1745,12 +1799,52 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "test@example.com [personal] (active)" in output
+        assert "test@example.com (active)" in output
         assert "account2@example.com" in output
         assert "├ 5h:" in output
         assert "└ 7d:" in output
         assert "10%" in output
         assert "50%" in output
+
+    @pytest.mark.parametrize(
+        "mode, tagged",
+        [
+            ("auto", {"orgA", "orgB"}),
+            ("on", {"orgA", "orgB", "solo"}),
+            ("off", set()),
+        ],
+    )
+    def test_list_org_tag_follows_ui_org_tag(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys, mode, tagged,
+    ):
+        """Two accounts share an email and one does not: ``auto`` tags the pair only."""
+        for num, email, org in (
+            ("1", "dup@example.com", "orgA"),
+            ("2", "dup@example.com", "orgB"),
+            ("3", "solo@example.com", "solo"),
+        ):
+            sample_sequence_data["accounts"][num] = {
+                "email": email, "uuid": f"uuid-{num}", "added": "2024-01-01T00:00:00Z",
+                "organizationUuid": f"org-{num}", "organizationName": org,
+            }
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        settings_path(switcher.backup_dir).write_text(json.dumps({"ui": {"orgTag": mode}}))
+
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert {o for o in ("orgA", "orgB", "solo") if f"[{o}]" in output} == tagged
+        # A hidden tag leaves no stray space behind.
+        assert ("  3: solo@example.com\n" in output) is (mode != "on")
 
     def test_list_shows_alias_before_email(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
@@ -1773,7 +1867,7 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "  1: dev (test@example.com) [personal] (active)" in output
+        assert "  1: dev (test@example.com) (active)" in output
         # unaliased account keeps rendering plain email, no spurious parens
         assert "  2: account2@example.com" in output
         assert "(account2@example.com)" not in output
@@ -2439,6 +2533,52 @@ class TestActiveAccountRefresh:
         }
         write_live.assert_called_once_with(self._REFRESHED)
         write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+
+    @pytest.mark.parametrize(
+        "outcome, ending",
+        [
+            ("refreshed", "saved its successor ({new})."),
+            ("transient", "ended without a successor (transient)."),
+        ],
+    )
+    def test_the_active_refresh_is_bracketed_in_the_log(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog, outcome, ending,
+    ):
+        """The active account's refresh writes the same pair of lines as the
+        gate's: one before the POST, one for how it ended."""
+        import logging
+
+        switcher = self._switcher(sample_sequence_data)
+        result = (
+            oauth.RefreshOutcome(self._REFRESHED, None)
+            if outcome == "refreshed"
+            else oauth.RefreshOutcome(None, "transient")
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=result), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 10}})), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        old = oauth.credential_fingerprint(self._EXPIRED)[:19]
+        new = oauth.credential_fingerprint(self._REFRESHED)[:19]
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Refresh ")
+        ]
+        assert lines == [
+            f"Refresh starting for account 1 ({old}).",
+            "Refresh for account 1 " + ending.format(new=new),
+        ]
 
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -5197,6 +5337,7 @@ class TestBackwardCompatibility:
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        settings_path(backup_dir).write_text(json.dumps({"ui": {"orgTag": "on"}}))
 
         config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
@@ -5222,6 +5363,7 @@ class TestBackwardCompatibility:
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        settings_path(backup_dir).write_text(json.dumps({"ui": {"orgTag": "on"}}))
 
         config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
@@ -9272,6 +9414,53 @@ class TestSharedOAuthCredentialPreservation:
             "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         }
 
+    @staticmethod
+    def _cred(token, pointer=None):
+        data = {"claudeAiOauth": {"accessToken": token}}
+        if pointer is not None:
+            data["keychainOverflow"] = pointer
+        return json.dumps(data)
+
+    @pytest.mark.parametrize("target_pointer", [{"slot": "a", "key": "stale"}, None])
+    def test_shared_only_keychain_overflow_pointer_follows_the_switch(
+        self, temp_home, target_pointer
+    ):
+        switcher = ClaudeAccountSwitcher()
+        live_pointer = {"slot": "b", "key": "current"}
+
+        composed = json.loads(switcher._prepare_credentials_for_activation(
+            self._cred("target", target_pointer), self._cred("live", live_pointer)
+        ))
+
+        assert composed["keychainOverflow"] == live_pointer
+
+    @pytest.mark.parametrize(
+        "a_pointer, b_pointer",
+        [
+            pytest.param({"slot": "a", "key": "k", "login": "h"}, None, id="b-has-none"),
+            pytest.param(
+                {"slot": "a", "key": "k", "login": "h"},
+                {"slot": "b", "key": "k", "member": "m"},
+                id="b-mixed",
+            ),
+            pytest.param(None, {"slot": "b", "key": "k", "member": "m"}, id="a-has-none"),
+            pytest.param("opaque", None, id="a-non-dict"),
+        ],
+    )
+    def test_mixed_keychain_overflow_pointer_returns_as_stored_after_a_b_a(
+        self, temp_home, a_pointer, b_pointer
+    ):
+        switcher = ClaudeAccountSwitcher()
+        a_saved = self._cred("a", a_pointer)
+
+        on_b = switcher._prepare_credentials_for_activation(
+            self._cred("b", b_pointer), a_saved
+        )
+        back_on_a = switcher._prepare_credentials_for_activation(a_saved, on_b)
+
+        assert json.loads(back_on_a) == json.loads(a_saved)
+        assert json.loads(on_b).get("keychainOverflow") == b_pointer
+
     def test_account_bound_and_unknown_siblings_stay_target_owned(
         self, temp_home
     ):
@@ -10891,6 +11080,191 @@ class TestConsumeGate:
         unclaimed = s.list_unclaimed_credentials()
         assert unclaimed, "consumed successor must be stashed, never discarded"
 
+    @staticmethod
+    def _refresh_lines(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Refresh ")
+        ]
+
+    def test_a_refresh_is_bracketed_in_the_log(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """One line before the POST with the grant about to be sent, one after
+        the write with its successor: the default log shows the whole chain."""
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        old = oauth.credential_fingerprint(self._OLD)[:19]
+        new = oauth.credential_fingerprint(self._NEW)[:19]
+        assert self._refresh_lines(caplog) == [
+            f"Refresh starting for account 1 ({old}).",
+            f"Refresh for account 1 saved its successor ({new}).",
+        ]
+        assert "rt-old" not in caplog.text and "rt-new" not in caplog.text
+
+    def test_a_refresh_without_a_successor_says_how_it_ended(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        old = oauth.credential_fingerprint(self._OLD)[:19]
+        assert self._refresh_lines(caplog) == [
+            f"Refresh starting for account 1 ({old}).",
+            "Refresh for account 1 ended without a successor (invalid_grant).",
+        ]
+
+    def test_an_interrupted_refresh_leaves_only_its_start_line(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """What the pair is for: a process stopped between the POST and the
+        reply writes nothing more, and the start line alone shows it."""
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=KeyboardInterrupt), \
+             caplog.at_level(logging.INFO, logger="claude-swap"), \
+             pytest.raises(KeyboardInterrupt):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        old = oauth.credential_fingerprint(self._OLD)[:19]
+        assert self._refresh_lines(caplog) == [
+            f"Refresh starting for account 1 ({old}).",
+        ]
+
+    def test_a_declined_refresh_writes_no_start_line(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """The start line means a POST is about to go out, so a gate that
+        declines before the POST must not write it."""
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._write_credentials(self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert self._refresh_lines(caplog) == []
+
+    def test_gate_leaves_a_grant_the_live_login_holds(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The live login holding the same refresh token means Claude Code
+        renews it. The gate saves a successor to the backup only, so a POST
+        here would leave the live store on a spent grant (#590)."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._write_credentials(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-old",
+                "expiresAt": 1000,
+            }
+        }))
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert result.error == "live-login"
+        assert result.credentials is None
+        assert result.consumed_fp == oauth.credential_fingerprint(self._OLD)
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_gate_refreshes_when_the_live_login_is_another_grant(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Another account's live login is no reason to hold back."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._write_credentials(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-other",
+                "expiresAt": 1000,
+            }
+        }))
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)) as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_called_once()
+        assert result.error is None
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW
+
+    def test_gate_refreshes_when_there_is_no_live_login(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A live store that was read and is empty holds nobody's grant."""
+        from claude_swap.credentials import ActiveCredentials
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(s, "_read_active_credentials",
+                          return_value=ActiveCredentials("", False)), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)) as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_called_once()
+        assert result.error is None
+
+    @pytest.mark.parametrize(
+        "value, keychain_unavailable, degraded",
+        [
+            (None, False, False),
+            ("", True, True),
+            # The Keychain read failed and the fallback file answered with
+            # another account's login: the Keychain may still hold this grant.
+            ('{"claudeAiOauth": {"accessToken": "a", "refreshToken": '
+             '"rt-other", "expiresAt": 1000}}', False, True),
+        ],
+        ids=["read-error", "keychain-unavailable", "fallback-served"],
+    )
+    def test_gate_defers_when_the_live_login_cannot_be_read_for_certain(
+        self, temp_home: Path, sample_sequence_data: dict,
+        value, keychain_unavailable, degraded,
+    ):
+        """Whether the live login holds the grant is unknown, so nothing is
+        POSTed and nothing strikes: the next pass reads again."""
+        from claude_swap.credentials import ActiveCredentials
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(
+            s, "_read_active_credentials",
+            return_value=ActiveCredentials(value, keychain_unavailable, degraded),
+        ), patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert result.error == "transient"
+        assert result.credentials is None
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
     def test_gate_prefers_newer_session_profile_lineage(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -11382,6 +11756,41 @@ class TestInactiveRefreshRoutesThroughGate:
         assert gate["args"] == ("2", "b@example.com")
         assert "called" not in direct
         assert record.error is None
+
+    def test_idle_slot_holding_the_live_grant_is_not_refreshed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """#590: the config names another account while the live login is this
+        slot's, so the slot is polled as idle. Its expired token must not be
+        refreshed from the backup, and the known-expired token must not be
+        sent to the usage endpoint either."""
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-old", "refreshToken": "rt-shared",
+                "expiresAt": 1000,
+            }
+        })
+        s._write_account_credentials("2", "b@example.com", expired)
+        s._write_credentials(expired)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
+             patch.object(s, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.request_usage_data") as usage:
+            info = (2, "b@example.com", "", "", False, expired, "")
+            record = s._fetch_account_usage(info)
+
+        post.assert_not_called()
+        usage.assert_not_called()
+        assert record.error == "live-login"
+        assert record.struck_fp is None
+        assert s._read_account_credentials("2", "b@example.com") == expired
 
 
 class TestStrikeUnbindsInCollector:

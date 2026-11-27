@@ -25,7 +25,7 @@ One threshold compared against the busiest window forces the same number on wind
 
 ## Per-account threshold
 
-`cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one: auto-switch leaves that account when *its* line is reached and prefers candidates still under *theirs*, with ranking and the hysteresis margin counting room under each account's own line rather than raw headroom. Like the global threshold it is a switch-away line, not a hard cap — with nothing under its line, or the active account at its limit, it still lands somewhere rather than stall (`priority-consume-first` is the exception: it holds, see below). With a weekly line set, the override applies to the 5-hour window only. Accounts without one keep the global threshold. `cswap threshold` alone lists the default and every override, `--unset` clears one, and the [TUI](../README.md#interactive-dashboard-tui) shows a `th 85%` badge.
+`cswap threshold <num|email> <pct>` gives one account its own switch-away line (40–99.9) in place of the global one: auto-switch leaves that account when *its* line is reached and prefers candidates still under *theirs*, with ranking and the hysteresis margin counting room under each account's own line rather than raw headroom. Like the global threshold it is a switch-away line, not a hard cap — with nothing under its line, or the active account at its limit, it still lands somewhere rather than stall (`priority-consume-first` is the exception: it holds, see below). With a weekly line set, the override applies to the 5-hour window only. Accounts without one keep the global threshold. `cswap threshold` alone lists the default and every override, `--unset` clears one, and the [TUI](../README.md#interactive-dashboard-tui) shows a `th 85%` badge.
 
 ## Account priority tiers
 
@@ -54,6 +54,8 @@ Usage polling is adaptive — a couple of accounts per check, busy alternates wa
 ## When something fails
 
 It fails safe: if a usage check errors it keeps trusting the last-known numbers, for a bounded time, while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
+
+The active account is the exception while its usage checks are being rate-limited (a 429). It is the one being used, so its last-known numbers only show how far it had got: enough to act on once they reach a switch line, not enough to stay on. Once they are more than five minutes old the check reports `active-usage-stale`, and after `autoswitch.unhealthyTicks` such checks (about eight minutes after the last good reading by default) it moves, once the cooldown allows, to an account it has just read with at least the hysteresis margin of room under every one of its lines. While no account qualifies it stays and reports `no-verified-target`. An ordinary switch straight back to the account it just left waits until that account's usage has been read again. One refused check is enough to start this, so an account that was fine can be left early.
 
 An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 

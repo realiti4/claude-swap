@@ -203,7 +203,7 @@ class TestValidationAtTheWriteBoundary(PolicyCliBase):
     is the one that matters - `sequence.json` is the user's live account store.
     """
 
-    @pytest.mark.parametrize("bad", ["20", "0", "100", "abc", "", "9e9"])
+    @pytest.mark.parametrize("bad", ["20", "39.9", "0", "100", "abc", "", "9e9"])
     def test_a_rejected_value_exits_nonzero_and_writes_nothing(
         self, temp_home: Path, capsys, bad: str
     ):
@@ -222,10 +222,10 @@ class TestValidationAtTheWriteBoundary(PolicyCliBase):
             self._threshold(["2", "20"])
         captured = capsys.readouterr()
         text = captured.out + captured.err
-        assert "50" in text
+        assert "40" in text
         assert "99.9" in text
 
-    @pytest.mark.parametrize("good", ["50", "99.9", "85.5"])
+    @pytest.mark.parametrize("good", ["40", "50", "99.9", "85.5"])
     def test_the_boundaries_themselves_are_accepted(
         self, temp_home: Path, capsys, good: str
     ):

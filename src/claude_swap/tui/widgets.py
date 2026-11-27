@@ -254,6 +254,7 @@ def account_card_text(
     weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    show_tag: bool = True,
     login: str | None = "full",
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
@@ -270,7 +271,8 @@ def account_card_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -365,6 +367,7 @@ def mini_account_text(
     *,
     palette: Palette = Palette.DARK,
     login: str | None = "full",
+    show_tag: bool = True,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -381,7 +384,8 @@ def mini_account_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
@@ -477,7 +481,10 @@ class AccountsPanel(Static):
         minis = iter(
             fit_login(
                 lambda login: [
-                    mini_account_text(acc, now, palette=palette, login=login)
+                    mini_account_text(
+                        acc, now, palette=palette, login=login,
+                        show_tag=app.tag_shown(acc),
+                    )
                     for acc in inactive
                 ],
                 panel_width,
@@ -490,7 +497,7 @@ class AccountsPanel(Static):
                     fitted_card_text(
                         acc, width, panel_width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
-                        palette=palette,
+                        palette=palette, show_tag=app.tag_shown(acc),
                     )
                 )
             elif self._show_minis:
@@ -526,6 +533,7 @@ class AccountCard(Static):
         return fitted_card_text(
             self._acc, width, width, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
+            show_tag=self.app.tag_shown(self._acc),
         )
 
 

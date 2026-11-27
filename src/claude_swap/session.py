@@ -768,6 +768,9 @@ class SessionManager:
         terminal to one account per session needs the isolation guaranteed,
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
+
+        Notices on the way are printed plainly. `cswap run` sends them to
+        stderr, because stdout is claude's (``cli._run_launch``).
         """
         claude_bin = shutil.which("claude")
         if not claude_bin:
@@ -1124,6 +1127,12 @@ class SessionManager:
                     f"earns a strike. If the slot strikes, log in again and "
                     f"re-add it: cswap --add-account --slot {account_num}"
                 )
+            if outcome.error == "live-login":
+                # The gate declined because the live login holds this same
+                # grant. ``_bootstrap`` refuses that copy too; raising here
+                # keeps the "continuing with the stored credentials" warning
+                # below from preceding it.
+                raise self._live_login_error(account_num)
             if outcome.error is not None:
                 warning(
                     f"Could not refresh the token for Account-{account_num}; "
@@ -1229,6 +1238,17 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
+        # Checked here, on the login about to be copied, and before anything
+        # of the profile is touched. The consume gate's own check does not
+        # cover every way in: it reports success without reaching it when the
+        # backup moved after the caller's snapshot. Only a certain match
+        # refuses: a live store that cannot be read is no reason to fail a
+        # launch the stored credentials can serve.
+        if self.switcher._live_login_holds(
+            self.switcher.read_account_credentials(account_num, email) or ""
+        ):
+            raise self._live_login_error(account_num)
+
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)
@@ -1292,6 +1312,17 @@ class SessionManager:
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
+        )
+
+    @staticmethod
+    def _live_login_error(account_num: str) -> SessionError:
+        """The refusal to copy the live login into a session profile: two
+        Claude Codes on one refresh token invalidate each other."""
+        return SessionError(
+            f"Account-{account_num}'s stored login is the live login right "
+            f"now, so a session would be a second copy of the same login. "
+            f"Run 'cswap --switch-to {account_num}' so cswap treats it as the "
+            f"active account, then start claude normally."
         )
 
     @staticmethod

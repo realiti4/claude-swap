@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -54,7 +55,7 @@ def normalize_alias(name: str) -> str:
 #: literals rather than imported: ``models`` is a leaf and must not import
 #: ``settings``. The two are asserted equal in
 #: ``tests/test_account_policy_values.py`` so they cannot drift apart.
-ACCOUNT_THRESHOLD_MIN = 50.0
+ACCOUNT_THRESHOLD_MIN = 40.0
 ACCOUNT_THRESHOLD_MAX = 99.9
 
 
@@ -218,6 +219,15 @@ class AccountInfo:
             "organizationName": self.organization_name,
             "added": self.added,
         }
+
+
+def org_tag_shown(mode: str, email: str, emails: Sequence[str]) -> bool:
+    """Whether a per-account listing draws ``email``'s org tag under ``ui.orgTag``.
+
+    ``on`` always, ``off`` never, ``auto`` only when another managed account
+    (``emails`` lists every one, ``email`` included) has the same email.
+    """
+    return mode == "on" or (mode == "auto" and emails.count(email) > 1)
 
 
 @dataclass(frozen=True)

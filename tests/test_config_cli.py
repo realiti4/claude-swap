@@ -57,13 +57,14 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "ui.orgTag",
             "run.shareHistory",
             "updates.check",
             "usage.headerProbe",
             "usage.fableProbe",
         ):
             assert key in out
-        assert out.count("(default)") == 14
+        assert out.count("(default)") == 15
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -90,7 +91,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 14
+        assert len(by_key) == 15
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
@@ -237,7 +238,14 @@ class TestConfigValidation:
     def test_out_of_range_exits_1(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.threshold", "30"], capsys)
         assert code == 1
-        assert "between 50 and 99.9" in err
+        assert "between 40 and 99.9" in err
+        code, _, err = _run(["set", "autoswitch.threshold", "39.9"], capsys)
+        assert code == 1
+        assert "between 40 and 99.9" in err
+
+    def test_lower_bound_is_accepted(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.threshold", "40"], capsys)
+        assert code == 0
 
     def test_unknown_key_exits_1_and_lists_valid_keys(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.bogus", "1"], capsys)
