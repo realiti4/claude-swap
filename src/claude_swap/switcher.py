@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -5427,6 +5428,11 @@ class ClaudeAccountSwitcher:
         endpoint just accepted it). Definitive verdicts are memoized per
         lineage so a persistent drift state doesn't re-probe every pass.
 
+        :meth:`_save_active_login` calls this before any usage request, for a
+        quarantined slot's new login. The probe is then that token's first
+        request, and a refused one leaves the backup alone like any other
+        unresolved probe.
+
         Best-effort: any failure (lock contention, read error, identity
         moved, oracle unreachable) just leaves the backup stale — the
         recovery branch consumes nothing it cannot attribute. Never raises.
@@ -5745,11 +5751,15 @@ class ClaudeAccountSwitcher:
         self,
         infos: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry] | None = None,
+        relogged: dict[str, str] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant. ``entries``
         is the pre-fetch snapshot, for each row's refused-credential stamp
-        and stored reading."""
+        and stored reading. A slot in ``relogged`` (slot → the lease this
+        collector holds on its row) is fetched only once its new login is
+        saved as its backup (:meth:`_save_active_login`)."""
+        relogged = relogged or {}
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
@@ -5758,6 +5768,19 @@ class ClaudeAccountSwitcher:
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             entry = entries.get(num) if entries else None
+            if num in relogged and not self._save_active_login(
+                info, relogged[num]
+            ):
+                # An error, not a sentinel: the store's failure backoff then
+                # paces the next attempt.
+                self._logger.info(
+                    "Account %s's new login was not taken up this pass "
+                    "(ownership unverified, a store busy, or the row taken "
+                    "over by another collector); the next attempt waits for "
+                    "the backoff.",
+                    num,
+                )
+                return num, FetchRecord(error="login-unverified")
             return num, self._fetch_account_usage(
                 info,
                 entry.rejected_fingerprint if entry else None,
@@ -5811,21 +5834,31 @@ class ClaudeAccountSwitcher:
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        # ``relogged`` holds the quarantined slots that get an attempt all the
+        # same, because a new login is waiting to be saved for them
+        # (_active_login_replaced).
+        relogged: set[str] = set()
         for num in info_by_num:
             if num in sentinels:
                 continue
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+                if self._active_login_replaced(entry, _i):
+                    relogged.add(num)
+                else:
+                    sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
                 # Clear the stale strike ROW too: display and fetch
                 # eligibility (_row_eligible gates on the raw count) must
-                # agree, or the slot silently freezes at last-good.
+                # agree, or the slot silently freezes at last-good. A row
+                # under another collector's lease is left to it (``claims``):
+                # that collector has just saved a new login and its fetch is
+                # in flight.
                 self._usage_store.clear_dead_token(
-                    [num], {num: identities[num]}
+                    [num], {num: identities[num]}, claims={}
                 )
                 entries = store.entries(identities, models)
         requested = [
@@ -5844,6 +5877,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                struck_ok=relogged,
             )
         else:
             claims = store.reserve(
@@ -5851,6 +5885,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                struck_ok=relogged,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
@@ -5877,10 +5912,13 @@ class ClaudeAccountSwitcher:
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
 
+        accepted: set[str] = set()
         if claims:
             pre = entries
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims], pre
+                [info_by_num[num] for num in claims],
+                pre,
+                {num: claims[num] for num in relogged if num in claims},
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
@@ -5901,11 +5939,88 @@ class ClaudeAccountSwitcher:
                     entries[num], num, _i[1], _i[5], _i[4]
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
+        # A re-logged slot with no recorded attempt this pass (not due, in
+        # backoff, another collector's lease) is still quarantined.
+        for num in relogged - accepted:
+            sentinels[num] = USAGE_RELOGIN_REQUIRED
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    def _active_login_replaced(
+        self,
+        entry: UsageEntry,
+        account_info: tuple[int, str, str, str, bool, str, str],
+    ) -> bool:
+        """Whether a quarantined active slot's live login is a usable
+        credential of another generation than the struck one.
+
+        Logging in again with Claude Code writes the live store only. The slot
+        backup is cswap's own copy and keeps the struck generation, so
+        :meth:`_entry_token_dead` keeps holding, and the fetch that would
+        bring the backup up to date is the one the quarantine withholds.
+        Such a slot is offered to ``UsageStore.reserve`` despite its strike,
+        and the fetch that wins the claim saves the new login first
+        (:meth:`_save_active_login`).
+
+        False for an incomplete live credential, and for one that is expired
+        or carries no finite expiry time, which has nothing to verify with;
+        for a degraded read, whose bytes may be a stale copy; and for a strike
+        recorded without a fingerprint, which cannot be told apart from the
+        live generation.
+        """
+        _num, _email, _org_name, _org_uuid, is_active, creds, _alias = account_info
+        if not is_active or self._active_read_degraded:
+            return False
+        live = oauth.extract_oauth_data(creds)
+        if not (live and live.get("accessToken") and live.get("refreshToken")):
+            return False
+        expires_at = live.get("expiresAt")
+        if not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
+            return False
+        if oauth.is_oauth_token_expired(expires_at):
+            return False
+        return not entry.token_dead(stored_fp=oauth.credential_fingerprint(creds))
+
+    def _save_active_login(
+        self,
+        account_info: tuple[int, str, str, str, bool, str, str],
+        claim_id: str,
+    ) -> bool:
+        """Save a quarantined active slot's new live login as its backup and
+        lift the quarantine. True once the backup holds that login and the
+        strike is cleared under ``claim_id``, the caller's lease on the row.
+
+        The write is :meth:`_resync_rotated_backup`'s: the profile endpoint
+        must name this slot's account, and the live store is re-read under
+        the locks. Nothing is sent to the token endpoint. The strike is
+        cleared here, with the lease kept, so that the fetch that follows
+        records as any other: its failure sets the row's backoff, and no
+        later pass has a stale strike left to clear.
+
+        On False the caller does not fetch. Either the backup and the strike
+        are untouched, or some other writer replaced the backup meanwhile
+        (the struck grant is gone, but this login was not the one saved), or
+        the lease is no longer this collector's and its outcome would not be
+        recorded. The next pass treats the slot by the ordinary rules.
+        """
+        num, email, _org_name, org_uuid, _active, creds, _alias = account_info
+        slot = str(num)
+        self._resync_rotated_backup(slot, email, org_uuid, creds)
+        backup, unreadable = self._read_account_credentials_ex(slot, email)
+        if (
+            unreadable
+            or not backup
+            or oauth.credential_fingerprint(backup)
+            != oauth.credential_fingerprint(creds)
+        ):
+            return False
+        cleared = self._usage_store.clear_dead_token(
+            [slot], {slot: (email, org_uuid or "")}, claims={slot: claim_id}
+        )
+        return slot in cleared
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
