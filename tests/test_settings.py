@@ -297,6 +297,13 @@ class TestUsageSettings:
         assert unset_setting(tmp_path, "usage.fableProbe") is True
         assert load_usage_settings(tmp_path).fable_probe is False
 
+    def test_request_log_is_off_until_set(self, tmp_path: Path):
+        assert load_usage_settings(tmp_path).request_log is False
+        assert set_setting(tmp_path, "usage.requestLog", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(request_log=True)
+        assert unset_setting(tmp_path, "usage.requestLog") is True
+        assert load_usage_settings(tmp_path).request_log is False
+
     def test_a_non_bool_key_does_not_take_the_other_one_down(
         self, tmp_path: Path, caplog
     ):

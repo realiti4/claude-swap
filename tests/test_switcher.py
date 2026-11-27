@@ -1301,6 +1301,7 @@ class TestSetupTokenHeaderProbeWiring:
             # Opt-in: each probe is a real request on the subscription.
             assert mock_fetch.call_args.kwargs["header_probe"] is False
             assert mock_fetch.call_args.kwargs["scoped_probe"] is False
+            assert mock_fetch.call_args.kwargs["request_log"] is False
             set_setting(switcher.backup_dir, "usage.headerProbe", "true")
             # A same-second rewrite can keep the mtime; force a visible change.
             path = settings_path(switcher.backup_dir)
@@ -1310,10 +1311,12 @@ class TestSetupTokenHeaderProbeWiring:
             # The Fable probe is a second opt-in.
             assert mock_fetch.call_args.kwargs["scoped_probe"] is False
             set_setting(switcher.backup_dir, "usage.fableProbe", "true")
+            set_setting(switcher.backup_dir, "usage.requestLog", "true")
             os.utime(path, (time.time() + 10, time.time() + 10))
             stored = {"seven_day": {"pct": 1.0}}
             switcher._fetch_account_usage(self._info(), None, stored)
             assert mock_fetch.call_args.kwargs["scoped_probe"] is True
+            assert mock_fetch.call_args.kwargs["request_log"] is True
             # The stored reading rides along: it can pause the Fable probe.
             assert mock_fetch.call_args.kwargs["last_usage"] is stored
 

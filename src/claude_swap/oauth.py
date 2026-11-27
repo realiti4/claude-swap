@@ -561,8 +561,13 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
-def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
+def request_usage_data(
+    access_token: str, *, request_log: bool = False, slot: str | None = None
+) -> dict:
+    """Request raw utilization data from the Anthropic usage API.
+
+    ``request_log`` logs one INFO line for the request (see
+    :func:`_log_usage_request`); ``slot`` is the account number it names."""
     url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -570,7 +575,7 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    outcome, resp_headers, err = "?", None, None
+    outcome, resp_headers = "?", None
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             resp_headers = resp.headers
@@ -578,49 +583,43 @@ def request_usage_data(access_token: str) -> dict:
         outcome = "http-200"
         return data
     except Exception as e:
-        err, resp_headers = e, getattr(e, "headers", resp_headers)
+        resp_headers = getattr(e, "headers", resp_headers)
         outcome = f"http-{e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
         raise
     finally:
-        try:
-            _log_usage_request(access_token, outcome, resp_headers, err)
-        except Exception:  # a log line must never replace the result or the HTTPError
-            pass
-        err = resp_headers = None  # err's traceback holds this frame: break the cycle
+        if request_log:
+            try:
+                _log_usage_request(access_token, outcome, resp_headers, slot)
+            except Exception:  # a log line must never replace the result or the HTTPError
+                pass
 
 
-def _log_safe(value, cap: int = 64, free_text: bool = False) -> str:
-    """Server-controlled text made safe for one log line: ASCII only (a folded
-    header can carry CR/LF and would forge a line), capped. ``free_text`` keeps
-    punctuation; the default keeps what an id or a number needs."""
-    keep = str.isprintable if free_text else lambda c: c.isalnum() or c in " ._:-"
-    return "".join(c for c in str(value or "") if c.isascii() and keep(c))[:cap].strip()
+def _log_safe(value) -> str:
+    """A server-controlled header value made safe for one log line: ASCII only
+    (a folded header can carry CR/LF and would forge a line), what an id or a
+    number needs, capped."""
+    keep = (c for c in str(value or "") if c.isascii() and (c.isalnum() or c in " ._:-"))
+    return "".join(keep)[:64].strip()
 
 
 def _log_usage_request(
-    access_token: str, outcome: str, headers, err: Exception | None
+    access_token: str, outcome: str, headers, slot: str | None
 ) -> None:
     """One INFO line per usage request, success or not, so a block can be
-    traced to the token and process that spent the budget. The token appears
-    only as a 12-hex sha256 prefix of the access token; no email, so the line
-    is paste-safe. A 429 adds its Retry-After and the cause its body states
-    (the one status whose body is read here: ``_classify_usage_error`` reads a
-    403's, and an HTTPError body can be read once)."""
+    traced to the token, slot and process that spent the budget. The token
+    appears only as a 12-hex sha256 prefix of the access token; no email, so
+    the line is paste-safe. No body is read: a 429 adds its Retry-After only."""
     headers = headers or {}
     tag = hashlib.sha256(access_token.encode()).hexdigest()[:12]
     argv0 = os.path.basename(sys.argv[0]) if sys.argv else ""
-    parts = [f"Usage request: {outcome} token {tag} pid {os.getpid()} ({argv0 or '?'})"]
-    for name in ("request-id", "x-request-id"):
+    at = f" slot {slot}" if slot is not None else ""
+    parts = [f"Usage request: {outcome} token {tag}{at} pid {os.getpid()} ({argv0 or '?'})"]
+    for name in ("request-id", "x-request-id", "cf-ray"):
         if value := _log_safe(headers.get(name)):
             parts.append(f"{name} {value}")
     if outcome == "http-429":
         if value := _log_safe(headers.get("Retry-After")):
             parts.append(f"retry-after {value}")
-        try:
-            body = json.loads(err.read(4096))["error"]
-            parts.append(f"{_log_safe(body['type'])}: {_log_safe(body['message'], 160, True)}")
-        except Exception:
-            pass
     _logger.info(" ".join(parts))
 
 
@@ -1410,6 +1409,7 @@ def try_fetch_usage_for_account(
     header_probe: bool = False,
     scoped_probe: bool = False,
     last_usage: dict | None = None,
+    request_log: bool = False,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -1427,7 +1427,8 @@ def try_fetch_usage_for_account(
     backoff pace it exactly like an endpoint fetch; without it the outcome is
     the ``"setup-token"`` error and no request is sent. ``scoped_probe`` and
     ``last_usage`` (the account's stored reading) only shape that probe, see
-    :func:`_usage_from_probe`.
+    :func:`_usage_from_probe`. ``request_log`` logs a line for each usage
+    endpoint request (see :func:`request_usage_data`).
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -1486,7 +1487,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        data = request_usage_data(access_token, request_log=request_log, slot=account_num)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
@@ -1535,7 +1536,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
-            data = request_usage_data(new_token)
+            data = request_usage_data(new_token, request_log=request_log, slot=account_num)
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
