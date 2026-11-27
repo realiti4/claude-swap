@@ -339,9 +339,10 @@ def test_org_mismatch_message_offers_a_way_out_for_either_stale_side(
     """Either side of an org mismatch can be the stale one. The credential
     store can hold another organization's token, or the config can still
     name the previous organization after a fresh login to the token's one.
-    Telling the user only to log in to the config's organization sends the
-    second case back to the login they meant to leave, so the message must
-    offer a login to each organization."""
+    Telling the user to log in to the config's organization sends the
+    second case back to the login they meant to leave, so the message names
+    both organizations and then gives a way out that picks neither: log in
+    again to the account they want."""
     s = _switcher(temp_home, mock_claude_config, "ax@example.com", org="org-A")
 
     with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
@@ -352,8 +353,10 @@ def test_org_mismatch_message_offers_a_way_out_for_either_stale_side(
             s.add_account(slot=7, assume_yes=True)
 
     msg = str(e.value)
-    assert "log in to organization org-A" in msg, msg
-    assert "log in to organization org-B again" in msg, msg
+    named, _, way_out = msg.partition("Nothing was changed.")
+    assert "organization org-A" in named and "organization org-B" in named, msg
+    assert "Log in again" in way_out, msg
+    assert "org-A" not in way_out and "org-B" not in way_out, msg
     assert "7" not in s._get_sequence_data().get("accounts", {})
 
 
@@ -372,8 +375,8 @@ def test_org_mismatch_message_names_a_personal_account_as_such(
             s.add_account(slot=7, assume_yes=True)
 
     msg = str(e.value)
-    assert "log in to your personal account" in msg, msg
-    assert "log in to organization org-B again" in msg, msg
+    assert "belongs to organization org-B" in msg, msg
+    assert "the config names your personal account" in msg, msg
 
 
 def test_email_mismatch_message_still_names_both_addresses(

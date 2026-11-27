@@ -3956,18 +3956,19 @@ class ClaudeAccountSwitcher:
         # nothing (it's the address that agrees) -- name the two
         # organizations that disagree instead. Either side can be the stale
         # one: the credential store may hold another organization's token,
-        # or the config may have been rewritten after a fresh login to the
-        # token's organization. The message gives the way out of both.
+        # or the config may name the organization of an earlier login. A
+        # new login repairs either, so the message gives that one way out
+        # without picking a side: Claude Code 2.1.332 stores ``oauthAccount``
+        # from the new token's profile on sign-in, then saves the token.
         seen_label = f"organization {seen_org}" if seen_org else "your personal account"
         config_label = f"organization {org_uuid}" if org_uuid else "your personal account"
         raise ConfigError(
             f"The stored credential for {email} belongs to {seen_label}, "
             f"but the config names {config_label}. Nothing was changed. "
-            f"Two accounts can share an email across organizations, so one "
-            f"of the two is out of date. To add {config_label}, log in to "
-            f"{config_label} in THIS environment, then re-run. If you just "
-            f"logged in to {seen_label}, the config was rewritten after that "
-            f"login: log in to {seen_label} again, then re-run."
+            f"Two accounts can share an email across organizations, and "
+            f"either the credential or the config is out of date. Log in "
+            f"again in THIS environment to the account you want to add, "
+            f"then re-run."
         )
 
     def _reject_live_api_key_capture(self, creds: str) -> None:
