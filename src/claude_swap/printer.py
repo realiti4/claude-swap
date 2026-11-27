@@ -48,7 +48,7 @@ def _pal(key: str) -> str:
 
 
 def _enable_windows_vt() -> bool:
-    """Enable VT processing on Windows console."""
+    """Enable VT processing on Windows console, and say whether it is on."""
     if sys.platform != "win32":
         return True
     try:
@@ -57,9 +57,15 @@ def _enable_windows_vt() -> bool:
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         mode = ctypes.c_ulong()
-        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        return True
+        # Both calls report failure by returning 0, never by raising, so the
+        # except arm below is blind to them. A console that refuses
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING -- legacy conhost, Windows 10
+        # before 1511 -- would otherwise be told colors work and get a literal
+        # escape sequence on every line. Nothing to OR the flag into if the
+        # read failed, so that is checked first.
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
     except Exception:
         return False
 
