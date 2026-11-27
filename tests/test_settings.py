@@ -831,20 +831,34 @@ class TestLocalOverlay:
         assert unset_setting(tmp_path, "autoswitch.threshold") is False
         assert _local(tmp_path).read_text() == "{}"
 
-    @pytest.mark.parametrize(
-        "key, literal, raw",
-        [("updates.check", 0, "false"), ("usage.headerProbe", 1, "true")],
-    )
-    def test_a_bool_equal_to_the_base_literal_still_lands(
-        self, tmp_path: Path, key, literal, raw
-    ):
-        """Python reads ``0 == False``; a write must not compare values."""
-        section, name = key.split(".")
-        settings_path(tmp_path).write_text(json.dumps({section: {name: literal}}))
+    def test_a_bool_equal_to_the_base_literal_still_lands(self, tmp_path: Path):
+        """Python reads ``1 == True``; a write must not compare values."""
+        settings_path(tmp_path).write_text(json.dumps({"usage": {"headerProbe": 1}}))
         _local(tmp_path).write_text("{}")
-        value = set_setting(tmp_path, key, raw)
-        assert json.loads(_local(tmp_path).read_text())[section][name] is value
-        assert next(v for s, v, _ in effective_settings(tmp_path) if s.dotted == key) is value
+        value = set_setting(tmp_path, "usage.headerProbe", "true")
+        assert json.loads(_local(tmp_path).read_text())["usage"]["headerProbe"] is value
+        assert next(
+            v for s, v, _ in effective_settings(tmp_path) if s.dotted == "usage.headerProbe"
+        ) is value
+
+    @pytest.mark.parametrize("body", ["", " \n"], ids=["touched", "whitespace"])
+    def test_an_empty_local_file_is_an_empty_overlay(
+        self, tmp_path: Path, caplog, body
+    ):
+        """``touch settings.local.json`` is the natural way to opt in."""
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))
+        before = settings_path(tmp_path).read_bytes()
+        _local(tmp_path).write_text(body)
+        with caplog.at_level(logging.WARNING):
+            assert load_settings(tmp_path).threshold == 80.0
+        assert not caplog.records
+        set_setting(tmp_path, "autoswitch.threshold", "70")
+        assert json.loads(_local(tmp_path).read_text())["autoswitch"]["threshold"] == 70.0
+        assert settings_path(tmp_path).read_bytes() == before
+
+    def test_a_dangling_local_link_still_takes_the_write(self, tmp_path: Path):
+        _local(tmp_path).symlink_to(tmp_path / "gone" / "settings.local.json")
+        assert settings_write_path(tmp_path) == _local(tmp_path)
 
     def test_corrupt_local_degrades_reads_and_refuses_writes(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))

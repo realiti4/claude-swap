@@ -319,9 +319,10 @@ def settings_stamp(backup_root: Path) -> tuple[float | None, float | None]:
 
 def settings_write_path(backup_root: Path) -> Path:
     """The file a settings write lands in: ``settings.local.json`` once someone
-    has created it, else ``settings.json``."""
+    has created it, else ``settings.json``. ``lexists``: a dangling link counts,
+    as it does for ``atomic_write_json``."""
     local = backup_root / LOCAL_SETTINGS_FILENAME
-    return local if local.exists() else settings_path(backup_root)
+    return local if os.path.lexists(local) else settings_path(backup_root)
 
 
 def _overlay(base: dict, local: dict) -> dict:
@@ -411,7 +412,7 @@ def _read_raw(path: Path) -> dict:
 
 def _read_file(path: Path) -> dict:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8").strip() or "{}")
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -688,7 +689,7 @@ def _read_raw_for_write(path: Path) -> dict:
     except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"could not read {path}: {e}") from e
     try:
-        raw = json.loads(text)
+        raw = json.loads(text.strip() or "{}")  # a touched, empty file is {}
     except json.JSONDecodeError as e:
         raise ConfigError(
             f"{path} is not valid JSON ({e}); fix or delete it before "

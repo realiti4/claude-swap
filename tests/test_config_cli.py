@@ -320,6 +320,10 @@ class TestConfigUnset:
         assert code == 0
         assert "80" in out and "default" not in out
         assert _run(["get", "autoswitch.threshold"], capsys)[1].strip() == "80"
+        # Now only settings.json sets it: say so, not "not set".
+        code, _, err = _run(["unset", "autoswitch.threshold"], capsys)
+        assert code == 0
+        assert "set in settings.json" in err and "does not write" in err
 
     def test_unset_when_not_set_is_a_noop(self, temp_home, capsys):
         code, _, err = _run(["unset", "autoswitch.threshold"], capsys)

@@ -1143,7 +1143,14 @@ Examples:
                 )
                 print(f"{args.key} unset ({now})")
             else:
-                print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+                spec = setting_spec(args.key)
+                from_base = any(s for sp, _, s in effective_settings(root) if sp is spec)
+                why = (
+                    "is set in settings.json, which this command does not write"
+                    if from_base
+                    else "is not set"
+                )
+                print(muted(f"{args.key} {why}; nothing to do"), file=sys.stderr)
     except ClaudeSwitchError as e:
         if json_mode:
             print(json.dumps(error_envelope(e), indent=2))
