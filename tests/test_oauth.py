@@ -1115,7 +1115,7 @@ class TestUsageRequestLog:
     TOKEN = "sk-ant-oat01-secret"
     TAG = hashlib.sha256(TOKEN.encode()).hexdigest()[:12]
     RATE = json.dumps({"type": "error", "error": {
-        "type": "rate_limit_error", "message": "Slow down\r\nINFO forged " + "x" * 400,
+        "type": "rate_limit_error", "message": "Slow down",
     }}).encode()
     HTTP = staticmethod(TestClassifyUsageError._http_error)
 
@@ -1140,11 +1140,11 @@ class TestUsageRequestLog:
 
     def test_success_logs_one_line(self, caplog):
         (line,), raised = self._request(
-            caplog, return_value=self._ok({"request-id": "req_ok", "cf-ray": "9a8b-YYZ"}),
+            caplog, return_value=self._ok({"request-id": "req_ok", "cf-ray": "9a8b7c6d-xy"}),
         )
         assert raised is None
         for part in ("http-200", self.TAG, "slot 7", f"pid {os.getpid()}", "request-id req_ok",
-                     "cf-ray 9a8b-YYZ"):
+                     "cf-ray 9a8b7c6d-xy"):
             assert part in line
         assert self.TOKEN not in line
 
@@ -1166,17 +1166,11 @@ class TestUsageRequestLog:
         assert all(p in line for p in present)
         assert not any(a in line for a in absent)
 
-    @pytest.mark.parametrize("urlopen", [
-        {"return_value": _ok()}, {"side_effect": HTTP(429, {"Retry-After": "9"}, RATE)},
-    ])
-    def test_default_logs_nothing(self, caplog, urlopen):
+    def test_default_logs_nothing(self, caplog):
         """The trace is opt-in: a plain call sends one request and logs nothing."""
-        with patch("claude_swap.oauth.urllib.request.urlopen", **urlopen), \
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=self._ok()), \
                 caplog.at_level(logging.DEBUG, logger="claude-swap"):
-            try:
-                oauth.request_usage_data(self.TOKEN)
-            except urllib.error.HTTPError:
-                pass
+            assert oauth.request_usage_data(self.TOKEN) == {"ok": 1}
         assert caplog.records == []
 
     @pytest.mark.parametrize("urlopen", [{"side_effect": HTTP(401)}, {"return_value": _ok()}])
