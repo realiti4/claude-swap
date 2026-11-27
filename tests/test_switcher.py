@@ -7686,7 +7686,7 @@ class TestFormatUsageLines:
 
         now = datetime.now(timezone.utc)
         passed = (now - timedelta(hours=43)).isoformat()
-        ahead = (now + timedelta(days=3)).isoformat()
+        ahead = (now + timedelta(days=3, minutes=30)).isoformat()
         usage = {
             "five_hour": {"pct": 19.0, "resets_at": passed},
             "seven_day": {"pct": 22.0, "resets_at": ahead},
@@ -7696,7 +7696,7 @@ class TestFormatUsageLines:
         clock = oauth.format_reset(passed)[1]
         assert five == f"5h:       ?   reset  {clock}"
         assert fable == f"Fable:    ?   reset  {clock}"
-        assert seven.startswith("7d:     22%   resets ") and "in 2d 23h" in seven
+        assert seven.startswith("7d:     22%   resets ") and "in 3d 0h" in seven
         assert five.index(clock) == seven.index(oauth.format_reset(ahead)[1])
 
     def test_weekly_window_past_its_reset_is_not_measured_against_pace(self):
