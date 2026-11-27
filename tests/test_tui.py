@@ -3264,7 +3264,9 @@ class TestUnswitchableRowsAreListed:
         the Next-best row while the dashboard row drew no figure. Upstream
         #625 draws a passed window as `5h ?` on every surface, whether a
         fetch is claimed, only a retry is scheduled, or the pct was measured
-        after the reset, so the panel reads that and calls nothing full."""
+        after the reset, so the panel's chips read that. The label is the
+        engine's veto on the stored figure (`5h full`), as the decision log
+        prints it, so only the chips and the mini row carry no figure."""
         from claude_swap.settings import AutoSwitchSettings
         from claude_swap.tui.widgets import mini_account_text
 
@@ -3292,7 +3294,98 @@ class TestUnswitchableRowsAreListed:
             for out in (panel, mini):
                 assert "5h ?" in out and "Fable ?" in out, out
                 assert "100%" not in out and "⟳" not in out, out
-                assert "full" not in out and "-only" not in out, out
+            assert "  5h full" in panel and "-only" not in panel, panel
+            assert "full" not in mini, mini
+
+    @pytest.mark.parametrize(
+        ("active_pct", "header"),
+        [(95.0, "all accounts exhausted"), (20.0, "not previewed (active below threshold)")],
+        ids=["engine-ran", "engine-not-run"],
+    )
+    def test_a_passed_window_still_carries_the_engines_block_label(self, active_pct, header):
+        """The engine reads the stored 5h figure whether or not its reset has
+        passed, so the label is `classify_candidate_block` over every window,
+        as the decision log prints it (`_describe`): only the chip reads
+        `5h ?`. A live 7d at 100% behind it keeps its chip, and a live Fable
+        at 100% is never called `Fable-only` while the stored 5h still blocks.
+        With the engine pass not run (active below its line) the label is the
+        only reason on the row."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        def render(second_window):
+            return self._render(self._snap(
+                self._acct("1", "a@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": active_pct}, "seven_day": {"pct": 20.0},
+                    "scoped": [{"name": "Fable", "pct": 20.0}],
+                }),
+                self._acct("2", "b@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                    **second_window,
+                }),
+            ), active="1", settings=AutoSwitchSettings(
+                model="Fable", threshold=90.0, strategy="best"))
+
+        live = {"resets_at": _iso_in(86400 * 3)}
+        out = render({"seven_day": {"pct": 100.0, **live}})
+        assert header in out, out
+        assert "5h ?" in out and "7d(⟳" in out and "):100%" in out, out
+        assert "  5h full" in out and "7d full" not in out, out
+        out = render({
+            "seven_day": {"pct": 5.0, **live},
+            "scoped": [{"name": "Fable", "pct": 100.0, **live}],
+        })
+        assert "5h ?" in out and "  5h full" in out and "Fable-only" not in out, out
+
+    @pytest.mark.parametrize("active_pct", [95.0, 20.0], ids=["engine-ran", "engine-not-run"])
+    @pytest.mark.parametrize("window", ["5h", "7d"])
+    def test_a_passed_window_over_its_line_but_under_100_still_reads_full(self, active_pct, window):
+        """A passed window stored at 95% against a line of 90 reads `?` on its
+        chip, which shows no figure: the decision log's `(5h full)` must print
+        on the row too, or the row has no figure, label or reason."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        stored = {"pct": 95.0, "resets_at": _iso_in(-60)}
+        other = {"pct": 5.0, "resets_at": _iso_in(86400 * 3)}
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": active_pct}, "seven_day": {"pct": 20.0},
+            }),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": stored if window == "5h" else other,
+                "seven_day": stored if window == "7d" else other,
+            }),
+        ), active="1", settings=AutoSwitchSettings(
+            threshold=90.0, weekly_threshold=90.0, strategy="best"))
+        assert f"{window} ?" in out and f"  {window} full" in out, out
+        assert "95%" not in out and "not a candidate" not in out, out
+
+    def test_a_passed_model_window_alone_still_reads_model_only_as_the_log_does(self):
+        """A model window past its reset (stored 100%) with 5h/7d open is
+        still what the engine and the decision log call a model-only block."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(-60)}],
+            }),
+        ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
+        assert "Fable ?" in out and "Fable-only" in out, out
+
+    def test_a_rejected_probe_keeps_its_reading_after_its_reset_passes(self):
+        """A refused probe is not a usage window that ended: its chip keeps
+        the limit it reported (`rejected(...):100%`), never `rejected ?`."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "refused@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "rejected": {"retry_after_s": None, "resets_at": _iso_in(-60)},
+            }),
+        ), active="1", settings=AutoSwitchSettings())
+        assert "rejected ?" not in out and "rejected(" in out and ":100%" in out, out
 
     def test_a_passed_chip_keeps_the_columns_after_it_aligned(self):
         """A `5h ?` chip is shorter than `5h(⟳4h19m):45%`; the column the 7d

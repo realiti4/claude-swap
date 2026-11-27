@@ -246,9 +246,10 @@ def _chip_parts(
     """One window's chip as ``(reading, figure, passed)``, read as the
     dashboard reads it: ``5h ?`` once the reset has passed
     (``oauth.window_reset_passed``, the stored pct describes a window that
-    ended), else ``5h(⟳2h04m):`` and the pct."""
+    ended), else ``5h(⟳2h04m):`` and the pct. A refused probe (``rejected``)
+    is a limit, not a window that ended."""
     window = {"resets_at": resets_at}
-    if oauth.window_reset_passed(window, now):
+    if label != oauth.REJECTED_LABEL and oauth.window_reset_passed(window, now):
         return f"{label} ", "?", True
     reset = data.reset_text(window, now, entry.fetched_at, entry=entry)
     return data.chip_label(label, reset, wpct), f"{wpct:.0f}%", False
@@ -744,18 +745,11 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
-                    # A window whose chip reads `5h ?` (its reset has passed)
-                    # has no opinion to contribute -- so it is dropped
-                    # rather than zeroed: a zeroed pct would still be a
-                    # fabricated measurement, never one the window actually
-                    # reported (#325).
+                    # Over EVERY window, a passed one included: the engine and
+                    # the decision log read its stored pct, so only its chip
+                    # reads `5h ?`, never the label (#325).
                     kind, blocked_model = classify_candidate_block(
-                        (
-                            (label, p) for label, p, _t, _f, passed in chips
-                            if not passed
-                        ),
-                        line,
-                        weekly,
+                        ((label, p) for label, p, _ in windows), line, weekly,
                     )
                     if kind == "model":
                         entry.append(f"  {blocked_model}-only", style=palette.muted)
