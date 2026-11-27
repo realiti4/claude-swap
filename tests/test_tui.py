@@ -5234,6 +5234,16 @@ class TestUnswitchableRowsAreListed:
             assert "5h ? · 7d(⟳" in out and "):5%" in out, out
             assert "100%" not in out and "5h(⟳" not in out, out
         assert "Fable ?" in panel and "full" not in panel and "-only" not in panel, panel
+        # Every window past its reset: nothing is left to classify.
+        only = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0, **passed}},
+            fetched_at=now - 10, age_s=10.0,
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=only),
+        ), active="1", settings=AutoSwitchSettings())
+        assert "5h ?" in out and "100%" not in out and "full" not in out, out
 
     def test_the_panel_still_calls_a_window_that_has_not_reset_full(self):
         """CONTROL for the test above: a window that has not reset keeps its
