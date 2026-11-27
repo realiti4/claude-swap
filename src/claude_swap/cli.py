@@ -402,6 +402,129 @@ def _unmap_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+# Longest look-back `cswap tokens --hours` accepts: the ledger keeps eight
+# days of history (tokens.RETENTION_S), so asking for more would only
+# return the same eight days.
+_TOKENS_MAX_HOURS = 192.0
+
+
+def _tokens_command(argv: list[str]) -> None:
+    """Handle `cswap tokens [--hours N] [--limit N] [--json]`.
+
+    Shows how many tokens Claude Code on this computer sent and received,
+    totalled per cswap account and listed per prompt. Counts are read from
+    Claude Code's local session logs (see tokens.py). Only numbers, model
+    names, times and project folder names are shown, never prompt or reply
+    text.
+    """
+    import time
+
+    from claude_swap import tokens
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} tokens",
+        description="Tokens sent and received per prompt, from this computer's Claude Code logs.",
+    )
+    parser.add_argument(
+        "--hours", type=float, default=24.0,
+        help=f"look back this many hours (default 24, max {_TOKENS_MAX_HOURS:g})",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=25,
+        help="how many recent prompts to list (default 25; 0 shows totals only)",
+    )
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    # Clamp rather than reject: a too-large window just means "everything".
+    hours = min(max(args.hours, 0.1), _TOKENS_MAX_HOURS)
+    since = time.time() - hours * 3600
+
+    switcher = ClaudeAccountSwitcher()
+    ledger = tokens.ledger_for(switcher.backup_dir)
+    ledger.refresh(force=True)  # a one-off command: always read the latest
+    current = switcher.current_account_number()
+
+    prompts = ledger.prompts(since, current)
+    totals = ledger.totals(since, current)
+    # `prompts[-0:]` would be the whole list, so 0 must be handled explicitly.
+    listed = prompts[-args.limit:] if args.limit > 0 else []
+
+    if args.json:
+        print(json.dumps(_tokens_json(hours, totals, listed), indent=2))
+    else:
+        _print_tokens_report(hours, totals, listed)
+
+
+def _tokens_json(hours: float, totals: dict, prompts: list) -> dict:
+    """The `cswap tokens --json` document. Field names are a contract: add, never rename."""
+    return {
+        "schemaVersion": 1,
+        "hours": hours,
+        # {slot: {sent, received, calls, prompts, cache_read}}; "?" = unknown
+        "totals": totals,
+        "prompts": [
+            {
+                "ts": p.ts,
+                "account": p.account,
+                "project": p.project,
+                "calls": p.calls,
+                "sent": p.sent,
+                "received": p.received,
+                "cacheRead": p.cache_read,
+                "peakContext": p.peak_context,
+                "models": p.models,
+            }
+            for p in prompts
+        ],
+    }
+
+
+def _print_tokens_report(hours: float, totals: dict, prompts: list) -> None:
+    """Print `cswap tokens` as two tables: totals per account, then recent prompts."""
+    import time
+
+    from claude_swap.tokens import human, short_model
+
+    print(
+        f"Tokens from this computer's Claude Code logs, last {hours:g}h "
+        "(sent = input + cache read + cache write; received = output)"
+    )
+
+    # Totals per account. "cache hit" is the share of sent tokens served from
+    # the prompt cache: high is cheap, and a drop after a switch is the cost
+    # of starting cold on another account.
+    print(f"  {'account':<8} {'sent':>9} {'received':>9} {'prompts':>8} {'calls':>6} {'cache hit':>9}")
+    for slot, row in sorted(totals.items()):
+        cache_hit_pct = row["cache_read"] / row["sent"] * 100 if row["sent"] else 0.0
+        print(
+            f"  #{slot:<7} {human(row['sent']):>9} {human(row['received']):>9} "
+            f"{row['prompts']:>8} {row['calls']:>6} {cache_hit_pct:>8.0f}%"
+        )
+
+    if prompts:
+        # One row per prompt, oldest first. "peak ctx" is the largest single
+        # request: how big the conversation got while answering it.
+        print()
+        print(
+            f"  {'time':<11} {'acct':<4} {'project':<16} {'model':<10} "
+            f"{'calls':>5} {'sent':>8} {'recv':>7} {'peak ctx':>8}"
+        )
+        for p in prompts:
+            when = time.strftime("%m-%d %H:%M", time.localtime(p.ts))
+            models = ",".join(short_model(m) for m in p.models)
+            print(
+                f"  {when:<11} #{p.account or '?':<3} {p.project[:16]:<16} "
+                f"{models[:10]:<10} {p.calls:>5} {human(p.sent):>8} "
+                f"{human(p.received):>7} {human(p.peak_context):>8}"
+            )
+
+    print(dimmed(
+        "Only this computer is visible; claude.ai or other machines on the "
+        "same accounts are not."
+    ))
+
+
 def _unclaimed_command(argv: list[str]) -> None:
     """Handle `cswap unclaimed [--purge ID]` — inspect or drop a stash row.
 
@@ -1469,6 +1592,9 @@ def main() -> None:
     if argv and argv[0] == "unclaimed":
         _unclaimed_command(argv[1:])
         return
+    if argv and argv[0] == "tokens":
+        _tokens_command(argv[1:])
+        return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
@@ -1530,6 +1656,7 @@ Commands:
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
+  %(prog)s tokens [--hours N]         tokens sent/received per prompt (this computer)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)

@@ -229,6 +229,7 @@ cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap swap 2 3                  # Exchange two accounts' slot numbers
+cswap tokens [--hours N]        # Tokens sent/received per account and prompt, from this computer's Claude Code logs
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
