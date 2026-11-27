@@ -110,7 +110,7 @@ from claude_swap.settings import (
     load_ui_settings,
     load_usage_settings,
     parse_model_names,
-    settings_path,
+    settings_stamp,
 )
 from claude_swap.usage_store import (
     FetchRecord,
@@ -569,14 +569,17 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, weekly_threshold, models)) — see
+        # (settings mtimes, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
-            float | None, tuple[float, float | None, tuple[str, ...]]
+            tuple[float | None, float | None],
+            tuple[float, float | None, tuple[str, ...]],
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
-        # (settings mtime, the usage section) — see _usage_settings.
-        self._usage_settings_cache: tuple[float | None, UsageSettings] | None = None
+        # (settings mtimes, the usage section), see _usage_settings.
+        self._usage_settings_cache: tuple[
+            tuple[float | None, float | None], UsageSettings
+        ] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -2332,11 +2335,7 @@ class ClaudeAccountSwitcher:
         stat per pass)."""
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
-        path = settings_path(self.backup_dir)
-        try:
-            mtime: float | None = path.stat().st_mtime
-        except OSError:
-            mtime = None
+        mtime = settings_stamp(self.backup_dir)
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
@@ -2349,13 +2348,9 @@ class ClaudeAccountSwitcher:
         return inputs
 
     def _usage_settings(self) -> UsageSettings:
-        """The ``usage`` section of the settings file (reloaded only when it
-        changes — one stat per fetch)."""
-        path = settings_path(self.backup_dir)
-        try:
-            mtime: float | None = path.stat().st_mtime
-        except OSError:
-            mtime = None
+        """The ``usage`` section of the settings files (reloaded only when
+        either changes; two stats per fetch)."""
+        mtime = settings_stamp(self.backup_dir)
         cache = getattr(self, "_usage_settings_cache", None)
         if cache is not None and cache[0] == mtime:
             return cache[1]
@@ -2364,15 +2359,17 @@ class ClaudeAccountSwitcher:
         return loaded
 
     def _probe_options(self, last_usage: dict | None) -> dict:
-        """The header-probe arguments of ``oauth.try_fetch_usage_for_account``
-        for a setup-token account: ``usage.headerProbe``, ``usage.fableProbe``
-        and the account's stored reading, which tells the probe that a
-        per-model bucket is spent and not to be asked about again yet."""
+        """The usage-setting arguments of ``oauth.try_fetch_usage_for_account``:
+        ``usage.requestLog``, and for a setup-token account ``usage.headerProbe``,
+        ``usage.fableProbe`` and the account's stored reading, which tells the
+        probe that a per-model bucket is spent and not to be asked about again
+        yet."""
         usage = self._usage_settings()
         return {
             "header_probe": usage.header_probe,
             "scoped_probe": usage.fable_probe,
             "last_usage": last_usage,
+            "request_log": usage.request_log,
         }
 
     @macos_keychain.memo_reads()
@@ -4975,13 +4972,20 @@ class ClaudeAccountSwitcher:
             return creds
         # Same address, different org: naming the address twice says
         # nothing (it's the address that agrees) -- name the two
-        # organizations that disagree instead.
+        # organizations that disagree instead. Either side can be the stale
+        # one: the credential store may hold another organization's token,
+        # or the config may name the organization of an earlier login. A
+        # new login repairs either, so the message gives that one way out
+        # without picking a side: Claude Code 2.1.332 stores ``oauthAccount``
+        # from the new token's profile on sign-in, then saves the token.
+        seen_label = f"organization {seen_org}" if seen_org else "your personal account"
+        config_label = f"organization {org_uuid}" if org_uuid else "your personal account"
         raise ConfigError(
-            f"The stored credential for {email} belongs to organization "
-            f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
-            f"Nothing was changed. Two accounts can share an email "
-            f"across organizations. Log in as {email} in the "
-            f"{org_uuid or 'personal'} organization in THIS environment, "
+            f"The stored credential for {email} belongs to {seen_label}, "
+            f"but the config names {config_label}. Nothing was changed. "
+            f"Two accounts can share an email across organizations, and "
+            f"either the credential or the config is out of date. Log in "
+            f"again in THIS environment to the account you want to add, "
             f"then re-run."
         )
 

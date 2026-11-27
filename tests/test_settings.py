@@ -22,6 +22,7 @@ from claude_swap.settings import (
     UnrecognizedKey,
     UpdateSettings,
     UsageSettings,
+    _read_raw,
     effective_settings,
     explicit_share_history,
     load_run_settings,
@@ -34,6 +35,7 @@ from claude_swap.settings import (
     save_settings,
     set_setting,
     settings_path,
+    settings_write_path,
     unrecognized_keys,
     unset_setting,
 )
@@ -402,6 +404,13 @@ class TestUsageSettings:
         )
         assert unset_setting(tmp_path, "usage.fableProbe") is True
         assert load_usage_settings(tmp_path).fable_probe is False
+
+    def test_request_log_is_off_until_set(self, tmp_path: Path):
+        assert load_usage_settings(tmp_path).request_log is False
+        assert set_setting(tmp_path, "usage.requestLog", "true") is True
+        assert load_usage_settings(tmp_path) == UsageSettings(request_log=True)
+        assert unset_setting(tmp_path, "usage.requestLog") is True
+        assert load_usage_settings(tmp_path).request_log is False
 
     def test_a_non_bool_key_does_not_take_the_other_one_down(
         self, tmp_path: Path, caplog
@@ -887,3 +896,117 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+def _local(root: Path) -> Path:
+    return root / "settings.local.json"
+
+
+class TestLocalOverlay:
+    """``settings.local.json`` is opt-in: until someone creates it,
+    settings.json is the only file; once it exists it overrides settings.json
+    and takes every write."""
+
+    def test_without_an_overlay_nothing_creates_one(self, tmp_path: Path):
+        assert settings_write_path(tmp_path) == settings_path(tmp_path)
+        set_setting(tmp_path, "autoswitch.threshold", "80")
+        assert not _local(tmp_path).exists()
+        assert json.loads(settings_path(tmp_path).read_text())["autoswitch"] == {
+            "threshold": 80.0
+        }
+
+    @pytest.mark.parametrize(
+        "base, local, merged",
+        [
+            ({"a": {"k": 1, "j": 2}}, {"a": {"k": 3}}, {"a": {"k": 3, "j": 2}}),
+            ({"x": [1], "y": 1}, {"x": [2]}, {"x": [2], "y": 1}),
+            ({"a": {"k": 1}}, {"a": 5}, {"a": 5}),
+            ({}, {"a": {"k": 1}}, {"a": {"k": 1}}),
+        ],
+    )
+    def test_reads_see_local_over_base(self, tmp_path: Path, base, local, merged):
+        settings_path(tmp_path).write_text(json.dumps(base))
+        _local(tmp_path).write_text(json.dumps(local))
+        assert _read_raw(settings_path(tmp_path)) == merged
+
+    @pytest.mark.parametrize(
+        "write",
+        [
+            lambda root: set_setting(root, "autoswitch.threshold", "70"),
+            lambda root: save_settings(root, AutoSwitchSettings(threshold=70.0)),
+        ],
+        ids=["set", "save"],
+    )
+    def test_with_an_overlay_writes_go_to_it_alone(self, tmp_path: Path, write):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))
+        before = settings_path(tmp_path).read_bytes()
+        _local(tmp_path).write_text("{}")
+        assert settings_write_path(tmp_path) == _local(tmp_path)
+        write(tmp_path)
+        assert settings_path(tmp_path).read_bytes() == before
+        assert json.loads(_local(tmp_path).read_text())["autoswitch"]["threshold"] == 70.0
+        assert load_settings(tmp_path).threshold == 70.0
+
+    def test_a_write_into_the_overlay_keeps_its_previous_bytes_as_prev(self, tmp_path: Path):
+        # The `.prev` backup is of the file a write overwrites, which is the overlay once it exists.
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))
+        _local(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 70}}))
+        before = _local(tmp_path).read_bytes()
+        set_setting(tmp_path, "autoswitch.threshold", "75")
+        assert _local(tmp_path).with_name("settings.local.json.prev").read_bytes() == before
+        assert not settings_path(tmp_path).with_name("settings.json.prev").exists()
+
+    def test_unset_with_an_overlay_shows_the_base_value(self, tmp_path: Path):
+        before = json.dumps({"autoswitch": {"threshold": 80}})
+        settings_path(tmp_path).write_text(before)
+        _local(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 70}}))
+        assert unset_setting(tmp_path, "autoswitch.threshold") is True
+        assert "autoswitch" not in json.loads(_local(tmp_path).read_text())
+        assert settings_path(tmp_path).read_text() == before
+        _, value, is_set = next(
+            row for row in effective_settings(tmp_path) if row[0].dotted == "autoswitch.threshold"
+        )
+        assert (value, is_set) == (80.0, True)
+
+    def test_unset_of_a_key_only_the_base_sets_writes_nothing(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))
+        _local(tmp_path).write_text("{}")
+        assert unset_setting(tmp_path, "autoswitch.threshold") is False
+        assert _local(tmp_path).read_text() == "{}"
+
+    def test_a_bool_equal_to_the_base_literal_still_lands(self, tmp_path: Path):
+        """Python reads ``1 == True``; a write must not compare values."""
+        settings_path(tmp_path).write_text(json.dumps({"usage": {"headerProbe": 1}}))
+        _local(tmp_path).write_text("{}")
+        value = set_setting(tmp_path, "usage.headerProbe", "true")
+        assert json.loads(_local(tmp_path).read_text())["usage"]["headerProbe"] is value
+        assert next(
+            v for s, v, _ in effective_settings(tmp_path) if s.dotted == "usage.headerProbe"
+        ) is value
+
+    @pytest.mark.parametrize("body", ["", " \n"], ids=["touched", "whitespace"])
+    def test_an_empty_local_file_is_an_empty_overlay(
+        self, tmp_path: Path, caplog, body
+    ):
+        """``touch settings.local.json`` is the natural way to opt in."""
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))
+        before = settings_path(tmp_path).read_bytes()
+        _local(tmp_path).write_text(body)
+        with caplog.at_level(logging.WARNING):
+            assert load_settings(tmp_path).threshold == 80.0
+        assert not caplog.records
+        set_setting(tmp_path, "autoswitch.threshold", "70")
+        assert json.loads(_local(tmp_path).read_text())["autoswitch"]["threshold"] == 70.0
+        assert settings_path(tmp_path).read_bytes() == before
+
+    def test_a_dangling_local_link_still_takes_the_write(self, tmp_path: Path):
+        _local(tmp_path).symlink_to(tmp_path / "gone" / "settings.local.json")
+        assert settings_write_path(tmp_path) == _local(tmp_path)
+
+    def test_corrupt_local_degrades_reads_and_refuses_writes(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))
+        _local(tmp_path).write_text("{not json")
+        assert load_settings(tmp_path).threshold == 80.0
+        with pytest.raises(ConfigError, match="not valid JSON"):
+            set_setting(tmp_path, "autoswitch.cooldownSeconds", "600")
+        assert _local(tmp_path).read_text() == "{not json"

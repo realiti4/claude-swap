@@ -305,7 +305,7 @@ cswap menubar --foreground          # run attached to this terminal, for debuggi
 
 ### Configuration
 
-Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges.
+Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges. To keep a `settings.json` under version control untouched, create an untracked `settings.local.json` beside it: it overrides `settings.json`, and edits are then written to it alone.
 
 <details>
 <summary>Commands & usage</summary>
@@ -320,6 +320,7 @@ cswap config set run.shareHistory false   # each account keeps its own chat hist
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request
+cswap config set usage.requestLog true    # opt in: log one line per usage request (slot, token tag, request id, cf-ray)
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
