@@ -290,6 +290,15 @@ def config_lock_dir() -> Path:
     return path.parent / (path.name + ".lock")
 
 
+def _delete_pending(exc: OSError) -> bool:
+    """Windows answers EACCES for a name whose `rmdir` is still delete-pending.
+
+    A peer's release, not a permission, so it is contention there. On POSIX it
+    is a real EACCES and stays an error.
+    """
+    return os.name == "nt" and isinstance(exc, PermissionError)
+
+
 def _nap(want: float, start: float, timeout: float) -> None:
     """Sleep at most what is LEFT of the budget, never a full jitter draw.
 
@@ -378,8 +387,10 @@ def proper_lockfile(
     held_fd = -1
     start = time.monotonic()
     while True:
+        made = False
         try:
             os.mkdir(lock_dir)
+            made = True
             try:
                 can_pin = _fd_pins_an_inode(lock_dir.parent)
             except BaseException:
@@ -458,16 +469,21 @@ def proper_lockfile(
             # claim here about which OTHER arm sleeps, because that sentence
             # has been true and false in successive merges.
             time.sleep(max(0.0, min(0.05, timeout - (time.monotonic() - start))))
-        except OSError:
-            # `mkdir` made the directory and the open could not read it back,
-            # so nobody holds it and every waiter is blocked for the full
-            # staleness window. Retrying cannot clear this errno; releasing
-            # the name can.
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                pass
-            raise
+        except OSError as exc:
+            if made:
+                # `mkdir` made the directory and the open could not read it
+                # back, so nobody holds it and every waiter is blocked for the
+                # full staleness window. Retrying cannot clear this errno;
+                # releasing the name can.
+                try:
+                    os.rmdir(lock_dir)
+                except OSError:
+                    pass
+                raise
+            # A REFUSED `mkdir` MADE NOTHING, so the name is a peer's and is
+            # never removed here. Delete-pending falls through as contention.
+            if not _delete_pending(exc):
+                raise
         # A NAME THAT IS NOT A DIRECTORY IS NEVER A LOCK AND NO RETRY MAKES
         # IT ONE: `mkdir` cannot replace it and `rmdir` answers ENOTDIR, so not
         # even the stale branch clears it. `islink` covered only half of that --
@@ -496,7 +512,9 @@ def proper_lockfile(
             )
         try:
             held_mtime = os.stat(lock_dir).st_mtime
-        except FileNotFoundError:
+        except OSError as exc:
+            if not isinstance(exc, FileNotFoundError) and not _delete_pending(exc):
+                raise
             # BACK OFF HERE TOO. A dangling symlink at the lock path answers
             # FileExistsError to mkdir and FileNotFoundError to stat, so this
             # arm can repeat for the whole budget.

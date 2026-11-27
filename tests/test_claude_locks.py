@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import math
 import os
 import shutil
 import sys
@@ -858,6 +859,40 @@ class TestProperLockfile:
                     pass
             assert takeover.is_symlink() or takeover.exists()
 
+    @pytest.mark.parametrize(
+        "os_name,op,refusals,outcome",
+        [
+            ("nt", "mkdir", 1, None),
+            ("nt", "mkdir", math.inf, ClaudeCodeLockTimeout),
+            ("nt", "stat", math.inf, ClaudeCodeLockTimeout),
+            ("posix", "mkdir", 1, PermissionError),
+            ("posix", "stat", 1, PermissionError),
+        ],
+        ids=["nt-mkdir-once", "nt-mkdir-always", "nt-stat-always",
+             "posix-mkdir", "posix-stat"],
+    )
+    def test_an_eacces_on_the_lock_path_is_contention_only_on_windows(
+        self, lock_dir, monkeypatch, os_name, op, refusals, outcome
+    ):
+        """A delete-pending name answers EACCES to `mkdir` and `stat` on
+        Windows: a peer's release, so retry inside the budget. Never an
+        `rmdir`, which is for a directory WE made and would remove a live
+        peer's lock. On POSIX it is a real EACCES and still raises."""
+        if outcome is not None:
+            lock_dir.mkdir()  # a live peer's lock
+        fake = _RefusingOs(lock_dir, os_name, op, refusals)
+        monkeypatch.setattr(claude_locks, "os", fake)
+        _scripted_time(monkeypatch, 1.0)
+        if outcome is None:
+            with proper_lockfile(lock_dir, timeout=1.0):
+                assert fake.rmdirs == []
+        else:
+            with pytest.raises(outcome):
+                with proper_lockfile(lock_dir, timeout=1.0):
+                    pass
+            assert fake.rmdirs == [] and lock_dir.is_dir()
+        assert fake.refused >= 1, "premise: the injection never fired"
+
 
 class _ForcedTakeoverRace:
     """Stand-in for ``claude_locks.os`` that forces the #420 interleaving:
@@ -910,6 +945,36 @@ class _ForcedTakeoverRace:
                 second = self._removals == 2
             if second:
                 self._retaken.wait(2)
+        return os.rmdir(path, *args, **kwargs)
+
+
+class _RefusingOs:
+    """Stand-in for ``claude_locks.os``: reports ``name`` and refuses ``op`` on
+    the lock path with EACCES ``refusals`` times, recording its `rmdir`s."""
+
+    def __init__(self, lock_dir, name, op, refusals):
+        self.name, self.refused, self.rmdirs = name, 0, []
+        self._lock, self._op, self._refusals = str(lock_dir), op, refusals
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+    def _refuse(self, op, path):
+        if op == self._op and str(path) == self._lock and self.refused < self._refusals:
+            self.refused += 1
+            raise PermissionError(errno.EACCES, "Access is denied")
+
+    def mkdir(self, path, *args, **kwargs):
+        self._refuse("mkdir", path)
+        return os.mkdir(path, *args, **kwargs)
+
+    def stat(self, path, *args, **kwargs):
+        self._refuse("stat", path)
+        return os.stat(path, *args, **kwargs)
+
+    def rmdir(self, path, *args, **kwargs):
+        if str(path) == self._lock:
+            self.rmdirs.append(str(path))
         return os.rmdir(path, *args, **kwargs)
 
 
