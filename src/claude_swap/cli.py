@@ -1063,7 +1063,8 @@ def _config_command(argv: list[str]) -> None:
 
     Pre-dispatched before the main parser is built, like `run` and `auto`
     (same limitation: `config` must be the first argument). Edits
-    settings.json in the backup root with strict validation — unlike loading,
+    settings.json in the backup root (or settings.local.json once someone has
+    created it) with strict validation — unlike loading,
     which forgivingly clamps — so a typo'd key or out-of-range value errors
     loudly here instead of silently degrading at `cswap auto` time. `list`
     also names the keys a hand edit left in the file that nothing reads.
@@ -1075,7 +1076,7 @@ def _config_command(argv: list[str]) -> None:
         load_usage_settings,
         set_setting,
         setting_spec,
-        settings_path,
+        settings_write_path,
         unrecognized_keys,
         unset_setting,
     )
@@ -1101,7 +1102,7 @@ Examples:
   cswap config set autoswitch.threshold 80
   cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config unset autoswitch.threshold   # back to the default
-  cswap config path                         # where settings.json lives
+  cswap config path                         # the file `set` writes
         """,
     )
     parser.add_argument(
@@ -1133,7 +1134,11 @@ Examples:
     p_set.add_argument("value", metavar="VALUE")
     p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
     p_unset.add_argument("key", metavar="KEY")
-    sub.add_parser("path", help="Print the settings.json location")
+    sub.add_parser(
+        "path",
+        help="Print the file `set` writes (settings.json, or "
+        "settings.local.json once it exists)",
+    )
 
     args = parser.parse_args(argv)
     json_mode = bool(getattr(args, "json", False))
@@ -1150,14 +1155,14 @@ Examples:
         root = switcher.backup_dir
 
         if action == "path":
-            print(settings_path(root))
+            print(settings_write_path(root))
         elif action == "list":
             rows = effective_settings(root)
             ignored = unrecognized_keys(root)
             if json_mode:
                 payload = {
                     "schemaVersion": 1,
-                    "path": str(settings_path(root)),
+                    "path": str(settings_write_path(root)),
                     "settings": [
                         {"key": spec.dotted, "value": value, "isSet": is_set}
                         for spec, value, is_set in rows
@@ -1213,10 +1218,26 @@ Examples:
                 )
         elif action == "unset":
             if unset_setting(root, args.key):
-                default = setting_spec(args.key).default
-                print(f"{args.key} unset (default: {format_setting_value(default)})")
+                spec = setting_spec(args.key)
+                value, is_set = next(
+                    (v, s) for sp, v, s in effective_settings(root) if sp is spec
+                )
+                # With settings.local.json in play, settings.json may still set it.
+                now = (
+                    f"now {format_setting_value(value)}, from settings.json"
+                    if is_set
+                    else f"default: {format_setting_value(spec.default)}"
+                )
+                print(f"{args.key} unset ({now})")
             else:
-                print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+                spec = setting_spec(args.key)
+                from_base = any(s for sp, _, s in effective_settings(root) if sp is spec)
+                why = (
+                    "is set in settings.json, which this command does not write"
+                    if from_base
+                    else "is not set"
+                )
+                print(muted(f"{args.key} {why}; nothing to do"), file=sys.stderr)
     except ClaudeSwitchError as e:
         if json_mode:
             print(json.dumps(error_envelope(e), indent=2))
