@@ -5268,6 +5268,21 @@ class TestUnswitchableRowsAreListed:
         assert "Fable-walled" not in out and "5h full" not in out, out
         assert "5h ?" in out and "not a candidate (at its limit)" in out, out
 
+    def test_a_passed_model_window_alone_still_reads_walled_as_the_log_does(self):
+        """Only the `full` text is dropped for a passed window: a model window
+        past its reset (stored 100%) with 5h/7d open is still what the engine
+        and the decision log call Fable-walled."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(-60)}],
+            }),
+        ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
+        assert "Fable ?" in out and "Fable-walled" in out, out
+
     def test_a_rejected_probe_keeps_its_reading_after_its_reset_passes(self):
         """A refused probe is not a usage window that ended: it stays at its
         limit as `rejected full`, never `rejected ?`."""

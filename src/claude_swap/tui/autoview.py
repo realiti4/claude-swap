@@ -610,7 +610,7 @@ class AutoScreen(Screen):
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it).
                 # The CLASSIFICATION (open/model/full) reads the same way
-                # here as in the decision log — same helper,
+                # here as in the decision log, same helper,
                 # `classify_candidate_block`, the same row bar the engine's
                 # own landing gate reads (#321). It still does
                 # not fold in the engine's other, separate, stricter landing
@@ -619,7 +619,9 @@ class AutoScreen(Screen):
                 # two print `kind == "full"` in different words on purpose
                 # (the elif below): the log always says "full", this panel
                 # reserves "full" for a window actually at or over 100 and
-                # says nothing otherwise. Always on `models`, the full pinned
+                # says nothing otherwise, nor when that window's chip reads
+                # `?` (a passed reset): the gate below prints the engine's
+                # own reason instead. Always on `models`, the full pinned
                 # set: this label explains why the row is not simply "open"
                 # on the criteria the user actually configured, independent
                 # of whether the pass above retried on the 5h/7d-only axis
@@ -629,10 +631,7 @@ class AutoScreen(Screen):
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows), row_bar, weekly,
                     )
-                    if blocked_model in passed:
-                        # The engine still reads the stored figure, but a label
-                        # beside a `?` chip would contradict it: say nothing, and
-                        # let the "not a candidate" gate print the engine's reason.
+                    if kind == "full" and blocked_model in passed:
                         kind = "open"
                     if kind == "model":
                         entry.append(
