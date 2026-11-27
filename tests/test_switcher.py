@@ -13663,6 +13663,48 @@ class TestActiveReloginRecovery:
         self._collect(s)
         assert net.usage.call_count == 1
 
+    def test_a_collector_that_saw_the_strike_earlier_clears_nothing_once_it_is_gone(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A second collector reads the stale strike right after the save but
+        reaches the store only after the first has cleared it and recorded a
+        429. Its clear finds no strike and leaves that deadline alone."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+        save = s._resync_rotated_backup
+        clear = s._usage_store.clear_dead_token
+        arriving_late: list = []
+
+        def hold_back_the_scans_clear(nums, identities, **kwargs):
+            if kwargs.get("claims") == {}:
+                arriving_late.append(lambda: clear(nums, identities, **kwargs))
+                return set()
+            return clear(nums, identities, **kwargs)
+
+        def save_then_second_collector(*args):
+            save(*args)
+            monkeypatch.setattr(
+                s._usage_store, "clear_dead_token", hold_back_the_scans_clear
+            )
+            s._collect_usage_entries(info, fetch=set())
+            monkeypatch.setattr(s._usage_store, "clear_dead_token", clear)
+
+        monkeypatch.setattr(s, "_resync_rotated_backup", save_then_second_collector)
+        net.usage.return_value = oauth.UsageOutcome(
+            usage=None, error="http-429", retry_after_s=900.0
+        )
+        s._collect_usage_entries(info)
+        deadline = self._row(s).backoff_until
+        assert deadline is not None and len(arriving_late) == 1
+
+        assert arriving_late[0]() == set()
+        assert self._row(s).backoff_until == deadline
+        monkeypatch.setattr(s, "_resync_rotated_backup", save)
+        self._collect(s)
+        assert net.usage.call_count == 1
+
     def test_a_lost_lease_stops_the_attempt_before_the_fetch(
         self, temp_home: Path, monkeypatch
     ):

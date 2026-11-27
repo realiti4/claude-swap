@@ -1339,8 +1339,11 @@ class UsageStore:
         - a slot named in ``claims`` is cleared only while that lease is still
           the row's, and the lease is kept: :meth:`record` then accepts the
           holder's outcome, and the backoff a failure sets is the row's own;
-        - any other slot is cleared only when no live lease is on it. The
-          holder clears it, or a later pass does once the lease has ended.
+        - any other slot is cleared only when it still carries a strike and
+          no live lease is on it. Under a lease, the holder clears it, or a
+          later pass does once the lease has ended. With no strike left,
+          someone else cleared it since the caller looked, and the failure
+          state now on the row belongs to a newer fetch.
 
         Returns the slots cleared.
         """
@@ -1357,7 +1360,7 @@ class UsageStore:
             elif num in claims:
                 if row.get("claimId") != claims[num]:
                     return
-            elif _live_claim(
+            elif not int(row.get("authDeadStrikes") or 0) or _live_claim(
                 _num_or_none(row.get("claimUntil")),
                 _num_or_none(row.get("lastAttemptAt")),
                 now,

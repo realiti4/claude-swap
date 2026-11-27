@@ -1350,6 +1350,20 @@ class TestDeadTokenQuarantine:
         assert store.clear_dead_token(["1"], IDENT, claims={}) == {"1"}
         assert not store.entries(IDENT)["1"].token_dead()
 
+    def test_a_collector_arriving_after_the_strike_is_gone_clears_nothing(
+        self, store, clock
+    ):
+        claims = self._struck_and_leased(store, clock)
+        store.clear_dead_token(["1"], IDENT, claims=claims)
+        store.record(self.OUTCOME, IDENT, claims)
+        deadline = store.entries(IDENT)["1"].backoff_until
+        # A collector that saw the strike before all of that takes the lock
+        # only now: the lease has ended, and the 429's deadline is on the row.
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == set()
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_error == "http-429"
+        assert entry.backoff_until == deadline
+
     def test_a_lease_nobody_finished_stops_holding_the_row_when_it_expires(
         self, store, clock
     ):
