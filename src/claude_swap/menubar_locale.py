@@ -1,0 +1,107 @@
+"""Display strings for the macOS menu."""
+
+ZH = {
+    'Auto-switch failed to start': '自动切换启动失败',
+    'Auto-switch stopped': '自动切换已停止',
+    'Auto-switch error': '自动切换错误',
+    'Configuration warning': '配置提醒',
+    'All accounts exhausted': '所有账号额度均已耗尽',
+    'Account quarantined': '账号已暂停轮换',
+    'Auto-switched account': '已自动切换账号',
+    'Settings': '设置',
+    'Language': '语言',
+    'Account cards': '账号卡片',
+    'Rotate to next': '切换到下一个账号',
+    'Switch to best': '切换到剩余额度最多的账号',
+    'Switch to next (skip exhausted accounts)': '切换到下一个账号（跳过额度已用尽的账号）',
+    'Refresh current credentials': '刷新当前凭据',
+    'Refresh now': '立即刷新',
+    'Quit': '退出',
+    'No managed accounts': '尚未添加账号',
+    'Add account': '添加账号',
+    'From current login': '从当前登录添加',
+    'From setup-token…': '使用 setup-token 添加…',
+    'Remove account': '移除账号',
+    'Disable / enable account': '停用或启用账号',
+    'Switch history': '切换记录',
+    'No switches logged yet': '暂无切换记录',
+    'Open full log…': '打开完整日志…',
+    'Show account name in menu bar': '在菜单栏显示账号名',
+    'Title percentage': '菜单栏百分比',
+    'None': '不显示',
+    'Session (5h)': '5 小时用量',
+    'Weekly (7d)': '每周用量',
+    'Both (5h · 7d)': '同时显示',
+    'Show model limits in title': '在菜单栏显示模型用量',
+    'Refresh interval': '刷新间隔',
+    '30 seconds': '30 秒',
+    '60 seconds': '60 秒',
+    '5 minutes': '5 分钟',
+    'Auto-switch accounts': '自动切换账号',
+    'Auto-switch threshold': '自动切换阈值',
+    'Start at login': '登录时启动',
+    'Cancel': '取消',
+    'Remove': '移除',
+    'Next': '下一步',
+    'Add': '添加',
+    'Add account from setup-token': '使用 setup-token 添加账号',
+    'Email for this token:': '此令牌对应的邮箱',
+    'Setup token (sk-ant-oat01-…):': '输入 setup-token（sk-ant-oat01-…）',
+    'No active Claude Code login detected. Log in first.': '请先登录 Claude Code。',
+    'Remove account {num}?': '移除账号 {num}？',
+    'Auto-switch off': '自动切换已关闭',
+    'Auto-switch running': '自动切换运行中',
+    '⚠ Auto-switch stopped, click to restart': '⚠ 自动切换已停止，点击重启',
+    'no usage reading yet': '暂未读取用量',
+    'usage stale, read {age}': '用量已过期，上次读取于{age}',
+    'usage read {age}': '用量更新于{age}',
+    'just now': '刚刚',
+    '{time} ago': '{time}前',
+    'Account switched': '账号已切换',
+    'Switch takes effect within ~30s — restart Claude Code to apply immediately.': '切换将在约 30 秒内生效，重启 Claude Code 可立即生效。',
+    'Active': '使用中',
+    'Disabled': '已停用',
+    'Rejected': '请求被拒绝',
+    '5 hours': '5 小时',
+    'Weekly': '本周',
+    'Model': '模型',
+    'Model quota': '模型额度',
+    'Usage unavailable': '暂无额度数据',
+    'Resets in {time}': '{time}后重置',
+    'No reset time': '暂无重置时间',
+    'No data': '未提供数据',
+    'Sign in again': '需要重新登录',
+    'Sign in again in {time}': '{time}后需重新登录',
+    'Account {num}': '账号 {num}',
+}
+
+
+def translate(language, message, **values):
+    template = ZH.get(message, message) if language == "zh-Hans" else message
+    return template.format(**values) if values else template
+
+
+def duration(language, value):
+    if language == "zh-Hans":
+        return value.translate(str.maketrans({"d": "天", "h": "小时", "m": "分"}))
+    return value
+
+
+def weekly_reset_time(language, value):
+    """Format an offset-aware reset instant in the computer's local timezone."""
+    from datetime import datetime
+
+    if not isinstance(value, str):
+        return ""
+    try:
+        instant = datetime.fromisoformat(value)
+        if instant.tzinfo is None:
+            return ""
+        local = instant.astimezone()
+    except (ValueError, OverflowError, OSError):
+        return ""
+    if language == "zh-Hans":
+        day = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[local.weekday()]
+        return f"（{day} {local:%H:%M}）"
+    day = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[local.weekday()]
+    return f"({day} {local:%H:%M})"
