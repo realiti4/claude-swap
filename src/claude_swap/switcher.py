@@ -5878,7 +5878,8 @@ class ClaudeAccountSwitcher:
                     creds = self._store._strip_stamped_ids_from_live(active)
                     if str(data.get("activeAccountNumber")) == str(num):
                         creds = self._store._reseat_blank_keychain_login(
-                            active, str(num), email, creds
+                            active, str(num), email, creds,
+                            barred=lambda fp: self._engine_quarantined(str(num), fp),
                         )
             else:
                 # Display read cache: this value feeds sentinels, token-status

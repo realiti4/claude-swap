@@ -25,6 +25,7 @@ import socket
 import sys
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Callable, NamedTuple, Protocol
 
@@ -1576,6 +1577,7 @@ class CredentialStore:
 
     def _reseat_blank_keychain_login(
         self, active: ActiveCredentials, account_num: str, email: str, creds: str,
+        barred: Callable[[str | None], bool],
     ) -> str:
         """The login the pass continues on, with a blanked Keychain item re-seated.
 
@@ -1584,13 +1586,14 @@ class CredentialStore:
         only answers for itself, and Claude Code reads the Keychain first. Writes
         the file's ``claudeAiOauth`` (ids dropped, the item's sibling keys kept)
         when the item's fresh locked read has both tokens empty and the file is
-        the backup's lineage with a complete unexpired pair. No POST, no item
-        created, the file only has its mtime stamped.
+        the backup's lineage with a complete unexpired pair and ``barred(fp)``
+        (the engine's quarantine, a host lookup the store may not reach) is
+        false. No POST, no item created, the file only has its mtime stamped.
 
         Once per slot and generation across processes: the fingerprint is
         recorded in ``credentials_dir/.reseated-<slot>`` before the write (no
-        record, no write) and removed when the write fails, so the next pass
-        retries.
+        record, no write) and the record is emptied when the write fails, so
+        the next pass retries.
         """
         if (
             active.degraded or active.keychain_unavailable
@@ -1618,6 +1621,7 @@ class CredentialStore:
                 or oauth.credential_fingerprint(
                     self._read_backup_uncached(account_num, email)
                 ) != fp
+                or barred(fp)
             ):
                 return creds
             with (
@@ -1633,7 +1637,8 @@ class CredentialStore:
                 try:
                     macos_keychain.set_password(*item, seated)
                 except macos_keychain.KEYCHAIN_ERRORS:
-                    marker.unlink(missing_ok=True)
+                    with suppress(OSError):  # never replaces the Keychain error
+                        atomic_write_text(marker, "")
                     raise
                 self._stamp_credentials_file_to_item_mdat("the re-seat")
         except (ClaudeSwitchError, UnicodeDecodeError, *macos_keychain.KEYCHAIN_ERRORS) as e:

@@ -7,12 +7,14 @@ POST, at most once per generation.
 import json
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from claude_swap import credentials, macos_keychain, oauth
+from claude_swap.exceptions import ClaudeCodeLockTimeout
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 from tests.test_autoswitch import EngineHarness
@@ -146,9 +148,10 @@ def test_a_blank_item_that_lost_its_refresh_stamp_is_reseated_and_the_pass_runs_
         ({"item": _blank()}, "dry_run"),
         ({"item": _blank()}, "custom_profile"),
         ({"item": _blank()}, "roster_elsewhere"),
+        ({"item": _blank()}, "quarantined"),
     ],
     ids=["item-has-tokens", "absent-item", "other-lineage", "expired", "incomplete-pair",
-         "linux", "read-only", "dry-run", "custom-profile", "roster-elsewhere"],
+         "linux", "read-only", "dry-run", "custom-profile", "roster-elsewhere", "quarantined"],
 )
 def test_a_pass_that_may_not_reseat_leaves_the_item_as_it_was(
     temp_home: Path, block_real_keychain, no_refresh, monkeypatch, setup, mode,
@@ -163,6 +166,10 @@ def test_a_pass_that_may_not_reseat_leaves_the_item_as_it_was(
         data = s._get_sequence_data()
         data["activeAccountNumber"] = 2
         s._write_json(s.sequence_file, data)
+    if mode == "quarantined":  # the engine barred slot 1's generation (e.g. identity-conflict)
+        fp = oauth.credential_fingerprint(json.dumps(SLOTS[1][1]))
+        (s.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"quarantine": {"1": {"refreshTokenFingerprint": fp}}}), encoding="utf-8")
 
     s._build_accounts_info(read_only=mode == "read_only")
 
@@ -171,13 +178,26 @@ def test_a_pass_that_may_not_reseat_leaves_the_item_as_it_was(
     no_refresh.assert_not_called()
 
 
+@pytest.mark.parametrize("record_unlink_denied", [False, True])
 def test_a_failed_keychain_write_leaves_the_item_blank_and_the_next_pass_retries(
-    temp_home: Path, block_real_keychain, no_refresh, monkeypatch,
+    temp_home: Path, block_real_keychain, no_refresh, monkeypatch, record_unlink_denied,
 ):
     s, live = _mac(temp_home, block_real_keychain, item=_blank())
     blank = block_real_keychain.data[KEY]
     mtime = live.stat().st_mtime
     real = macos_keychain.set_password
+    outcomes = []
+    monkeypatch.setattr(
+        s._store, "_log_detected_login", lambda _c, *, outcome, **_k: outcomes.append(outcome))
+    if record_unlink_denied:  # a record that cannot be removed must not keep the retry from the next pass
+        real_unlink = Path.unlink
+
+        def _deny(self, *a, **k):
+            if self.name.startswith(".reseated-"):
+                raise PermissionError("denied")
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(Path, "unlink", _deny)
 
     def _refused(*_a):
         raise macos_keychain.KeychainError("no GUI session")
@@ -186,6 +206,7 @@ def test_a_failed_keychain_write_leaves_the_item_blank_and_the_next_pass_retries
     s._build_accounts_info()
 
     assert block_real_keychain.data[KEY] == blank and live.stat().st_mtime == mtime
+    assert outcomes == ["blank Keychain login left: KeychainError"], "the Keychain error was masked"
     store = s._store
     assert store._keychain_usable_cache is not False and not store._pinned_to_oauth_file
 
@@ -193,6 +214,78 @@ def test_a_failed_keychain_write_leaves_the_item_blank_and_the_next_pass_retries
     s._build_accounts_info()
 
     assert json.loads(block_real_keychain.data[KEY]) == _reseated(_login())
+
+
+@pytest.mark.parametrize("lands", ["item", "file", "held"])
+def test_a_login_that_lands_before_the_locked_reread_is_never_overwritten(
+    temp_home: Path, block_real_keychain, no_refresh, monkeypatch, lands,
+):
+    s, live = _mac(temp_home, block_real_keychain, item=_blank(), file=_login())  # no ids: no strip lock
+    blank = block_real_keychain.data[KEY]
+    landed = _login(refresh="rt-landed", access="sk-landed")
+    entered = []
+
+    @contextmanager
+    def _login_lands(**_kw):  # between the pre-lock checks and the locked re-read
+        entered.append(1)
+        if lands == "held":
+            raise ClaudeCodeLockTimeout("held")
+        if lands == "item":
+            block_real_keychain.data[KEY] = json.dumps(landed)
+        else:
+            live.write_text(json.dumps(landed), encoding="utf-8")
+        yield
+
+    monkeypatch.setattr(credentials, "claude_credentials_lock", _login_lands)
+
+    s._build_accounts_info()
+
+    assert entered == [1], "the login must land inside the re-seat's own lock entry"
+    assert block_real_keychain.data[KEY] == (json.dumps(landed) if lands == "item" else blank)
+    assert not (s.credentials_dir / ".reseated-1").exists()
+    no_refresh.assert_not_called()
+
+
+@pytest.mark.parametrize("verdict", ["degraded", "keychain_unavailable"])
+def test_an_active_read_that_failed_never_reseats(
+    temp_home: Path, block_real_keychain, no_refresh, verdict,
+):
+    s, live = _mac(temp_home, block_real_keychain, item=_blank())
+    before = dict(block_real_keychain.data)
+    creds = live.read_text(encoding="utf-8")
+    active = credentials.ActiveCredentials(
+        creds, verdict == "keychain_unavailable", verdict == "degraded")
+
+    assert s._store._reseat_blank_keychain_login(active, "1", EMAIL, creds, lambda fp: False) == creds
+
+    assert block_real_keychain.data == before
+    assert not (s.credentials_dir / ".reseated-1").exists()
+
+
+def test_the_whole_pass_on_the_seated_bytes_sends_a_usage_get_and_no_refresh_post(
+    temp_home: Path, block_real_keychain, no_refresh, monkeypatch,
+):
+    s, _live = _mac(temp_home, block_real_keychain, item=_blank())
+    sent = []
+
+    def _answer(req, *_a, **_k):
+        sent.append(req)
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "five_hour": {"utilization": 10, "resets_at": "2099-01-01T00:00:00+00:00"},
+            "seven_day": {"utilization": 20, "resets_at": "2099-01-01T00:00:00+00:00"},
+        }).encode()
+        return response
+
+    monkeypatch.setattr(oauth.urllib.request, "urlopen", _answer)
+
+    s._run_usage_fetches(s._build_accounts_info())
+
+    assert json.loads(block_real_keychain.data[KEY]) == _reseated(_login())
+    assert "Bearer sk-1" in {r.get_header("Authorization") for r in sent}, "no fetch ran on the seated login"
+    assert {r.get_method() for r in sent} == {"GET"}, [(r.get_method(), r.full_url) for r in sent]
+    no_refresh.assert_not_called()
 
 
 def test_the_same_generation_blanked_again_is_not_reseated_but_the_next_one_is(
