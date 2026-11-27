@@ -21338,7 +21338,8 @@ class TestActiveReloginRecovery:
         # the profile names as another account is registered as that
         # account's own slot, which reads its usage: never slot 1.)
         assert [c[0] for c in net.mock_calls if c[0] != "usage"] == ["profile"]
-        assert "1" not in [c.args[0] for c in net.usage.call_args_list]
+        slots = [str(c.args[0]) for c in net.usage.call_args_list]
+        assert slots == ([] if profile is None else ["2"])
         assert s._read_account_credentials("1", self.EMAIL) == old
         assert self._row(s).token_dead() and self._row(s).last_good is None
 
