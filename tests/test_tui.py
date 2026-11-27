@@ -558,6 +558,27 @@ class TestFormatting:
         fetch.assert_not_called()
         consume.assert_not_called()
 
+    def test_window_past_its_reset_is_a_row_drawn_as_unknown(self):
+        # Issue #376: the stored figure describes the window that ended, so
+        # the row has none and no at-limit or pace marker, and says how long
+        # ago it ended and when.
+        from claude_swap.tui.widgets import mini_account_text, usage_rows
+
+        entry = make_entry(pct5=19.0, pct7=22.0, scoped=[("Fable", 100.0)])
+        entry.last_good["five_hour"]["resets_at"] = _iso_in(-(3 * 3600 + 330))
+        entry.last_good["scoped"][0]["resets_at"] = _iso_in(-(3 * 3600 + 330))
+        now = time.time()
+        five, seven, fable = usage_rows(entry.last_good, now, entry.fetched_at)
+        assert five[:3] == ("5h", None, "reset 3h 5m ago")
+        assert five[3].startswith("reset 3h 5m ago · ")
+        assert seven[:2] == ("7d", 22.0) and seven[2].startswith("resets ")
+        assert fable[:3] == ("Fable", None, "reset 3h 5m ago")
+        mini = mini_account_text(make_account(2, entry=entry), now).plain
+        # The 7d chip carries its reset countdown, and every scoped window
+        # this row draws still draws: the ended one as "?", never as 100%.
+        assert re.search(r"5h \? · 7d\S*:22% · Fable \?", mini), mini
+        assert "100%" not in mini and "(!)" not in mini
+
 
 class TestSnapshotSource:
     def _source(self, tmp_path: Path, accounts=None):
@@ -843,48 +864,38 @@ class TestUsageRows:
         assert "resets 5h" in card, card
         assert "reset unknown" not in card, card
 
-    def test_active_cards_5h_row_reads_refetching_not_a_stale_100pct_reset(self):
+    def test_active_cards_5h_row_draws_a_passed_reset_as_unknown_not_a_stale_100pct(
+        self,
+    ):
         """A window whose reset has passed while the served pct still
         predates it must not claim "resets now" beside a 100% that is
         already wrong -- PR #325, the active card's own copy of the defect
         the inactive-row chip and the Next-best row also carried.
 
-        #325 follow-up: the active card is threaded with `entry` too (not
-        only `fetched_at`), so it must ALSO tell a genuinely claimed fetch
-        (still "refetching") from nothing in flight (names its own retry
-        instead of resting on the placeholder)."""
+        Upstream #625 settles it by drawing no figure for a window whose
+        reset has passed and saying how long ago it ended, so the row reads
+        the same whether a fetch is claimed, only a retry is scheduled, or
+        the pct was measured after the reset."""
         from claude_swap.tui.widgets import account_card_text, usage_rows
 
         now = time.time()
         last_good = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}}
         fetched_at = now - 120  # measured well before the reset fired
-        # `next_poll_at` is ALSO set: a real discriminator (see the test
-        # above) rather than a bare `claim_until` a stubbed-out `claimed()`
-        # would pass just as well.
         claimed = UsageEntry(
             last_good=last_good, fetched_at=fetched_at, age_s=120.0,
             claim_until=now + 30, next_poll_at=now + 300,
         )
-        row = usage_rows(last_good, now, fetched_at, entry=claimed)[0]
-        assert row[2] == "refetching", row
-        assert row[3] == "refetching", row
+        waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
+        for entry, fetched in ((claimed, fetched_at), (waiting, fetched_at),
+                               (None, now - 10)):
+            row = usage_rows(last_good, now, fetched, entry=entry)[0]
+            assert row[:3] == ("5h", None, "reset 1m ago"), row
+            assert row[3].startswith("reset 1m ago · "), row
 
         card = account_card_text(make_account(1, active=True, entry=claimed), 80).plain
-        assert "refetching" in card, card
+        assert "reset 1m ago" in card, card
+        assert "100%" not in card and "refetching" not in card, card
         assert "resets now" not in card, card
-
-        # Nothing claimed, a scheduled next poll: names the retry, not the
-        # placeholder -- the row must not rest on "refetching" forever.
-        waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
-        row = usage_rows(last_good, now, fetched_at, entry=waiting)[0]
-        assert row[2] == "retry 5m", row
-        assert "refetching" not in row[2], row
-
-        # CONTROL: a fetch that landed after the reset carries a fresh pct,
-        # so the ordinary "resets now" reading must still apply.
-        fresh_fetched_at = now - 10
-        row = usage_rows(last_good, now, fresh_fetched_at)[0]
-        assert row[2] == "resets now", row
 
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
@@ -1026,35 +1037,32 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "5h(⟳?):42%" in mini_account_text(acc, now).plain
 
-    def test_dashboard_chip_reads_refetching_not_stale_reset_now(self):
+    def test_dashboard_chip_draws_a_passed_reset_as_unknown_whatever_the_fetch_state(
+        self,
+    ):
         """Same PR #325 defect, third surface: the dashboard's inactive-row
         chip must not say `⟳now` beside a pct that provably predates the
         reset it names.
 
-        #325 follow-up: "refetching" here names a fetch genuinely claimed;
-        the same row with nothing in flight must name its own retry
-        instead of resting on the placeholder."""
+        Upstream #625 settles it by drawing no figure at all for a window
+        whose reset has passed, so the chip reads `5h ?` and the entry's
+        fetch state (claimed, or only a scheduled retry) no longer shows
+        here; `reset_text` still names it, for the surfaces that ask."""
         from claude_swap.tui.widgets import mini_account_text
 
         now = time.time()
         fetched_at = now - 120
-        # `next_poll_at` is ALSO set: a real discriminator (see
-        # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
         claimed = UsageEntry(
             last_good={"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}},
             fetched_at=fetched_at,
             age_s=120.0,
             claim_until=now + 30, next_poll_at=now + 300,
         )
-        acc = make_account(1, entry=claimed)
-        out = mini_account_text(acc, now).plain
-        assert "5h(⟳refetching):100%" in out, out
-        assert "⟳now" not in out, out
-
         waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
-        out2 = mini_account_text(make_account(1, entry=waiting), now).plain
-        assert "5h(⟳retry 5m):100%" in out2, out2
-        assert "refetching" not in out2, out2
+        for entry in (claimed, waiting):
+            out = mini_account_text(make_account(1, entry=entry), now).plain
+            assert "5h ?" in out, out
+            assert "100%" not in out and "⟳" not in out, out
 
     @pytest.mark.parametrize(
         "age_s, expect_dim",

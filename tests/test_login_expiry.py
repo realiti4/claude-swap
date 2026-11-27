@@ -188,11 +188,24 @@ class TestCliList:
         assert len(lines) == 1
 
     def test_age_note_stays_on_the_last_usage_row(self):
+        # A reading waiting for its next scheduled poll.
         now = time.time()
-        entry = UsageEntry(last_good=_MEASURED, fetched_at=now - 3 * 3600, age_s=3 * 3600)
+        entry = UsageEntry(last_good=_MEASURED, fetched_at=now - 240, age_s=240)
         with_note = _usage_entry_lines(entry, now + DUE)
         assert "ago" in with_note[-2] and "7d:" in with_note[-2]
         assert "login:" in with_note[-1] and "ago" not in with_note[-1]
+
+    def test_a_headed_block_still_ends_with_the_login_row(self):
+        # A reading whose latest fetch failed carries its age above the rows.
+        now = time.time()
+        entry = UsageEntry(
+            last_good=_MEASURED, fetched_at=now - 3 * 3600, age_s=3 * 3600,
+            last_error="timeout", consecutive_failures=4,
+        )
+        head, *rows = _usage_entry_lines(entry, now + DUE)
+        assert head == "last read 3h ago (timeout)"
+        assert "7d:" in rows[-2] and "login:" in rows[-1]
+        assert not any("ago" in row for row in rows)
 
 
 # ---------------------------------------------------------------------------

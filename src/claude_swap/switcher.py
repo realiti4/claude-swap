@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -103,7 +104,7 @@ from claude_swap.settings import (
     load_ui_settings,
     load_usage_settings,
     parse_model_names,
-    settings_path,
+    settings_stamp,
 )
 from claude_swap.usage_store import (
     FetchRecord,
@@ -152,6 +153,19 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
     return "  (ahead of pace)" if result and result.ahead else ""
 
 
+def _passed_reset_body(window: dict) -> str:
+    """Row body for a window whose reset has passed
+    (``oauth.window_reset_passed``): when it ended, with no figure and no
+    marker, since the stored ones describe the window that ended. Laid out
+    like a current row, so the clocks share a column::
+
+        ├ 5h:    ?   reset  Nov 26 03:20
+        └ 7d:  22%   resets Nov 30 22:20  in 2d 23h
+    """
+    _countdown, clock = oauth.fresh_reset_strings(window)
+    return f"   ?   {'reset':<6} {clock}"
+
+
 def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str, str]]:
     """(label, body) rows for one usage measurement, unpadded.
 
@@ -172,6 +186,9 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
+            if oauth.window_reset_passed(w):
+                rows.append((label, _passed_reset_body(w)))
+                continue
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
             marker = _pace_marker(w, fetched_at) if label == "7d" else ""
             # ``pct`` None (utilization unavailable) renders as ``?``, never 0%.
@@ -183,6 +200,9 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
             else:
                 rows.append((label, f"{pct}{marker}"))
     for w in usage.get("scoped") or []:
+        if oauth.window_reset_passed(w):
+            rows.append((w["name"], _passed_reset_body(w)))
+            continue
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
         marker = "  (!)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
@@ -361,13 +381,24 @@ def _usage_entry_lines(
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
-    line when an older measurement exists. Measurements render as usual, age-
-    annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served); an account
-    with no measurement at all shows "usage unavailable" plus the last fetch
-    error, so a failing endpoint is visible instead of a silent blank. A
-    "login" row (``_login_row``) ends the block while the slot's stored login
-    is due for renewal, whichever branch, so it shows under a sentinel or a
-    missing measurement too.
+    line when an older measurement exists. Measurements render as usual, with
+    their age once older than ``_USAGE_AGE_NOTE_S``. A reading that is only
+    waiting for its next scheduled poll carries the age on its last row. One
+    whose latest fetch failed, or that is too old to drive a switch decision
+    (``UsageEntry.decision_value``), is headed by it instead, with the
+    failure, so no row below reads as current::
+
+        last read 1d ago (http-429)
+        ├ 5h:    ?   reset  Nov 26 03:20
+        └ 7d:  22%   resets Nov 30 22:20  in 2d 23h
+
+    Claude Code 2.1.332's usage screen heads a reading it could not refresh
+    the same way ("Showing last-known usage as of ... (couldn't refresh)").
+    An account with no measurement at all shows "usage unavailable" plus the
+    last fetch error, so a failing endpoint is visible instead of a silent
+    blank. A "login" row (``_login_row``) ends the block while the slot's
+    stored login is due for renewal, whichever branch, so it shows under a
+    sentinel or a missing measurement too.
     """
     login_row = _login_row(login_expires_at, entry.sentinel == USAGE_RELOGIN_REQUIRED)
     login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1)) if login_row else None
@@ -388,17 +419,26 @@ def _usage_entry_lines(
         extra = (login_row,) if login_row is not None else ()
         lines = _format_usage_lines(entry.last_good, entry.fetched_at, extra_rows=extra)
         usage_count = len(lines) - len(extra)
+        out = []
         if (
             usage_count
             and entry.age_s is not None
             and entry.age_s > _USAGE_AGE_NOTE_S
             and entry.fetched_at is not None
         ):
-            lines[usage_count - 1] += f" · {format_age(int(entry.fetched_at * 1000))}"
-        return [
+            age = format_age(int(entry.fetched_at * 1000))
+            if entry.last_error:
+                note = ERROR_NOTES.get(entry.last_error, entry.last_error)
+                out.append(dimmed(f"last read {age} ({note})"))
+            elif entry.decision_value() is None:
+                out.append(dimmed(f"last read {age}"))
+            else:
+                lines[usage_count - 1] += f" · {age}"
+        out.extend(
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
-        ]
+        )
+        return out
     detail = "usage unavailable"
     if entry.last_error:
         detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"
@@ -498,14 +538,17 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, weekly_threshold, models)) — see
+        # (settings mtimes, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
-            float | None, tuple[float, float | None, tuple[str, ...]]
+            tuple[float | None, float | None],
+            tuple[float, float | None, tuple[str, ...]],
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
-        # (settings mtime, the usage section) — see _usage_settings.
-        self._usage_settings_cache: tuple[float | None, UsageSettings] | None = None
+        # (settings mtimes, the usage section), see _usage_settings.
+        self._usage_settings_cache: tuple[
+            tuple[float | None, float | None], UsageSettings
+        ] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -2134,11 +2177,7 @@ class ClaudeAccountSwitcher:
         stat per pass)."""
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
-        path = settings_path(self.backup_dir)
-        try:
-            mtime: float | None = path.stat().st_mtime
-        except OSError:
-            mtime = None
+        mtime = settings_stamp(self.backup_dir)
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
@@ -2151,13 +2190,9 @@ class ClaudeAccountSwitcher:
         return inputs
 
     def _usage_settings(self) -> UsageSettings:
-        """The ``usage`` section of the settings file (reloaded only when it
-        changes — one stat per fetch)."""
-        path = settings_path(self.backup_dir)
-        try:
-            mtime: float | None = path.stat().st_mtime
-        except OSError:
-            mtime = None
+        """The ``usage`` section of the settings files (reloaded only when
+        either changes; two stats per fetch)."""
+        mtime = settings_stamp(self.backup_dir)
         cache = getattr(self, "_usage_settings_cache", None)
         if cache is not None and cache[0] == mtime:
             return cache[1]
@@ -2166,15 +2201,17 @@ class ClaudeAccountSwitcher:
         return loaded
 
     def _probe_options(self, last_usage: dict | None) -> dict:
-        """The header-probe arguments of ``oauth.try_fetch_usage_for_account``
-        for a setup-token account: ``usage.headerProbe``, ``usage.fableProbe``
-        and the account's stored reading, which tells the probe that a
-        per-model bucket is spent and not to be asked about again yet."""
+        """The usage-setting arguments of ``oauth.try_fetch_usage_for_account``:
+        ``usage.requestLog``, and for a setup-token account ``usage.headerProbe``,
+        ``usage.fableProbe`` and the account's stored reading, which tells the
+        probe that a per-model bucket is spent and not to be asked about again
+        yet."""
         usage = self._usage_settings()
         return {
             "header_probe": usage.header_probe,
             "scoped_probe": usage.fable_probe,
             "last_usage": last_usage,
+            "request_log": usage.request_log,
         }
 
     def switchable_account_numbers(self) -> list[str]:
@@ -4271,13 +4308,20 @@ class ClaudeAccountSwitcher:
             return creds
         # Same address, different org: naming the address twice says
         # nothing (it's the address that agrees) -- name the two
-        # organizations that disagree instead.
+        # organizations that disagree instead. Either side can be the stale
+        # one: the credential store may hold another organization's token,
+        # or the config may name the organization of an earlier login. A
+        # new login repairs either, so the message gives that one way out
+        # without picking a side: Claude Code 2.1.332 stores ``oauthAccount``
+        # from the new token's profile on sign-in, then saves the token.
+        seen_label = f"organization {seen_org}" if seen_org else "your personal account"
+        config_label = f"organization {org_uuid}" if org_uuid else "your personal account"
         raise ConfigError(
-            f"The stored credential for {email} belongs to organization "
-            f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
-            f"Nothing was changed. Two accounts can share an email "
-            f"across organizations. Log in as {email} in the "
-            f"{org_uuid or 'personal'} organization in THIS environment, "
+            f"The stored credential for {email} belongs to {seen_label}, "
+            f"but the config names {config_label}. Nothing was changed. "
+            f"Two accounts can share an email across organizations, and "
+            f"either the credential or the config is out of date. Log in "
+            f"again in THIS environment to the account you want to add, "
             f"then re-run."
         )
 
@@ -5811,6 +5855,11 @@ class ClaudeAccountSwitcher:
         endpoint just accepted it). Definitive verdicts are memoized per
         lineage so a persistent drift state doesn't re-probe every pass.
 
+        :meth:`_save_active_login` calls this before any usage request, for a
+        quarantined slot's new login. The probe is then that token's first
+        request, and a refused one leaves the backup alone like any other
+        unresolved probe.
+
         Best-effort: any failure (lock contention, read error, identity
         moved, oracle unreachable) just leaves the backup stale — the
         recovery branch consumes nothing it cannot attribute. Never raises.
@@ -6147,11 +6196,15 @@ class ClaudeAccountSwitcher:
         self,
         infos: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry] | None = None,
+        relogged: dict[str, str] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant. ``entries``
         is the pre-fetch snapshot, for each row's refused-credential stamp
-        and stored reading."""
+        and stored reading. A slot in ``relogged`` (slot → the lease this
+        collector holds on its row) is fetched only once its new login is
+        saved as its backup (:meth:`_save_active_login`)."""
+        relogged = relogged or {}
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
@@ -6160,6 +6213,19 @@ class ClaudeAccountSwitcher:
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             entry = entries.get(num) if entries else None
+            if num in relogged and not self._save_active_login(
+                info, relogged[num]
+            ):
+                # An error, not a sentinel: the store's failure backoff then
+                # paces the next attempt.
+                self._logger.info(
+                    "Account %s's new login was not taken up this pass "
+                    "(ownership unverified, a store busy, or the row taken "
+                    "over by another collector); the next attempt waits for "
+                    "the backoff.",
+                    num,
+                )
+                return num, FetchRecord(error="login-unverified")
             return num, self._fetch_account_usage(
                 info,
                 entry.rejected_fingerprint if entry else None,
@@ -6215,6 +6281,10 @@ class ClaudeAccountSwitcher:
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
         live_slots: set[str] = set()
+        # ``relogged`` holds the quarantined slots that get an attempt all the
+        # same, because a new login is waiting to be saved for them
+        # (_active_login_replaced).
+        relogged: set[str] = set()
         for num in info_by_num:
             if num in sentinels:
                 continue
@@ -6235,7 +6305,12 @@ class ClaudeAccountSwitcher:
                     {num: identities[num]}, models
                 )[num]
             elif dead:
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+                # A struck ACTIVE slot whose live login is another generation
+                # still gets an attempt (_active_login_replaced).
+                if self._active_login_replaced(entry, _i):
+                    relogged.add(num)
+                else:
+                    sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif dead is None:
                 # CANNOT DETERMINE — no stored source could be examined. Do
                 # not confirm the strike (it condemns an already-healed slot)
@@ -6264,11 +6339,15 @@ class ClaudeAccountSwitcher:
                 # what the three keywords below are for; see
                 # `clear_dead_token`. `entry.struck_fingerprint` is what THIS
                 # read saw, and the write re-checks it under the store lock.
+                # ``claims={}`` also leaves a row under another collector's lease
+                # to it: that collector has just saved a new login and its fetch
+                # is in flight.
                 self._usage_store.clear_dead_token(
                     [num], {num: identities[num]},
                     revoke_claim=False,
                     strike_only=True,
                     expected_fingerprints={num: entry.struck_fingerprint},
+                    claims={},
                 )
                 entries = store.entries(identities, models)
         # Every pass, fetches or none: arm A of the sweep still drains a
@@ -6308,6 +6387,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                struck_ok=relogged,
             )
         else:
             claims = store.reserve(
@@ -6315,6 +6395,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                struck_ok=relogged,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
@@ -6341,10 +6422,13 @@ class ClaudeAccountSwitcher:
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
 
+        accepted: set[str] = set()
         if claims:
             pre = entries
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims], pre
+                [info_by_num[num] for num in claims],
+                pre,
+                {num: claims[num] for num in relogged if num in claims},
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
@@ -6370,6 +6454,10 @@ class ClaudeAccountSwitcher:
                 # dead is None: same ambiguity as the pre-fetch scan above
                 # (unreadable backup on a struck active slot) — set no
                 # sentinel, see that scan's comment for why.
+        # A re-logged slot with no recorded attempt this pass (not due, in
+        # backoff, another collector's lease) is still quarantined.
+        for num in relogged - accepted:
+            sentinels[num] = USAGE_RELOGIN_REQUIRED
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
@@ -6617,6 +6705,79 @@ class ClaudeAccountSwitcher:
             )
             return False
         return True
+
+    def _active_login_replaced(
+        self,
+        entry: UsageEntry,
+        account_info: tuple[int, str, str, str, bool, str, str],
+    ) -> bool:
+        """Whether a quarantined active slot's live login is a usable
+        credential of another generation than the struck one.
+
+        Logging in again with Claude Code writes the live store only. The slot
+        backup is cswap's own copy and keeps the struck generation, so
+        :meth:`_entry_token_dead` keeps holding, and the fetch that would
+        bring the backup up to date is the one the quarantine withholds.
+        Such a slot is offered to ``UsageStore.reserve`` despite its strike,
+        and the fetch that wins the claim saves the new login first
+        (:meth:`_save_active_login`).
+
+        False for an incomplete live credential, and for one that is expired
+        or carries no finite expiry time, which has nothing to verify with;
+        for a degraded read, whose bytes may be a stale copy; and for a strike
+        recorded without a fingerprint, which cannot be told apart from the
+        live generation.
+        """
+        _num, _email, _org_name, _org_uuid, is_active, creds, _alias = account_info
+        if not is_active or self._active_read_degraded:
+            return False
+        live = oauth.extract_oauth_data(creds)
+        if not (live and live.get("accessToken") and live.get("refreshToken")):
+            return False
+        expires_at = live.get("expiresAt")
+        if not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
+            return False
+        if oauth.is_oauth_token_expired(expires_at):
+            return False
+        return not entry.token_dead(stored_fp=oauth.credential_fingerprint(creds))
+
+    def _save_active_login(
+        self,
+        account_info: tuple[int, str, str, str, bool, str, str],
+        claim_id: str,
+    ) -> bool:
+        """Save a quarantined active slot's new live login as its backup and
+        lift the quarantine. True once the backup holds that login and the
+        strike is cleared under ``claim_id``, the caller's lease on the row.
+
+        The write is :meth:`_resync_rotated_backup`'s: the profile endpoint
+        must name this slot's account, and the live store is re-read under
+        the locks. Nothing is sent to the token endpoint. The strike is
+        cleared here, with the lease kept, so that the fetch that follows
+        records as any other: its failure sets the row's backoff, and no
+        later pass has a stale strike left to clear.
+
+        On False the caller does not fetch. Either the backup and the strike
+        are untouched, or some other writer replaced the backup meanwhile
+        (the struck grant is gone, but this login was not the one saved), or
+        the lease is no longer this collector's and its outcome would not be
+        recorded. The next pass treats the slot by the ordinary rules.
+        """
+        num, email, _org_name, org_uuid, _active, creds, _alias = account_info
+        slot = str(num)
+        self._resync_rotated_backup(slot, email, org_uuid, creds)
+        backup, unreadable = self._read_account_credentials_ex(slot, email)
+        if (
+            unreadable
+            or not backup
+            or oauth.credential_fingerprint(backup)
+            != oauth.credential_fingerprint(creds)
+        ):
+            return False
+        cleared = self._usage_store.clear_dead_token(
+            [slot], {slot: (email, org_uuid or "")}, claims={slot: claim_id}
+        )
+        return slot in cleared
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?

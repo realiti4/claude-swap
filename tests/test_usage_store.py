@@ -1622,6 +1622,62 @@ class TestDeadTokenQuarantine:
         store.clear_dead_token(["2"], IDENT, revoke_claim=False)
         assert not store.entries(IDENT)["2"].token_dead()
 
+    OUTCOME = {"1": FetchRecord(error="http-429", retry_after_s=900.0)}
+
+    def _struck_and_leased(self, store, clock) -> dict[str, str]:
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S)
+        return store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"})
+
+    def test_a_lease_holders_clear_keeps_its_lease(self, store, clock):
+        claims = self._struck_and_leased(store, clock)
+        assert store.clear_dead_token(["1"], IDENT, claims=claims) == {"1"}
+        assert not store.entries(IDENT)["1"].token_dead()
+        # Its outcome lands, and the backoff is the row's own.
+        assert store.record(self.OUTCOME, IDENT, claims) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_error == "http-429"
+        assert entry.consecutive_failures == 1
+        assert entry.backoff_until >= clock.now + 900
+
+    def test_a_collector_without_the_lease_leaves_a_leased_row_alone(
+        self, store, clock
+    ):
+        claims = self._struck_and_leased(store, clock)
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == set()
+        assert store.clear_dead_token(["1"], IDENT, claims={"1": "not-mine"}) == set()
+        assert store.entries(IDENT)["1"].token_dead()
+        assert store.record(self.OUTCOME, IDENT, claims) == {"1"}
+        # The lease ended with that record: now the stale strike may go.
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == {"1"}
+        assert not store.entries(IDENT)["1"].token_dead()
+
+    def test_a_collector_arriving_after_the_strike_is_gone_clears_nothing(
+        self, store, clock
+    ):
+        claims = self._struck_and_leased(store, clock)
+        store.clear_dead_token(["1"], IDENT, claims=claims)
+        store.record(self.OUTCOME, IDENT, claims)
+        deadline = store.entries(IDENT)["1"].backoff_until
+        # A collector that saw the strike before all of that takes the lock
+        # only now: the lease has ended, and the 429's deadline is on the row.
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == set()
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_error == "http-429"
+        assert entry.backoff_until == deadline
+
+    def test_a_lease_nobody_finished_stops_holding_the_row_when_it_expires(
+        self, store, clock
+    ):
+        self._struck_and_leased(store, clock)
+        clock.advance(CLAIM_TTL_S + 1)
+        assert store.clear_dead_token(["1"], IDENT, claims={}) == {"1"}
+
+    def test_a_clear_without_claims_takes_the_lease_with_it(self, store, clock):
+        claims = self._struck_and_leased(store, clock)
+        assert store.clear_dead_token(["1"], IDENT) == {"1"}
+        assert store.record(self.OUTCOME, IDENT, claims) == set()
+
 
 class TestReserve:
     """Atomic fetch reservation: eligibility re-checked under the lock."""
@@ -1699,6 +1755,33 @@ class TestReserve:
         clock.advance(TRUST_MAX_AGE_S)  # backoff long gone; quarantine stays
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+
+    def test_struck_ok_lifts_the_dead_token_gate_for_the_named_slot_only(
+        self, store, clock
+    ):
+        store.record(
+            {
+                "1": FetchRecord(error="invalid_grant"),
+                "2": FetchRecord(error="invalid_grant"),
+            },
+            IDENT,
+        )
+        clock.advance(TRUST_MAX_AGE_S)
+        won = store.reserve(["1", "2"], IDENT, respect_plans=True, struck_ok={"1"})
+        assert set(won) == {"1"}
+        # Winning the claim clears nothing: the outcome decides the strike.
+        assert store.entries(IDENT)["1"].token_dead()
+
+    def test_struck_ok_still_waits_out_backoff_and_a_live_claim(self, store, clock):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        clock.advance(BACKOFF_BASE_S - 1)
+        assert store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"}) == {}
+        clock.advance(2)
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"})
+        ) == {"1"}
+        # A second collector meets the first one's lease.
+        assert store.reserve(["1"], IDENT, respect_plans=False, struck_ok={"1"}) == {}
 
     def test_unknown_row_and_identity_mismatch_win(self, store, clock):
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
