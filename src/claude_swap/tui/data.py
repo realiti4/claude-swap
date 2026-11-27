@@ -93,8 +93,11 @@ def sentinel_label(sentinel: str) -> str:
 
 
 def window_pct(last_good: dict | None, key: str) -> float | None:
-    """Utilization pct of one window ("five_hour"/"seven_day"), if known."""
-    if not isinstance(last_good, dict):
+    """Utilization pct of one window ("five_hour"/"seven_day"), if known.
+    A 5h window that is not running is not known: no chip is drawn for it."""
+    if not isinstance(last_good, dict) or (
+        key == "five_hour" and not oauth.five_hour_live(last_good)
+    ):
         return None
     window = last_good.get(key)
     if not isinstance(window, dict):
@@ -150,6 +153,21 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     if not isinstance(last_good, dict):
         return None
     return reset_text(last_good.get(key), now)
+
+
+def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
+    """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
+
+    THE one place that decides how a window reads — the dashboard's inactive
+    rows and the auto view's Next-best rows both draw it, so one account
+    cannot read two ways on two screens. The caller appends the pct so it can
+    colour it by severity. The countdown shows whenever it is known, not only
+    at 100%: a saturated candidate's worth IS when it comes back.
+    """
+    reset = window_reset_text(last_good, key, now)
+    if not reset:
+        return f"{label}:"
+    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
 
 
 def format_duration(seconds: float) -> str:

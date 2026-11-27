@@ -15,6 +15,7 @@ from tests.test_autoswitch import EngineHarness, _iso_at
 
 
 def _harness(temp_home, *, accounts=3, **settings):
+    settings.setdefault("strategy", "best")  # this fork's default is consume-first; the file asserts upstream's
     h = EngineHarness(temp_home, **settings)
     for number in range(1, accounts + 1):
         h.seed(number, f"account{number}@example.com")
