@@ -227,9 +227,10 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # 429/timeout/network blip does, so there is nothing to gain by retrying (and
 # each retry with a dead token just draws a fresh 401/429). At this many
 # strikes the account is quarantined: no more fetches, and the collector
-# surfaces "re-login needed". A single success, a credential refresh via
-# login/add, or a rotation that moves the stored fingerprint off the condemned
-# generation resets the count and lifts the quarantine. Raise to 2 if a
+# surfaces "re-login needed". (``reserve``'s ``struck_ok`` is how a
+# replacement login gets its attempt.) A single success, a credential refresh
+# via login/add, or a rotation that moves the stored fingerprint off the
+# condemned generation resets the count and lifts the quarantine. Raise to 2 if a
 # buffer against a one-off misclassification is ever wanted; the trade-off
 # is a ~10-min-slower verdict
 # (the failure backoff between the two strikes).
@@ -1427,6 +1428,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        struck_ok: Iterable[str] = (),
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1454,10 +1456,17 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+
+        ``struck_ok`` names slots the dead-token gate does not hold back: the
+        caller has found a login for them other than the struck generation
+        and will save it before it fetches. Every other gate still applies,
+        so the attempt is paced like any fetch, and the strike itself is left
+        for the outcome to clear.
         """
         nums = list(nums)
         if not nums:
             return {}
+        struck_ok = set(struck_ok)
         now = self.clock()
         won: dict[str, str] = {}
         with self._lock():
@@ -1470,7 +1479,11 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row,
+                        now,
+                        respect_plans,
+                        repair_overslept,
+                        struck_ok=num in struck_ok,
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -2017,7 +2030,8 @@ class UsageStore:
         revoke_claim: bool = True,
         strike_only: bool = False,
         expected_fingerprints: dict[str, str | None] | None = None,
-    ) -> None:
+        claims: dict[str, str] | None = None,
+    ) -> set[str]:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
         Called after a re-login/add rewrites a slot's stored credential: the
@@ -2040,10 +2054,28 @@ class UsageStore:
         ``struckFingerprint`` UNDER THIS METHOD'S LOCK against what that
         lock-free read saw, so a strike landing in the gap is not overwritten
         by a stale decision; a row that no longer matches is left alone.
+
+        ``claims`` is the collector's way to clear without taking a row away
+        from a fetch in flight, and it implies ``revoke_claim=False``: the slot
+        → lease ids it holds itself (empty when it holds none). It clears on
+        what it read, so:
+
+        - a slot named in ``claims`` is cleared only while that lease is still
+          the row's, and the lease is kept: :meth:`record` then accepts the
+          holder's outcome, and the backoff a failure sets is the row's own;
+        - any other slot is cleared only when it still carries a strike and
+          no live lease is on it. Under a lease, the holder clears it, or a
+          later pass does once the lease has ended. With no strike left,
+          someone else cleared it since the caller looked, and the failure
+          state now on the row belongs to a newer fetch.
+
+        Returns the slots cleared.
         """
         nums = list(nums)
         if not nums:
-            return
+            return set()
+        now = self.clock()
+        cleared: set[str] = set()
 
         def apply(num: str, row: dict) -> None:
             if (
@@ -2051,6 +2083,16 @@ class UsageStore:
                 and row.get("struckFingerprint") != expected_fingerprints.get(num)
             ):
                 return  # the row moved since the caller's lock-free read
+            if claims is not None:
+                if num in claims:
+                    if row.get("claimId") != claims[num]:
+                        return
+                elif not int(row.get("authDeadStrikes") or 0) or _live_claim(
+                    _num_or_none(row.get("claimUntil")),
+                    _num_or_none(row.get("lastAttemptAt")),
+                    now,
+                ):
+                    return
             # BOTH DIRECTIONS OR NEITHER: a transition log that speaks only
             # on the way in reports every recovery as a permanent fault. Only
             # a struck row speaks — every re-login and add calls this on
@@ -2067,7 +2109,8 @@ class UsageStore:
                     num,
                     identities[num][0],  # _mutate already indexed it
                 )
-            if revoke_claim:
+            cleared.add(num)
+            if revoke_claim and claims is None:
                 row["claimId"] = None
                 row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
@@ -2088,6 +2131,7 @@ class UsageStore:
                 row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
+        return cleared
 
 
 def _num_or_none(value: object) -> float | None:
@@ -2106,10 +2150,16 @@ def _pruned_attempts(row: dict, now: float) -> list[float]:
 
 
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    *,
+    struck_ok: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
-    (see :meth:`UsageStore.reserve` for the two caller modes)."""
+    (see :meth:`UsageStore.reserve` for the two caller modes and
+    ``struck_ok``)."""
     # The hourly attempt cap binds in every mode, forced or scheduled: a row
     # that already spent its budget this trailing hour is ineligible however
     # due or stale it looks.
@@ -2118,8 +2168,10 @@ def _row_eligible(
     # A suspected race stays eligible ON PURPOSE: the strike blocks the fetch,
     # and only a fetch can succeed, so vetoing here is what made one
     # `invalid_grant` permanent. Backoff below still paces the single retry.
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES and not (
-        _strike_is_suspected_race(
+    if (
+        not struck_ok
+        and int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES
+        and not _strike_is_suspected_race(
             int(row.get("authDeadStrikes") or 0),
             _num_or_none(row.get("fetchedAt")),
             _strike_time(row),
