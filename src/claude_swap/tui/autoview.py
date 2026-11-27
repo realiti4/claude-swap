@@ -619,9 +619,9 @@ class AutoScreen(Screen):
                 # two print `kind == "full"` in different words on purpose
                 # (the elif below): the log always says "full", this panel
                 # reserves "full" for a window actually at or over 100 and
-                # says nothing otherwise, nor when that window's chip reads
-                # `?` (a passed reset): the gate below prints the engine's
-                # own reason instead. Always on `models`, the full pinned
+                # says nothing otherwise. A passed window's chip reads `?`
+                # but the label still classifies its stored figure, as the
+                # log does. Always on `models`, the full pinned
                 # set: this label explains why the row is not simply "open"
                 # on the criteria the user actually configured, independent
                 # of whether the pass above retried on the 5h/7d-only axis
@@ -631,8 +631,6 @@ class AutoScreen(Screen):
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows), row_bar, weekly,
                     )
-                    if kind == "full" and blocked_model in passed:
-                        kind = "open"
                     if kind == "model":
                         entry.append(
                             f"  {model_block_label(blocked_model)}",

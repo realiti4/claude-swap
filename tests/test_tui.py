@@ -5233,8 +5233,12 @@ class TestUnswitchableRowsAreListed:
         for out in (panel, mini):
             assert "5h ? · 7d(⟳" in out and "):5%" in out, out
             assert "100%" not in out and "5h(⟳" not in out, out
-        assert "Fable ?" in panel and "full" not in panel and "-walled" not in panel, panel
-        # Every window past its reset: nothing is left to classify.
+        # The chips read `?`; the label is the engine's veto on the stored
+        # figure, as in the decision log (5h before Fable).
+        assert "Fable ?" in panel and "  5h full" in panel, panel
+        assert "-walled" not in panel, panel
+        # Every window past its reset: the chip reads `?`, the label still
+        # names the stored figure's veto.
         only = UsageEntry(
             last_good={"five_hour": {"pct": 100.0, **passed}},
             fetched_at=now - 10, age_s=10.0,
@@ -5243,35 +5247,49 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
             self._acct("2", "b@x.com", switchable=True, usage=only),
         ), active="1", settings=AutoSwitchSettings())
-        assert "5h ?" in out and "100%" not in out and "full" not in out, out
+        assert "5h ?" in out and "100%" not in out and "  5h full" in out, out
 
-    def test_a_passed_window_the_engine_still_reads_is_not_called_model_walled(self):
+    @pytest.mark.parametrize(
+        ("active_pct", "header"),
+        [(95.0, "no candidate qualifies"), (20.0, "not previewed (active below threshold)")],
+        ids=["engine-ran", "engine-not-run"],
+    )
+    def test_a_passed_window_still_carries_the_engines_full_label(self, active_pct, header):
         """The engine reads the stored 5h figure whether or not its reset has
-        passed, so a 5h past its reset at 100% still refuses the row as "at its
-        limit". With the pinned model's live window also over its line, the
-        panel must not read `Fable-walled` ("5h/7d have room"); the passed
-        window only draws as `5h ?` and the engine's own reason prints."""
+        passed, so the label is `classify_candidate_block` over every window,
+        as the decision log prints it: only the chip reads `5h ?`. A live 7d
+        at 100% behind it keeps its chip, and a live Fable at 100% is never
+        called `Fable-walled` ("5h/7d have room"). With the engine pass not
+        run (active below its line) the label is the only reason on the row."""
         from claude_swap.settings import AutoSwitchSettings
 
-        out = self._render(self._snap(
-            self._acct("1", "a@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0},
-                "scoped": [{"name": "Fable", "pct": 20.0}],
-            }),
-            self._acct("2", "b@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
-                "seven_day": {"pct": 5.0, "resets_at": _iso_in(86400 * 3)},
-                "scoped": [{"name": "Fable", "pct": 100.0,
-                            "resets_at": _iso_in(86400 * 3)}],
-            }),
-        ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
-        assert "Fable-walled" not in out and "5h full" not in out, out
-        assert "5h ?" in out and "not a candidate (at its limit)" in out, out
+        def render(second_window):
+            return self._render(self._snap(
+                self._acct("1", "a@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": active_pct}, "seven_day": {"pct": 20.0},
+                    "scoped": [{"name": "Fable", "pct": 20.0}],
+                }),
+                self._acct("2", "b@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                    **second_window,
+                }),
+            ), active="1", settings=AutoSwitchSettings(
+                model="Fable", threshold=90.0, strategy="best"))
+
+        live = {"resets_at": _iso_in(86400 * 3)}
+        out = render({"seven_day": {"pct": 100.0, **live}})
+        assert header in out, out
+        assert "5h ?" in out and "7d(⟳" in out and "):100%" in out, out
+        assert "  5h full" in out and "7d full" not in out, out
+        out = render({
+            "seven_day": {"pct": 5.0, **live},
+            "scoped": [{"name": "Fable", "pct": 100.0, **live}],
+        })
+        assert "5h ?" in out and "  5h full" in out and "Fable-walled" not in out, out
 
     def test_a_passed_model_window_alone_still_reads_walled_as_the_log_does(self):
-        """Only the `full` text is dropped for a passed window: a model window
-        past its reset (stored 100%) with 5h/7d open is still what the engine
-        and the decision log call Fable-walled."""
+        """A model window past its reset (stored 100%) with 5h/7d open is
+        still what the engine and the decision log call Fable-walled."""
         from claude_swap.settings import AutoSwitchSettings
 
         out = self._render(self._snap(
