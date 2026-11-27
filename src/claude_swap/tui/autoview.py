@@ -60,6 +60,7 @@ from claude_swap.tui.widgets import (
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
+    from claude_swap.usage_store import UsageEntry
 
 _EVENT_ROLES = {
     "switch": "accent",
@@ -236,6 +237,21 @@ def _line_note(binding: BindingWindow | None, label: str, differs: bool) -> str:
     if not differs or binding is None or label != binding.label:
         return ""
     return f" (line {pct_label(binding.line)}%)"
+
+
+def _chip_parts(
+    label: str, wpct: float, resets_at: str | None, now: float,
+    entry: UsageEntry,
+) -> tuple[str, str, bool]:
+    """One window's chip as ``(reading, figure, passed)``, read as the
+    dashboard reads it: ``5h ?`` once the reset has passed
+    (``oauth.window_reset_passed``, the stored pct describes a window that
+    ended), else ``5h(⟳2h04m):`` and the pct."""
+    window = {"resets_at": resets_at}
+    if oauth.window_reset_passed(window, now):
+        return f"{label} ", "?", True
+    reset = data.reset_text(window, now, entry.fetched_at, entry=entry)
+    return data.chip_label(label, reset, wpct), f"{wpct:.0f}%", False
 
 
 class AutoScreen(Screen):
@@ -598,16 +614,12 @@ class AutoScreen(Screen):
             )
             differs = weekly is not None or acc.number in thresholds
             for label, wpct, resets_at in windows:
-                width = len(
-                    data.chip_label(
-                        label,
-                        data.reset_text(
-                            {"resets_at": resets_at}, now, acc.usage.fetched_at,
-                            entry=acc.usage,
-                        ),
-                        wpct,
-                    )
-                ) + len(f"{wpct:.0f}%") + len(_line_note(bound, label, differs))
+                reading, figure, _passed = _chip_parts(
+                    label, wpct, resets_at, now, acc.usage
+                )
+                width = len(reading) + len(figure) + len(
+                    _line_note(bound, label, differs)
+                )
                 chip_width[label] = max(chip_width.get(label, 0), width)
         for acc in snap.accounts:
             if acc.number == active_number:
@@ -685,26 +697,20 @@ class AutoScreen(Screen):
                 # chips and the label can never disagree on which windows
                 # exist for this account.
                 windows = row_windows[acc.number]
-                fetched_at = acc.usage.fetched_at
                 # Computed once per window so the chip and the block label
                 # below read the exact same reset, never two separate calls
                 # that could drift.
                 chips = [
-                    (
-                        label, wpct,
-                        data.reset_text(
-                            {"resets_at": resets_at}, now, fetched_at,
-                            entry=acc.usage,
-                        ),
-                    )
+                    (label, wpct, *_chip_parts(label, wpct, resets_at, now, acc.usage))
                     for label, wpct, resets_at in windows
                 ]
-                for i, (label, wpct, reset) in enumerate(chips):
+                for i, (label, wpct, label_text, pct_text, passed) in enumerate(chips):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
-                    label_text = data.chip_label(label, reset, wpct)
                     entry.append(label_text, style=palette.muted)
-                    pct_text = f"{wpct:.0f}%"
-                    entry.append(pct_text, style=palette.severity(wpct))
+                    entry.append(
+                        pct_text,
+                        style=palette.muted if passed else palette.severity(wpct),
+                    )
                     # The raw pct stays; once a weekly line makes the lines
                     # differ, the BINDING window's chip also names the line it
                     # is judged against. Inside the chip's column (counted in
@@ -738,23 +744,15 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
-                    # A window whose chip reads data.REFETCHING, or one of
-                    # the retry/backoff markers reset_text names for the
-                    # same provably-stale case (#325 follow-up — the chip
-                    # no longer says REFETCHING forever, but the pct beside
-                    # it is exactly as stale either way), has no opinion to
-                    # contribute -- so it is dropped rather than zeroed: a
-                    # zeroed pct would still be a fabricated measurement,
-                    # never one the window actually reported (#325). Every
-                    # OTHER reading `reset_text` returns is prefixed
-                    # "resets " (a duration, "now") or is None (unknown) --
-                    # the stale-placeholder family is the one shape that is
-                    # neither, so that is what is excluded here rather than
-                    # naming each marker.
+                    # A window whose chip reads `5h ?` (its reset has passed)
+                    # has no opinion to contribute -- so it is dropped
+                    # rather than zeroed: a zeroed pct would still be a
+                    # fabricated measurement, never one the window actually
+                    # reported (#325).
                     kind, blocked_model = classify_candidate_block(
                         (
-                            (label, p) for label, p, reset in chips
-                            if reset is None or reset.startswith("resets ")
+                            (label, p) for label, p, _t, _f, passed in chips
+                            if not passed
                         ),
                         line,
                         weekly,

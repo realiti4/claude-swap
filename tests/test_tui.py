@@ -878,8 +878,8 @@ class TestUsageRows:
         the pct was measured after the reset."""
         from claude_swap.tui.widgets import account_card_text, usage_rows
 
-        now = time.time()
         last_good = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}}
+        now = time.time()  # after `_iso_in`, which truncates: 60s ago, never 59
         fetched_at = now - 120  # measured well before the reset fired
         claimed = UsageEntry(
             last_good=last_good, fetched_at=fetched_at, age_s=120.0,
@@ -3257,66 +3257,82 @@ class TestUnswitchableRowsAreListed:
         assert "Fable-only" in out, out
         assert "  5h full" in out, out
 
-    def test_the_panel_never_calls_a_refetching_window_full(self):
-        """PR #325: a 5h window whose reset just fired reads `refetching`
-        on the chip -- the same row's block label must not still say
-        `5h full` off the same provably-stale pct, which would contradict
-        the chip it sits beside.
+    def test_a_passed_window_reads_the_same_on_the_panel_and_the_dashboard(self):
+        """PR #325: one account must not read two ways on two screens. A
+        window whose reset has passed while the served pct predates it drew
+        `5h(⟳refetching):100%` (or `⟳retry 5m`) beside a `5h full` label on
+        the Next-best row while the dashboard row drew no figure. Upstream
+        #625 draws a passed window as `5h ?` on every surface, whether a
+        fetch is claimed, only a retry is scheduled, or the pct was measured
+        after the reset, so the panel reads that and calls nothing full."""
+        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.tui.widgets import mini_account_text
 
-        #325 follow-up: the block label stays suppressed on the SAME stale
-        pct whether the chip beside it is genuinely claimed ("refetching")
-        or names its own retry -- the block filter is keyed on the pct's
-        staleness, not on which of those two words the chip happens to
-        show."""
         now = time.time()
-        stale_usage = UsageEntry(
-            last_good={
-                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
-                "seven_day": {"pct": 5.0},
-            },
-            fetched_at=now - 120,  # measured well before the reset fired
-            age_s=120.0,
-            # `next_poll_at` is ALSO set: a real discriminator (see
-            # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+        passed = {"resets_at": _iso_in(-60)}
+        last_good = {
+            "five_hour": {"pct": 100.0, **passed},
+            "scoped": [{"name": "Fable", "pct": 100.0, **passed}],
+        }
+        claimed = UsageEntry(
+            last_good=last_good, fetched_at=now - 120, age_s=120.0,
             claim_until=now + 30, next_poll_at=now + 330,
         )
-        out = self._render(self._snap(
-            self._acct("1", "a@x.com", switchable=True),
-            self._acct("2", "b@x.com", switchable=True, usage=stale_usage),
-        ), active="1")
-        assert "5h(⟳refetching):" in out, out
-        assert "5h full" not in out, out
-
-        # Same drift note as the spend-only variant above: a wide margin
-        # past the 5m boundary.
-        waiting_usage = dataclasses.replace(
-            stale_usage, claim_until=None, next_poll_at=now + 330
+        waiting = dataclasses.replace(claimed, claim_until=None)
+        fresh = dataclasses.replace(
+            claimed, fetched_at=now - 10, age_s=10.0, claim_until=None,
+            next_poll_at=None,
         )
-        out2 = self._render(self._snap(
-            self._acct("1", "a@x.com", switchable=True),
-            self._acct("2", "b@x.com", switchable=True, usage=waiting_usage),
-        ), active="1")
-        assert "5h(⟳retry 5m):" in out2, out2
-        assert "5h full" not in out2, out2
+        for entry in (claimed, waiting, fresh):
+            panel = self._render(self._snap(
+                self._acct("1", "a@x.com", switchable=True),
+                self._acct("2", "b@x.com", switchable=True, usage=entry),
+            ), active="1", settings=AutoSwitchSettings(model="Fable"))
+            mini = mini_account_text(make_account(2, entry=entry), now).plain
+            for out in (panel, mini):
+                assert "5h ?" in out and "Fable ?" in out, out
+                assert "100%" not in out and "⟳" not in out, out
+                assert "full" not in out and "-only" not in out, out
+
+    def test_a_passed_chip_keeps_the_columns_after_it_aligned(self):
+        """A `5h ?` chip is shorter than `5h(⟳4h19m):45%`; the column the 7d
+        chip starts in is sized from what each row draws, not from the
+        countdown a passed window no longer shows."""
+        now = datetime.now(timezone.utc)
+        week = {"pct": 9.0, "resets_at": (now + timedelta(days=3)).isoformat()}
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 99.0,
+                              "resets_at": (now - timedelta(minutes=1)).isoformat()},
+                "seven_day": week,
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 45.0,
+                              "resets_at": (now + timedelta(hours=4, minutes=19)).isoformat()},
+                "seven_day": week,
+            }),
+        ), active="9")
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 "))]
+        assert len(lines) == 2 and any("5h ?" in line for line in lines), lines
+        assert lines[0].index("7d") == lines[1].index("7d"), lines
 
     def test_the_panel_still_calls_a_genuinely_full_window_full(self):
-        """CONTROL for the test above: a fetch that landed AFTER the reset
-        carries a fresh pct, so a window that is really at/over threshold
-        must still read `5h full` -- the filter must not go unconditional."""
-        now = time.time()
-        fresh_usage = UsageEntry(
+        """CONTROL for the test above: a window that has not reset keeps its
+        figure and still reads `5h full` -- the filter must not go
+        unconditional."""
+        full_usage = UsageEntry(
             last_good={
-                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                "five_hour": {"pct": 100.0, "resets_at": _iso_in(3600)},
                 "seven_day": {"pct": 5.0},
             },
-            fetched_at=now - 10,  # measured after the reset fired
+            fetched_at=time.time() - 10,
             age_s=10.0,
         )
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
-            self._acct("2", "b@x.com", switchable=True, usage=fresh_usage),
+            self._acct("2", "b@x.com", switchable=True, usage=full_usage),
         ), active="1")
-        assert "5h full" in out, out
+        assert "5h full" in out and "5h(⟳" in out, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a

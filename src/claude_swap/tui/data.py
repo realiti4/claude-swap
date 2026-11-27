@@ -234,8 +234,9 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
 
     THE one place that decides how a window reads — the dashboard's inactive
     rows and the auto view's Next-best rows both draw it, so one account
-    cannot read two ways on two screens. The caller appends the pct so it can
-    colour it by severity. The countdown shows whenever it is known, not only
+    cannot read two ways on two screens. Both read a window whose reset has
+    passed as ``5h ?`` (``oauth.window_reset_passed``) without asking this.
+    The caller appends the pct so it can colour it by severity. The countdown shows whenever it is known, not only
     at 100%: a saturated candidate's worth IS when it comes back.
 
     A known countdown renders in one fixed-width shape, zero-padded, so the
