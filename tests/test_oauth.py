@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
 import ssl
 import urllib.error
 from datetime import datetime, timezone
@@ -628,6 +631,58 @@ class TestTryRefreshOAuthCredentials:
             assert "unknown" in message
             assert "spent" not in message
 
+    @pytest.mark.parametrize("code, warned", [(502, True), (400, False)])
+    def test_an_error_reply_that_stops_mid_read_is_transient(
+        self, caplog, code, warned
+    ):
+        """A gateway can drop the connection while the error body is read.
+        That must come back as an outcome, not raise through the caller."""
+        import http.client
+        import logging
+
+        err = self._http_error(code, b"")
+        err.read = MagicMock(side_effect=http.client.IncompleteRead(b"par"))
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err
+        ), caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error == "transient"
+        assert outcome.credentials is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert bool(warnings) is warned
+        assert "IncompleteRead" in caplog.text
+
+    def test_reply_text_stays_out_of_the_log_at_every_level(self, caplog):
+        """The error body is whatever a server or a proxy chose to send, and
+        --debug output gets pasted into issues: only the status, a known
+        OAuth error code and exception types are logged."""
+        import logging
+
+        failures = (
+            self._http_error(
+                400, b'{"error": "invalid_request", "error_description": "MARKER"}'
+            ),
+            self._http_error(400, b'{"error": "MARKER"}'),
+            self._http_error(400, b'{"error": {"nested": "MARKER"}}'),
+            self._http_error(503, b"<html>MARKER</html>"),
+            urllib.error.URLError("MARKER"),
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            for failure in failures:
+                with patch(
+                    "claude_swap.oauth.urllib.request.urlopen", side_effect=failure
+                ):
+                    outcome = oauth.try_refresh_oauth_credentials(
+                        self._make_credentials()
+                    )
+                assert outcome.error == "transient"
+
+        assert "MARKER" not in caplog.text
+        assert "HTTP 400, error invalid_request" in caplog.text
+        assert "HTTP 400, error unrecognised" in caplog.text
+
     def test_answered_refresh_is_not_logged_as_no_reply(self, caplog):
         """A 4xx is the server's answer to the request, whatever it says."""
         import logging
@@ -1233,6 +1288,102 @@ class TestClassifyUsageError:
 
     def test_fallback_type_name(self):
         assert oauth._classify_usage_error(ValueError("x"))[0] == "ValueError"
+
+
+class TestUsageRequestLog:
+    """``request_usage_data`` logs one INFO line per request when asked
+    (outcome, token tag, slot, process, request and cf-ray ids), never reads a
+    body for it, and changes nothing it returns or raises."""
+
+    TOKEN = "sk-ant-oat01-secret"
+    TAG = hashlib.sha256(TOKEN.encode()).hexdigest()[:12]
+    RATE = json.dumps({"type": "error", "error": {
+        "type": "rate_limit_error", "message": "Slow down",
+    }}).encode()
+    HTTP = staticmethod(TestClassifyUsageError._http_error)
+
+    def _request(self, caplog, **urlopen):
+        """Run one request: its INFO lines and what it raised."""
+        raised = None
+        with patch("claude_swap.oauth.urllib.request.urlopen", **urlopen), \
+                caplog.at_level(logging.INFO, logger="claude-swap"):
+            try:
+                oauth.request_usage_data(self.TOKEN, request_log=True, slot="7")
+            except Exception as e:
+                raised = e
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO], raised
+
+    @staticmethod
+    def _ok(headers=None):
+        resp = MagicMock(status=200, headers=headers or {})
+        resp.read.return_value = b'{"ok": 1}'
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return resp
+
+    def test_success_logs_one_line(self, caplog):
+        (line,), raised = self._request(
+            caplog, return_value=self._ok({"request-id": "req_ok", "cf-ray": "9a8b7c6d-xy"}),
+        )
+        assert raised is None
+        for part in ("http-200", self.TAG, "slot 7", f"pid {os.getpid()}", "request-id req_ok",
+                     "cf-ray 9a8b7c6d-xy"):
+            assert part in line
+        assert self.TOKEN not in line
+
+    @pytest.mark.parametrize("err, present, absent", [
+        (HTTP(429, {"request-id": "req_abc\nforged", "X-Request-Id": "xr_1", "Retry-After": "3600"}, RATE),
+         ["http-429", "request-id req_abc", "x-request-id xr_1", "retry-after 3600"],
+         ["rate_limit_error", "Slow down"]),
+        (HTTP(500, {"request-id": "req_5"}, RATE), ["http-500", "request-id req_5"],
+         ["rate_limit_error", "retry-after"]),
+        (TimeoutError(), ["TimeoutError"], []),
+        (urllib.error.URLError(TimeoutError()), ["URLError"], []),
+    ])
+    def test_failure_logs_one_line_and_reraises(self, caplog, err, present, absent):
+        """No body is read, and a log line never carries a newline."""
+        (line,), raised = self._request(caplog, side_effect=err)
+        assert raised is err
+        assert not isinstance(err, urllib.error.HTTPError) or err.fp.tell() == 0
+        assert self.TAG in line and self.TOKEN not in line and "\n" not in line
+        assert all(p in line for p in present)
+        assert not any(a in line for a in absent)
+
+    def test_default_logs_nothing(self, caplog):
+        """The trace is opt-in: a plain call sends one request and logs nothing."""
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=self._ok()), \
+                patch("claude_swap.oauth._pin_aware_ssl_context", return_value=None), \
+                caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            assert oauth.request_usage_data(self.TOKEN) == {"ok": 1}
+        assert caplog.records == []
+
+    @pytest.mark.parametrize("urlopen", [{"side_effect": HTTP(401)}, {"return_value": _ok()}])
+    def test_a_failing_log_line_changes_nothing(self, urlopen):
+        with patch.object(oauth._logger, "info", side_effect=RuntimeError("boom")), \
+                patch("claude_swap.oauth.urllib.request.urlopen", **urlopen):
+            if "side_effect" in urlopen:
+                with pytest.raises(urllib.error.HTTPError) as raised:
+                    oauth.request_usage_data(self.TOKEN, request_log=True)
+                assert raised.value is urlopen["side_effect"]
+            else:
+                assert oauth.request_usage_data(self.TOKEN, request_log=True) == {"ok": 1}
+
+    @pytest.mark.parametrize("code, headers, body, error, retry_after", [
+        (429, {"Retry-After": "3600"}, RATE, "http-429", 3600.0),
+        (403, {}, TestClassifyUsageError.ORG_BODY, TestClassifyUsageError.ORG, None),
+    ])
+    def test_outcome_is_unchanged(self, caplog, code, headers, body, error, retry_after):
+        """The log line leaves the 403 body for ``_classify_usage_error``, and
+        ``try_fetch_usage_for_account`` passes the option and its slot on."""
+        with patch("claude_swap.oauth.urllib.request.urlopen",
+                   side_effect=self.HTTP(code, headers, body)), \
+                caplog.at_level(logging.INFO, logger="claude-swap"):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", TestTryFetchUsageOutcome._make_credentials(), is_active=False,
+                request_log=True,
+            )
+        assert (outcome.error, outcome.retry_after_s) == (error, retry_after)
+        assert "slot 1" in caplog.text
 
 
 class TestTryFetchUsageOutcome:
@@ -2742,6 +2893,8 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         seen = []
 
         class _Resp:
+            headers = {}
+
             def __enter__(self_inner):
                 return self_inner
 

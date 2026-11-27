@@ -1656,7 +1656,7 @@ class TestAutoScreen:
             assert "threshold 99.9% (session)" in summary.render().plain
             screen.action_threshold_step(-60.0)
             await pilot.pause()
-            assert screen._settings.threshold == 50.0  # spec's lower bound
+            assert screen._settings.threshold == 40.0  # spec's lower bound
 
     @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
     async def test_pin_toggle_flips_the_files_value_and_shows_it(

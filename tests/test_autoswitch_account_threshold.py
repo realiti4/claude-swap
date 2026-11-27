@@ -1292,7 +1292,7 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
     def test_threshold_departure_with_no_viable_target_blocks(self, temp_home):
         live = self._stage(temp_home,
                            expires_at=int(1_000_000.0 * 1000) + 3_600_000)
-        # `ACCOUNT_THRESHOLD_MIN` is 50: the lowest line the store accepts,
+        # 50 is a line the store accepts (`ACCOUNT_THRESHOLD_MIN` is 40),
         # crossed here at 60%.
         live.switcher.set_account_threshold("1", 50.0)
         live.engine = live._make_engine()

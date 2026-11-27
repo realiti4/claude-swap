@@ -1029,28 +1029,301 @@ class TestAdaptiveScheduler:
         assert counts["1"] == 3
         assert counts["2"] == 2  # now stale → the escalation refreshes it
 
-    def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
-        # The active account's fetches are being refused (429 with a long
-        # Retry-After). Its last-good data ages past STALE_OK_S, but the
-        # staleness is deliberate: headroom stays known, so no unhealthy
-        # ticks and no escalate-all burst while the server is rate limiting.
+    _EMAILS = {"1": "a@example.com", "2": "b@example.com", "3": "c@example.com"}
+
+    def _refuse(self, h, num, retry_after_s=3600.0):
+        """Record a usage 429 for one account, as a refused refresh does."""
+        h.switcher._usage_store.record(
+            {num: FetchRecord(error="http-429", retry_after_s=retry_after_s)},
+            {num: (self._EMAILS[num], "")},
+        )
+
+    @staticmethod
+    def _reasons(h):
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    @staticmethod
+    def _switches(h):
+        return [
+            (e.from_ref["number"], e.to_ref["number"], e.trigger)
+            for e in h.events
+            if isinstance(e, SwitchEvent)
+        ]
+
+    @pytest.mark.parametrize(
+        "shape, pct, known",
+        [
+            ("far from its line", 50, "5h 50% read 8m ago"),
+            # Inside the band where a readable active has every peer refetched.
+            ("near its line", 86, "5h 86% read 8m ago"),
+            # Its window reset inside the backoff: the store drops the reading.
+            ("reading lapsed", 50, "no current reading"),
+        ],
+    )
+    def test_a_blind_active_counts_without_refetching_its_peers(
+        self, temp_home, monkeypatch, shape, pct, known
+    ):
+        # The active account's refreshes are being refused (429 with a long
+        # Retry-After) and its last reading has aged past STALE_OK_S. The
+        # store still trusts that reading as a lower bound, which cannot say
+        # the account is still below its line (#208). The tick counts toward
+        # leaving and says why; the active account's backoff is respected,
+        # and its peers keep their ordinary poll plan while the count runs.
+        h = self._harness(temp_home, monkeypatch)
+        resets = _iso_at(h.clock.now + 300) if shape == "reading lapsed" else None
+        usage = {"1": _usage(pct, resets), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.clock.advance(400)
+        counts.clear()
+        h.events.clear()
+        outcome = self._tick(h, counts, usage)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 1
+        stale = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in stale] == ["active-usage-stale"]
+        assert stale[0].detail == (
+            f"{known}, usage refresh rate-limited; 1/3 before "
+            "moving to an account with a recent reading"
+        )
+        assert "1" not in counts  # backoff respected
+        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+
+    def test_a_429_frozen_active_reading_moves_to_a_measured_account(
+        self, temp_home, monkeypatch
+    ):
+        # #208 as reported: line 85, the active account's last reading 58%,
+        # then every refresh 429s while the account keeps being used. The
+        # frozen 58% must not keep answering "below the line".
+        h = self._harness(temp_home, monkeypatch, threshold=85.0)
+        usage = {"1": _usage(58), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        h.events.clear()
+        errors = {"1": "http-429"}
+        outcomes = []
+        for _ in range(12):
+            h.clock.advance(60)
+            outcomes.append(self._tick(h, counts, usage, errors))
+            if outcomes[-1] is TickOutcome.SWITCHED:
+                break
+        reasons = self._reasons(h)
+        assert outcomes[-1] is TickOutcome.SWITCHED
+        # While the reading is younger than STALE_OK_S it still decides
+        # ("below-threshold"); once it ages past, two counted ticks, then the
+        # move to the account with the most room, read in that same tick.
+        assert reasons[-2:] == ["active-usage-stale", "active-usage-stale"]
+        assert reasons.count("below-threshold") == len(reasons) - 2
+        assert self._switches(h) == [(1, 2, "active-stale")]
+
+    def test_two_rate_limited_accounts_do_not_swap(self, temp_home, monkeypatch):
+        # Both accounts hold a reading and a refused refresh. Neither can be
+        # measured, so neither is a reason to leave the other: nine ticks, no
+        # switch, and no request sent into either backoff.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        self._refuse(h, "1")
+        self._refuse(h, "2")
+        h.clock.advance(400)
+        counts.clear()
+        h.events.clear()
+        for _ in range(9):
+            assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        assert self._switches(h) == []
+        assert h.active_number() == 1
+        assert counts == {}
+        assert self._reasons(h) == (
+            ["active-usage-stale"] * 2 + ["no-verified-target"] * 7
+        )
+
+    def test_a_window_reset_during_the_backoff_still_needs_a_measured_account(
+        self, temp_home, monkeypatch
+    ):
+        # The active account's window resets inside the 429's backoff, so the
+        # store stops trusting its reading and the account reads as unknown.
+        # The refusal is the same one: the engine still leaves only for a
+        # measured account with room, never onto the 98% peer the failover
+        # escape would take.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {
+            "1": _usage(50, _iso_at(h.clock.now + 600)),
+            "2": _usage(98),
+        }
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        self._refuse(h, "1")
+        h.clock.advance(700)
+        h.events.clear()
+        for _ in range(4):
+            assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        polls = [e for e in h.events if isinstance(e, PollEvent)]
+        assert polls[-1].headroom["1"] is None
+        reasons = self._reasons(h)
+        assert reasons == ["active-usage-stale"] * 2 + ["no-verified-target"] * 2
+        assert "no current reading" in [
+            e for e in h.events if isinstance(e, NoSwitchEvent)
+        ][-1].detail
+        assert h.active_number() == 1
+        # Once the peer has room, the same state moves to it.
+        usage["2"] = _usage(20)
+        h.clock.advance(200)
+        assert self._tick(h, counts, usage) is TickOutcome.SWITCHED
+        assert self._switches(h) == [(1, 2, "active-stale")]
+
+    def test_an_active_unreadable_for_another_reason_still_fails_over(
+        self, temp_home, monkeypatch
+    ):
+        # Not a 429: nothing says the account is merely being throttled, so
+        # the failover escape keeps its landing rule (any account with quota).
+        h = self._harness(temp_home, monkeypatch, accounts=2, unhealthy_ticks=1)
+        counts: dict[str, int] = {}
+        outcome = self._tick(
+            h, counts, {"2": _usage(98)}, errors_by_num={"1": "timeout"}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert self._switches(h) == [(1, 2, "failover")]
+
+    def _leave_blind_for_2(self, h, counts, usage):
+        """Account 1 goes blind and the engine moves to account 2."""
+        self._tick(h, counts, usage)
+        self._refuse(h, "1")
+        h.clock.advance(400)
+        for _ in range(3):
+            outcome = self._tick(h, counts, usage)
+            h.clock.advance(60)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_account_left_blind_is_not_returned_to_on_its_old_reading(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch, accounts=2, cooldown_seconds=0)
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        self._leave_blind_for_2(h, counts, usage)
+        # Now account 2 goes blind, while account 1 is still refused.
+        self._refuse(h, "2")
+        h.clock.advance(400)
+        h.events.clear()
+        for _ in range(6):
+            assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        assert h.active_number() == 2
+        assert self._reasons(h)[-1] == "no-verified-target"
+
+    def test_the_account_left_blind_is_returned_to_once_it_reads_again(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        self._leave_blind_for_2(h, counts, usage)
+        # Account 1's backoff runs out, then account 2 goes blind. Account 1
+        # reads 50% again: no better than when it was left, but measured.
+        h.clock.advance(4200)
+        self._refuse(h, "2")
+        h.clock.advance(400)
+        h.events.clear()
+        for _ in range(3):
+            outcome = self._tick(h, counts, usage)
+            h.clock.advance(60)
+        assert outcome is TickOutcome.SWITCHED
+        assert self._switches(h) == [(2, 1, "active-stale")]
+
+    def test_the_move_off_a_blind_active_waits_out_the_cooldown(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        self._refuse(h, "1")
+        h.clock.advance(400)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock()))
+        before = counts["2"]
+        for _ in range(5):  # 0s..240s into the 300s cooldown
+            assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        assert self._reasons(h)[-3:] == ["cooldown"] * 3
+        # Its own poll plan came due once. The landing check, which would
+        # have read it again by now, does not run while the cooldown holds.
+        assert counts["2"] == before + 1
+        assert self._tick(h, counts, usage) is TickOutcome.SWITCHED
+        assert self._switches(h) == [(1, 2, "active-stale")]
+
+    def test_a_refresh_that_gets_through_clears_the_count(
+        self, temp_home, monkeypatch
+    ):
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.clock.advance(400)
+        self._tick(h, counts, usage)
         h.clock.advance(60)
+        self._tick(h, counts, usage)
+        assert h.engine._unhealthy_ticks == 2
+        h.clock.advance(200)  # past the 600s backoff
+        h.events.clear()
+        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 0
+        assert self._reasons(h) == ["below-threshold"]
+
+    @pytest.mark.parametrize(
+        "pct, trigger", [(100, "at-limit"), (95, "proactive")]
+    )
+    def test_a_frozen_reading_at_or_over_its_line_leaves_at_once(
+        self, temp_home, monkeypatch, pct, trigger
+    ):
+        # A lower bound does show a crossing. A refused refresh must not make
+        # the engine wait out the count on a reading already at its line, nor
+        # cost it the refresh of every peer that picks the best landing.
+        h = self._harness(temp_home, monkeypatch)
+        reading = _usage(pct, _iso_at(h.clock.now + 3 * 3600))
+        h.switcher._usage_store.record(
+            {"1": FetchRecord(usage=reading)}, {"1": ("a@example.com", "")}
+        )
+        self._refuse(h, "1")
+        h.clock.advance(400)
+        counts: dict[str, int] = {}
+        outcome = self._tick(
+            h, counts, {"1": reading, "2": _usage(40), "3": _usage(10)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert self._switches(h) == [(1, 3, trigger)]
+        assert counts == {"2": 1, "3": 1}
+
+    def test_one_failed_refresh_of_a_recent_active_reading_is_trusted(
+        self, temp_home, monkeypatch
+    ):
+        # A single 429 on a reading younger than STALE_OK_S changes nothing:
+        # the reading is as recent as any trusted one.
+        h = self._harness(temp_home, monkeypatch)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         h.switcher._usage_store.record(
             {"1": FetchRecord(error="http-429", retry_after_s=600.0)},
             {"1": ("a@example.com", "")},
         )
-        h.clock.advance(400)  # active data now well past STALE_OK_S, in backoff
-        counts.clear()
+        h.clock.advance(120)
+        h.events.clear()
         outcome = self._tick(h, counts, usage)
         assert outcome is TickOutcome.NO_ACTION
         assert h.engine._unhealthy_ticks == 0
-        assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "below-threshold"
+        ]
 
     def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
         self, temp_home, monkeypatch
@@ -1888,6 +2161,240 @@ class TestAdaptiveScheduler:
         # so a rotated credential is noticed on the next tick, not minutes later.
         assert fetch_sets[:3] == [{"1", "2"}, {"3"}, {"2"}]  # t0, t60, t120
 
+
+
+class TestActiveStaleLanding:
+    """Where the engine may go when a 429 keeps the active account's usage
+    from being read (`_active_reading_blind`), one decision per tick."""
+
+    @staticmethod
+    def _blind(
+        value: dict, now: float, age: float = 900.0, trusted: bool = True
+    ) -> UsageEntry:
+        """The active account: read ``age`` seconds ago, refused since.
+        ``trusted`` is whether the store still serves that reading; it stops
+        once the reading's window has reset."""
+        return UsageEntry(
+            last_good=value, fetched_at=now - age, age_s=age,
+            consecutive_failures=3, last_error="http-429",
+            backoff_until=now + 3000, trust_extended=trusted,
+        )
+
+    @staticmethod
+    def _read(value: dict, now: float, age: float = 0.0, failures: int = 0):
+        """A peer: read ``age`` seconds ago, ``failures`` refusals since."""
+        return UsageEntry(
+            last_good=value, fetched_at=now - age, age_s=age,
+            consecutive_failures=failures,
+            last_error="http-429" if failures else None,
+            trust_extended=bool(failures),
+        )
+
+    def _harness(self, temp_home, accounts=2, **settings) -> EngineHarness:
+        h = EngineHarness(temp_home, **{"unhealthy_ticks": 1, **settings})
+        emails = ["a@example.com", "b@example.com", "c@example.com"]
+        for num in range(1, accounts + 1):
+            h.seed(num, emails[num - 1])
+        h.make_live("a@example.com", 1)
+        return h
+
+    @pytest.mark.parametrize(
+        "peer_pct, age, failures, lands",
+        [
+            # Read in this pass with room under its line. Under `best` the
+            # frozen 70% is not compared against: 74% would not beat it.
+            (74, 0.0, 0, True),
+            (98, 0.0, 0, False),   # over its line
+            (85, 0.0, 0, False),   # under it, by less than the margin
+            (10, 200.0, 0, False),  # a reading older than the serve TTL
+            (10, 60.0, 1, False),  # a recent reading, refused since
+        ],
+    )
+    def test_only_a_measured_account_with_room_is_a_landing(
+        self, temp_home, peer_pct, age, failures, lands
+    ):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(peer_pct), now, age, failures),
+        })
+        if lands:
+            assert outcome is TickOutcome.SWITCHED
+            switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+            assert switch.trigger == "active-stale"
+            assert h.active_number() == 2
+        else:
+            # Staying is "nothing to do" for `--once`, never "blocked".
+            assert outcome is TickOutcome.NO_ACTION
+            assert h.active_number() == 1
+            hold = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+            assert [e.reason for e in hold] == ["no-verified-target"]
+            assert hold[0].detail == (
+                "5h 70% read 15m ago, usage refresh rate-limited; staying: "
+                "no other account has a recent reading with room to spare"
+            )
+
+    def test_the_landing_with_the_most_room_wins(self, temp_home):
+        h = self._harness(temp_home, accounts=3)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(40), now),
+            "3": self._read(_usage(20), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_consume_first_lands_on_the_soonest_weekly_reset(self, temp_home):
+        # Every measured account with room qualifies, a later reset than the
+        # active's included: this is a move away, not the below-line nudge.
+        h = self._harness(temp_home, accounts=3, strategy="consume-first")
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage7(20, 20, _R_SOON), now),
+            "2": self._read(_usage7(10, 10, _R_LATEST), now),
+            "3": self._read(_usage7(40, 40, _R_LATER), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_priority_lands_on_the_highest_tier(self, temp_home):
+        h = self._harness(
+            temp_home, accounts=3, strategy="priority-consume-first"
+        )
+        h.switcher.set_account_priority("3", 100)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage7(20, 20, _R_SOON), now),
+            "2": self._read(_usage7(10, 10, _R_SOON), now),
+            "3": self._read(_usage7(40, 40, _R_LATER), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    @pytest.mark.parametrize(
+        "trusted, known",
+        [(True, "5h 70% read 15m ago"), (False, "no current reading")],
+    )
+    def test_a_blind_account_with_no_peer_says_why_it_stays(
+        self, temp_home, trusted, known
+    ):
+        # Nowhere to go: "nothing to do" (exit code 2), never a "blocked" a
+        # cron wrapper would act on, and not a bare "below-threshold" on a
+        # reading that cannot show it. The same before and after the
+        # reading's window resets inside the backoff.
+        h = self._harness(temp_home, accounts=1)
+        outcome = h.tick_with_entries(
+            {"1": self._blind(_usage(70), h.clock.now, trusted=trusted)}
+        )
+        assert outcome is TickOutcome.NO_ACTION
+        hold = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in hold] == ["no-verified-target"]
+        assert hold[0].detail.startswith(f"{known}, usage refresh rate-limited")
+
+    def test_an_api_key_account_is_not_a_landing(self, temp_home):
+        # The last resort is for an account that must be left. A blind one
+        # last read below its line is not that.
+        h = self._harness(temp_home, include_api_key_accounts=True)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now),
+            "2": UsageEntry(sentinel="api key"),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_no_proactive_return_to_the_account_left_blind_until_it_is_read(
+        self, temp_home
+    ):
+        # Account 1 was left on a frozen 70% and is still refused when
+        # account 2 crosses its line. That 70% is the number nobody trusted,
+        # so it is no landing for an ordinary move. The escape at the limit
+        # keeps its rule: any account with quota beats a spent one.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        assert h.tick_with_entries({
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(10), now),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(400)  # past the cooldown
+        h.events.clear()
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now, age=1300.0),
+            "2": self._read(_usage(91), now),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 2
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "no-qualifying-candidate"
+        ]
+        outcome = h.tick_with_entries({
+            "1": self._blind(_usage(70), now, age=1300.0),
+            "2": self._read(_usage(100), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert [
+            e.trigger for e in h.events if isinstance(e, SwitchEvent)
+        ] == ["at-limit"]
+
+    def test_a_refresh_landing_while_the_peers_are_read_cancels_the_move(
+        self, temp_home
+    ):
+        # Another surface reads the active account between this tick's own
+        # collection and its reading of the peers. The reason to leave is
+        # gone, so the move is too.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        before = {
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(10), now),
+        }
+        after = {**before, "1": self._read(_usage(12), now)}
+
+        def entries_for(fetch=None, **kwargs):
+            return after if fetch == {"2"} else before
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=entries_for
+        ):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert h.engine._unhealthy_ticks == 0
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "active-usage-refreshed"
+        ]
+
+    def test_a_later_proactive_move_may_return_to_the_account_left_blind(
+        self, temp_home
+    ):
+        # Account 1 was left on a reading nobody trusted (70%). When account
+        # 2 then crosses its line, account 1 at a measured 80% is a fair
+        # landing: the no-return bar must not hold it to the 70% it was left
+        # at, or the engine sits on account 2 until its limit.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        assert h.tick_with_entries({
+            "1": self._blind(_usage(70), now),
+            "2": self._read(_usage(10), now),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(400)  # past the cooldown
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": self._read(_usage(80), now),
+            "2": self._read(_usage(91), now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert [
+            e.trigger for e in h.events if isinstance(e, SwitchEvent)
+        ] == ["active-stale", "proactive"]
 
 
 class TestApiKeyAccounts:

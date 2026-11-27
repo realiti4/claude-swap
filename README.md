@@ -114,7 +114,7 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 **Per-account controls**
 
 - `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target.
-- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
+- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (40–99.9) in place of the global one.
 - `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
 
 **Good to know**
@@ -359,7 +359,7 @@ Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin), which the ex
 
 ### Configuration
 
-Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges.
+Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges. To keep a `settings.json` under version control untouched, create an untracked `settings.local.json` beside it: it overrides `settings.json`, and edits are then written to it alone.
 
 <details>
 <summary>Commands & usage</summary>
@@ -376,6 +376,7 @@ cswap config set pin.desktopFollows on    # Desktop app inference follows the ac
 cswap config set pin.connectorsFollowPin on  # claude.ai MCP connectors follow the pinned account (see "Cloud pin")
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request
+cswap config set usage.requestLog true    # opt in: log one line per usage request (slot, token tag, request id, cf-ray)
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
