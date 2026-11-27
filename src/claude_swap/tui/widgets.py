@@ -9,6 +9,7 @@ auto-switch trigger line), and stale-measurement dimming.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Iterable, NamedTuple
 
 from rich.cells import cell_len
@@ -105,6 +106,20 @@ def _reset_parts(window: dict, now: float) -> tuple[str | None, str | None]:
     return reset, f"{reset} · {clock}" if clock else reset
 
 
+def _passed_reset_parts(window: dict, now: float) -> tuple[str, str]:
+    """``_reset_parts`` for a window whose reset has passed
+    (``oauth.window_reset_passed``): how long ago, then when.
+
+    ``("reset 3h 5m ago", "reset 3h 5m ago · Nov 26 03:42")``.
+    """
+    reset_utc = datetime.fromisoformat(window["resets_at"])
+    ago = f"reset {data.format_duration(now - reset_utc.timestamp())} ago"
+    clock = oauth.reset_clock_string(
+        reset_utc, datetime.fromtimestamp(now, tz=timezone.utc)
+    )
+    return ago, f"{ago} · {clock}"
+
+
 def _pace_suffix(window: dict, fetched_at: float | None) -> str:
     """"(ahead of pace)" when a weekly window is meaningfully ahead, else ""."""
     result = pace.compute_pace(window, fetched_at=fetched_at)
@@ -116,7 +131,10 @@ def usage_rows(
 ) -> list[tuple[str, float | None, str, str]]:
     """(label, pct, suffix, suffix_full) rows mirroring the CLI's
     ``_format_usage_lines``. ``pct`` is None for a 5h/7d window reported
-    without a figure; ``usage_bar`` draws that row as ``usage unknown``.
+    without a figure and for a 5h, 7d or per-model window whose reset has
+    passed (``oauth.window_reset_passed``), which then carries no marker and
+    says when it ended instead; ``usage_bar`` draws that row as ``usage
+    unknown``.
 
     ``suffix_full`` extends the reset countdown with the absolute clock time
     (``resets 2h 13m · 20:39``) for rows that have room; otherwise it equals
@@ -140,6 +158,9 @@ def usage_rows(
     for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
+            if oauth.window_reset_passed(window, now):
+                rows.append((label, None, *_passed_reset_parts(window, now)))
+                continue
             reset, reset_full = _reset_parts(window, now)
             suffix, suffix_full = reset or "", reset_full or ""
             if key == "seven_day":
@@ -155,6 +176,9 @@ def usage_rows(
                 suffix_full,
             ))
     for window in last_good.get("scoped") or []:
+        if oauth.window_reset_passed(window, now):
+            rows.append((window["name"], None, *_passed_reset_parts(window, now)))
+            continue
         pct = float(window["pct"])
         suffix, suffix_full = _reset_parts(window, now)
         suffix, suffix_full = suffix or "", suffix_full or ""
@@ -434,8 +458,11 @@ def _mini_body(
         window = last_good.get(key)
         if not window:
             continue
-        if not isinstance(window.get("pct"), (int, float)):
-            # No figure: unknown, not 0%. Padded to the width of "NNN%".
+        if not isinstance(
+            window.get("pct"), (int, float)
+        ) or oauth.window_reset_passed(window, now):
+            # No figure, or one for a window that has ended: unknown, not 0%.
+            # Padded to the width of "NNN%".
             cells[label] = Text.assemble(
                 (f"{label} ", palette.muted), (f"{'?':>4}", palette.muted)
             )
@@ -454,7 +481,7 @@ def _mini_body(
             ahead = bool(result and result.ahead)
         cells[label] = cell
     for window in last_good.get("scoped") or []:
-        if float(window["pct"]) >= 100:
+        if float(window["pct"]) >= 100 and not oauth.window_reset_passed(window, now):
             name = window["name"]
             cells[name] = Text(f"{name} (!)", style=palette.sev_crit)
     if isinstance(last_good.get("rejected"), dict):  # a refused setup-token probe
@@ -505,7 +532,8 @@ def mini_account_text(
     plan), any of them together.
     Pcts only, severity colored; a window at/over 100% brings its reset
     countdown along, a maxed per-model window shows as ``Fable (!)`` and a
-    refused setup-token probe as ``rejected (!)``. A
+    refused setup-token probe as ``rejected (!)``. A window whose reset has
+    passed shows ``?``, and a maxed per-model one no cell. A
     window the account lacks is a blank cell, and a sentinel state shows its
     label in place of the cells (ellipsized past ``_MINI_NOTE_CAP`` and the
     cells' width; the expanded card and the CLI carry the full text). Every

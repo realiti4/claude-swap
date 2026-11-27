@@ -6,6 +6,8 @@ import hashlib
 import json
 import logging
 import math
+import os
+import socket
 import ssl
 import sys
 import urllib.error
@@ -46,6 +48,18 @@ USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 USAGE_PROBE_SCOPED_MODELS = {"claude-fable-5-1": "7d_oi"}
 
 _logger = logging.getLogger("claude-swap")
+
+# Refresh failures that happen before any byte of the request is written: the
+# name did not resolve, the connection was refused, or the TLS handshake
+# rejected the certificate.
+_NEVER_SENT = (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)
+
+# The token endpoint's error codes (RFC 6749 section 5.2). A refresh failure
+# is logged with one of these or as unrecognised, never with the reply text.
+_OAUTH_ERROR_CODES = frozenset({
+    "invalid_request", "invalid_client", "invalid_grant",
+    "unauthorized_client", "unsupported_grant_type", "invalid_scope",
+})
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -305,8 +319,15 @@ def try_refresh_oauth_credentials(
             json.dumps(data), None, _parse_token_account(resp_data)
         )
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
-        _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
+        # Reading the error body can fail too, when a gateway drops the
+        # connection part-way. That is a reply without a verdict.
+        unread = ""
+        try:
+            body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
+        except Exception as read_error:
+            body = ""
+            unread = f", body unread ({type(read_error).__name__})"
+        err = None
         # Permanent only when the server itself rejected the grant: a 4xx AND
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
@@ -323,16 +344,76 @@ def try_refresh_oauth_credentials(
                 err = json.loads(body).get("error")
             except (ValueError, AttributeError):
                 err = None
-            # invalid_grant: this slot's refresh lineage is dead.
-            # invalid_client: OUR client credential was rejected — systemic
-            # (client_id rotated/blocked), no evidence about any slot, so it
-            # keeps its own kind and lands no strike.
-            if err in ("invalid_grant", "invalid_client"):
-                return RefreshOutcome(None, err)
+        # The status and a known OAuth error code only: the body is whatever
+        # a server or a proxy chose to send.
+        known = isinstance(err, str) and err in _OAUTH_ERROR_CODES
+        _logger.debug(
+            "OAuth refresh failed: HTTP %s, error %s%s",
+            e.code, err if known else "unrecognised", unread,
+        )
+        # invalid_grant: this slot's refresh lineage is dead.
+        # invalid_client: OUR client credential was rejected — systemic
+        # (client_id rotated/blocked), no evidence about any slot, so it
+        # keeps its own kind and lands no strike.
+        if err in ("invalid_grant", "invalid_client"):
+            return RefreshOutcome(None, err)
+        if e.code >= 500:
+            # Not a verdict on the grant either: a gateway can report an error
+            # for a request the origin already acted on.
+            _warn_grant_fate_unknown(credentials, f"HTTP {e.code}")
+        return RefreshOutcome(None, "transient")
+    except urllib.error.URLError as e:
+        # urllib wraps every failure before the reply is read in URLError:
+        # name lookup, connect, TLS and writing the request. A failure while
+        # reading the reply arrives unwrapped, below.
+        reason = e.reason
+        what = "URLError" if isinstance(reason, str) else type(reason).__name__
+        if isinstance(reason, (str, *_NEVER_SENT)):
+            # Nothing reached the server, so no grant can have been spent.
+            # The ordinary offline case; it stays quiet.
+            _logger.debug("OAuth refresh not sent: %s", what)
+        else:
+            # A timeout or a reset here can be the connect or the write, and
+            # the exception does not say which. INFO, because the default log
+            # keeps it and it is not a reason for alarm.
+            _logger.info(
+                "OAuth refresh for %s failed while connecting or sending "
+                "(%s); whether the request reached the server is unknown.",
+                credential_fingerprint(credentials)[:19],
+                what,
+            )
         return RefreshOutcome(None, "transient")
     except Exception as e:
-        _logger.debug("OAuth refresh failed: %r", e)
+        # The request went out and no usable reply came back: a timeout or
+        # reset while waiting, or a reply that could not be read. The type
+        # name only: a decode error's repr holds the reply bytes.
+        _logger.debug("OAuth refresh failed: %s", type(e).__name__)
+        _warn_grant_fate_unknown(credentials, type(e).__name__)
         return RefreshOutcome(None, "transient")
+
+
+def _warn_grant_fate_unknown(credentials: str, what: str) -> None:
+    """Log a refresh that went out and came back without a verdict on the grant.
+
+    The outcome stays ``transient``: a retry is the only move either way. But
+    a timeout, a reset or a server error is not proof that nothing was spent,
+    and if the server did rotate the grant, the next refresh of these same
+    bytes gets invalid_grant. WARNING is a level the default log keeps, so
+    that later strike can be traced back to this exchange.
+
+    This module is not told which account it serves, so the line carries the
+    head of the credential fingerprint ("sha256:" and 12 hex digits): the
+    value the usage store writes as ``struckFingerprint``. ``what`` is a
+    status or an exception type name, never a repr: a decode error's repr is
+    the reply body, and a reply body can hold tokens.
+    """
+    _logger.warning(
+        "OAuth refresh for %s got no usable reply (%s). The refresh token "
+        "on disk may now be spent; if the next refresh fails with "
+        "invalid_grant, re-run `cswap --add-account` after logging in.",
+        credential_fingerprint(credentials)[:19],
+        what,
+    )
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:
@@ -501,8 +582,36 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
-def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
+def window_reset_passed(window: dict | None, now: float | None = None) -> bool:
+    """Whether a usage window's recorded reset has come.
+
+    From then on the stored percentage describes a window that has ended, so
+    the human views print no figure for it. Claude Code 2.1.332 applies the
+    same test to the windows it holds: one is kept only while ``resets_at``
+    lies ahead. A window whose ``resets_at`` is missing or unreadable has not
+    passed one; ``format_reset`` reads exactly the values this accepts, so a
+    passed window always has a clock to print.
+    """
+    if not isinstance(window, dict) or not window.get("resets_at"):
+        return False
+    now_utc = (
+        datetime.now(timezone.utc)
+        if now is None
+        else datetime.fromtimestamp(now, tz=timezone.utc)
+    )
+    try:
+        return datetime.fromisoformat(window["resets_at"]) <= now_utc
+    except (ValueError, TypeError):
+        return False
+
+
+def request_usage_data(
+    access_token: str, *, request_log: bool = False, slot: str | None = None
+) -> dict:
+    """Request raw utilization data from the Anthropic usage API.
+
+    ``request_log`` logs one INFO line for the request (see
+    :func:`_log_usage_request`); ``slot`` is the account number it names."""
     url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -510,8 +619,52 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        return json.loads(resp.read().decode())
+    outcome, resp_headers = "?", None
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp_headers = resp.headers
+            data = json.loads(resp.read().decode())
+        outcome = "http-200"
+        return data
+    except Exception as e:
+        resp_headers = getattr(e, "headers", resp_headers)
+        outcome = f"http-{e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+        raise
+    finally:
+        if request_log:
+            try:
+                _log_usage_request(access_token, outcome, resp_headers, slot)
+            except Exception:  # a log line must never replace the result or the HTTPError
+                pass
+
+
+def _log_safe(value) -> str:
+    """A server-controlled header value made safe for one log line: ASCII only
+    (a folded header can carry CR/LF and would forge a line), what an id or a
+    number needs, capped."""
+    keep = (c for c in str(value or "") if c.isascii() and (c.isalnum() or c in " ._:-"))
+    return "".join(keep)[:64].strip()
+
+
+def _log_usage_request(
+    access_token: str, outcome: str, headers, slot: str | None
+) -> None:
+    """One INFO line per usage request, success or not, so a block can be
+    traced to the token, slot and process that spent the budget. The token
+    appears only as a 12-hex sha256 prefix of the access token; no email, so
+    the line is paste-safe. No body is read: a 429 adds its Retry-After only."""
+    headers = headers or {}
+    tag = hashlib.sha256(access_token.encode()).hexdigest()[:12]
+    argv0 = os.path.basename(sys.argv[0]) if sys.argv else ""
+    at = f" slot {slot}" if slot is not None else ""
+    parts = [f"Usage request: {outcome} token {tag}{at} pid {os.getpid()} ({argv0 or '?'})"]
+    for name in ("request-id", "x-request-id", "cf-ray"):
+        if value := _log_safe(headers.get(name)):
+            parts.append(f"{name} {value}")
+    if outcome == "http-429":
+        if value := _log_safe(headers.get("Retry-After")):
+            parts.append(f"retry-after {value}")
+    _logger.info(" ".join(parts))
 
 
 def is_setup_token(oauth: dict | None) -> bool:
@@ -1282,9 +1435,11 @@ def fetch_usage(access_token: str) -> dict | None:
 # `consume-busy` belongs here for a reason the other two make obvious only in
 # hindsight: the retry re-enters the same gate, finds it still held, and the
 # distinct kind arrives as generic "refresh-failed" — hiding it, and spending a
-# guaranteed 401 per pass to learn nothing.
+# guaranteed 401 per pass to learn nothing. `live-login` is the gate declining
+# a grant the live login also holds; the retry would be declined the same way.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "live-login",
 )
 
 
@@ -1298,6 +1453,7 @@ def try_fetch_usage_for_account(
     header_probe: bool = False,
     scoped_probe: bool = False,
     last_usage: dict | None = None,
+    request_log: bool = False,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -1315,7 +1471,8 @@ def try_fetch_usage_for_account(
     backoff pace it exactly like an endpoint fetch; without it the outcome is
     the ``"setup-token"`` error and no request is sent. ``scoped_probe`` and
     ``last_usage`` (the account's stored reading) only shape that probe, see
-    :func:`_usage_from_probe`.
+    :func:`_usage_from_probe`. ``request_log`` logs a line for each usage
+    endpoint request (see :func:`request_usage_data`).
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -1374,7 +1531,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        data = request_usage_data(access_token, request_log=request_log, slot=account_num)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
@@ -1423,7 +1580,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
-            data = request_usage_data(new_token)
+            data = request_usage_data(new_token, request_log=request_log, slot=account_num)
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)

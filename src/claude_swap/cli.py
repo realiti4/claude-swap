@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -195,6 +196,26 @@ Examples:
     )
     args = parser.parse_args(head)
 
+    # The parser's --help belongs on stdout. Nothing printed after it does:
+    # see _run_launch.
+    with contextlib.redirect_stdout(sys.stderr):
+        _run_launch(args, tail)
+
+
+def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
+    """Resolve the account for `cswap run` and hand the terminal to claude.
+
+    Runs with stdout redirected to stderr. Stdout belongs to claude, and a
+    caller may be reading it as data (`cswap run 2 -- -p ... --output-format
+    stream-json`), so a notice printed there lands in that stream: ahead of
+    claude's output when stdout is unbuffered, after it on Windows, where
+    cswap stays resident and flushes its buffer at exit. On a POSIX pipe it
+    is lost instead, because the exec discards what is still buffered.
+
+    The redirect covers every print on the way to the launch, the session
+    bootstrap's included, and rebinds only Python's ``sys.stdout``: claude
+    inherits the real stream.
+    """
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
@@ -253,6 +274,23 @@ def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
         if os.geteuid() == 0 and not switcher._is_running_in_container():
             error("Error: Do not run this script as root (unless running in a container)")
             sys.exit(1)
+
+
+def _person_at_terminal(args: argparse.Namespace) -> bool:
+    """Whether a person is running this command and can answer a system prompt.
+
+    The switcher's ``interactive`` flag: it lets the macOS Keychain migration
+    wait for the permission window. False for ``--json`` (a program reads the
+    result, even from a terminal) and for the menu bar app (launchd runs it),
+    and otherwise true only when stdin and stderr are both terminals: stderr
+    carries the notice that says what the window is for.
+    """
+    if args.json or args.menubar:
+        return False
+    try:
+        return sys.stdin.isatty() and sys.stderr.isatty()
+    except (AttributeError, ValueError):  # a closed or replaced stream
+        return False
 
 
 def _map_command(argv: list[str]) -> None:
@@ -803,7 +841,7 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's 5h window (or any window, "
-            "without a weekly line) reaches this utilization (50-99.9; "
+            "without a weekly line) reaches this utilization (40-99.9; "
             "default 90)"
         ),
     )
@@ -938,7 +976,8 @@ def _config_command(argv: list[str]) -> None:
 
     Pre-dispatched before the main parser is built, like `run` and `auto`
     (same limitation: `config` must be the first argument). Edits
-    settings.json in the backup root with strict validation — unlike loading,
+    settings.json in the backup root (or settings.local.json once someone has
+    created it) with strict validation — unlike loading,
     which forgivingly clamps — so a typo'd key or out-of-range value errors
     loudly here instead of silently degrading at `cswap auto` time. `list`
     also names the keys a hand edit left in the file that nothing reads.
@@ -950,7 +989,7 @@ def _config_command(argv: list[str]) -> None:
         load_usage_settings,
         set_setting,
         setting_spec,
-        settings_path,
+        settings_write_path,
         unrecognized_keys,
         unset_setting,
     )
@@ -976,7 +1015,7 @@ Examples:
   cswap config set autoswitch.threshold 80
   cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config unset autoswitch.threshold   # back to the default
-  cswap config path                         # where settings.json lives
+  cswap config path                         # the file `set` writes
         """,
     )
     parser.add_argument(
@@ -1008,7 +1047,11 @@ Examples:
     p_set.add_argument("value", metavar="VALUE")
     p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
     p_unset.add_argument("key", metavar="KEY")
-    sub.add_parser("path", help="Print the settings.json location")
+    sub.add_parser(
+        "path",
+        help="Print the file `set` writes (settings.json, or "
+        "settings.local.json once it exists)",
+    )
 
     args = parser.parse_args(argv)
     json_mode = bool(getattr(args, "json", False))
@@ -1025,14 +1068,14 @@ Examples:
         root = switcher.backup_dir
 
         if action == "path":
-            print(settings_path(root))
+            print(settings_write_path(root))
         elif action == "list":
             rows = effective_settings(root)
             ignored = unrecognized_keys(root)
             if json_mode:
                 payload = {
                     "schemaVersion": 1,
-                    "path": str(settings_path(root)),
+                    "path": str(settings_write_path(root)),
                     "settings": [
                         {"key": spec.dotted, "value": value, "isSet": is_set}
                         for spec, value, is_set in rows
@@ -1088,10 +1131,26 @@ Examples:
                 )
         elif action == "unset":
             if unset_setting(root, args.key):
-                default = setting_spec(args.key).default
-                print(f"{args.key} unset (default: {format_setting_value(default)})")
+                spec = setting_spec(args.key)
+                value, is_set = next(
+                    (v, s) for sp, v, s in effective_settings(root) if sp is spec
+                )
+                # With settings.local.json in play, settings.json may still set it.
+                now = (
+                    f"now {format_setting_value(value)}, from settings.json"
+                    if is_set
+                    else f"default: {format_setting_value(spec.default)}"
+                )
+                print(f"{args.key} unset ({now})")
             else:
-                print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+                spec = setting_spec(args.key)
+                from_base = any(s for sp, _, s in effective_settings(root) if sp is spec)
+                why = (
+                    "is set in settings.json, which this command does not write"
+                    if from_base
+                    else "is not set"
+                )
+                print(muted(f"{args.key} {why}; nothing to do"), file=sys.stderr)
     except ClaudeSwitchError as e:
         if json_mode:
             print(json.dumps(error_envelope(e), indent=2))
@@ -1896,7 +1955,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # serializes it (so no command writes JSON to stdout itself).
     payload: dict | None = None
     try:
-        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        switcher = ClaudeAccountSwitcher(
+            debug=args.debug, interactive=_person_at_terminal(args)
+        )
 
         # Check for root (unless in container) - POSIX only
         if sys.platform != "win32":

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
 import ssl
 import urllib.error
 from datetime import datetime, timezone
@@ -189,6 +192,47 @@ class TestFormatReset:
             countdown, clock = oauth.format_reset(future.isoformat())
         assert countdown == "45m"
         assert "h" not in countdown
+
+
+class TestWindowResetPassed:
+    """Test window_reset_passed."""
+
+    NOW = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _passed(self, seconds: float) -> bool:
+        from datetime import timedelta
+        resets_at = (self.NOW + timedelta(seconds=seconds)).isoformat()
+        return oauth.window_reset_passed({"resets_at": resets_at}, self.NOW.timestamp())
+
+    def test_passed_from_the_reset_instant_on(self):
+        # The boundary Claude Code 2.1.332 uses: a window is current only
+        # while its reset lies ahead.
+        assert self._passed(-43 * 3600)
+        assert self._passed(0)
+        assert not self._passed(1)
+        assert not self._passed(3 * 86400)
+
+    def test_reads_the_api_spelling_and_the_clock_by_default(self):
+        assert oauth.window_reset_passed({"resets_at": "2020-01-01T00:00:00Z"})
+        assert not oauth.window_reset_passed({"resets_at": "2999-01-01T00:00:00Z"})
+
+    @pytest.mark.parametrize(
+        "window",
+        [
+            None,
+            {},
+            {"pct": 5.0},
+            {"resets_at": None},
+            {"resets_at": "not-a-date"},
+            {"resets_at": 1774267200},
+            # No UTC offset: ``format_reset`` cannot place it either.
+            {"resets_at": "2020-01-01T00:00:00"},
+            # The fetch-time strings alone say nothing about now.
+            {"pct": 5.0, "clock": "15:59", "countdown": "0m"},
+        ],
+    )
+    def test_no_readable_reset_has_not_passed(self, window):
+        assert not oauth.window_reset_passed(window)
 
 
 class TestFetchUsage:
@@ -518,6 +562,182 @@ class TestTryRefreshOAuthCredentials:
         ):
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.error == "transient"
+
+    def test_no_reply_is_logged_with_the_generation(self, caplog):
+        """A refresh that got no reply may still have been consumed server-side,
+        so it must leave a trace the default log level keeps."""
+        import logging
+
+        creds = self._make_credentials()
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(creds)
+
+        assert outcome.error == "transient"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        # "sha256:" and 12 hex digits, as the store's struckFingerprint begins.
+        assert oauth.credential_fingerprint(creds)[:19] in warnings[0].getMessage()
+        assert "TimeoutError" in warnings[0].getMessage()
+
+    def test_server_error_reply_is_logged_as_no_reply(self, caplog):
+        """A 5xx is no verdict on the grant: a gateway can report an error for
+        a request the origin already acted on."""
+        import logging
+
+        for code in (502, 503, 504):
+            caplog.clear()
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=self._http_error(code, b"upstream error"),
+            ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(
+                    self._make_credentials()
+                )
+            assert outcome.error == "transient"
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert f"HTTP {code}" in warnings[0].getMessage()
+
+    def test_unreadable_reply_keeps_its_bytes_out_of_the_log(self, caplog):
+        """A decode error's repr is the reply body, and a reply body can hold
+        tokens: every line names the exception type and nothing more."""
+        import logging
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'\xff{"refresh_token": "leak-me"}'
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ), caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error == "transient"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "UnicodeDecodeError" in warnings[0].getMessage()
+        # The debug line too: with --debug it reaches the console and the file.
+        assert caplog.records
+        assert not [r for r in caplog.records if "leak-me" in r.getMessage()]
+
+    def test_a_request_that_never_left_is_not_logged(self, caplog):
+        """A failed name lookup, a refused connection or a rejected
+        certificate happens before any byte is written: no grant can have been
+        spent, and an offline machine must not fill the log."""
+        import logging
+        import socket
+
+        for cause in (
+            socket.gaierror(11001, "getaddrinfo failed"),
+            ConnectionRefusedError(10061, "refused"),
+            ssl.SSLCertVerificationError("self-signed certificate"),
+            "no host given",
+        ):
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=urllib.error.URLError(cause),
+            ), caplog.at_level(logging.INFO, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(
+                    self._make_credentials()
+                )
+            assert outcome.error == "transient"
+        assert not caplog.records
+
+    def test_a_failure_while_connecting_or_sending_leaves_delivery_open(
+        self, caplog
+    ):
+        """urllib reports a failed connect and a failed write the same way, so
+        a timeout or a reset there says what was seen and no more. INFO: the
+        default log keeps it, and it is not the no-reply warning."""
+        import logging
+
+        creds = self._make_credentials()
+        for cause in (TimeoutError("timed out"), ConnectionResetError(54, "reset")):
+            caplog.clear()
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=urllib.error.URLError(cause),
+            ), caplog.at_level(logging.INFO, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(creds)
+            assert outcome.error == "transient"
+            [record] = caplog.records
+            assert record.levelno == logging.INFO
+            message = record.getMessage()
+            assert oauth.credential_fingerprint(creds)[:19] in message
+            assert type(cause).__name__ in message
+            assert "unknown" in message
+            assert "spent" not in message
+
+    @pytest.mark.parametrize("code, warned", [(502, True), (400, False)])
+    def test_an_error_reply_that_stops_mid_read_is_transient(
+        self, caplog, code, warned
+    ):
+        """A gateway can drop the connection while the error body is read.
+        That must come back as an outcome, not raise through the caller."""
+        import http.client
+        import logging
+
+        err = self._http_error(code, b"")
+        err.read = MagicMock(side_effect=http.client.IncompleteRead(b"par"))
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err
+        ), caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error == "transient"
+        assert outcome.credentials is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert bool(warnings) is warned
+        assert "IncompleteRead" in caplog.text
+
+    def test_reply_text_stays_out_of_the_log_at_every_level(self, caplog):
+        """The error body is whatever a server or a proxy chose to send, and
+        --debug output gets pasted into issues: only the status, a known
+        OAuth error code and exception types are logged."""
+        import logging
+
+        failures = (
+            self._http_error(
+                400, b'{"error": "invalid_request", "error_description": "MARKER"}'
+            ),
+            self._http_error(400, b'{"error": "MARKER"}'),
+            self._http_error(400, b'{"error": {"nested": "MARKER"}}'),
+            self._http_error(503, b"<html>MARKER</html>"),
+            urllib.error.URLError("MARKER"),
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            for failure in failures:
+                with patch(
+                    "claude_swap.oauth.urllib.request.urlopen", side_effect=failure
+                ):
+                    outcome = oauth.try_refresh_oauth_credentials(
+                        self._make_credentials()
+                    )
+                assert outcome.error == "transient"
+
+        assert "MARKER" not in caplog.text
+        assert "HTTP 400, error invalid_request" in caplog.text
+        assert "HTTP 400, error unrecognised" in caplog.text
+
+    def test_answered_refresh_is_not_logged_as_no_reply(self, caplog):
+        """A 4xx is the server's answer to the request, whatever it says."""
+        import logging
+
+        for err in (
+            self._http_error(400, b'{"error": "invalid_grant"}'),
+            self._http_error(400, b'{"error": "temporarily_unavailable"}'),
+            self._http_error(429, b"slow down"),
+        ):
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen", side_effect=err
+            ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+                oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
     def test_missing_refresh_token_is_permanent(self):
         creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
@@ -978,6 +1198,101 @@ class TestClassifyUsageError:
 
     def test_fallback_type_name(self):
         assert oauth._classify_usage_error(ValueError("x"))[0] == "ValueError"
+
+
+class TestUsageRequestLog:
+    """``request_usage_data`` logs one INFO line per request when asked
+    (outcome, token tag, slot, process, request and cf-ray ids), never reads a
+    body for it, and changes nothing it returns or raises."""
+
+    TOKEN = "sk-ant-oat01-secret"
+    TAG = hashlib.sha256(TOKEN.encode()).hexdigest()[:12]
+    RATE = json.dumps({"type": "error", "error": {
+        "type": "rate_limit_error", "message": "Slow down",
+    }}).encode()
+    HTTP = staticmethod(TestClassifyUsageError._http_error)
+
+    def _request(self, caplog, **urlopen):
+        """Run one request: its INFO lines and what it raised."""
+        raised = None
+        with patch("claude_swap.oauth.urllib.request.urlopen", **urlopen), \
+                caplog.at_level(logging.INFO, logger="claude-swap"):
+            try:
+                oauth.request_usage_data(self.TOKEN, request_log=True, slot="7")
+            except Exception as e:
+                raised = e
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO], raised
+
+    @staticmethod
+    def _ok(headers=None):
+        resp = MagicMock(status=200, headers=headers or {})
+        resp.read.return_value = b'{"ok": 1}'
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return resp
+
+    def test_success_logs_one_line(self, caplog):
+        (line,), raised = self._request(
+            caplog, return_value=self._ok({"request-id": "req_ok", "cf-ray": "9a8b7c6d-xy"}),
+        )
+        assert raised is None
+        for part in ("http-200", self.TAG, "slot 7", f"pid {os.getpid()}", "request-id req_ok",
+                     "cf-ray 9a8b7c6d-xy"):
+            assert part in line
+        assert self.TOKEN not in line
+
+    @pytest.mark.parametrize("err, present, absent", [
+        (HTTP(429, {"request-id": "req_abc\nforged", "X-Request-Id": "xr_1", "Retry-After": "3600"}, RATE),
+         ["http-429", "request-id req_abc", "x-request-id xr_1", "retry-after 3600"],
+         ["rate_limit_error", "Slow down"]),
+        (HTTP(500, {"request-id": "req_5"}, RATE), ["http-500", "request-id req_5"],
+         ["rate_limit_error", "retry-after"]),
+        (TimeoutError(), ["TimeoutError"], []),
+        (urllib.error.URLError(TimeoutError()), ["URLError"], []),
+    ])
+    def test_failure_logs_one_line_and_reraises(self, caplog, err, present, absent):
+        """No body is read, and a log line never carries a newline."""
+        (line,), raised = self._request(caplog, side_effect=err)
+        assert raised is err
+        assert not isinstance(err, urllib.error.HTTPError) or err.fp.tell() == 0
+        assert self.TAG in line and self.TOKEN not in line and "\n" not in line
+        assert all(p in line for p in present)
+        assert not any(a in line for a in absent)
+
+    def test_default_logs_nothing(self, caplog):
+        """The trace is opt-in: a plain call sends one request and logs nothing."""
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=self._ok()), \
+                caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            assert oauth.request_usage_data(self.TOKEN) == {"ok": 1}
+        assert caplog.records == []
+
+    @pytest.mark.parametrize("urlopen", [{"side_effect": HTTP(401)}, {"return_value": _ok()}])
+    def test_a_failing_log_line_changes_nothing(self, urlopen):
+        with patch.object(oauth._logger, "info", side_effect=RuntimeError("boom")), \
+                patch("claude_swap.oauth.urllib.request.urlopen", **urlopen):
+            if "side_effect" in urlopen:
+                with pytest.raises(urllib.error.HTTPError) as raised:
+                    oauth.request_usage_data(self.TOKEN, request_log=True)
+                assert raised.value is urlopen["side_effect"]
+            else:
+                assert oauth.request_usage_data(self.TOKEN, request_log=True) == {"ok": 1}
+
+    @pytest.mark.parametrize("code, headers, body, error, retry_after", [
+        (429, {"Retry-After": "3600"}, RATE, "http-429", 3600.0),
+        (403, {}, TestClassifyUsageError.ORG_BODY, TestClassifyUsageError.ORG, None),
+    ])
+    def test_outcome_is_unchanged(self, caplog, code, headers, body, error, retry_after):
+        """The log line leaves the 403 body for ``_classify_usage_error``, and
+        ``try_fetch_usage_for_account`` passes the option and its slot on."""
+        with patch("claude_swap.oauth.urllib.request.urlopen",
+                   side_effect=self.HTTP(code, headers, body)), \
+                caplog.at_level(logging.INFO, logger="claude-swap"):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", TestTryFetchUsageOutcome._make_credentials(), is_active=False,
+                request_log=True,
+            )
+        assert (outcome.error, outcome.retry_after_s) == (error, retry_after)
+        assert "slot 1" in caplog.text
 
 
 class TestTryFetchUsageOutcome:
@@ -2235,6 +2550,26 @@ class TestConsumeBusyIsDeterministic:
                 refresh_via=lambda *_: oauth.RefreshOutcome(None, "consume-busy"),
             )
         assert out.error == "consume-busy", out.error
+        usage.assert_not_called()
+
+    def test_a_grant_left_to_the_live_login_does_not_spend_a_doomed_request(self):
+        """The gate declines a grant the live login holds. The token in hand
+        is still expired, and the retry after its 401 would be declined the
+        same way."""
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(None, "live-login"),
+            )
+        assert out.error == "live-login", out.error
+        assert out.struck_fp is None
         usage.assert_not_called()
 
     def test_every_deterministic_kind_has_a_note(self):
