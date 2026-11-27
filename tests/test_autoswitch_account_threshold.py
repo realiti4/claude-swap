@@ -55,7 +55,11 @@ GLOBAL = AutoSwitchSettings().threshold  # 90.0
 
 
 def _fleet(temp_home, **settings_kwargs) -> EngineHarness:
-    """Three seeded OAuth accounts, account 1 live and active."""
+    """Three seeded OAuth accounts, account 1 live and active. On `best`
+    unless a test says otherwise: these gates were written against it, and
+    consume-first (the shipped default since #325) answers a below-line active
+    with its own sooner-reset rule instead of `below-threshold`."""
+    settings_kwargs.setdefault("strategy", "best")
     h = EngineHarness(temp_home, **settings_kwargs)
     h.seed(1, "a@example.com")
     h.seed(2, "b@example.com")
@@ -544,8 +548,8 @@ class TestRankCandidatesStaysPure:
             if monkey is not None:
                 setattr(h.switcher, name, _boom)
 
-        ordered_a, _, _ = h.engine._rank_candidates(**kwargs)
-        ordered_b, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_a, _, _, _ = h.engine._rank_candidates(**kwargs)
+        ordered_b, _, _, _ = h.engine._rank_candidates(**kwargs)
         assert ordered_a == ordered_b
 
     def test_two_calls_on_different_snapshots_use_the_passed_map(self, temp_home):
@@ -553,7 +557,7 @@ class TestRankCandidatesStaysPure:
         h = _fleet(temp_home)
         thresholds = ThresholdMap({"2": 45.0, "3": 95.0}, GLOBAL)
         phase1 = self._kwargs(h, thresholds)
-        ordered1, _, _ = h.engine._rank_candidates(**phase1)
+        ordered1, _, _, _ = h.engine._rank_candidates(**phase1)
         # 2 is at 50 utilization, over its own 45 line -> not a landing spot.
         assert "2" not in ordered1
         assert ordered1 == ["3"]
@@ -561,7 +565,7 @@ class TestRankCandidatesStaysPure:
         phase2 = dict(phase1)
         phase2["usage"] = {"1": _usage(99.0), "2": _usage(20.0), "3": _usage(60.0)}
         phase2["headroom"] = {"1": 1.0, "2": 80.0, "3": 40.0}
-        ordered2, _, _ = h.engine._rank_candidates(**phase2)
+        ordered2, _, _, _ = h.engine._rank_candidates(**phase2)
         # Same map, fresher snapshot: 2 is now at 20, under its own line.
         assert ordered2[0] == "2"
 
@@ -1120,29 +1124,42 @@ class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
 
 
 class TestBestRanksByRoomUnderEachAccountsOwnLine:
-    """The `best` sort key ranks candidates on room under each one's own line.
+    """The `best` and consume-first sort keys rank candidates on room under
+    each one's own line (consume-first breaks its equal-reset tie on it).
 
     1 departs at 95% on the global line. 2 sits at 50% on a 60 line, 3 at
     55% on the global 90. Raw headroom ranks 2 first (50 vs 45); room on the
     90 scale ranks 3 first, because 2 is 10 points under a 60 line
     (`10 + 90 * 10 / 60 = 25`) while 3 is 35 points under a 90 line (`45`).
+    The weekly resets are reported, 2 and 3 alike and sooner than 1's, so
+    consume-first admits both and the tie falls to the room.
     """
 
-    def _usage_map(self) -> dict:
-        return {"1": _usage(95.0), "2": _usage(50.0), "3": _usage(55.0)}
+    STRATEGIES = pytest.mark.parametrize("strategy", ["best", "consume-first"])
 
-    def test_room_picks_the_candidate_raw_headroom_does_not(self, temp_home):
-        h = _fleet(temp_home)
+    def _usage_map(self) -> dict:
+        return {
+            "1": _usage7(95.0, 0.0, _R_LATEST),
+            "2": _usage7(50.0, 0.0, _R_SOON),
+            "3": _usage7(55.0, 0.0, _R_SOON),
+        }
+
+    @STRATEGIES
+    def test_room_picks_the_candidate_raw_headroom_does_not(
+        self, temp_home, strategy
+    ):
+        h = _fleet(temp_home, strategy=strategy)
         h.switcher.set_account_threshold("2", 60.0)
         h.engine = h._make_engine()
         outcome = h.tick_with_usage(self._usage_map())
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
         assert h.active_number() == 3
 
-    def test_equal_thresholds_keep_the_raw_headroom_pick(self, temp_home):
+    @STRATEGIES
+    def test_equal_thresholds_keep_the_raw_headroom_pick(self, temp_home, strategy):
         """With every account on the global, room is `100 - pct` and the
         ranking is main's: 2 at 50 headroom beats 3 at 45."""
-        h = _fleet(temp_home)
+        h = _fleet(temp_home, strategy=strategy)
         outcome = h.tick_with_usage(self._usage_map())
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
         assert h.active_number() == 2
