@@ -95,8 +95,10 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
+from claude_swap.chrome_session import ChromeSync
 from claude_swap.settings import (
     UsageSettings,
+    load_chrome_settings,
     load_settings,
     load_ui_settings,
     load_usage_settings,
@@ -456,6 +458,10 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        # Browser-side companion to an account switch: syncs the Claude in Chrome
+        # extension's OAuth pairing alongside Claude Code's OAuth token.
+        # Best-effort and disabled unless settings.json's `chrome` section opts in.
+        self._chrome = ChromeSync(load_chrome_settings(self.backup_dir), self.backup_dir)
         # (settings mtime, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
@@ -4435,6 +4441,11 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        # Best-effort: if the dedicated Claude Browser is up and its extension is
+        # connected to this same account, capture its OAuth tokens too. The org
+        # guard ensures a browser connected to a different account isn't stored
+        # here; otherwise this no-ops and the user runs `cswap chrome capture N`.
+        self._chrome.capture_for_account(account_num, organization_uuid, current_email)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -6367,6 +6378,23 @@ class ClaudeAccountSwitcher:
             payload["unclaimedCredentials"] = sorted(unclaimed)
         return payload
 
+    def _chrome_bound_accounts(self) -> set[str]:
+        """Account numbers that have a stored Claude browser session.
+
+        Empty unless the optional Chrome sync feature is enabled, so the
+        ``(chrome)`` marker in list/status/menu bar only appears for users who
+        opted in. Best-effort — any failure yields an empty set (no marker).
+        """
+        try:
+            from claude_swap.chrome_session import ChromeVault
+            from claude_swap.settings import load_chrome_settings
+
+            if not load_chrome_settings(self.backup_dir).enabled:
+                return set()
+            return ChromeVault(self.backup_dir).account_numbers()
+        except Exception:  # noqa: BLE001 - a display marker must never break listing
+            return set()
+
     def list_accounts(
         self,
         show_token_status: bool = False,
@@ -6403,6 +6431,7 @@ class ClaudeAccountSwitcher:
             return self._build_list_payload(accounts_info, entries, plans)
 
         seq_data = self._get_sequence_data() or {}
+        chrome_bound = self._chrome_bound_accounts()
         tag_mode = load_ui_settings(self.backup_dir).org_tag
         emails = [info[1] for info in accounts_info]
         print(bolded("Accounts:"))
@@ -6414,6 +6443,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            if str(num) in chrome_bound:
+                markers += f" {muted('(chrome)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label}{tag}{markers}")
             login_expires_at = oauth.login_expires_at_epoch(creds)
@@ -6579,9 +6610,13 @@ class ClaudeAccountSwitcher:
                 emails, current_email, org_name, current_org_uuid,
             )
             total = len(data.get("accounts", {}))
+            chrome_mark = (
+                f" {muted('(chrome)')}"
+                if str(account_num) in self._chrome_bound_accounts() else ""
+            )
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email}{tag})"
+                f"({current_email}{tag}){chrome_mark}"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry, login_expires_at = self._active_account_usage(
@@ -8315,6 +8350,10 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
+        # Best-effort browser sync, after the lock releases (CDP/network is safe
+        # here). Never affects the already-committed OAuth switch above; the
+        # menu bar runs it in the background (ChromeSync.follow_switch).
+        self._chrome.follow_switch(target_account)
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
     def _print_switch_followup(self) -> None:

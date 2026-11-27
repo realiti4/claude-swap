@@ -426,6 +426,7 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    chrome_bound: bool = False,
     login_expires_at: float | None = None,
     quarantined: bool = False,
 ) -> str:
@@ -438,6 +439,8 @@ def format_account_label(
     """
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
+    if chrome_bound:
+        marker += "  (chrome)"
     row = f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
     note = oauth.format_login_expiry(login_expires_at, quarantined, now)
     return f"{row} · {note}" if note else row
@@ -740,6 +743,9 @@ def run(switcher) -> int:
     # key on. Returns only when staying in this interpreter (already bundled,
     # opted out, framework build, or the bundle could not be built).
     app_bundle.maybe_reexec(switcher.backup_dir)
+    # Switch callbacks run on the AppKit main thread: keep the seconds a
+    # browser sync takes off it, so the menu stays responsive.
+    switcher._chrome.background = True
     if not app_bundle.in_bundle():
         ensure_notification_identity()
     try:
@@ -1059,6 +1065,12 @@ def run(switcher) -> int:
                             _purge(_sub)
                 _purge(self.menu._menu)
             self.menu.clear()
+            # Accounts with a stored browser session get a "(chrome)" marker.
+            # Best-effort: the optional Chrome sync must never break the menu.
+            try:
+                chrome_bound = self.switcher._chrome_bound_accounts()
+            except Exception:  # noqa: BLE001
+                chrome_bound = set()
             account_items = []
             for (
                 num, email, is_active, display, _last_good, alias, disabled, fetched_at,
@@ -1067,6 +1079,7 @@ def run(switcher) -> int:
                 item = rumps.MenuItem(
                     format_account_label(
                         num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                        chrome_bound=str(num) in chrome_bound,
                         login_expires_at=login_expires_at, quarantined=quarantined,
                     ),
                     callback=self._make_switch_to(num),
