@@ -386,6 +386,24 @@ class TestFormatting:
         assert tui_data.reset_clock(elapsed, now) is None
         assert tui_data.reset_text(elapsed, now) == "resets now"
 
+    def test_window_past_its_reset_is_a_row_drawn_as_unknown(self):
+        # Issue #376: the stored figure describes the window that ended, so
+        # the row has none and no at-limit or pace marker, and says how long
+        # ago it ended and when.
+        from claude_swap.tui.widgets import mini_account_text, usage_rows
+
+        entry = make_entry(pct5=19.0, pct7=22.0, scoped=[("Fable", 100.0)])
+        entry.last_good["five_hour"]["resets_at"] = _iso_in(-(3 * 3600 + 330))
+        entry.last_good["scoped"][0]["resets_at"] = _iso_in(-(3 * 3600 + 330))
+        now = time.time()
+        five, seven, fable = usage_rows(entry.last_good, now, entry.fetched_at)
+        assert five[:3] == ("5h", None, "reset 3h 5m ago")
+        assert five[3].startswith("reset 3h 5m ago · ")
+        assert seven[:2] == ("7d", 22.0) and seven[2].startswith("resets ")
+        assert fable[:3] == ("Fable", None, "reset 3h 5m ago")
+        mini = mini_account_text(make_account(2, entry=entry), now).plain
+        assert "5h ? · 7d 22%" in mini and "Fable" not in mini
+
 
 class TestSnapshotSource:
     def _source(self, tmp_path: Path, accounts=None):
@@ -1612,7 +1630,7 @@ class TestAutoScreen:
             assert "threshold 99.9% (session)" in summary.render().plain
             screen.action_threshold_step(-60.0)
             await pilot.pause()
-            assert screen._settings.threshold == 50.0  # spec's lower bound
+            assert screen._settings.threshold == 40.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

@@ -471,6 +471,82 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
 
+    def test_a_session_is_not_seeded_from_the_live_login(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """The live login holds this account's refresh token (#590).
+
+        The gate leaves that grant to Claude Code. Carrying on with the stored
+        credentials, as after any other failed refresh, would give the session
+        a second copy of the same login.
+        """
+        seeded_switcher._write_credentials(CREDS)
+        posted = []
+        monkeypatch.setattr(
+            oauth, "try_refresh_oauth_credentials",
+            lambda *a, **k: posted.append(a)
+            or oauth.RefreshOutcome(None, "transient"),
+        )
+
+        with pytest.raises(SessionError, match="live login"):
+            manager.setup_session("2", share=False)
+
+        assert posted == []
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not (session_dir / ".credentials.json").exists()
+
+    def test_bootstrap_checks_the_login_it_copies(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """The gate reports success without its live-login check when the
+        backup moved after the caller's snapshot: it adopts the fresh
+        credential and POSTs nothing. The copy must still be refused, and
+        before anything of the profile is touched."""
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "fresh-access",
+                "refreshToken": "shared-refresh",
+                "expiresAt": 9999999999999,
+            }
+        })
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, fresh
+        )
+        seeded_switcher._write_credentials(fresh)
+        # setup_session's snapshot predates that write.
+        real_read = ClaudeAccountSwitcher.read_account_credentials
+        reads = {"n": 0}
+
+        def stale_first(self, num, email):
+            reads["n"] += 1
+            return CREDS if reads["n"] == 1 else real_read(self, num, email)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "read_account_credentials", stale_first
+        )
+        posted = []
+        monkeypatch.setattr(
+            oauth, "try_refresh_oauth_credentials",
+            lambda *a, **k: posted.append(a)
+            or oauth.RefreshOutcome(None, "transient"),
+        )
+        deleted = []
+        monkeypatch.setattr(
+            session_mod, "delete_macos_keychain_entry", deleted.append
+        )
+
+        with pytest.raises(SessionError, match="live login"):
+            manager.setup_session("2", share=False)
+
+        assert posted == []
+        assert deleted == []
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not (session_dir / ".credentials.json").exists()
+
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
     ):

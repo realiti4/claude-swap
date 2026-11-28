@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -55,9 +56,10 @@ class TestConfigList:
             "updates.check",
             "usage.headerProbe",
             "usage.fableProbe",
+            "usage.requestLog",
         ):
             assert key in out
-        assert out.count("(default)") == 15
+        assert out.count("(default)") == 16
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -84,7 +86,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 15
+        assert len(by_key) == 16
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
@@ -226,7 +228,14 @@ class TestConfigValidation:
     def test_out_of_range_exits_1(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.threshold", "30"], capsys)
         assert code == 1
-        assert "between 50 and 99.9" in err
+        assert "between 40 and 99.9" in err
+        code, _, err = _run(["set", "autoswitch.threshold", "39.9"], capsys)
+        assert code == 1
+        assert "between 40 and 99.9" in err
+
+    def test_lower_bound_is_accepted(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.threshold", "40"], capsys)
+        assert code == 0
 
     def test_unknown_key_exits_1_and_lists_valid_keys(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.bogus", "1"], capsys)
@@ -301,6 +310,22 @@ class TestConfigUnset:
         raw = json.loads(_settings_file(capsys).read_text())
         assert "autoswitch" not in raw
 
+    def test_unset_with_an_overlay_reports_the_base_value(self, temp_home, capsys):
+        path = _settings_file(capsys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"autoswitch": {"threshold": 80}}))
+        path.with_name("settings.local.json").write_text(
+            json.dumps({"autoswitch": {"threshold": 70}})
+        )
+        code, out, _ = _run(["unset", "autoswitch.threshold"], capsys)
+        assert code == 0
+        assert "80" in out and "default" not in out
+        assert _run(["get", "autoswitch.threshold"], capsys)[1].strip() == "80"
+        # Now only settings.json sets it: say so, not "not set".
+        code, _, err = _run(["unset", "autoswitch.threshold"], capsys)
+        assert code == 0
+        assert "set in settings.json" in err and "does not write" in err
+
     def test_unset_when_not_set_is_a_noop(self, temp_home, capsys):
         code, _, err = _run(["unset", "autoswitch.threshold"], capsys)
         assert code == 0
@@ -312,6 +337,23 @@ class TestConfigMisc:
         code, out, _ = _run(["path"], capsys)
         assert code == 0
         assert out.strip().endswith("settings.json")
+
+    def test_path_names_the_file_a_write_lands_in(self, temp_home, capsys):
+        path = _settings_file(capsys)
+        assert path.name == "settings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.with_name("settings.local.json").write_text("{}")
+        assert _settings_file(capsys).name == "settings.local.json"
+        _, out, _ = _run(["--json"], capsys)
+        assert json.loads(out)["path"].endswith("settings.local.json")
+
+    def test_set_false_over_a_base_zero_reads_false(self, temp_home, capsys):
+        path = _settings_file(capsys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"updates": {"check": 0}}))
+        path.with_name("settings.local.json").write_text("{}")
+        assert _run(["set", "updates.check", "false"], capsys)[0] == 0
+        assert _run(["get", "updates.check"], capsys)[1].strip() == "false"
 
     def test_config_help(self, temp_home, capsys):
         code, out, _ = _run(["--help"], capsys)
@@ -403,3 +445,17 @@ class TestWeeklyThresholdConfig:
                 cli.main()
         assert captured["settings"].threshold == 85.0
         assert captured["settings"].weekly_threshold == 97.0
+
+
+class TestSettingsCache:
+    def test_cached_policy_sees_an_overlay_created_later(self, temp_home):
+        """The cached poll policy and usage settings key on both files."""
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        assert sw._poll_policy_inputs()[0] == 90.0
+        assert sw._usage_settings().header_probe is False
+        sw.backup_dir.joinpath("settings.local.json").write_text(
+            json.dumps({"autoswitch": {"threshold": 70}, "usage": {"headerProbe": True}})
+        )
+        assert sw._poll_policy_inputs()[0] == 70.0
+        assert sw._usage_settings().header_probe is True

@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -1301,6 +1302,7 @@ class TestSetupTokenHeaderProbeWiring:
             # Opt-in: each probe is a real request on the subscription.
             assert mock_fetch.call_args.kwargs["header_probe"] is False
             assert mock_fetch.call_args.kwargs["scoped_probe"] is False
+            assert mock_fetch.call_args.kwargs["request_log"] is False
             set_setting(switcher.backup_dir, "usage.headerProbe", "true")
             # A same-second rewrite can keep the mtime; force a visible change.
             path = settings_path(switcher.backup_dir)
@@ -1310,10 +1312,12 @@ class TestSetupTokenHeaderProbeWiring:
             # The Fable probe is a second opt-in.
             assert mock_fetch.call_args.kwargs["scoped_probe"] is False
             set_setting(switcher.backup_dir, "usage.fableProbe", "true")
+            set_setting(switcher.backup_dir, "usage.requestLog", "true")
             os.utime(path, (time.time() + 10, time.time() + 10))
             stored = {"seven_day": {"pct": 1.0}}
             switcher._fetch_account_usage(self._info(), None, stored)
             assert mock_fetch.call_args.kwargs["scoped_probe"] is True
+            assert mock_fetch.call_args.kwargs["request_log"] is True
             # The stored reading rides along: it can pause the Fable probe.
             assert mock_fetch.call_args.kwargs["last_usage"] is stored
 
@@ -1759,6 +1763,12 @@ class TestOrgTagShown:
         assert org_tag_shown(mode, email, emails) is shown
 
 
+def _iso_ahead(**delta) -> str:
+    """A reset time still ahead of the clock, as the usage API writes one."""
+    ahead = datetime.now(timezone.utc) + timedelta(**delta)
+    return ahead.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -1770,8 +1780,8 @@ class TestListAccountsUsage:
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
 
         usage_response = {
-            "five_hour": {"utilization": 10.0, "resets_at": "2026-01-01T00:00:00Z"},
-            "seven_day": {"utilization": 50.0, "resets_at": "2026-01-02T00:00:00Z"},
+            "five_hour": {"utilization": 10.0, "resets_at": _iso_ahead(hours=3)},
+            "seven_day": {"utilization": 50.0, "resets_at": _iso_ahead(days=3)},
         }
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps(usage_response).encode()
@@ -1871,7 +1881,7 @@ class TestListAccountsUsage:
 
         usage_response = {
             "five_hour": {"utilization": 0.0, "resets_at": None},
-            "seven_day": {"utilization": 100.0, "resets_at": "2026-04-03T02:59:59Z"},
+            "seven_day": {"utilization": 100.0, "resets_at": _iso_ahead(days=3)},
         }
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps(usage_response).encode()
@@ -2522,6 +2532,52 @@ class TestActiveAccountRefresh:
         }
         write_live.assert_called_once_with(self._REFRESHED)
         write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+
+    @pytest.mark.parametrize(
+        "outcome, ending",
+        [
+            ("refreshed", "saved its successor ({new})."),
+            ("transient", "ended without a successor (transient)."),
+        ],
+    )
+    def test_the_active_refresh_is_bracketed_in_the_log(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog, outcome, ending,
+    ):
+        """The active account's refresh writes the same pair of lines as the
+        gate's: one before the POST, one for how it ended."""
+        import logging
+
+        switcher = self._switcher(sample_sequence_data)
+        result = (
+            oauth.RefreshOutcome(self._REFRESHED, None)
+            if outcome == "refreshed"
+            else oauth.RefreshOutcome(None, "transient")
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=result), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 10}})), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        old = oauth.credential_fingerprint(self._EXPIRED)[:19]
+        new = oauth.credential_fingerprint(self._REFRESHED)[:19]
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Refresh ")
+        ]
+        assert lines == [
+            f"Refresh starting for account 1 ({old}).",
+            "Refresh for account 1 " + ending.format(new=new),
+        ]
 
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -7571,12 +7627,13 @@ class TestFormatUsageLines:
         assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
 
     def test_seven_day_ahead_of_pace_marker(self):
-        # 1 day elapsed of the week (resets_at 6 days out), 50% used -> far
-        # ahead of the ~14% expected at that point (issue #125).
+        # 2 days elapsed of the week (resets_at 5 days out), 50% used -> far
+        # ahead of the ~29% expected at that point (issue #125), and a day
+        # clear of the 24 h suppression after a reset.
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
-        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        now = time.time()
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=5)
         usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
         line = _format_usage_lines(usage, now)[0]
         assert "(ahead of pace)" in line
@@ -7585,7 +7642,7 @@ class TestFormatUsageLines:
         # Pace applies only to weekly windows, never the 5h one (issue #125).
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
+        now = time.time()
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)
         usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at.isoformat()}}
         line = _format_usage_lines(usage, now)[0]
@@ -7594,8 +7651,8 @@ class TestFormatUsageLines:
     def test_scoped_ahead_of_pace_marker_when_under_limit(self):
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
-        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        now = time.time()
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=5)
         usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at.isoformat()}]}
         line = _format_usage_lines(usage, now)[0]
         assert "(ahead of pace)" in line
@@ -7615,11 +7672,107 @@ class TestFormatUsageLines:
         # Just reset (elapsed ~0) -> suppressed even though pct looks "ahead".
         from datetime import datetime, timedelta, timezone
 
-        now = 1_700_000_000.0
+        now = time.time()
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)
         usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
         line = _format_usage_lines(usage, now)[0]
         assert "pace" not in line
+
+    def test_window_past_its_reset_has_no_figure_and_no_marker(self):
+        # The stored percentage describes the window that ended (issue #376):
+        # no figure, no "in 0m", no pace or at-limit marker, and the clock in
+        # the same column as a current row's.
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        passed = (now - timedelta(hours=43)).isoformat()
+        ahead = (now + timedelta(days=3, minutes=30)).isoformat()
+        usage = {
+            "five_hour": {"pct": 19.0, "resets_at": passed},
+            "seven_day": {"pct": 22.0, "resets_at": ahead},
+            "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": passed}],
+        }
+        five, seven, fable = _format_usage_lines(usage, now.timestamp())
+        clock = oauth.format_reset(passed)[1]
+        assert five == f"5h:       ?   reset  {clock}"
+        assert fable == f"Fable:    ?   reset  {clock}"
+        assert seven.startswith("7d:     22%   resets ") and "in 3d 0h" in seven
+        assert five.index(clock) == seven.index(oauth.format_reset(ahead)[1])
+
+    def test_weekly_window_past_its_reset_is_not_measured_against_pace(self):
+        from datetime import datetime, timedelta, timezone
+
+        fetched = datetime.now(timezone.utc) - timedelta(days=2)
+        resets_at = (fetched + timedelta(days=1)).isoformat()  # passed a day ago
+        usage = {"seven_day": {"pct": 90.0, "resets_at": resets_at}}
+        line = _format_usage_lines(usage, fetched.timestamp())[0]
+        assert line.startswith("7d:    ?   reset ") and "pace" not in line
+
+
+class TestUsageEntryLinesAge:
+    """Where ``_usage_entry_lines`` puts a reading's age (issue #376)."""
+
+    @staticmethod
+    def _entry(age_s: float, five_hour_resets_in_s: float = 3 * 3600, **fields) -> UsageEntry:
+        now = datetime.now(timezone.utc)
+
+        def at(seconds: float) -> str:
+            return (now + timedelta(seconds=seconds)).isoformat()
+
+        usage = {
+            "five_hour": {"pct": 19.0, "resets_at": at(five_hour_resets_in_s)},
+            "seven_day": {"pct": 22.0, "resets_at": at(3 * 86400)},
+            "scoped": [{"name": "Fable", "pct": 0.0, "resets_at": at(3 * 86400)}],
+        }
+        return UsageEntry(
+            last_good=usage, fetched_at=now.timestamp() - age_s, age_s=age_s, **fields
+        )
+
+    def test_reading_frozen_by_a_429_is_headed_and_its_passed_window_has_no_figure(self):
+        # The report: 45 hours of 429s, the 5h window long over, the weekly
+        # one still open. No row may read as current.
+        entry = self._entry(
+            45 * 3600, five_hour_resets_in_s=-43 * 3600,
+            last_error="http-429", consecutive_failures=40,
+        )
+        head, five, seven, fable = _usage_entry_lines(entry)
+        assert head == "last read 1d ago (http-429)"
+        assert five.startswith("├ 5h:       ?   reset  ") and "19%" not in five
+        assert seven.startswith("├ 7d:     22%   resets ")
+        assert fable.startswith("└ Fable:   0%   resets ")
+        assert "in 0m" not in five and not any("ago" in row for row in (five, seven, fable))
+
+    def test_failed_fetch_heads_a_reading_the_engine_still_trusts(self):
+        # A 429-frozen reading stays decision-trusted until its window resets;
+        # a person reading the list is told at once.
+        entry = self._entry(
+            90 * 60, last_error="http-429", consecutive_failures=3, trust_extended=True
+        )
+        assert entry.decision_value() is not None
+        assert _usage_entry_lines(entry)[0] == "last read 1h ago (http-429)"
+
+    def test_failure_is_worded_as_the_unavailable_line_words_it(self):
+        entry = self._entry(600, last_error="tls-cert", consecutive_failures=1)
+        head = _usage_entry_lines(entry)[0]
+        assert head.startswith("last read 10m ago (the TLS certificate was refused")
+
+    def test_reading_too_old_to_decide_on_is_headed_without_a_failure(self):
+        entry = self._entry(3 * 3600)
+        assert entry.decision_value() is None
+        head, *rows = _usage_entry_lines(entry)
+        assert head == "last read 3h ago"
+        assert not any("ago" in row for row in rows)
+
+    def test_reading_waiting_for_its_scheduled_poll_keeps_the_note_on_its_last_row(self):
+        entry = self._entry(8 * 60, trust_extended=True)
+        lines = _usage_entry_lines(entry)
+        assert [line[:4] for line in lines] == ["├ 5h", "├ 7d", "└ Fa"]
+        assert lines[-1].endswith(" · 8m ago")
+        assert not any("ago" in line for line in lines[:-1])
+
+    def test_fresh_reading_has_no_age(self):
+        lines = _usage_entry_lines(self._entry(30))
+        assert len(lines) == 3 and not any("ago" in line for line in lines)
 
 
 def _read_safety_copy(switcher, entry_id: str) -> str:
@@ -9811,6 +9964,53 @@ class TestSharedOAuthCredentialPreservation:
             "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         }
 
+    @staticmethod
+    def _cred(token, pointer=None):
+        data = {"claudeAiOauth": {"accessToken": token}}
+        if pointer is not None:
+            data["keychainOverflow"] = pointer
+        return json.dumps(data)
+
+    @pytest.mark.parametrize("target_pointer", [{"slot": "a", "key": "stale"}, None])
+    def test_shared_only_keychain_overflow_pointer_follows_the_switch(
+        self, temp_home, target_pointer
+    ):
+        switcher = ClaudeAccountSwitcher()
+        live_pointer = {"slot": "b", "key": "current"}
+
+        composed = json.loads(switcher._prepare_credentials_for_activation(
+            self._cred("target", target_pointer), self._cred("live", live_pointer)
+        ))
+
+        assert composed["keychainOverflow"] == live_pointer
+
+    @pytest.mark.parametrize(
+        "a_pointer, b_pointer",
+        [
+            pytest.param({"slot": "a", "key": "k", "login": "h"}, None, id="b-has-none"),
+            pytest.param(
+                {"slot": "a", "key": "k", "login": "h"},
+                {"slot": "b", "key": "k", "member": "m"},
+                id="b-mixed",
+            ),
+            pytest.param(None, {"slot": "b", "key": "k", "member": "m"}, id="a-has-none"),
+            pytest.param("opaque", None, id="a-non-dict"),
+        ],
+    )
+    def test_mixed_keychain_overflow_pointer_returns_as_stored_after_a_b_a(
+        self, temp_home, a_pointer, b_pointer
+    ):
+        switcher = ClaudeAccountSwitcher()
+        a_saved = self._cred("a", a_pointer)
+
+        on_b = switcher._prepare_credentials_for_activation(
+            self._cred("b", b_pointer), a_saved
+        )
+        back_on_a = switcher._prepare_credentials_for_activation(a_saved, on_b)
+
+        assert json.loads(back_on_a) == json.loads(a_saved)
+        assert json.loads(on_b).get("keychainOverflow") == b_pointer
+
     def test_account_bound_and_unknown_siblings_stay_target_owned(
         self, temp_home
     ):
@@ -11430,6 +11630,191 @@ class TestConsumeGate:
         unclaimed = s.list_unclaimed_credentials()
         assert unclaimed, "consumed successor must be stashed, never discarded"
 
+    @staticmethod
+    def _refresh_lines(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Refresh ")
+        ]
+
+    def test_a_refresh_is_bracketed_in_the_log(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """One line before the POST with the grant about to be sent, one after
+        the write with its successor: the default log shows the whole chain."""
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        old = oauth.credential_fingerprint(self._OLD)[:19]
+        new = oauth.credential_fingerprint(self._NEW)[:19]
+        assert self._refresh_lines(caplog) == [
+            f"Refresh starting for account 1 ({old}).",
+            f"Refresh for account 1 saved its successor ({new}).",
+        ]
+        assert "rt-old" not in caplog.text and "rt-new" not in caplog.text
+
+    def test_a_refresh_without_a_successor_says_how_it_ended(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        old = oauth.credential_fingerprint(self._OLD)[:19]
+        assert self._refresh_lines(caplog) == [
+            f"Refresh starting for account 1 ({old}).",
+            "Refresh for account 1 ended without a successor (invalid_grant).",
+        ]
+
+    def test_an_interrupted_refresh_leaves_only_its_start_line(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """What the pair is for: a process stopped between the POST and the
+        reply writes nothing more, and the start line alone shows it."""
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=KeyboardInterrupt), \
+             caplog.at_level(logging.INFO, logger="claude-swap"), \
+             pytest.raises(KeyboardInterrupt):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        old = oauth.credential_fingerprint(self._OLD)[:19]
+        assert self._refresh_lines(caplog) == [
+            f"Refresh starting for account 1 ({old}).",
+        ]
+
+    def test_a_declined_refresh_writes_no_start_line(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """The start line means a POST is about to go out, so a gate that
+        declines before the POST must not write it."""
+        import logging
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._write_credentials(self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert self._refresh_lines(caplog) == []
+
+    def test_gate_leaves_a_grant_the_live_login_holds(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The live login holding the same refresh token means Claude Code
+        renews it. The gate saves a successor to the backup only, so a POST
+        here would leave the live store on a spent grant (#590)."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._write_credentials(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-old",
+                "expiresAt": 1000,
+            }
+        }))
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert result.error == "live-login"
+        assert result.credentials is None
+        assert result.consumed_fp == oauth.credential_fingerprint(self._OLD)
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_gate_refreshes_when_the_live_login_is_another_grant(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Another account's live login is no reason to hold back."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._write_credentials(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-other",
+                "expiresAt": 1000,
+            }
+        }))
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)) as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_called_once()
+        assert result.error is None
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW
+
+    def test_gate_refreshes_when_there_is_no_live_login(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A live store that was read and is empty holds nobody's grant."""
+        from claude_swap.credentials import ActiveCredentials
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(s, "_read_active_credentials",
+                          return_value=ActiveCredentials("", False)), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)) as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_called_once()
+        assert result.error is None
+
+    @pytest.mark.parametrize(
+        "value, keychain_unavailable, degraded",
+        [
+            (None, False, False),
+            ("", True, True),
+            # The Keychain read failed and the fallback file answered with
+            # another account's login: the Keychain may still hold this grant.
+            ('{"claudeAiOauth": {"accessToken": "a", "refreshToken": '
+             '"rt-other", "expiresAt": 1000}}', False, True),
+        ],
+        ids=["read-error", "keychain-unavailable", "fallback-served"],
+    )
+    def test_gate_defers_when_the_live_login_cannot_be_read_for_certain(
+        self, temp_home: Path, sample_sequence_data: dict,
+        value, keychain_unavailable, degraded,
+    ):
+        """Whether the live login holds the grant is unknown, so nothing is
+        POSTed and nothing strikes: the next pass reads again."""
+        from claude_swap.credentials import ActiveCredentials
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(
+            s, "_read_active_credentials",
+            return_value=ActiveCredentials(value, keychain_unavailable, degraded),
+        ), patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert result.error == "transient"
+        assert result.credentials is None
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
     def test_gate_prefers_newer_session_profile_lineage(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -11921,6 +12306,41 @@ class TestInactiveRefreshRoutesThroughGate:
         assert gate["args"] == ("2", "b@example.com")
         assert "called" not in direct
         assert record.error is None
+
+    def test_idle_slot_holding_the_live_grant_is_not_refreshed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """#590: the config names another account while the live login is this
+        slot's, so the slot is polled as idle. Its expired token must not be
+        refreshed from the backup, and the known-expired token must not be
+        sent to the usage endpoint either."""
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-old", "refreshToken": "rt-shared",
+                "expiresAt": 1000,
+            }
+        })
+        s._write_account_credentials("2", "b@example.com", expired)
+        s._write_credentials(expired)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
+             patch.object(s, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.request_usage_data") as usage:
+            info = (2, "b@example.com", "", "", False, expired, "")
+            record = s._fetch_account_usage(info)
+
+        post.assert_not_called()
+        usage.assert_not_called()
+        assert record.error == "live-login"
+        assert record.struck_fp is None
+        assert s._read_account_credentials("2", "b@example.com") == expired
 
 
 class TestStrikeUnbindsInCollector:
@@ -13570,6 +13990,360 @@ class TestActiveSlotStrikeParity:
         ):
             s._fetch_active_usage("2", "b@example.com", fresh)
         resync.assert_not_called()
+
+
+class TestActiveReloginRecovery:
+    """Issue #456: logging in again with Claude Code replaces the live login
+    only, so a quarantined active slot's backup keeps the struck generation.
+    The collector gives such a slot a paced attempt that saves the new login
+    before it fetches."""
+
+    EMAIL, UUID, ORG = "owner@example.com", "owner-uuid", "owner-org"
+    IDENT = {"1": (EMAIL, ORG)}
+    USAGE = {"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}}
+
+    @staticmethod
+    def _cred(name: str, expires_in_s: int = 3600, refresh: bool = True) -> str:
+        data = {
+            "accessToken": f"at-{name}",
+            "expiresAt": int((time.time() + expires_in_s) * 1000),
+        }
+        if refresh:
+            data["refreshToken"] = f"rt-{name}"
+        return json.dumps({"claudeAiOauth": data})
+
+    def _quarantined(self, temp_home, monkeypatch, old, *, fingerprint=True):
+        """Slot 1 is the active account and ``old`` (live and backup) was
+        refused. Returns the switcher and one mock per endpoint."""
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": self.EMAIL, "accountUuid": self.UUID,
+            "organizationUuid": self.ORG,
+        }}))
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "sequence": [1],
+            "accounts": {"1": {
+                "email": self.EMAIL, "uuid": self.UUID,
+                "organizationUuid": self.ORG,
+            }},
+        })
+        s._write_account_credentials("1", self.EMAIL, old)
+        s._write_credentials(old)
+        claims = s._usage_store.reserve(["1"], self.IDENT, respect_plans=False)
+        s._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(old) if fingerprint else None,
+            )},
+            self.IDENT, claims,
+        )
+        net = MagicMock()
+        net.usage.return_value = oauth.UsageOutcome(usage=self.USAGE)
+        net.profile.return_value = {
+            "uuid": self.UUID, "email": self.EMAIL, "organizationUuid": self.ORG,
+        }
+        net.refresh.return_value = oauth.RefreshOutcome(
+            credentials=None, error="invalid_grant"
+        )
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", net.usage)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", net.profile)
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", net.refresh)
+        # Past the strike's failure backoff, and frozen there: a failed
+        # attempt's backoff then covers the next pass.
+        after_backoff = s._usage_store.clock() + 600
+        s._usage_store.clock = lambda: after_backoff
+        return s, net
+
+    @staticmethod
+    def _collect(s, **kwargs) -> UsageEntry:
+        return s._collect_usage_entries(s._build_accounts_info(), **kwargs)["1"]
+
+    def _row(self, s) -> UsageEntry:
+        return s._usage_store.entries(self.IDENT)["1"]
+
+    def test_new_login_is_saved_then_fetched(self, temp_home: Path, monkeypatch):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        assert self._collect(s).sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+
+        new = self._cred("new")
+        s._write_credentials(new)  # Claude Code's /login
+        entry = self._collect(s)
+
+        assert entry.sentinel is None and entry.last_good == self.USAGE
+        assert s._read_account_credentials("1", self.EMAIL) == new
+        assert not self._row(s).token_dead()
+        # Ownership is settled and the backup saved before the usage request.
+        assert [c[0] for c in net.mock_calls] == ["profile", "usage"]
+        net.profile.assert_called_once_with("at-new")
+
+    def test_no_attempt_inside_the_backoff(self, temp_home: Path, monkeypatch):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        strike_time = s._usage_store.clock() - 600
+        s._usage_store.clock = lambda: strike_time
+        assert self._collect(s).sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+
+    def test_cache_only_pass_makes_no_attempt(self, temp_home: Path, monkeypatch):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        assert self._collect(s, fetch=set()).sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+
+    @pytest.mark.parametrize("profile", [
+        None,
+        {"uuid": "other-uuid", "email": "other@example.com",
+         "organizationUuid": "owner-org"},
+    ], ids=["lookup-unavailable", "another-account"])
+    def test_unverified_login_is_not_fetched_and_the_retry_is_paced(
+        self, temp_home: Path, monkeypatch, profile
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        net.profile.return_value = profile
+
+        for _ in range(3):
+            assert self._collect(s).sentinel == USAGE_RELOGIN_REQUIRED
+
+        # One lookup, then the failure backoff holds the next attempt; no
+        # usage is read with a login nobody attributed to this slot.
+        assert [c[0] for c in net.mock_calls] == ["profile"]
+        assert s._read_account_credentials("1", self.EMAIL) == old
+        assert self._row(s).token_dead() and self._row(s).last_good is None
+
+    def test_the_refused_grant_is_never_posted_again(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The shape in which the active fetch falls back to the backup's
+        grant: the new token is refused and the backup expires later."""
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", 7200)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        new = self._cred("new", 3600)
+        s._write_credentials(new)
+        net.usage.return_value = oauth.UsageOutcome(usage=None, error="http-401")
+
+        entry = self._collect(s)
+
+        posted = [
+            oauth.credential_fingerprint(c.args[0])
+            for c in net.refresh.call_args_list
+        ]
+        assert posted == [oauth.credential_fingerprint(new)]
+        # The new login was refused in its own right, and says so.
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert self._row(s).struck_fingerprint == oauth.credential_fingerprint(new)
+
+    def test_a_429_after_the_save_keeps_its_deadline(
+        self, temp_home: Path, monkeypatch
+    ):
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        new = self._cred("new")
+        s._write_credentials(new)
+        net.usage.return_value = oauth.UsageOutcome(
+            usage=None, error="http-429", retry_after_s=900.0
+        )
+
+        assert self._collect(s).sentinel is None
+        row = self._row(s)
+        assert s._read_account_credentials("1", self.EMAIL) == new
+        assert not row.token_dead() and row.last_error == "http-429"
+        assert row.backoff_until is not None
+        assert row.backoff_until >= s._usage_store.clock() + 900
+
+        # The strike went with the save, so no later pass clears the row and
+        # the server's deadline with it.
+        assert self._collect(s).sentinel is None
+        assert net.usage.call_count == 1
+        assert self._row(s).backoff_until == row.backoff_until
+        net.refresh.assert_not_called()
+
+    def test_another_collector_during_the_request_leaves_its_outcome_to_land(
+        self, temp_home: Path, monkeypatch
+    ):
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+
+        def during_the_request(*_args, **_kwargs):
+            # A second surface's cache-only pass while the first is waiting.
+            s._collect_usage_entries(info, fetch=set())
+            return oauth.UsageOutcome(
+                usage=None, error="http-429", retry_after_s=900.0
+            )
+
+        net.usage.side_effect = during_the_request
+        s._collect_usage_entries(info)
+
+        row = self._row(s)
+        assert row.last_error == "http-429"
+        assert row.backoff_until is not None
+
+    def test_another_collector_right_after_the_save_leaves_the_lease_alone(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The moment the backup holds the new login and the strike is still
+        on the row is when a second collector's own stale-strike clear would
+        fire. The row is under the first collector's lease, so it waits."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+        save = s._resync_rotated_backup
+
+        def save_then_second_collector(*args):
+            save(*args)
+            s._collect_usage_entries(info, fetch=set())
+
+        monkeypatch.setattr(s, "_resync_rotated_backup", save_then_second_collector)
+        net.usage.return_value = oauth.UsageOutcome(
+            usage=None, error="http-429", retry_after_s=900.0
+        )
+        s._collect_usage_entries(info)
+
+        row = self._row(s)
+        assert row.last_error == "http-429" and not row.token_dead()
+        assert row.backoff_until is not None
+        assert row.backoff_until >= s._usage_store.clock() + 900
+        monkeypatch.setattr(s, "_resync_rotated_backup", save)
+        self._collect(s)
+        assert net.usage.call_count == 1
+
+    def test_a_collector_that_saw_the_strike_earlier_clears_nothing_once_it_is_gone(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A second collector reads the stale strike right after the save but
+        reaches the store only after the first has cleared it and recorded a
+        429. Its clear finds no strike and leaves that deadline alone."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+        save = s._resync_rotated_backup
+        clear = s._usage_store.clear_dead_token
+        arriving_late: list = []
+
+        def hold_back_the_scans_clear(nums, identities, **kwargs):
+            if kwargs.get("claims") == {}:
+                arriving_late.append(lambda: clear(nums, identities, **kwargs))
+                return set()
+            return clear(nums, identities, **kwargs)
+
+        def save_then_second_collector(*args):
+            save(*args)
+            monkeypatch.setattr(
+                s._usage_store, "clear_dead_token", hold_back_the_scans_clear
+            )
+            s._collect_usage_entries(info, fetch=set())
+            monkeypatch.setattr(s._usage_store, "clear_dead_token", clear)
+
+        monkeypatch.setattr(s, "_resync_rotated_backup", save_then_second_collector)
+        net.usage.return_value = oauth.UsageOutcome(
+            usage=None, error="http-429", retry_after_s=900.0
+        )
+        s._collect_usage_entries(info)
+        deadline = self._row(s).backoff_until
+        assert deadline is not None and len(arriving_late) == 1
+
+        assert arriving_late[0]() == set()
+        assert self._row(s).backoff_until == deadline
+        monkeypatch.setattr(s, "_resync_rotated_backup", save)
+        self._collect(s)
+        assert net.usage.call_count == 1
+
+    def test_a_lost_lease_stops_the_attempt_before_the_fetch(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A `cswap add` elsewhere clears the row and takes the lease with
+        it. An outcome under the old lease would not be recorded, so the
+        request is not sent."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        new = self._cred("new")
+        s._write_credentials(new)
+        verified = net.profile.return_value
+
+        def lookup_while_the_row_is_cleared(_token):
+            s._usage_store.clear_dead_token(["1"], self.IDENT)
+            return verified
+
+        net.profile.side_effect = lookup_while_the_row_is_cleared
+        self._collect(s)
+
+        net.usage.assert_not_called()
+        assert s._read_account_credentials("1", self.EMAIL) == new
+        assert self._row(s).last_error is None
+
+    def test_a_backup_another_writer_replaced_is_not_taken_for_the_save(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The struck grant is gone from the backup, but not because this
+        login was verified and saved."""
+        old = self._cred("old", -3600)
+        s, net = self._quarantined(temp_home, monkeypatch, old)
+        s._write_credentials(self._cred("new"))
+        third = self._cred("third")
+
+        def failed_lookup(_token):
+            s._write_account_credentials("1", self.EMAIL, third)
+            return None
+
+        net.profile.side_effect = failed_lookup
+        self._collect(s)
+
+        net.usage.assert_not_called()
+        assert self._row(s).last_error == "login-unverified"
+        assert self._row(s).last_good is None
+        assert s._read_account_credentials("1", self.EMAIL) == third
+
+    @pytest.mark.parametrize("case", [
+        "same-generation", "expired", "no-expiry", "infinite-expiry",
+        "no-refresh-token", "degraded-read", "strike-without-fingerprint",
+    ])
+    def test_anything_short_of_a_usable_new_login_stays_quarantined(
+        self, temp_home: Path, monkeypatch, case
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        old = self._cred("old", 3600 if case == "same-generation" else -3600)
+        s, net = self._quarantined(
+            temp_home, monkeypatch, old,
+            fingerprint=case != "strike-without-fingerprint",
+        )
+        if case == "expired":
+            s._write_credentials(self._cred("new", -3600))
+        elif case in ("no-expiry", "infinite-expiry"):
+            login = json.loads(self._cred("new"))
+            if case == "no-expiry":
+                del login["claudeAiOauth"]["expiresAt"]
+            else:
+                login["claudeAiOauth"]["expiresAt"] = float("inf")
+            s._write_credentials(json.dumps(login))
+        elif case == "no-refresh-token":
+            s._write_credentials(self._cred("new", refresh=False))
+        elif case != "same-generation":
+            s._write_credentials(self._cred("new"))
+        info = s._build_accounts_info()
+        if case == "degraded-read":
+            s._record_active_verdict(ActiveCredentials(info[0][5], False, True))
+
+        assert s._collect_usage_entries(info)["1"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert net.mock_calls == []
+        assert s._read_account_credentials("1", self.EMAIL) == old
+        # No attempt was claimed either: the row still carries the strike's
+        # own failure, not a failed save.
+        assert self._row(s).last_error == "invalid_grant"
 
 
 class TestUltraReviewCoverageGaps:
